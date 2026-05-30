@@ -1,0 +1,32 @@
+{
+  "schema": "sa.plugin/1",
+  "name": "db",
+  "version": "0.1.0",
+  "source": {
+    "type": "local",
+    "path": "."
+  },
+  "abi": {
+    "plugin": 1,
+    "saasm": ">=0.4.0"
+  },
+  "artifacts": {
+    "linux-x86_64": {
+      "path": "zig-out/lib/libdb.so"
+    }
+  },
+  "interfaces": {},
+  "skills": ["database"],
+  "permissions": {
+    "fs": [
+      { "op": "read", "path": "$PROJECT/**" },
+      { "op": "write", "path": "$PROJECT/**" },
+      { "op": "create", "path": "$PROJECT/**" },
+      { "op": "delete", "path": "$PROJECT/**" }
+    ],
+    "net": [],
+    "env": [],
+    "process": { "spawn": false, "exec": [] }
+  },
+  "dependencies": {}
+}
