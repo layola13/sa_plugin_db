@@ -12,7 +12,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/plugin.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
     root_module.addImport("plugin_api", plugin_api);
     const lib = b.addLibrary(.{

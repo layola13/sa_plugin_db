@@ -10,3 +10,10 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# code-index generated artifacts
+.code_index
+.claude/skills/
+.codex/skills/
+.opencode/skills/
+# end code-index generated artifacts

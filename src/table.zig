@@ -1,6 +1,5 @@
 const std = @import("std");
 const schema = @import("schema.zig");
-const sig = @import("common/signature.zig");
 
 pub const TableError = error{
     OutOfMemory,
@@ -233,14 +232,14 @@ fn parseJsonValue(allocator: std.mem.Allocator, source: []const u8) TableError!s
     return std.json.parseFromSlice(std.json.Value, allocator, source, .{}) catch |err| return mapJsonError(err);
 }
 
-fn parsePrimTypeTable(text: []const u8) TableError!sig.PrimType {
-    return sig.parsePrimType(text) catch |err| switch (err) {
+fn parsePrimTypeTable(text: []const u8) TableError!schema.PrimType {
+    return schema.parsePrimType(text) catch |err| switch (err) {
         error.OutOfMemory => TableError.OutOfMemory,
         else => TableError.InvalidFormat,
     };
 }
 
-fn effectivePrimType(column: schema.Column) TableError!sig.PrimType {
+fn effectivePrimType(column: schema.Column) TableError!schema.PrimType {
     if (column.ty) |ty| return ty;
     return switch (column.stride) {
         1 => .u8,
@@ -265,7 +264,7 @@ fn duplicateColumns(allocator: std.mem.Allocator, columns: []const schema.Column
         out[idx] = .{
             .name = try allocator.dupe(u8, column.name),
             .stride = column.stride,
-            .ty = try allocator.dupe(u8, sig.primTypeName(ty)),
+            .ty = try allocator.dupe(u8, schema.primTypeName(ty)),
         };
     }
     return out;
@@ -579,7 +578,7 @@ fn verifySchemaAgainstMeta(schema_obj: schema.Schema, meta: TableMeta) TableErro
         const ty = try effectivePrimType(column);
         if (!std.mem.eql(u8, column.name, meta_column.name)) return TableError.InvalidFormat;
         if (column.stride != meta_column.stride) return TableError.InvalidFormat;
-        if (!std.mem.eql(u8, sig.primTypeName(ty), meta_column.ty)) return TableError.InvalidFormat;
+        if (!std.mem.eql(u8, schema.primTypeName(ty), meta_column.ty)) return TableError.InvalidFormat;
     }
 }
 
@@ -719,6 +718,45 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     }
 }
 
+fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(schema_path);
+    if (std.fs.cwd().openFile(schema_path, .{})) |file| {
+        var f = file;
+        defer f.close();
+        f.chmod(0o644) catch {};
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFileError(err),
+    }
+
+    const meta_path = try tableMetaPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(meta_path);
+    if (std.fs.cwd().openFile(meta_path, .{})) |file| {
+        var f = file;
+        defer f.close();
+        f.chmod(0o644) catch {};
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFileError(err),
+    }
+
+    for (meta.segments) |segment| {
+        for (segment.files) |file_meta| {
+            const path = try activePath(allocator, root_dir, file_meta.path);
+            defer allocator.free(path);
+            if (std.fs.cwd().openFile(path, .{})) |file| {
+                var f = file;
+                defer f.close();
+                f.chmod(0o644) catch {};
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return mapFileError(err),
+            }
+        }
+    }
+}
+
 fn parseDataFileFormat(path: []const u8) enum { csv, jsonl } {
     if (std.mem.endsWith(u8, path, ".jsonl")) return .jsonl;
     return .csv;
@@ -788,7 +826,7 @@ fn freeCsvRecord(allocator: std.mem.Allocator, fields: []const []u8) void {
     allocator.free(fields);
 }
 
-fn appendTextValue(buf: *std.ArrayList(u8), ty: sig.PrimType, text: []const u8) TableError!void {
+fn appendTextValue(buf: *std.ArrayList(u8), ty: schema.PrimType, text: []const u8) TableError!void {
     const trimmed = trim(text);
     if (trimmed.len == 0) return TableError.InvalidFormat;
     switch (ty) {
@@ -816,18 +854,39 @@ fn appendTextValue(buf: *std.ArrayList(u8), ty: sig.PrimType, text: []const u8) 
             const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat;
             try writeScalarBytes(buf, ty, v);
         },
-        .u32 => { const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
-        .u16 => { const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
-        .u8 => { const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
-        .i64 => { const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
-        .i32 => { const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
-        .i16 => { const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
-        .i8 => { const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat; try writeScalarBytes(buf, ty, v); },
+        .u32 => {
+            const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
+        .u16 => {
+            const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
+        .u8 => {
+            const v = std.fmt.parseInt(u64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
+        .i64 => {
+            const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
+        .i32 => {
+            const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
+        .i16 => {
+            const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
+        .i8 => {
+            const v = std.fmt.parseInt(i64, trimmed, 10) catch return TableError.InvalidFormat;
+            try writeScalarBytes(buf, ty, v);
+        },
         .void, .v128 => return TableError.InvalidFormat,
     }
 }
 
-fn writeScalarBytes(buf: *std.ArrayList(u8), ty: sig.PrimType, value: anytype) TableError!void {
+fn writeScalarBytes(buf: *std.ArrayList(u8), ty: schema.PrimType, value: anytype) TableError!void {
     var tmp: [16]u8 = undefined;
     switch (ty) {
         .i1 => {
@@ -939,7 +998,7 @@ fn writeScalarBytes(buf: *std.ArrayList(u8), ty: sig.PrimType, value: anytype) T
     }
 }
 
-fn appendJsonValue(buf: *std.ArrayList(u8), ty: sig.PrimType, value: std.json.Value) TableError!void {
+fn appendJsonValue(buf: *std.ArrayList(u8), ty: schema.PrimType, value: std.json.Value) TableError!void {
     switch (value) {
         .null => return TableError.InvalidFormat,
         .bool => |b| try writeScalarBytes(buf, ty, b),
@@ -1136,6 +1195,30 @@ pub fn lockTable(
     return tableInfo(owned);
 }
 
+pub fn unlockTable(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError!TableInfo {
+    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(meta_path);
+    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
+    defer allocator.free(source);
+    var parsed = try parseTableMeta(allocator, source);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
+    try validateSegmentHashes(allocator, root_dir, parsed.value);
+    var owned = try duplicateTableMeta(allocator, parsed.value);
+    defer owned.deinit(allocator);
+    if (owned.locked) {
+        owned.locked = false;
+        owned.epoch += 1;
+    }
+    try makeWritableRecursive(allocator, root_dir, owned);
+    try writeMeta(allocator, root_dir, table_name, owned);
+    return tableInfo(owned);
+}
+
 pub fn compactTable(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -1180,7 +1263,7 @@ fn writeFileToTemp(dir: std.fs.Dir, path: []const u8, bytes: []const u8) !void {
     try file.writeAll(bytes);
 }
 
-test "table ingest, verify, snapshot, restore, lock and compact are real" {
+test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
@@ -1236,6 +1319,12 @@ test "table ingest, verify, snapshot, restore, lock and compact are real" {
     try std.testing.expect(locked.locked);
 
     try std.testing.expectError(TableError.Locked, ingestTable(std.testing.allocator, ".", table_name, jsonl));
+
+    const unlocked = try unlockTable(std.testing.allocator, ".", table_name);
+    try std.testing.expect(!unlocked.locked);
+
+    const after_unlock = try ingestTable(std.testing.allocator, ".", table_name, jsonl);
+    try std.testing.expectEqual(@as(u64, 5), after_unlock.row_count);
 
     const restored = try restoreTable(std.testing.allocator, ".", table_name, snap1.epoch);
     try std.testing.expectEqual(@as(u64, 2), restored.row_count);

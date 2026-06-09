@@ -10,10 +10,13 @@ pub const SkillSection = struct {
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
-    host_version: ?[]const u8 = null,
+    host_version: ?[]const u8 = host_version,
     log: ?*const fn (ctx: *const anyopaque, level: LogLevel, message_ptr: [*]const u8, message_len: usize) callconv(.c) void = null,
     log_ctx: ?*anyopaque = null,
     json_mode: bool = false,
+    broker_abi_version: u32 = 0,
+    broker_call: ?BrokerCallFn = null,
+    broker_ctx: ?*anyopaque = null,
 };
 
 pub const LogLevel = enum(u8) {
@@ -24,8 +27,10 @@ pub const LogLevel = enum(u8) {
 };
 
 pub const abi_version: u32 = 1;
-pub const host_version: []const u8 = "sci-0.1";
+pub const host_version: []const u8 = "sci-0.2";
 pub const descriptor_symbol_name: [:0]const u8 = "saasm_plugin_descriptor_v1";
+pub const descriptor_fn_symbol_name: [:0]const u8 = "saasm_plugin_descriptor_v1_fn";
+pub const broker_abi_version: u32 = 1;
 
 pub const AbiStatus = enum(u32) {
     ok = 0,
@@ -33,6 +38,25 @@ pub const AbiStatus = enum(u32) {
     failed = 2,
     version_mismatch = 3,
     invalid_descriptor = 4,
+};
+
+pub const BrokerCallFn = *const fn (ctx: ?*anyopaque, op: u32, req: ?*const anyopaque, resp: ?*anyopaque) callconv(.c) u32;
+
+pub const BrokerOp = enum(u32) {
+    env_get = 1,
+    fs_read = 2,
+    http_request = 3,
+    process_spawn = 4,
+};
+
+pub const BrokerStatus = enum(u32) {
+    ok = 0,
+    denied = 1,
+    unsupported = 2,
+    invalid_request = 3,
+    not_found = 4,
+    insufficient_buffer = 5,
+    failed = 6,
 };
 
 pub const PluginDescriptor = extern struct {

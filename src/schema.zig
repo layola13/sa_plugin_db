@@ -69,11 +69,11 @@ pub fn ifaceFilePath(allocator: std.mem.Allocator, source_path: []const u8) ![]u
     else
         basename;
     if (std.fs.path.dirname(source_path)) |dir| {
-        const filename = try std.fmt.allocPrint(allocator, "{s}.iface", .{stem});
+        const filename = try std.fmt.allocPrint(allocator, "{s}.sai", .{stem});
         defer allocator.free(filename);
         return try std.fs.path.join(allocator, &.{ dir, filename });
     }
-    return try std.fmt.allocPrint(allocator, "{s}.iface", .{stem});
+    return try std.fmt.allocPrint(allocator, "{s}.sai", .{stem});
 }
 
 fn trim(text: []const u8) []const u8 {
@@ -177,7 +177,7 @@ fn writeDefInt(writer: anytype, name: []const u8, value: u64) !void {
     try writer.print("#def {s} = {d}\n", .{ name, value });
 }
 
-fn parsePrimType(text: []const u8) ParseError!PrimType {
+pub fn parsePrimType(text: []const u8) ParseError!PrimType {
     const trimmed = std.mem.trim(u8, text, " \t\r");
     inline for ([_]struct { name: []const u8, ty: PrimType }{
         .{ .name = "void", .ty = .void },
@@ -201,7 +201,7 @@ fn parsePrimType(text: []const u8) ParseError!PrimType {
     return ParseError.UnsupportedType;
 }
 
-fn primTypeName(ty: PrimType) []const u8 {
+pub fn primTypeName(ty: PrimType) []const u8 {
     return switch (ty) {
         .void => "void",
         .i1 => "i1",
