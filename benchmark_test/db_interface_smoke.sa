@@ -4,16 +4,25 @@
 @const TABLE = utf8:"members"
 @const SCHEMA_PATH = utf8:"members.sadb-schema"
 @const SCHEMA = utf8:"#def MAX_ROWS = 16\n#def COL_ID_STRIDE = 8 // u64\n#def COL_PLAN_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n#def COL_BALANCE_CENTS_STRIDE = 8 // i64\n"
+@const DICT_STATUS = utf8:"member_status"
+@const STATUS_ACTIVE = utf8:"active"
+@const STATUS_PAUSED = utf8:"paused"
+@const STATUS_CLOSED = utf8:"closed"
 
 #def ROOT_LEN = 1
 #def TABLE_LEN = 7
 #def SCHEMA_PATH_LEN = 19
 #def SCHEMA_LEN = 190
+#def DICT_STATUS_LEN = 13
+#def STATUS_ACTIVE_LEN = 6
+#def STATUS_PAUSED_LEN = 6
+#def STATUS_CLOSED_LEN = 6
 #def ROWS = 4
 #def TOTAL_ROWS = 5
 #def UPSERT_ROWS = 6
 #def COL_BYTES = 32
 #def ROW_BYTES = 40
+#def DICT_VALUE_BUF_BYTES = 8
 #def RANGE_ROWS_CAP = 4
 #def RANGE_ROWS_BYTES = 32
 #def PROJECT_COLUMNS = 2
@@ -39,6 +48,7 @@ L_ENTRY:
     balance_range_rows = alloc RANGE_ROWS_BYTES
     project_columns = alloc PROJECT_COLUMNS_BYTES
     projected_rows = alloc PROJECTED_ROWS_BYTES
+    dict_value_buf = alloc DICT_VALUE_BUF_BYTES
 
     store id_col+0, 1 as u64
     store id_col+8, 2 as u64
@@ -48,10 +58,6 @@ L_ENTRY:
     store plan_col+8, 2 as u64
     store plan_col+16, 1 as u64
     store plan_col+24, 3 as u64
-    store status_col+0, 1 as u64
-    store status_col+8, 1 as u64
-    store status_col+16, 0 as u64
-    store status_col+24, 1 as u64
     store points_col+0, 10 as u64
     store points_col+8, 20 as u64
     store points_col+16, 30 as u64
@@ -62,7 +68,7 @@ L_ENTRY:
     store balance_col+24, -25 as i64
     store new_row+0, 5 as u64
     store new_row+8, 4 as u64
-    store new_row+16, 1 as u64
+    store new_row+16, 0 as u64
     store new_row+24, 50 as u64
     store new_row+32, 125 as i64
     store project_columns+0, 0 as u64
@@ -70,6 +76,20 @@ L_ENTRY:
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_DICT_INTERN dict_active_status, active_status_id, active_status_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN, info
+    EXPAND DB_DICT_INTERN dict_paused_status, paused_status_id, paused_status_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_PAUSED, STATUS_PAUSED_LEN, info
+    EXPAND DB_DICT_INTERN dict_active_again_status, active_status_id_again, active_status_inserted_again, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN, info
+    EXPAND DB_DICT_LOOKUP dict_lookup_status, lookup_active_found, lookup_active_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN
+    EXPAND DB_DICT_LOOKUP dict_missing_status, lookup_closed_found, lookup_closed_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_CLOSED, STATUS_CLOSED_LEN
+    EXPAND DB_DICT_VALUE_LEN dict_len_status, paused_value_found, paused_value_len, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, paused_status_id
+    EXPAND DB_DICT_VALUE_COPY dict_copy_status, paused_copy_found, paused_copy_written, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, paused_status_id, dict_value_buf, DICT_VALUE_BUF_BYTES
+    paused_first_byte = load dict_value_buf+0 as u8
+    paused_last_byte = load dict_value_buf+5 as u8
+    store status_col+0, active_status_id as u64
+    store status_col+8, active_status_id as u64
+    store status_col+16, paused_status_id as u64
+    store status_col+24, active_status_id as u64
+    store new_row+16, active_status_id as u64
     EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 1, plan_col, COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 2, status_col, COL_BYTES
@@ -85,14 +105,14 @@ L_ENTRY:
     EXPAND DB_INFO_ROW_COUNT rows_after_duplicate, info
     store new_row+0, 5 as u64
     store new_row+8, 4 as u64
-    store new_row+16, 1 as u64
+    store new_row+16, active_status_id as u64
     store new_row+24, 55 as u64
     store new_row+32, 150 as i64
     EXPAND DB_UPSERT_ROW_U64_KEY upsert_existing_status, upsert_existing_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 5, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_upsert_existing, info
     store new_row+0, 6 as u64
     store new_row+8, 5 as u64
-    store new_row+16, 0 as u64
+    store new_row+16, paused_status_id as u64
     store new_row+24, 60 as u64
     store new_row+32, -75 as i64
     EXPAND DB_UPSERT_ROW_U64_KEY upsert_new_status, upsert_new_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 6, new_row, ROW_BYTES, info
@@ -162,6 +182,29 @@ L_ENTRY:
 
     ok_remove = eq remove_status, SA_DB_OK
     ok_init = eq init_status, SA_DB_OK
+    ok_dict_active_status = eq dict_active_status, SA_DB_OK
+    ok_dict_active_id = eq active_status_id, 1
+    ok_dict_active_inserted = eq active_status_inserted, 1
+    ok_dict_paused_status = eq dict_paused_status, SA_DB_OK
+    ok_dict_paused_id = eq paused_status_id, 2
+    ok_dict_paused_inserted = eq paused_status_inserted, 1
+    ok_dict_active_again_status = eq dict_active_again_status, SA_DB_OK
+    ok_dict_active_again_id = eq active_status_id_again, 1
+    ok_dict_active_again_inserted = eq active_status_inserted_again, 0
+    ok_dict_lookup_status = eq dict_lookup_status, SA_DB_OK
+    ok_lookup_active_found = eq lookup_active_found, 1
+    ok_lookup_active_id = eq lookup_active_id, active_status_id
+    ok_dict_missing_status = eq dict_missing_status, SA_DB_OK
+    ok_lookup_closed_found = eq lookup_closed_found, 0
+    ok_lookup_closed_id = eq lookup_closed_id, 0
+    ok_dict_len_status = eq dict_len_status, SA_DB_OK
+    ok_paused_value_found = eq paused_value_found, 1
+    ok_paused_value_len = eq paused_value_len, 6
+    ok_dict_copy_status = eq dict_copy_status, SA_DB_OK
+    ok_paused_copy_found = eq paused_copy_found, 1
+    ok_paused_copy_written = eq paused_copy_written, 6
+    ok_paused_first_byte = eq paused_first_byte, 112
+    ok_paused_last_byte = eq paused_last_byte, 100
     ok_ingest = eq ingest_status, SA_DB_OK
     ok_rows = eq rows, ROWS
     ok_create_index_status = eq create_index_status, SA_DB_OK
@@ -177,13 +220,13 @@ L_ENTRY:
     ok_upsert_new_inserted = eq upsert_new_inserted, 1
     ok_rows_after_upsert_new = eq rows_after_upsert_new, UPSERT_ROWS
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
-    ok_snapshot_epoch = eq snapshot_epoch, 6
+    ok_snapshot_epoch = eq snapshot_epoch, 8
     ok_open_status = eq open_status, SA_DB_OK
     ok_shape_status = eq shape_status, SA_DB_OK
     ok_shape_rows = eq shape_rows, UPSERT_ROWS
     ok_shape_columns = eq shape_columns, COLUMN_COUNT
     ok_shape_row_bytes = eq shape_row_bytes, ROW_BYTES
-    ok_shape_epoch = eq shape_epoch, 6
+    ok_shape_epoch = eq shape_epoch, 8
     ok_column_info_status = eq column_info_status, SA_DB_OK
     ok_column_stride = eq column_stride, 8
     ok_column_type = eq column_type, SA_DB_TYPE_U64
@@ -263,7 +306,30 @@ L_ENTRY:
     ok_restore_sum = eq points_sum_restore, 215
     ok_close_restore_status = eq close_restore_status, SA_DB_OK
     ok01 = and ok_remove, ok_init
-    ok02 = and ok01, ok_ingest
+    ok_dict01 = and ok_dict_active_status, ok_dict_active_id
+    ok_dict02 = and ok_dict01, ok_dict_active_inserted
+    ok_dict03 = and ok_dict02, ok_dict_paused_status
+    ok_dict04 = and ok_dict03, ok_dict_paused_id
+    ok_dict05 = and ok_dict04, ok_dict_paused_inserted
+    ok_dict06 = and ok_dict05, ok_dict_active_again_status
+    ok_dict07 = and ok_dict06, ok_dict_active_again_id
+    ok_dict08 = and ok_dict07, ok_dict_active_again_inserted
+    ok_dict09 = and ok_dict08, ok_dict_lookup_status
+    ok_dict10 = and ok_dict09, ok_lookup_active_found
+    ok_dict11 = and ok_dict10, ok_lookup_active_id
+    ok_dict12 = and ok_dict11, ok_dict_missing_status
+    ok_dict13 = and ok_dict12, ok_lookup_closed_found
+    ok_dict14 = and ok_dict13, ok_lookup_closed_id
+    ok_dict15 = and ok_dict14, ok_dict_len_status
+    ok_dict16 = and ok_dict15, ok_paused_value_found
+    ok_dict17 = and ok_dict16, ok_paused_value_len
+    ok_dict18 = and ok_dict17, ok_dict_copy_status
+    ok_dict19 = and ok_dict18, ok_paused_copy_found
+    ok_dict20 = and ok_dict19, ok_paused_copy_written
+    ok_dict21 = and ok_dict20, ok_paused_first_byte
+    ok_dict22 = and ok_dict21, ok_paused_last_byte
+    ok01a = and ok01, ok_dict22
+    ok02 = and ok01a, ok_ingest
     ok03 = and ok02, ok_rows
     ok04 = and ok03, ok_create_index_status
     ok04a = and ok04, ok_create_i64_index_status
@@ -366,6 +432,29 @@ L_ENTRY:
 
     !remove_status
     !init_status
+    !dict_active_status
+    !active_status_id
+    !active_status_inserted
+    !dict_paused_status
+    !paused_status_id
+    !paused_status_inserted
+    !dict_active_again_status
+    !active_status_id_again
+    !active_status_inserted_again
+    !dict_lookup_status
+    !lookup_active_found
+    !lookup_active_id
+    !dict_missing_status
+    !lookup_closed_found
+    !lookup_closed_id
+    !dict_len_status
+    !paused_value_found
+    !paused_value_len
+    !dict_copy_status
+    !paused_copy_found
+    !paused_copy_written
+    !paused_first_byte
+    !paused_last_byte
     !ingest_status
     !rows
     !create_index_status
@@ -471,6 +560,29 @@ L_ENTRY:
     !close_restore_status
     !ok_remove
     !ok_init
+    !ok_dict_active_status
+    !ok_dict_active_id
+    !ok_dict_active_inserted
+    !ok_dict_paused_status
+    !ok_dict_paused_id
+    !ok_dict_paused_inserted
+    !ok_dict_active_again_status
+    !ok_dict_active_again_id
+    !ok_dict_active_again_inserted
+    !ok_dict_lookup_status
+    !ok_lookup_active_found
+    !ok_lookup_active_id
+    !ok_dict_missing_status
+    !ok_lookup_closed_found
+    !ok_lookup_closed_id
+    !ok_dict_len_status
+    !ok_paused_value_found
+    !ok_paused_value_len
+    !ok_dict_copy_status
+    !ok_paused_copy_found
+    !ok_paused_copy_written
+    !ok_paused_first_byte
+    !ok_paused_last_byte
     !ok_ingest
     !ok_rows
     !ok_create_index_status
@@ -572,6 +684,29 @@ L_ENTRY:
     !ok_restore_sum
     !ok_close_restore_status
     !ok01
+    !ok_dict01
+    !ok_dict02
+    !ok_dict03
+    !ok_dict04
+    !ok_dict05
+    !ok_dict06
+    !ok_dict07
+    !ok_dict08
+    !ok_dict09
+    !ok_dict10
+    !ok_dict11
+    !ok_dict12
+    !ok_dict13
+    !ok_dict14
+    !ok_dict15
+    !ok_dict16
+    !ok_dict17
+    !ok_dict18
+    !ok_dict19
+    !ok_dict20
+    !ok_dict21
+    !ok_dict22
+    !ok01a
     !ok02
     !ok03
     !ok04
@@ -682,6 +817,7 @@ L_ENTRY:
     !balance_range_rows
     !project_columns
     !projected_rows
+    !dict_value_buf
     br ok -> L_OK, L_FAIL
 
 L_OK:

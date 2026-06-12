@@ -60,6 +60,14 @@ pub const IndexMeta = struct {
     bytes: u64,
 };
 
+pub const DictMeta = struct {
+    name: []const u8,
+    path: []const u8,
+    sha256: []const u8,
+    bytes: u64,
+    entries: u64,
+};
+
 pub const TableMeta = struct {
     magic: []const u8,
     version: u32,
@@ -75,6 +83,7 @@ pub const TableMeta = struct {
     columns: []ColumnMeta,
     segments: []SegmentMeta,
     indexes: []IndexMeta = &.{},
+    dicts: []DictMeta = &.{},
 
     pub fn deinit(self: *TableMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.magic);
@@ -101,8 +110,35 @@ pub const TableMeta = struct {
             allocator.free(index.sha256);
         }
         allocator.free(self.indexes);
+        for (self.dicts) |dict| {
+            allocator.free(dict.name);
+            allocator.free(dict.path);
+            allocator.free(dict.sha256);
+        }
+        allocator.free(self.dicts);
         self.* = undefined;
     }
+};
+
+pub const DictInternResult = struct {
+    info: TableInfo,
+    id: u64,
+    inserted: bool,
+};
+
+pub const DictLookupResult = struct {
+    found: bool,
+    id: u64,
+};
+
+pub const DictValueLenResult = struct {
+    found: bool,
+    len: u64,
+};
+
+pub const DictValueCopyResult = struct {
+    found: bool,
+    written: u64,
 };
 
 pub const TableWriteLock = struct {
@@ -328,6 +364,10 @@ fn segmentFileName(allocator: std.mem.Allocator, table_name: []const u8, seg_id:
 
 fn indexFileName(allocator: std.mem.Allocator, table_name: []const u8, kind: []const u8, column_index: u64, epoch: u64) TableError![]u8 {
     return allocPrintPath(allocator, "{s}.idx.{s}.{d}.{d}.dat", .{ table_name, kind, column_index, epoch });
+}
+
+fn dictFileName(allocator: std.mem.Allocator, table_name: []const u8, dict_name: []const u8, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.dict.{s}.{d}.dat", .{ table_name, dict_name, epoch });
 }
 
 fn snapshotDir(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
@@ -599,6 +639,9 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
     const indexes = try duplicateIndexMetas(allocator, meta.indexes);
     errdefer freeIndexMetas(allocator, indexes);
 
+    const dicts = try duplicateDictMetas(allocator, meta.dicts);
+    errdefer freeDictMetas(allocator, dicts);
+
     return .{
         .magic = try allocator.dupe(u8, meta.magic),
         .version = meta.version,
@@ -614,6 +657,7 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
         .columns = columns,
         .segments = segments,
         .indexes = indexes,
+        .dicts = dicts,
     };
 }
 
@@ -639,6 +683,7 @@ fn buildInitialMeta(
         .columns = try duplicateColumns(allocator, schema_obj.columns),
         .segments = try allocator.alloc(SegmentMeta, 0),
         .indexes = try allocator.alloc(IndexMeta, 0),
+        .dicts = try allocator.alloc(DictMeta, 0),
     };
 }
 
@@ -720,6 +765,39 @@ fn freeIndexMetas(allocator: std.mem.Allocator, indexes: []IndexMeta) void {
         allocator.free(index.sha256);
     }
     allocator.free(indexes);
+}
+
+fn freeDictMeta(allocator: std.mem.Allocator, dict: DictMeta) void {
+    allocator.free(dict.name);
+    allocator.free(dict.path);
+    allocator.free(dict.sha256);
+}
+
+fn freeDictMetas(allocator: std.mem.Allocator, dicts: []DictMeta) void {
+    for (dicts) |dict| freeDictMeta(allocator, dict);
+    allocator.free(dicts);
+}
+
+fn duplicateDictMetas(allocator: std.mem.Allocator, dicts: []const DictMeta) TableError![]DictMeta {
+    const out = try allocator.alloc(DictMeta, dicts.len);
+    for (out) |*dict| dict.* = .{
+        .name = &.{},
+        .path = &.{},
+        .sha256 = &.{},
+        .bytes = 0,
+        .entries = 0,
+    };
+    errdefer freeDictMetas(allocator, out);
+    for (dicts, 0..) |dict, idx| {
+        out[idx] = .{
+            .name = try allocator.dupe(u8, dict.name),
+            .path = try allocator.dupe(u8, dict.path),
+            .sha256 = try allocator.dupe(u8, dict.sha256),
+            .bytes = dict.bytes,
+            .entries = dict.entries,
+        };
+    }
+    return out;
 }
 
 fn duplicateSegmentMetas(allocator: std.mem.Allocator, segments: []const SegmentMeta) TableError![]SegmentMeta {
@@ -926,6 +1004,14 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
         defer allocator.free(dst_path);
         try copyFile(allocator, src_path, dst_path);
     }
+
+    for (meta.dicts) |dict| {
+        const src_path = try activePath(allocator, root_dir, dict.path);
+        defer allocator.free(src_path);
+        const dst_path = try joinPath(allocator, &.{ snapshot_dir_path, dict.path });
+        defer allocator.free(dst_path);
+        try copyFile(allocator, src_path, dst_path);
+    }
 }
 
 fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError!TableInfo {
@@ -965,6 +1051,14 @@ fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
         const src_path = try joinPath(allocator, &.{ snapshot_dir_path, index.path });
         defer allocator.free(src_path);
         const dst_path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(dst_path);
+        try copyFile(allocator, src_path, dst_path);
+    }
+
+    for (parsed.value.dicts) |dict| {
+        const src_path = try joinPath(allocator, &.{ snapshot_dir_path, dict.path });
+        defer allocator.free(src_path);
+        const dst_path = try activePath(allocator, root_dir, dict.path);
         defer allocator.free(dst_path);
         try copyFile(allocator, src_path, dst_path);
     }
@@ -1031,6 +1125,105 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
             try buildI64IndexBytes(allocator, root_dir, meta, column_index, index.unique);
         defer allocator.free(expected);
         if (!std.mem.eql(u8, bytes, expected)) return TableError.VerifyFailed;
+    }
+}
+
+const DICT_MAX_NAME_BYTES: usize = 64;
+const DICT_MAX_VALUE_BYTES: usize = 1024 * 1024;
+
+fn validateDictName(dict_name: []const u8) TableError!void {
+    if (dict_name.len == 0 or dict_name.len > DICT_MAX_NAME_BYTES) return TableError.InvalidFormat;
+    for (dict_name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return TableError.InvalidFormat;
+    }
+}
+
+fn validateDictValue(value: []const u8) TableError!void {
+    if (value.len == 0 or value.len > DICT_MAX_VALUE_BYTES) return TableError.InvalidFormat;
+}
+
+fn dictEntryCount(bytes: []const u8) TableError!u64 {
+    if (bytes.len < 8) return TableError.VerifyFailed;
+    const count = readU64LE(bytes, 0);
+    var offset: usize = 8;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        if (offset > bytes.len or bytes.len - offset < 8) return TableError.VerifyFailed;
+        const len_u64 = readU64LE(bytes, offset);
+        if (len_u64 == 0 or len_u64 > DICT_MAX_VALUE_BYTES) return TableError.VerifyFailed;
+        if (len_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        if (offset > bytes.len or bytes.len - offset < len) return TableError.VerifyFailed;
+        offset += len;
+    }
+    if (offset != bytes.len) return TableError.VerifyFailed;
+    return count;
+}
+
+fn dictValueSliceById(bytes: []const u8, id: u64) TableError!?[]const u8 {
+    if (id == 0) return null;
+    const count = try dictEntryCount(bytes);
+    if (id > count) return null;
+    var offset: usize = 8;
+    var current_id: u64 = 1;
+    while (current_id <= count) : (current_id += 1) {
+        const len_u64 = readU64LE(bytes, offset);
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        const value = bytes[offset .. offset + len];
+        if (current_id == id) return value;
+        offset += len;
+    }
+    return null;
+}
+
+fn dictFindValueId(bytes: []const u8, value: []const u8) TableError!?u64 {
+    const count = try dictEntryCount(bytes);
+    var offset: usize = 8;
+    var current_id: u64 = 1;
+    while (current_id <= count) : (current_id += 1) {
+        const len_u64 = readU64LE(bytes, offset);
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        const candidate = bytes[offset .. offset + len];
+        if (std.mem.eql(u8, candidate, value)) return current_id;
+        offset += len;
+    }
+    return null;
+}
+
+fn findDictMetaIndex(meta: TableMeta, dict_name: []const u8) ?usize {
+    for (meta.dicts, 0..) |dict, idx| {
+        if (std.mem.eql(u8, dict.name, dict_name)) return idx;
+    }
+    return null;
+}
+
+fn readDictBytes(allocator: std.mem.Allocator, root_dir: []const u8, dict: DictMeta) TableError![]u8 {
+    const path = try activePath(allocator, root_dir, dict.path);
+    defer allocator.free(path);
+    const bytes = try readFileAlloc(allocator, path, 1 << 30);
+    errdefer allocator.free(bytes);
+    if (bytes.len != dict.bytes) return TableError.VerifyFailed;
+    const count = try dictEntryCount(bytes);
+    if (count != dict.entries) return TableError.VerifyFailed;
+    const hash = hashBytes(bytes);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    if (!std.mem.eql(u8, hex[0..], dict.sha256)) return TableError.VerifyFailed;
+    return bytes;
+}
+
+fn validateDictFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    for (meta.dicts, 0..) |dict, idx| {
+        try validateDictName(dict.name);
+        if (dict.path.len == 0 or dict.sha256.len != 64) return TableError.VerifyFailed;
+        for (meta.dicts[0..idx]) |previous| {
+            if (std.mem.eql(u8, previous.name, dict.name)) return TableError.VerifyFailed;
+        }
+        const bytes = try readDictBytes(allocator, root_dir, dict);
+        allocator.free(bytes);
     }
 }
 
@@ -1106,6 +1299,19 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
             else => return mapFileError(err),
         }
     }
+
+    for (meta.dicts) |dict| {
+        const path = try activePath(allocator, root_dir, dict.path);
+        defer allocator.free(path);
+        if (std.fs.cwd().openFile(path, .{})) |file| {
+            var f = file;
+            defer f.close();
+            f.chmod(0o444) catch {};
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
+        }
+    }
 }
 
 fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
@@ -1118,6 +1324,7 @@ fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, 
     try verifySchemaAgainstMeta(schema_obj, meta);
     try validateSegmentHashes(allocator, root_dir, meta);
     try validateIndexFiles(allocator, root_dir, meta);
+    try validateDictFiles(allocator, root_dir, meta);
 }
 
 fn maybeSelectRecoveryMeta(
@@ -1248,6 +1455,19 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     for (meta.indexes) |index| {
         const path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(path);
+        if (std.fs.cwd().openFile(path, .{})) |file| {
+            var f = file;
+            defer f.close();
+            f.chmod(0o644) catch {};
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
+        }
+    }
+
+    for (meta.dicts) |dict| {
+        const path = try activePath(allocator, root_dir, dict.path);
         defer allocator.free(path);
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
@@ -1671,6 +1891,11 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
             defer allocator.free(path);
             try deleteIfExists(path);
         }
+        for (owned.dicts) |dict| {
+            const path = try activePath(allocator, root_dir, dict.path);
+            defer allocator.free(path);
+            try deleteIfExists(path);
+        }
     } else |err| switch (err) {
         TableError.NotFound => {},
         else => return err,
@@ -1838,6 +2063,165 @@ fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, ro
         try buffers[idx].appendSlice(column.bytes);
     }
     return buffers;
+}
+
+fn buildDictBytesWithValue(allocator: std.mem.Allocator, old_bytes: []const u8, old_count: u64, value: []const u8) TableError![]u8 {
+    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const extra = std.math.add(usize, 8, value.len) catch return TableError.CursorOverflow;
+    const total = std.math.add(usize, old_bytes.len, if (old_bytes.len == 0) 8 + extra else extra) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+
+    const entry_offset: usize = if (old_bytes.len == 0) blk: {
+        writeU64LE(out, 0, new_count);
+        break :blk 8;
+    } else blk: {
+        @memcpy(out[0..old_bytes.len], old_bytes);
+        writeU64LE(out, 0, new_count);
+        break :blk old_bytes.len;
+    };
+    writeU64LE(out, entry_offset, @intCast(value.len));
+    @memcpy(out[entry_offset + 8 .. entry_offset + 8 + value.len], value);
+    return out;
+}
+
+fn makeDictMeta(allocator: std.mem.Allocator, dict_name: []const u8, path: []const u8, bytes: []const u8, entries: u64) TableError!DictMeta {
+    const name = try allocator.dupe(u8, dict_name);
+    errdefer allocator.free(name);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const sha256 = try hashHexAlloc(allocator, bytes);
+    errdefer allocator.free(sha256);
+    return .{
+        .name = name,
+        .path = owned_path,
+        .sha256 = sha256,
+        .bytes = bytes.len,
+        .entries = entries,
+    };
+}
+
+fn putDictMeta(allocator: std.mem.Allocator, meta: *TableMeta, dict: DictMeta) TableError!void {
+    if (findDictMetaIndex(meta.*, dict.name)) |idx| {
+        freeDictMeta(allocator, meta.dicts[idx]);
+        meta.dicts[idx] = dict;
+        return;
+    }
+
+    const old_dicts = meta.dicts;
+    const new_dicts = try allocator.alloc(DictMeta, old_dicts.len + 1);
+    @memcpy(new_dicts[0..old_dicts.len], old_dicts);
+    new_dicts[old_dicts.len] = dict;
+    allocator.free(old_dicts);
+    meta.dicts = new_dicts;
+}
+
+pub fn internStringDict(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    dict_name: []const u8,
+    value: []const u8,
+) TableError!DictInternResult {
+    try validateDictName(dict_name);
+    try validateDictValue(value);
+
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+
+    var old_bytes: []u8 = &.{};
+    var old_count: u64 = 0;
+    var has_old = false;
+    if (findDictMetaIndex(meta, dict_name)) |idx| {
+        old_bytes = try readDictBytes(allocator, root_dir, meta.dicts[idx]);
+        has_old = true;
+        old_count = try dictEntryCount(old_bytes);
+        if (try dictFindValueId(old_bytes, value)) |id| {
+            allocator.free(old_bytes);
+            return .{ .info = tableInfo(meta), .id = id, .inserted = false };
+        }
+    }
+    defer if (has_old) allocator.free(old_bytes);
+
+    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const new_bytes = try buildDictBytesWithValue(allocator, old_bytes, old_count, value);
+    defer allocator.free(new_bytes);
+
+    const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
+    const basename = try dictFileName(allocator, table_name, dict_name, next_epoch);
+    defer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
+
+    const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
+    var consumed = false;
+    errdefer if (!consumed) freeDictMeta(allocator, new_meta);
+    try putDictMeta(allocator, &meta, new_meta);
+    consumed = true;
+    meta.epoch = next_epoch;
+    try writeMeta(allocator, root_dir, table_name, meta);
+    return .{ .info = tableInfo(meta), .id = new_count, .inserted = true };
+}
+
+pub fn lookupStringDict(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    dict_name: []const u8,
+    value: []const u8,
+) TableError!DictLookupResult {
+    try validateDictName(dict_name);
+    try validateDictValue(value);
+
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    const idx = findDictMetaIndex(meta, dict_name) orelse return .{ .found = false, .id = 0 };
+    const bytes = try readDictBytes(allocator, root_dir, meta.dicts[idx]);
+    defer allocator.free(bytes);
+    if (try dictFindValueId(bytes, value)) |id| return .{ .found = true, .id = id };
+    return .{ .found = false, .id = 0 };
+}
+
+pub fn stringDictValueLen(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    dict_name: []const u8,
+    id: u64,
+) TableError!DictValueLenResult {
+    try validateDictName(dict_name);
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    const idx = findDictMetaIndex(meta, dict_name) orelse return .{ .found = false, .len = 0 };
+    const bytes = try readDictBytes(allocator, root_dir, meta.dicts[idx]);
+    defer allocator.free(bytes);
+    const value = (try dictValueSliceById(bytes, id)) orelse return .{ .found = false, .len = 0 };
+    return .{ .found = true, .len = value.len };
+}
+
+pub fn copyStringDictValue(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    dict_name: []const u8,
+    id: u64,
+    out: []u8,
+) TableError!DictValueCopyResult {
+    try validateDictName(dict_name);
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    const idx = findDictMetaIndex(meta, dict_name) orelse return .{ .found = false, .written = 0 };
+    const bytes = try readDictBytes(allocator, root_dir, meta.dicts[idx]);
+    defer allocator.free(bytes);
+    const value = (try dictValueSliceById(bytes, id)) orelse return .{ .found = false, .written = 0 };
+    if (out.len < value.len) return TableError.CursorOverflow;
+    @memcpy(out[0..value.len], value);
+    return .{ .found = true, .written = value.len };
 }
 
 pub fn createU64Index(
@@ -3317,6 +3701,7 @@ pub fn verifyTable(
     defer meta.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, meta);
     try validateIndexFiles(allocator, root_dir, meta);
+    try validateDictFiles(allocator, root_dir, meta);
     return tableInfo(meta);
 }
 
@@ -3349,6 +3734,7 @@ pub fn unlockTable(
     defer owned.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, owned);
     try validateIndexFiles(allocator, root_dir, owned);
+    try validateDictFiles(allocator, root_dir, owned);
     if (owned.locked) {
         owned.locked = false;
         owned.epoch += 1;
@@ -3459,6 +3845,77 @@ test "table verify rejects segment byte-count metadata mismatch" {
     owned.segments[0].files[0].bytes += 8;
     try writeMeta(std.testing.allocator, ".", table_name, owned);
 
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table string dictionary is persisted snapshotted restored and verified" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "dict_members";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "dict_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    const active = try internStringDict(std.testing.allocator, ".", table_name, "member_status", "active");
+    try std.testing.expectEqual(@as(u64, 1), active.id);
+    try std.testing.expect(active.inserted);
+    try std.testing.expectEqual(@as(u64, 1), active.info.epoch);
+    const paused = try internStringDict(std.testing.allocator, ".", table_name, "member_status", "paused");
+    try std.testing.expectEqual(@as(u64, 2), paused.id);
+    try std.testing.expect(paused.inserted);
+    try std.testing.expectEqual(@as(u64, 2), paused.info.epoch);
+    const active_again = try internStringDict(std.testing.allocator, ".", table_name, "member_status", "active");
+    try std.testing.expectEqual(@as(u64, 1), active_again.id);
+    try std.testing.expect(!active_again.inserted);
+    try std.testing.expectEqual(@as(u64, 2), active_again.info.epoch);
+
+    const lookup_active = try lookupStringDict(std.testing.allocator, ".", table_name, "member_status", "active");
+    try std.testing.expect(lookup_active.found);
+    try std.testing.expectEqual(@as(u64, 1), lookup_active.id);
+    const lookup_missing = try lookupStringDict(std.testing.allocator, ".", table_name, "member_status", "closed");
+    try std.testing.expect(!lookup_missing.found);
+
+    const paused_len = try stringDictValueLen(std.testing.allocator, ".", table_name, "member_status", paused.id);
+    try std.testing.expect(paused_len.found);
+    try std.testing.expectEqual(@as(u64, 6), paused_len.len);
+    var value_buf: [8]u8 = undefined;
+    const copied = try copyStringDictValue(std.testing.allocator, ".", table_name, "member_status", paused.id, &value_buf);
+    try std.testing.expect(copied.found);
+    try std.testing.expectEqual(@as(u64, 6), copied.written);
+    try std.testing.expectEqualStrings("paused", value_buf[0..@intCast(copied.written)]);
+    var too_small: [4]u8 = undefined;
+    try std.testing.expectError(TableError.CursorOverflow, copyStringDictValue(std.testing.allocator, ".", table_name, "member_status", paused.id, &too_small));
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.epoch);
+    const snap = try snapshotTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), snap.epoch);
+
+    const disabled = try internStringDict(std.testing.allocator, ".", table_name, "member_status", "disabled");
+    try std.testing.expectEqual(@as(u64, 3), disabled.id);
+    const lookup_disabled = try lookupStringDict(std.testing.allocator, ".", table_name, "member_status", "disabled");
+    try std.testing.expect(lookup_disabled.found);
+
+    _ = try restoreTable(std.testing.allocator, ".", table_name, snap.epoch);
+    const restored_disabled = try lookupStringDict(std.testing.allocator, ".", table_name, "member_status", "disabled");
+    try std.testing.expect(!restored_disabled.found);
+    const restored_paused = try lookupStringDict(std.testing.allocator, ".", table_name, "member_status", "paused");
+    try std.testing.expect(restored_paused.found);
+    try std.testing.expectEqual(@as(u64, 2), restored_paused.id);
+
+    var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer meta.deinit(std.testing.allocator);
+    const dict_path = try activePath(std.testing.allocator, ".", meta.dicts[0].path);
+    defer std.testing.allocator.free(dict_path);
+    try writeFile(std.testing.allocator, dict_path, "corrupt");
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
 }
 

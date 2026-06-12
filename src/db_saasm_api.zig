@@ -354,6 +354,125 @@ pub export fn sa_db_create_i64_index(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_dict_intern(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_id: ?*u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    id_slot.* = 0;
+    inserted_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.internStringDict(gpa.allocator(), root, table_name, dict_name, value) catch |err| return tableStatus(err);
+    id_slot.* = result.id;
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_dict_lookup(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_found: ?*u64,
+    out_id: ?*u64,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    id_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.lookupStringDict(gpa.allocator(), root, table_name, dict_name, value) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    id_slot.* = result.id;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_dict_value_len(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    id: u64,
+    out_found: ?*u64,
+    out_len: ?*u64,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const len_slot = out_len orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    len_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.stringDictValueLen(gpa.allocator(), root, table_name, dict_name, id) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    len_slot.* = result.len;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_dict_value_copy(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    id: u64,
+    out_buf_ptr: ?[*]u8,
+    out_buf_len: u64,
+    out_found: ?*u64,
+    out_written: ?*u64,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_buf = outputBytes(out_buf_ptr, out_buf_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    written_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.copyStringDictValue(gpa.allocator(), root, table_name, dict_name, id, out_buf) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    written_slot.* = result.written;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_delete_u64_key(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -811,6 +930,62 @@ pub export fn sa_db_max_i64_handle(handle: ?*anyopaque, column_index: u64, out_m
     const max_value = table.snapshotMaxI64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
     max_slot.* = max_value;
     return SA_DB_OK;
+}
+
+test "db SA ABI interns and reads string dictionaries" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "members.sadb-schema".ptr, "members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var active_id: u64 = 0;
+    var inserted: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, "active".ptr, "active".len, &active_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), active_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(@as(u64, 1), info.epoch);
+    var paused_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, "paused".ptr, "paused".len, &paused_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 2), paused_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, "active".ptr, "active".len, &active_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), active_id);
+    try std.testing.expectEqual(@as(u64, 0), inserted);
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+
+    var found: u64 = 0;
+    var lookup_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, "paused".ptr, "paused".len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 2), lookup_id);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, "closed".ptr, "closed".len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(@as(u64, 0), lookup_id);
+
+    var value_len: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_value_len(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, paused_id, &found, &value_len));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 6), value_len);
+    var value_buf: [8]u8 = undefined;
+    var written: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_value_copy(root.ptr, root.len, "members".ptr, "members".len, "member_status".ptr, "member_status".len, paused_id, &value_buf, value_buf.len, &found, &written));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 6), written);
+    try std.testing.expectEqualStrings("paused", value_buf[0..@intCast(written)]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "members".ptr, "members".len, &info));
 }
 
 test "db SA ABI creates ingests updates and scans raw columns" {

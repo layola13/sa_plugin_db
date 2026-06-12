@@ -45,6 +45,10 @@ Core native calls:
 - `sa_db_upsert_row_u64_key`
 - `sa_db_create_u64_index`
 - `sa_db_create_i64_index`
+- `sa_db_dict_intern`
+- `sa_db_dict_lookup`
+- `sa_db_dict_value_len`
+- `sa_db_dict_value_copy`
 - `sa_db_delete_u64_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
@@ -96,7 +100,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_U64_HANDLE`, `DB_GET_I64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
-`DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
+`DB_DICT_VALUE_COPY`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
 `DB_RECOVER`.
 
@@ -124,7 +129,18 @@ Primitive type codes exported through `db.sal` match the schema compiler enum:
 `SA_DB_TYPE_I1`, `I8`, `I16`, `I32`, `I64`, `U8`, `U16`, `U32`, `U64`, `F32`,
 `F64`, `PTR`, `BLOB_HANDLE`, and `V128`. ERP code can map `i1` to boolean,
 `i64`/`u64` to scaled decimals or date/time encodings, and fixed-width columns
-to packed row buffers while higher-level decimal/date/string-dict APIs are added.
+to packed row buffers while higher-level decimal/date helpers are added.
+
+Low-cardinality strings are supported through table-level dictionaries rather
+than variable-width string columns. `sa_db_dict_intern` / `DB_DICT_INTERN` maps a
+non-empty byte string such as `active`, `paid`, `warehouse_a`, or `invoice` to a
+stable 1-based `u64` ID inside a named dictionary; ID `0` is reserved for caller
+semantics such as null/unknown. Repeated intern returns the existing ID without
+advancing the table epoch. `sa_db_dict_lookup` finds an existing ID,
+`sa_db_dict_value_len` returns the byte length for an ID, and
+`sa_db_dict_value_copy` copies the stored bytes into the caller buffer. ERP rows
+store the returned ID in a normal `u64` column, so status/category/type fields can
+reuse the existing `u64` indexes, range reads, projections, and row APIs.
 
 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE` returns row indices for an
 inclusive `[min, max]` range over an indexed `u64` column. It is designed for ERP
@@ -161,12 +177,13 @@ metadata file (`<table>.meta.<epoch>`). Mutating existing column data writes a n
 versioned column file and then advances the manifest, so a crash before manifest
 replacement leaves the previous epoch readable. Qmod read/write paths use the
 same active-manifest protocol as the public table APIs. Segment metadata records
-SHA-256 and byte counts. U64 index files are also versioned, hashed, snapshotted,
-restored, and rebuilt on ingest/update/compact/qmod writes. Verification checks
-schema hash, segment hash, index hash, recorded size, and the expected
-`rows * column_stride` size. `recover` scans versioned metadata files and rebuilds
-the manifest to the highest valid epoch, which covers corrupted or missing
-manifest files after an interrupted commit.
+SHA-256 and byte counts. U64/I64 index files and string dictionary files are also
+versioned, hashed, snapshotted, restored, and verified. Indexes are rebuilt on
+ingest/update/compact/qmod writes. Verification checks schema hash, segment hash,
+index hash, dictionary hash, recorded size, dictionary entry count, and the
+expected `rows * column_stride` size. `recover` scans versioned metadata files
+and rebuilds the manifest to the highest valid epoch, which covers corrupted or
+missing manifest files after an interrupted commit.
 
 `sa_db_create_u64_index(..., unique=1)` now acts as a real uniqueness
 constraint. Creating the unique index rejects existing duplicate values, and
@@ -196,6 +213,13 @@ has primary-key semantics instead of deleting an arbitrary non-unique match. The
 delete rewrites the remaining rows into a new column segment, rebuilds indexes,
 advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
 
+`sa_db_dict_intern` / `DB_DICT_INTERN` provides the first string data-model layer
+for ERP fields with small repeated value sets. The dictionary itself is a
+versioned table artifact, so snapshot, restore, verify, recover, lock, unlock,
+and table removal handle it with the same consistency rules as columns and
+indexes. It is not a general varchar/blob store; it is intentionally optimized
+for stable labels that can be represented as integer IDs in fixed-width rows.
+
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
 ERP foundation work is to add those missing database semantics without losing
@@ -210,8 +234,9 @@ benchmarks. The required baseline is:
   orders, invoices/payments, and journal entries, with SQLite comparisons for
   single-threaded, concurrent, and mixed read/write workloads.
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
-  and dictionary-encoded strings. Primitive schema type codes are now exposed;
-  higher-level typed column families still need dedicated encode/query helpers.
+  and dictionary-encoded strings. Primitive schema type codes are exposed and the
+  first low-cardinality string dictionary API exists; decimal/date/null helpers
+  and richer typed column families still need dedicated encode/query helpers.
 - Row-oriented public operations on top of the column store: fixed-width insert
   read by row index or unique `u64` key, upsert, range query handles, and delete
   by unique `u64` key exist now. Projected batch reads now cover the first ERP
