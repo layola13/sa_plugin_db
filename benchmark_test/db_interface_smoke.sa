@@ -48,6 +48,7 @@ L_ENTRY:
     EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, COL_BYTES
     EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
     EXPAND DB_INFO_ROW_COUNT rows, info
+    EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
     EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INFO_EPOCH snapshot_epoch, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
@@ -75,8 +76,9 @@ L_ENTRY:
     ok_init = eq init_status, SA_DB_OK
     ok_ingest = eq ingest_status, SA_DB_OK
     ok_rows = eq rows, ROWS
+    ok_create_index_status = eq create_index_status, SA_DB_OK
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
-    ok_snapshot_epoch = eq snapshot_epoch, 1
+    ok_snapshot_epoch = eq snapshot_epoch, 2
     ok_open_status = eq open_status, SA_DB_OK
     ok_handle_sum_status = eq handle_sum_status, SA_DB_OK
     ok_handle_sum = eq handle_points_sum_before, 100
@@ -112,45 +114,47 @@ L_ENTRY:
     ok01 = and ok_remove, ok_init
     ok02 = and ok01, ok_ingest
     ok03 = and ok02, ok_rows
-    ok04 = and ok03, ok_snapshot_status
-    ok05 = and ok04, ok_snapshot_epoch
-    ok06 = and ok05, ok_open_status
-    ok07 = and ok06, ok_handle_sum_status
-    ok08 = and ok07, ok_handle_sum
-    ok09 = and ok08, ok_handle_count_status
-    ok10 = and ok09, ok_handle_count
-    ok11 = and ok10, ok_find_status
-    ok12 = and ok11, ok_find_found
-    ok13 = and ok12, ok_find_row
-    ok14 = and ok13, ok_get_status
-    ok15 = and ok14, ok_get_points
-    ok16 = and ok15, ok_handle_min_status
-    ok17 = and ok16, ok_handle_min
-    ok18 = and ok17, ok_handle_max_status
-    ok19 = and ok18, ok_handle_max
-    ok20 = and ok19, ok_update_status
-    ok21 = and ok20, ok_updated_rows
-    ok22 = and ok21, ok_recover_status
-    ok23 = and ok22, ok_stale_sum_status
-    ok24 = and ok23, ok_stale_sum
-    ok25 = and ok24, ok_close_status
-    ok26 = and ok25, ok_open_after_status
-    ok27 = and ok26, ok_sum_after_status
-    ok28 = and ok27, ok_sum_after
-    ok29 = and ok28, ok_count_status
-    ok30 = and ok29, ok_count
-    ok31 = and ok30, ok_close_after_status
-    ok32 = and ok31, ok_verify
-    ok33 = and ok32, ok_restore_status
-    ok34 = and ok33, ok_open_restore_status
-    ok35 = and ok34, ok_restore_sum_status
-    ok36 = and ok35, ok_restore_sum
-    ok = and ok36, ok_close_restore_status
+    ok04 = and ok03, ok_create_index_status
+    ok05 = and ok04, ok_snapshot_status
+    ok06 = and ok05, ok_snapshot_epoch
+    ok07 = and ok06, ok_open_status
+    ok08 = and ok07, ok_handle_sum_status
+    ok09 = and ok08, ok_handle_sum
+    ok10 = and ok09, ok_handle_count_status
+    ok11 = and ok10, ok_handle_count
+    ok12 = and ok11, ok_find_status
+    ok13 = and ok12, ok_find_found
+    ok14 = and ok13, ok_find_row
+    ok15 = and ok14, ok_get_status
+    ok16 = and ok15, ok_get_points
+    ok17 = and ok16, ok_handle_min_status
+    ok18 = and ok17, ok_handle_min
+    ok19 = and ok18, ok_handle_max_status
+    ok20 = and ok19, ok_handle_max
+    ok21 = and ok20, ok_update_status
+    ok22 = and ok21, ok_updated_rows
+    ok23 = and ok22, ok_recover_status
+    ok24 = and ok23, ok_stale_sum_status
+    ok25 = and ok24, ok_stale_sum
+    ok26 = and ok25, ok_close_status
+    ok27 = and ok26, ok_open_after_status
+    ok28 = and ok27, ok_sum_after_status
+    ok29 = and ok28, ok_sum_after
+    ok30 = and ok29, ok_count_status
+    ok31 = and ok30, ok_count
+    ok32 = and ok31, ok_close_after_status
+    ok33 = and ok32, ok_verify
+    ok34 = and ok33, ok_restore_status
+    ok35 = and ok34, ok_open_restore_status
+    ok36 = and ok35, ok_restore_sum_status
+    ok37 = and ok36, ok_restore_sum
+    ok = and ok37, ok_close_restore_status
 
     !remove_status
     !init_status
     !ingest_status
     !rows
+    !create_index_status
     !snapshot_status
     !snapshot_epoch
     !open_status
@@ -192,6 +196,7 @@ L_ENTRY:
     !ok_init
     !ok_ingest
     !ok_rows
+    !ok_create_index_status
     !ok_snapshot_status
     !ok_snapshot_epoch
     !ok_open_status
@@ -262,6 +267,7 @@ L_ENTRY:
     !ok34
     !ok35
     !ok36
+    !ok37
     !id_col
     !plan_col
     !status_col

@@ -14,6 +14,7 @@ const skills = [_]plugin.SkillSection{
             "db register <query.sa>",
             "db exec <hash> [--params <file>]",
             "db ingest <table> <csv|jsonl>",
+            "db index-u64 <table> <column-index> [unique]",
             "db inspect <table|hash>",
             "db status <table>",
             "db snapshot <table>",
@@ -62,7 +63,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
     const sub = if (argv.len >= 3) argv[2] else "";
     return switch (err) {
         error.MissingSourcePath => if (sub.len == 0)
-            "usage: sa db <init|register|exec|ingest|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ..."
+            "usage: sa db <init|register|exec|ingest|index-u64|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ..."
         else if (std.mem.eql(u8, sub, "init"))
             "usage: sa db init <schema.sadb-schema>"
         else if (std.mem.eql(u8, sub, "register"))
@@ -71,12 +72,14 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
             "usage: sa db exec <hash> [--params <file>]"
         else if (std.mem.eql(u8, sub, "ingest"))
             "usage: sa db ingest <table> <csv|jsonl>"
+        else if (std.mem.eql(u8, sub, "index-u64"))
+            "usage: sa db index-u64 <table> <column-index> [unique]"
         else if (std.mem.eql(u8, sub, "restore"))
             "usage: sa db restore <table> <epoch>"
         else if (std.mem.eql(u8, sub, "recover"))
             "usage: sa db recover <table>"
         else
-            "usage: sa db <init|register|exec|ingest|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ...",
+            "usage: sa db <init|register|exec|ingest|index-u64|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ...",
         error.UnexpectedArgument => "remove the extra DB argument",
         error.InvalidPath => "check the DB schema or table path",
         error.FileNotFound, error.NotDir => "check that the DB schema file exists",
@@ -275,6 +278,19 @@ fn runDbIngest(allocator: std.mem.Allocator, argv: []const []const u8, stdout: s
     return 0;
 }
 
+fn runDbIndexU64(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+    if (argv.len < 5) return error.MissingSourcePath;
+    if (argv.len > 6) return error.UnexpectedArgument;
+    const column_index = std.fmt.parseInt(usize, argv[4], 10) catch return error.InvalidFormat;
+    const unique = if (argv.len == 6) blk: {
+        if (!std.mem.eql(u8, argv[5], "unique")) return error.UnexpectedArgument;
+        break :blk true;
+    } else false;
+    const info = table.createU64Index(allocator, ".", argv[3], column_index, unique) catch |err| return mapTableError(err);
+    try printInfo(stdout, info);
+    return 0;
+}
+
 fn runDbInspect(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
@@ -359,6 +375,7 @@ fn runDbCommandImpl(allocator: std.mem.Allocator, argv: []const []const u8, stdo
     if (std.mem.eql(u8, sub, "register")) return try runDbRegister(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "exec")) return try runDbExec(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "ingest")) return try runDbIngest(allocator, argv, stdout);
+    if (std.mem.eql(u8, sub, "index-u64")) return try runDbIndexU64(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "inspect") or std.mem.eql(u8, sub, "status")) return try runDbInspect(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "snapshot")) return try runDbSnapshot(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "restore")) return try runDbRestore(allocator, argv, stdout);
@@ -455,10 +472,11 @@ test "db plugin wrapper exports runtime descriptor" {
     try std.testing.expectEqualStrings("db", std.mem.span(exported.name));
     try std.testing.expectEqual(@as(usize, 1), exported.skills_len);
     const items = exported.skills_ptr[0].items;
-    try std.testing.expectEqual(@as(usize, 13), items.len);
+    try std.testing.expectEqual(@as(usize, 14), items.len);
     try std.testing.expectEqualStrings("db init <schema.sadb-schema>", items[0]);
-    try std.testing.expectEqualStrings("db recover <table>", items[8]);
-    try std.testing.expectEqualStrings("db unlock <table>", items[12]);
+    try std.testing.expectEqualStrings("db index-u64 <table> <column-index> [unique]", items[4]);
+    try std.testing.expectEqualStrings("db recover <table>", items[9]);
+    try std.testing.expectEqualStrings("db unlock <table>", items[13]);
 }
 
 test "db plugin wrapper abi maps missing init schema to cli diagnostic" {

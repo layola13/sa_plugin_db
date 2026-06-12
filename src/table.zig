@@ -44,6 +44,16 @@ pub const SegmentMeta = struct {
     files: []FileMeta,
 };
 
+pub const IndexMeta = struct {
+    name: []const u8,
+    kind: []const u8,
+    column_index: u64,
+    unique: bool,
+    path: []const u8,
+    sha256: []const u8,
+    bytes: u64,
+};
+
 pub const TableMeta = struct {
     magic: []const u8,
     version: u32,
@@ -58,6 +68,7 @@ pub const TableMeta = struct {
     next_segment_id: u64,
     columns: []ColumnMeta,
     segments: []SegmentMeta,
+    indexes: []IndexMeta = &.{},
 
     pub fn deinit(self: *TableMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.magic);
@@ -77,6 +88,13 @@ pub const TableMeta = struct {
             allocator.free(segment.files);
         }
         allocator.free(self.segments);
+        for (self.indexes) |index| {
+            allocator.free(index.name);
+            allocator.free(index.kind);
+            allocator.free(index.path);
+            allocator.free(index.sha256);
+        }
+        allocator.free(self.indexes);
         self.* = undefined;
     }
 };
@@ -98,6 +116,12 @@ pub const ReadColumnSnapshot = struct {
 pub const ReadSegmentSnapshot = struct {
     rows: u64,
     columns: []ReadColumnSnapshot,
+};
+
+pub const ReadIndexSnapshot = struct {
+    column_index: u64,
+    unique: bool,
+    entries: []const u8,
 };
 
 pub const U64CompareOp = enum(u32) {
@@ -122,6 +146,7 @@ pub const ReadSnapshot = struct {
     row_count: u64,
     columns: []ColumnMeta,
     segments: []ReadSegmentSnapshot,
+    indexes: []ReadIndexSnapshot,
 
     pub fn destroy(self: *ReadSnapshot) void {
         const backing_allocator = self.backing_allocator;
@@ -234,6 +259,10 @@ fn schemaMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name
 
 fn segmentFileName(allocator: std.mem.Allocator, table_name: []const u8, seg_id: u64, column_index: usize) TableError![]u8 {
     return allocPrintPath(allocator, "{s}.col{d}.{d}.dat", .{ table_name, column_index, seg_id });
+}
+
+fn indexFileName(allocator: std.mem.Allocator, table_name: []const u8, column_index: u64, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.idx.u64.{d}.{d}.dat", .{ table_name, column_index, epoch });
 }
 
 fn snapshotDir(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
@@ -502,6 +531,9 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
         };
     }
 
+    const indexes = try duplicateIndexMetas(allocator, meta.indexes);
+    errdefer freeIndexMetas(allocator, indexes);
+
     return .{
         .magic = try allocator.dupe(u8, meta.magic),
         .version = meta.version,
@@ -516,6 +548,7 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
         .next_segment_id = meta.next_segment_id,
         .columns = columns,
         .segments = segments,
+        .indexes = indexes,
     };
 }
 
@@ -540,6 +573,7 @@ fn buildInitialMeta(
         .next_segment_id = 0,
         .columns = try duplicateColumns(allocator, schema_obj.columns),
         .segments = try allocator.alloc(SegmentMeta, 0),
+        .indexes = try allocator.alloc(IndexMeta, 0),
     };
 }
 
@@ -613,6 +647,16 @@ fn freeSegmentMetas(allocator: std.mem.Allocator, segments: []SegmentMeta) void 
     allocator.free(segments);
 }
 
+fn freeIndexMetas(allocator: std.mem.Allocator, indexes: []IndexMeta) void {
+    for (indexes) |index| {
+        allocator.free(index.name);
+        allocator.free(index.kind);
+        allocator.free(index.path);
+        allocator.free(index.sha256);
+    }
+    allocator.free(indexes);
+}
+
 fn duplicateSegmentMetas(allocator: std.mem.Allocator, segments: []const SegmentMeta) TableError![]SegmentMeta {
     const out = try allocator.alloc(SegmentMeta, segments.len);
     errdefer {
@@ -645,6 +689,32 @@ fn duplicateSegmentMetas(allocator: std.mem.Allocator, segments: []const Segment
         };
     }
 
+    return out;
+}
+
+fn duplicateIndexMetas(allocator: std.mem.Allocator, indexes: []const IndexMeta) TableError![]IndexMeta {
+    const out = try allocator.alloc(IndexMeta, indexes.len);
+    for (out) |*index| index.* = .{
+        .name = &.{},
+        .kind = &.{},
+        .column_index = 0,
+        .unique = false,
+        .path = &.{},
+        .sha256 = &.{},
+        .bytes = 0,
+    };
+    errdefer freeIndexMetas(allocator, out);
+    for (indexes, 0..) |index, idx| {
+        out[idx] = .{
+            .name = try allocator.dupe(u8, index.name),
+            .kind = try allocator.dupe(u8, index.kind),
+            .column_index = index.column_index,
+            .unique = index.unique,
+            .path = try allocator.dupe(u8, index.path),
+            .sha256 = try allocator.dupe(u8, index.sha256),
+            .bytes = index.bytes,
+        };
+    }
     return out;
 }
 
@@ -783,6 +853,14 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
             try copyFile(allocator, src_path, dst_path);
         }
     }
+
+    for (meta.indexes) |index| {
+        const src_path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(src_path);
+        const dst_path = try joinPath(allocator, &.{ snapshot_dir_path, index.path });
+        defer allocator.free(dst_path);
+        try copyFile(allocator, src_path, dst_path);
+    }
 }
 
 fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError!TableInfo {
@@ -818,6 +896,14 @@ fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
         }
     }
 
+    for (parsed.value.indexes) |index| {
+        const src_path = try joinPath(allocator, &.{ snapshot_dir_path, index.path });
+        defer allocator.free(src_path);
+        const dst_path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(dst_path);
+        try copyFile(allocator, src_path, dst_path);
+    }
+
     var owned = try duplicateTableMeta(allocator, parsed.value);
     defer owned.deinit(allocator);
     try writeMeta(allocator, root_dir, table_name, owned);
@@ -851,6 +937,28 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
         }
     }
     if (total_rows != meta.row_count) return TableError.VerifyFailed;
+}
+
+fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    for (meta.indexes) |index| {
+        if (!std.mem.eql(u8, index.kind, "u64")) return TableError.VerifyFailed;
+        if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
+        const column_index: usize = @intCast(index.column_index);
+        try ensureU64Column(meta, column_index);
+        if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+        const path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(path);
+        const bytes = try readFileAlloc(allocator, path, 1 << 30);
+        defer allocator.free(bytes);
+        if (bytes.len != index.bytes) return TableError.VerifyFailed;
+        const hash = hashBytes(bytes);
+        const hex = std.fmt.bytesToHex(hash, .lower);
+        if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
+        try validateIndexBytesShape(bytes, meta.row_count, index.unique);
+        const expected = try buildU64IndexBytes(allocator, root_dir, meta, column_index, index.unique);
+        defer allocator.free(expected);
+        if (!std.mem.eql(u8, bytes, expected)) return TableError.VerifyFailed;
+    }
 }
 
 fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
@@ -912,6 +1020,19 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
             }
         }
     }
+
+    for (meta.indexes) |index| {
+        const path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(path);
+        if (std.fs.cwd().openFile(path, .{})) |file| {
+            var f = file;
+            defer f.close();
+            f.chmod(0o444) catch {};
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
+        }
+    }
 }
 
 fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
@@ -923,6 +1044,7 @@ fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, 
     defer schema_obj.deinit();
     try verifySchemaAgainstMeta(schema_obj, meta);
     try validateSegmentHashes(allocator, root_dir, meta);
+    try validateIndexFiles(allocator, root_dir, meta);
 }
 
 fn maybeSelectRecoveryMeta(
@@ -1028,6 +1150,19 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
                 error.FileNotFound => {},
                 else => return mapFileError(err),
             }
+        }
+    }
+
+    for (meta.indexes) |index| {
+        const path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(path);
+        if (std.fs.cwd().openFile(path, .{})) |file| {
+            var f = file;
+            defer f.close();
+            f.chmod(0o644) catch {};
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
         }
     }
 }
@@ -1350,6 +1485,13 @@ pub fn commitTableMeta(allocator: std.mem.Allocator, root_dir: []const u8, table
     try writeMeta(allocator, root_dir, table_name, meta);
 }
 
+pub fn commitTableMetaWithRebuiltIndexes(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    var owned = try duplicateTableMeta(allocator, meta);
+    defer owned.deinit(allocator);
+    try rebuildIndexes(allocator, root_dir, &owned);
+    try writeMeta(allocator, root_dir, table_name, owned);
+}
+
 pub fn rewriteColumnFileForEpoch(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -1412,6 +1554,11 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
                 defer allocator.free(path);
                 try deleteIfExists(path);
             }
+        }
+        for (owned.indexes) |index| {
+            const path = try activePath(allocator, root_dir, index.path);
+            defer allocator.free(path);
+            try deleteIfExists(path);
         }
     } else |err| switch (err) {
         TableError.NotFound => {},
@@ -1486,11 +1633,77 @@ pub fn ingestRawColumns(
     }
 
     try appendSegmentToMeta(allocator, root_dir, table_name, &meta, buffers, row_count);
+    try rebuildIndexes(allocator, root_dir, &meta);
     try writeMeta(allocator, root_dir, table_name, meta);
 
     for (buffers) |*buf| buf.deinit();
     allocator.free(buffers);
 
+    return tableInfo(meta);
+}
+
+pub fn createU64Index(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    unique: bool,
+) TableError!TableInfo {
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+    try ensureU64Column(meta, column_index);
+
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u64") and index.column_index == @as(u64, @intCast(column_index))) {
+            if (index.unique == unique) return tableInfo(meta);
+            return TableError.InvalidFormat;
+        }
+    }
+
+    const old_indexes = meta.indexes;
+    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
+    for (new_indexes) |*index| index.* = .{
+        .name = &.{},
+        .kind = &.{},
+        .column_index = 0,
+        .unique = false,
+        .path = &.{},
+        .sha256 = &.{},
+        .bytes = 0,
+    };
+    var assigned_indexes = false;
+    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
+
+    for (old_indexes, 0..) |index, idx| {
+        new_indexes[idx] = .{
+            .name = try allocator.dupe(u8, index.name),
+            .kind = try allocator.dupe(u8, index.kind),
+            .column_index = index.column_index,
+            .unique = index.unique,
+            .path = try allocator.dupe(u8, index.path),
+            .sha256 = try allocator.dupe(u8, index.sha256),
+            .bytes = index.bytes,
+        };
+    }
+
+    const new_index = &new_indexes[old_indexes.len];
+    new_index.* = .{
+        .name = try allocPrintPath(allocator, "u64_col{d}", .{column_index}),
+        .kind = try allocator.dupe(u8, "u64"),
+        .column_index = @intCast(column_index),
+        .unique = unique,
+        .path = try allocator.dupe(u8, ""),
+        .sha256 = try allocator.dupe(u8, ""),
+        .bytes = 0,
+    };
+
+    freeIndexMetas(allocator, old_indexes);
+    meta.indexes = new_indexes;
+    assigned_indexes = true;
+    meta.epoch += 1;
+    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
+    try writeMeta(allocator, root_dir, table_name, meta);
     return tableInfo(meta);
 }
 
@@ -1526,6 +1739,131 @@ fn expectedColumnBytes(segment_rows: u64, stride: u32) TableError!usize {
     return @intCast(expected);
 }
 
+const INDEX_RECORD_BYTES: usize = 16;
+
+const IndexEntry = struct {
+    key: u64,
+    row: u64,
+};
+
+fn indexEntryLessThan(_: void, lhs: IndexEntry, rhs: IndexEntry) bool {
+    return lhs.key < rhs.key or (lhs.key == rhs.key and lhs.row < rhs.row);
+}
+
+fn readIndexKey(bytes: []const u8, entry_index: usize) u64 {
+    const offset = entry_index * INDEX_RECORD_BYTES;
+    return std.mem.readInt(u64, bytes[offset .. offset + 8][0..8], .little);
+}
+
+fn readIndexRow(bytes: []const u8, entry_index: usize) u64 {
+    const offset = entry_index * INDEX_RECORD_BYTES + 8;
+    return std.mem.readInt(u64, bytes[offset .. offset + 8][0..8], .little);
+}
+
+fn writeIndexEntry(bytes: []u8, entry_index: usize, entry: IndexEntry) void {
+    const offset = entry_index * INDEX_RECORD_BYTES;
+    std.mem.writeInt(u64, bytes[offset .. offset + 8][0..8], entry.key, .little);
+    std.mem.writeInt(u64, bytes[offset + 8 .. offset + 16][0..8], entry.row, .little);
+}
+
+fn expectedIndexBytes(row_count: u64) TableError!usize {
+    const expected = std.math.mul(u64, row_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    if (expected > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(expected);
+}
+
+fn validateIndexBytesShape(bytes: []const u8, row_count: u64, unique: bool) TableError!void {
+    if (bytes.len != try expectedIndexBytes(row_count)) return TableError.VerifyFailed;
+    if (bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+    const n = bytes.len / INDEX_RECORD_BYTES;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const row = readIndexRow(bytes, i);
+        if (row >= row_count) return TableError.VerifyFailed;
+        if (i > 0) {
+            const prev_key = readIndexKey(bytes, i - 1);
+            const key = readIndexKey(bytes, i);
+            const prev_row = readIndexRow(bytes, i - 1);
+            if (prev_key > key) return TableError.VerifyFailed;
+            if (prev_key == key) {
+                if (unique) return TableError.VerifyFailed;
+                if (prev_row > row) return TableError.VerifyFailed;
+            }
+        }
+    }
+}
+
+fn buildU64IndexBytes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    unique: bool,
+) TableError![]u8 {
+    try ensureU64Column(meta, column_index);
+    if (meta.row_count > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const entries = try allocator.alloc(IndexEntry, @intCast(meta.row_count));
+    defer allocator.free(entries);
+
+    var row_base: u64 = 0;
+    var entry_idx: usize = 0;
+    for (meta.segments) |segment| {
+        const file_meta = segment.files[column_index];
+        const path = try activePath(allocator, root_dir, file_meta.path);
+        defer allocator.free(path);
+        const bytes = try readFileAlloc(allocator, path, 1 << 30);
+        defer allocator.free(bytes);
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            entries[entry_idx] = .{ .key = readU64LE(bytes, byte_offset), .row = row_base + i };
+            entry_idx += 1;
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    if (entry_idx != entries.len or row_base != meta.row_count) return TableError.VerifyFailed;
+
+    std.sort.block(IndexEntry, entries, {}, indexEntryLessThan);
+    if (unique and entries.len > 1) {
+        for (entries[1..], 1..) |entry, idx| {
+            if (entry.key == entries[idx - 1].key) return TableError.InvalidFormat;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedIndexBytes(meta.row_count));
+    for (entries, 0..) |entry, idx| writeIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, index_idx: usize) TableError!void {
+    const index = &meta.indexes[index_idx];
+    if (!std.mem.eql(u8, index.kind, "u64")) return TableError.InvalidFormat;
+    if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
+    const column_index: usize = @intCast(index.column_index);
+    const bytes = try buildU64IndexBytes(allocator, root_dir, meta.*, column_index, index.unique);
+    defer allocator.free(bytes);
+    const basename = try indexFileName(allocator, meta.table_name, index.column_index, meta.epoch);
+    defer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, bytes);
+    const next_path = try allocator.dupe(u8, basename);
+    errdefer allocator.free(next_path);
+    const next_hash = try hashHexAlloc(allocator, bytes);
+    errdefer allocator.free(next_hash);
+    allocator.free(index.path);
+    allocator.free(index.sha256);
+    index.path = next_path;
+    index.sha256 = next_hash;
+    index.bytes = bytes.len;
+}
+
+pub fn rebuildIndexes(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta) TableError!void {
+    for (0..meta.indexes.len) |idx| try rebuildIndexAt(allocator, root_dir, meta, idx);
+}
+
 pub fn openReadSnapshot(
     backing_allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -1540,6 +1878,7 @@ pub fn openReadSnapshot(
         .row_count = 0,
         .columns = &.{},
         .segments = &.{},
+        .indexes = &.{},
     };
     errdefer snapshot.destroy();
 
@@ -1555,6 +1894,7 @@ pub fn openReadSnapshot(
     snapshot.row_count = parsed.value.row_count;
     snapshot.columns = try duplicateColumnMetasToArena(arena_allocator, parsed.value.columns);
     snapshot.segments = try arena_allocator.alloc(ReadSegmentSnapshot, parsed.value.segments.len);
+    snapshot.indexes = try arena_allocator.alloc(ReadIndexSnapshot, parsed.value.indexes.len);
 
     for (parsed.value.segments, 0..) |segment, segment_idx| {
         const segment_columns = try arena_allocator.alloc(ReadColumnSnapshot, segment.files.len);
@@ -1571,6 +1911,27 @@ pub fn openReadSnapshot(
         snapshot.segments[segment_idx] = .{
             .rows = segment.rows,
             .columns = segment_columns,
+        };
+    }
+
+    for (parsed.value.indexes, 0..) |index, index_idx| {
+        if (!std.mem.eql(u8, index.kind, "u64")) return TableError.InvalidFormat;
+        if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
+        const column_index: usize = @intCast(index.column_index);
+        try ensureSnapshotU64Column(snapshot, column_index);
+        if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(parsed.value.row_count)))) return TableError.VerifyFailed;
+        const path = try activePath(backing_allocator, root_dir, index.path);
+        defer backing_allocator.free(path);
+        const bytes = try readFileAlloc(arena_allocator, path, 1 << 30);
+        if (bytes.len != index.bytes) return TableError.VerifyFailed;
+        const hash = hashBytes(bytes);
+        const hex = std.fmt.bytesToHex(hash, .lower);
+        if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
+        try validateIndexBytesShape(bytes, parsed.value.row_count, index.unique);
+        snapshot.indexes[index_idx] = .{
+            .column_index = index.column_index,
+            .unique = index.unique,
+            .entries = bytes,
         };
     }
 
@@ -1592,6 +1953,32 @@ fn compareU64(value: u64, op: U64CompareOp, expected: u64) bool {
         .gt => value > expected,
         .ge => value >= expected,
     };
+}
+
+fn snapshotIndexForU64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
+fn findU64InIndex(index: ReadIndexSnapshot, expected: u64) U64FindResult {
+    const n = index.entries.len / INDEX_RECORD_BYTES;
+    var lo: usize = 0;
+    var hi: usize = n;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const key = readIndexKey(index.entries, mid);
+        if (key < expected) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < n and readIndexKey(index.entries, lo) == expected) {
+        return .{ .found = true, .row_index = readIndexRow(index.entries, lo) };
+    }
+    return .{ .found = false, .row_index = 0 };
 }
 
 pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
@@ -1628,6 +2015,9 @@ pub fn snapshotCountU64Cmp(snapshot: *const ReadSnapshot, column_index: usize, o
 
 pub fn snapshotFindU64(snapshot: *const ReadSnapshot, column_index: usize, expected: u64) TableError!U64FindResult {
     try ensureSnapshotU64Column(snapshot, column_index);
+    if (snapshotIndexForU64Column(snapshot, column_index)) |index| {
+        return findU64InIndex(index, expected);
+    }
     var row_base: u64 = 0;
     for (snapshot.segments) |segment| {
         const bytes = segment.columns[column_index].bytes;
@@ -1761,6 +2151,7 @@ pub fn updateU64ColumnAdd(
     }
 
     owned.epoch = next_epoch;
+    try rebuildIndexes(allocator, root_dir, &owned);
     try writeMeta(allocator, root_dir, table_name, owned);
     return updated;
 }
@@ -1898,6 +2289,7 @@ pub fn verifyTable(
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, meta);
+    try validateIndexFiles(allocator, root_dir, meta);
     return tableInfo(meta);
 }
 
@@ -1923,6 +2315,7 @@ pub fn unlockTable(
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, owned);
+    try validateIndexFiles(allocator, root_dir, owned);
     if (owned.locked) {
         owned.locked = false;
         owned.epoch += 1;
@@ -1958,6 +2351,7 @@ pub fn compactTable(
     freeSegmentMetas(allocator, old_segments);
     owned.next_segment_id += 1;
     owned.epoch += 1;
+    try rebuildIndexes(allocator, root_dir, &owned);
     try writeMeta(allocator, root_dir, table_name, owned);
     return tableInfo(owned);
 }
@@ -2029,6 +2423,80 @@ test "table verify rejects segment byte-count metadata mismatch" {
     owned.segments[0].files[0].bytes += 8;
     try writeMeta(std.testing.allocator, ".", table_name, owned);
 
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table persistent u64 index tracks ingest update and corruption" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "indexed_members";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "indexed_members.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var ids1 = [_]u64{ 1, 2 };
+    var points1 = [_]u64{ 10, 20 };
+    const first_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids1[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(points1[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids1.len, &first_columns);
+    const indexed = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+    try std.testing.expectEqual(@as(u64, 2), indexed.row_count);
+
+    {
+        var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), meta.indexes.len);
+        try std.testing.expectEqual(@as(u64, 0), meta.indexes[0].column_index);
+        try std.testing.expect(meta.indexes[0].unique);
+        try std.testing.expectEqual(@as(u64, 32), meta.indexes[0].bytes);
+        try validateIndexFiles(std.testing.allocator, ".", meta);
+    }
+
+    var ids2 = [_]u64{3};
+    var points2 = [_]u64{30};
+    const second_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids2[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(points2[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids2.len, &second_columns);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(usize, 1), snapshot.indexes.len);
+        const found3 = try snapshotFindU64(snapshot, 0, 3);
+        try std.testing.expect(found3.found);
+        try std.testing.expectEqual(@as(u64, 2), found3.row_index);
+        try std.testing.expectEqual(@as(u64, 30), try snapshotGetU64(snapshot, 1, found3.row_index));
+    }
+
+    _ = try updateU64ColumnAdd(std.testing.allocator, ".", table_name, 0, 0, 1, 10);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        const old_id = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(!old_id.found);
+        const new_id = try snapshotFindU64(snapshot, 0, 11);
+        try std.testing.expect(new_id.found);
+        try std.testing.expectEqual(@as(u64, 0), new_id.row_index);
+    }
+
+    {
+        var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer meta.deinit(std.testing.allocator);
+        const index_path = try activePath(std.testing.allocator, ".", meta.indexes[0].path);
+        defer std.testing.allocator.free(index_path);
+        try writeFile(std.testing.allocator, index_path, "corrupt");
+    }
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
 }
 

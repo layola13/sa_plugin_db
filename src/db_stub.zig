@@ -1351,7 +1351,7 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
     if (current.value.max_rows != expected.max_rows) return false;
     if (current.value.row_bytes != expected.row_bytes) return false;
     if (current.value.next_segment_id != expected.next_segment_id) return false;
-    if (current.value.columns.len != expected.columns.len or current.value.segments.len != expected.segments.len) return false;
+    if (current.value.columns.len != expected.columns.len or current.value.segments.len != expected.segments.len or current.value.indexes.len != expected.indexes.len) return false;
     for (current.value.columns, expected.columns) |current_col, expected_col| {
         if (!std.mem.eql(u8, current_col.name, expected_col.name)) return false;
         if (!std.mem.eql(u8, current_col.ty, expected_col.ty)) return false;
@@ -1365,6 +1365,15 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
             if (!std.mem.eql(u8, current_file.sha256, expected_file.sha256)) return false;
             if (current_file.bytes != expected_file.bytes) return false;
         }
+    }
+    for (current.value.indexes, expected.indexes) |current_index, expected_index| {
+        if (!std.mem.eql(u8, current_index.name, expected_index.name)) return false;
+        if (!std.mem.eql(u8, current_index.kind, expected_index.kind)) return false;
+        if (current_index.column_index != expected_index.column_index) return false;
+        if (current_index.unique != expected_index.unique) return false;
+        if (!std.mem.eql(u8, current_index.path, expected_index.path)) return false;
+        if (!std.mem.eql(u8, current_index.sha256, expected_index.sha256)) return false;
+        if (current_index.bytes != expected_index.bytes) return false;
     }
     return true;
 }
@@ -1409,7 +1418,7 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
         }
     }
     write_table.parsed.value.epoch = next_epoch;
-    table_mod.commitTableMeta(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
+    table_mod.commitTableMetaWithRebuiltIndexes(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
 }
 
 fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
