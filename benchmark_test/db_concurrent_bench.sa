@@ -1,0 +1,544 @@
+@import "db.sal"
+@import "sa_std/fmt.sai"
+@import "sa_std/io/print.sai"
+@import "sa_std/time.sai"
+
+@const ROOT = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test"
+@const TABLE_Q = utf8:"members"
+@const TABLE_I = utf8:"members_ci"
+@const SCHEMA_Q_PATH = utf8:"members.sadb-schema"
+@const SCHEMA_I_PATH = utf8:"members_ci.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 50000\n#def COL_ID_STRIDE = 8 // u64\n#def COL_PLAN_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+@const NL = utf8:"\n"
+@const QUERY_WORKER_VT = vtable { call = @db_handle_query_worker }
+@const INSERT_WORKER_VT = vtable { call = @db_insert_worker }
+
+@const DB_SERIAL_QUERY = utf8:"db_serial_query_ns="
+@const DB_CONCURRENT_QUERY = utf8:"db_concurrent_query_ns="
+@const DB_CONCURRENT_INSERT = utf8:"db_concurrent_insert_ns="
+@const DB_SERIAL_QUERY_OK = utf8:"db_serial_query_ok="
+@const DB_CONCURRENT_QUERY_OK = utf8:"db_concurrent_query_ok="
+@const DB_CONCURRENT_INSERT_OK = utf8:"db_concurrent_insert_ok="
+@const DB_CONCURRENT_INSERT_ROWS = utf8:"db_concurrent_insert_rows="
+@const QUERIES_LABEL = utf8:"queries="
+@const THREADS_LABEL = utf8:"threads="
+@const SUM_TOTAL_LABEL = utf8:"sum_total="
+
+@extern pthread_spawn(*entry: ptr, *arg: ptr) -> i32
+@extern pthread_join(handle: i32, *out: ptr) -> i32
+@extern pthread_drop(handle: i32) -> void
+
+#def ROOT_LEN = 60
+#def TABLE_Q_LEN = 7
+#def TABLE_I_LEN = 10
+#def SCHEMA_Q_PATH_LEN = 19
+#def SCHEMA_I_PATH_LEN = 22
+#def SCHEMA_LEN = 152
+#def ROWS = 50000
+#def BATCH_ROWS = 12500
+#def COL_BYTES = 400000
+#def BATCH_COL_BYTES = 100000
+#def COLUMN_COUNT = 4
+#def COLUMNS_BYTES = 64
+#def FMT_BUF_BYTES = 32
+#def THREADS = 4
+#def QUERY_REPEATS = 25
+#def TOTAL_QUERIES = 100
+#def EXPECTED_SUM = 12500250000
+
+#def DB_SERIAL_QUERY_LEN = 19
+#def DB_CONCURRENT_QUERY_LEN = 23
+#def DB_CONCURRENT_INSERT_LEN = 24
+#def DB_SERIAL_QUERY_OK_LEN = 19
+#def DB_CONCURRENT_QUERY_OK_LEN = 23
+#def DB_CONCURRENT_INSERT_OK_LEN = 24
+#def DB_CONCURRENT_INSERT_ROWS_LEN = 26
+#def QUERIES_LABEL_LEN = 8
+#def THREADS_LABEL_LEN = 8
+#def SUM_TOTAL_LABEL_LEN = 10
+
+#def QueryThread_SIZE = 96
+#def QueryThread_handle = +0
+#def QueryThread_iterations = +8
+#def QueryThread_ok = +16
+#def QueryThread_sum_total = +24
+#def QueryThread_current_sum = +32
+#def QueryThread_last_status = +40
+#def QueryThread_info = +48
+#def QueryThread_verify_status = +80
+
+#def InsertThread_SIZE = 48
+#def InsertThread_handle = +0
+#def InsertThread_start_base = +8
+#def InsertThread_rows = +16
+#def InsertThread_ok = +24
+#def InsertThread_seen_rows = +32
+
+[MACRO] PRINT_U64_LINE %label, %label_len, %value
+    __fmt_buf_%value = stack_alloc FMT_BUF_BYTES
+    __fmt_len_slot_%value = stack_alloc 8
+    __fmt_status_%value = call @sa_fmt_u64_into(%value, 10, __fmt_buf_%value, FMT_BUF_BYTES, &__fmt_len_slot_%value)
+    __fmt_len_%value = load __fmt_len_slot_%value+0 as u64
+    call @sa_print_bytes(&%label, %label_len)
+    call @sa_print_bytes(&__fmt_buf_%value, __fmt_len_%value)
+    call @sa_print_bytes(&NL, 1)
+    !__fmt_status_%value
+    !__fmt_len_%value
+[END_MACRO]
+
+@fill_member_columns(&id_col: ptr, &plan_col: ptr, &status_col: ptr, &points_col: ptr, start_base: u64, rows: u64) -> i32:
+L_ENTRY:
+    i_slot = stack_alloc 8
+    store i_slot+0, 0 as u64
+    jmp L_FILL_COND
+
+L_FILL_COND:
+    i = load i_slot+0 as u64
+    fill_cond = ult i, rows
+    br fill_cond -> L_FILL_BODY, L_FILL_DONE
+
+L_FILL_BODY:
+    off = mul i, 8
+    id_ptr = ptr_add id_col, off
+    plan_ptr = ptr_add plan_col, off
+    status_ptr = ptr_add status_col, off
+    points_ptr = ptr_add points_col, off
+    global_i = add start_base, i
+    id_value = add global_i, 1
+    plan_low = and global_i, 3
+    plan_value = add plan_low, 1
+    status_value = and global_i, 1
+    points_value = mul id_value, 10
+    store id_ptr+0, id_value as u64
+    store plan_ptr+0, plan_value as u64
+    store status_ptr+0, status_value as u64
+    store points_ptr+0, points_value as u64
+    next_i = add i, 1
+    store i_slot+0, next_i as u64
+    !i
+    !fill_cond
+    !off
+    !id_ptr
+    !plan_ptr
+    !status_ptr
+    !points_ptr
+    !global_i
+    !id_value
+    !plan_low
+    !plan_value
+    !status_value
+    !points_value
+    !next_i
+    jmp L_FILL_COND
+
+L_FILL_DONE:
+    !i
+    !fill_cond
+    !id_col
+    !plan_col
+    !status_col
+    !points_col
+    !start_base
+    !rows
+    return 0
+
+@db_handle_query_worker(&slot: ptr) -> i32:
+L_ENTRY:
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    total_slot = stack_alloc 8
+    sum_ptr = ptr_add slot, QueryThread_current_sum
+    iterations = load slot+QueryThread_iterations as u64
+    store i_slot+0, 0 as u64
+    store ok_slot+0, 1 as u64
+    store total_slot+0, 0 as u64
+    store slot+QueryThread_current_sum, 0 as u64
+    store slot+QueryThread_last_status, 0 as u64
+    store slot+QueryThread_verify_status, 0 as u64
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE_Q, TABLE_Q_LEN
+    store slot+QueryThread_verify_status, open_status as u32
+    ok_open = eq open_status, SA_DB_OK
+    store ok_slot+0, ok_open as u64
+    jmp L_HQUERY_COND
+
+L_HQUERY_COND:
+    i = load i_slot+0 as u64
+    query_cond = ult i, iterations
+    br query_cond -> L_HQUERY_BODY, L_HQUERY_DONE
+
+L_HQUERY_BODY:
+    q_status = call @sa_db_sum_u64_handle(read_handle, 3, &sum_ptr)
+    q_sum = load sum_ptr+0 as u64
+    store slot+QueryThread_last_status, q_status as u32
+    ok_status = eq q_status, SA_DB_OK
+    ok_sum = eq q_sum, EXPECTED_SUM
+    ok_query = and ok_status, ok_sum
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_query
+    total_acc = load total_slot+0 as u64
+    total_next = add total_acc, q_sum
+    next_i = add i, 1
+    store ok_slot+0, ok_next as u64
+    store total_slot+0, total_next as u64
+    store i_slot+0, next_i as u64
+    !i
+    !query_cond
+    !q_status
+    !q_sum
+    !ok_status
+    !ok_sum
+    !ok_query
+    !ok_acc
+    !ok_next
+    !total_acc
+    !total_next
+    !next_i
+    jmp L_HQUERY_COND
+
+L_HQUERY_DONE:
+    close_status = call @sa_db_close_read_table(read_handle)
+    close_ok = eq close_status, SA_DB_OK
+    final_ok_before_close = load ok_slot+0 as u64
+    final_ok = and final_ok_before_close, close_ok
+    final_total = load total_slot+0 as u64
+    store slot+QueryThread_ok, final_ok as u64
+    store slot+QueryThread_sum_total, final_total as u64
+    store slot+QueryThread_verify_status, close_status as u32
+    !i
+    !query_cond
+    !close_status
+    !close_ok
+    !final_ok_before_close
+    !final_ok
+    !final_total
+    !iterations
+    !sum_ptr
+    !open_status
+    !ok_open
+    !read_handle
+    !slot
+    return 0
+
+@db_insert_worker(&slot: ptr) -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc BATCH_COL_BYTES
+    plan_col = alloc BATCH_COL_BYTES
+    status_col = alloc BATCH_COL_BYTES
+    points_col = alloc BATCH_COL_BYTES
+    start_base = load slot+InsertThread_start_base as u64
+    rows = load slot+InsertThread_rows as u64
+    fill_status = call @fill_member_columns(&id_col, &plan_col, &status_col, &points_col, start_base, rows)
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, BATCH_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, plan_col, BATCH_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, status_col, BATCH_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, BATCH_COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE_I, TABLE_I_LEN, rows, columns, COLUMN_COUNT, info
+    EXPAND DB_INFO_ROW_COUNT seen_rows, info
+    ok_fill = eq fill_status, 0
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok = and ok_fill, ok_ingest
+    store slot+InsertThread_ok, ok as u64
+    store slot+InsertThread_seen_rows, seen_rows as u64
+    !fill_status
+    !ingest_status
+    !seen_rows
+    !ok_fill
+    !ok_ingest
+    !ok
+    !start_base
+    !rows
+    !id_col
+    !plan_col
+    !status_col
+    !points_col
+    !slot
+    return 0
+
+@ffi_wrapper spawn_query_worker(*slot: ptr) -> i32:
+L_ENTRY:
+    worker_vt = &QUERY_WORKER_VT
+    worker_fn = load worker_vt+0 as ptr
+    worker_safe = assume_safe worker_fn
+    handle = call @pthread_spawn(*worker_safe, *slot)
+    !slot
+    return handle
+
+@ffi_wrapper spawn_insert_worker(*slot: ptr) -> i32:
+L_ENTRY:
+    worker_vt = &INSERT_WORKER_VT
+    worker_fn = load worker_vt+0 as ptr
+    worker_safe = assume_safe worker_fn
+    handle = call @pthread_spawn(*worker_safe, *slot)
+    !slot
+    return handle
+
+@ffi_wrapper join_worker(handle: i32, *slot: ptr) -> i32:
+L_ENTRY:
+    joined = call @pthread_join(handle, *slot)
+    !slot
+    !handle
+    return joined
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc COL_BYTES
+    plan_col = alloc COL_BYTES
+    status_col = alloc COL_BYTES
+    points_col = alloc COL_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_q_status, ROOT, ROOT_LEN, TABLE_Q, TABLE_Q_LEN, info
+    EXPAND DB_INIT_SCHEMA init_q_status, ROOT, ROOT_LEN, SCHEMA_Q_PATH, SCHEMA_Q_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    fill_q_status = call @fill_member_columns(&id_col, &plan_col, &status_col, &points_col, 0, ROWS)
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, plan_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, status_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_q_status, ROOT, ROOT_LEN, TABLE_Q, TABLE_Q_LEN, ROWS, columns, COLUMN_COUNT, info
+
+    serial_thread = alloc QueryThread_SIZE
+    store serial_thread+QueryThread_handle, 0 as i32
+    store serial_thread+QueryThread_iterations, TOTAL_QUERIES as u64
+    store serial_thread+QueryThread_ok, 0 as u64
+    store serial_thread+QueryThread_sum_total, 0 as u64
+    store serial_thread+QueryThread_current_sum, 0 as u64
+    store serial_thread+QueryThread_last_status, 0 as u64
+    store serial_thread+QueryThread_verify_status, 0 as u64
+    t_serial0 = call @sa_time_instant_ns()
+    serial_call = call @db_handle_query_worker(&serial_thread)
+    t_serial1 = call @sa_time_instant_ns()
+    db_serial_query_ns = sub t_serial1, t_serial0
+    serial_ok = load serial_thread+QueryThread_ok as u64
+    serial_sum_total = load serial_thread+QueryThread_sum_total as u64
+
+    qthreads = alloc 384
+    store qthreads+QueryThread_iterations, QUERY_REPEATS as u64
+    store qthreads+QueryThread_ok, 0 as u64
+    store qthreads+QueryThread_sum_total, 0 as u64
+    store qthreads+QueryThread_current_sum, 0 as u64
+    store qthreads+QueryThread_last_status, 0 as u64
+    store qthreads+QueryThread_verify_status, 0 as u64
+    qt1 = ptr_add qthreads, QueryThread_SIZE
+    store qt1+QueryThread_iterations, QUERY_REPEATS as u64
+    store qt1+QueryThread_ok, 0 as u64
+    store qt1+QueryThread_sum_total, 0 as u64
+    store qt1+QueryThread_current_sum, 0 as u64
+    store qt1+QueryThread_last_status, 0 as u64
+    store qt1+QueryThread_verify_status, 0 as u64
+    qt2 = ptr_add qthreads, 192
+    store qt2+QueryThread_iterations, QUERY_REPEATS as u64
+    store qt2+QueryThread_ok, 0 as u64
+    store qt2+QueryThread_sum_total, 0 as u64
+    store qt2+QueryThread_current_sum, 0 as u64
+    store qt2+QueryThread_last_status, 0 as u64
+    store qt2+QueryThread_verify_status, 0 as u64
+    qt3 = ptr_add qthreads, 288
+    store qt3+QueryThread_iterations, QUERY_REPEATS as u64
+    store qt3+QueryThread_ok, 0 as u64
+    store qt3+QueryThread_sum_total, 0 as u64
+    store qt3+QueryThread_current_sum, 0 as u64
+    store qt3+QueryThread_last_status, 0 as u64
+    store qt3+QueryThread_verify_status, 0 as u64
+    t_conq0 = call @sa_time_instant_ns()
+    qh0 = call @spawn_query_worker(*qthreads)
+    store qthreads+QueryThread_handle, qh0 as i32
+    qh1 = call @spawn_query_worker(*qt1)
+    store qt1+QueryThread_handle, qh1 as i32
+    qh2 = call @spawn_query_worker(*qt2)
+    store qt2+QueryThread_handle, qh2 as i32
+    qh3 = call @spawn_query_worker(*qt3)
+    store qt3+QueryThread_handle, qh3 as i32
+    qj0 = call @join_worker(qh0, *qthreads)
+    qj1 = call @join_worker(qh1, *qt1)
+    qj2 = call @join_worker(qh2, *qt2)
+    qj3 = call @join_worker(qh3, *qt3)
+    t_conq1 = call @sa_time_instant_ns()
+    db_concurrent_query_ns = sub t_conq1, t_conq0
+    qok0 = load qthreads+QueryThread_ok as u64
+    qok1 = load qt1+QueryThread_ok as u64
+    qok2 = load qt2+QueryThread_ok as u64
+    qok3 = load qt3+QueryThread_ok as u64
+    qsum0 = load qthreads+QueryThread_sum_total as u64
+    qsum1 = load qt1+QueryThread_sum_total as u64
+    qsum2 = load qt2+QueryThread_sum_total as u64
+    qsum3 = load qt3+QueryThread_sum_total as u64
+    qsum01 = add qsum0, qsum1
+    qsum23 = add qsum2, qsum3
+    concurrent_sum_total = add qsum01, qsum23
+    qjoin0 = eq qj0, 0
+    qjoin1 = eq qj1, 0
+    qjoin2 = eq qj2, 0
+    qjoin3 = eq qj3, 0
+    qjoins01 = and qjoin0, qjoin1
+    qjoins23 = and qjoin2, qjoin3
+    qjoins = and qjoins01, qjoins23
+    qoks01 = and qok0, qok1
+    qoks23 = and qok2, qok3
+    qoks = and qoks01, qoks23
+    concurrent_query_ok = and qjoins, qoks
+
+    EXPAND DB_REMOVE_TABLE remove_i_status, ROOT, ROOT_LEN, TABLE_I, TABLE_I_LEN, info
+    EXPAND DB_INIT_SCHEMA init_i_status, ROOT, ROOT_LEN, SCHEMA_I_PATH, SCHEMA_I_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    ithreads = alloc 192
+    store ithreads+InsertThread_start_base, 0 as u64
+    store ithreads+InsertThread_rows, BATCH_ROWS as u64
+    store ithreads+InsertThread_ok, 0 as u64
+    it1 = ptr_add ithreads, InsertThread_SIZE
+    store it1+InsertThread_start_base, BATCH_ROWS as u64
+    store it1+InsertThread_rows, BATCH_ROWS as u64
+    store it1+InsertThread_ok, 0 as u64
+    it2 = ptr_add ithreads, 96
+    store it2+InsertThread_start_base, 25000 as u64
+    store it2+InsertThread_rows, BATCH_ROWS as u64
+    store it2+InsertThread_ok, 0 as u64
+    it3 = ptr_add ithreads, 144
+    store it3+InsertThread_start_base, 37500 as u64
+    store it3+InsertThread_rows, BATCH_ROWS as u64
+    store it3+InsertThread_ok, 0 as u64
+    t_coni0 = call @sa_time_instant_ns()
+    ih0 = call @spawn_insert_worker(*ithreads)
+    store ithreads+InsertThread_handle, ih0 as i32
+    ih1 = call @spawn_insert_worker(*it1)
+    store it1+InsertThread_handle, ih1 as i32
+    ih2 = call @spawn_insert_worker(*it2)
+    store it2+InsertThread_handle, ih2 as i32
+    ih3 = call @spawn_insert_worker(*it3)
+    store it3+InsertThread_handle, ih3 as i32
+    ij0 = call @join_worker(ih0, *ithreads)
+    ij1 = call @join_worker(ih1, *it1)
+    ij2 = call @join_worker(ih2, *it2)
+    ij3 = call @join_worker(ih3, *it3)
+    t_coni1 = call @sa_time_instant_ns()
+    db_concurrent_insert_ns = sub t_coni1, t_coni0
+    store info+SaDbTableInfo_row_count, 0 as u64
+    store info+SaDbTableInfo_segment_count, 0 as u64
+    store info+SaDbTableInfo_epoch, 0 as u64
+    store info+SaDbTableInfo_locked, 0 as u64
+    EXPAND DB_VERIFY verify_i_status, ROOT, ROOT_LEN, TABLE_I, TABLE_I_LEN, info
+    EXPAND DB_INFO_ROW_COUNT concurrent_insert_rows, info
+    iok0 = load ithreads+InsertThread_ok as u64
+    iok1 = load it1+InsertThread_ok as u64
+    iok2 = load it2+InsertThread_ok as u64
+    iok3 = load it3+InsertThread_ok as u64
+    ijoin0 = eq ij0, 0
+    ijoin1 = eq ij1, 0
+    ijoin2 = eq ij2, 0
+    ijoin3 = eq ij3, 0
+    ijoins01 = and ijoin0, ijoin1
+    ijoins23 = and ijoin2, ijoin3
+    ijoins = and ijoins01, ijoins23
+    ioks01 = and iok0, iok1
+    ioks23 = and iok2, iok3
+    ioks = and ioks01, ioks23
+    verify_i_ok = eq verify_i_status, SA_DB_OK
+    insert_rows_ok = eq concurrent_insert_rows, ROWS
+    insert_ok_a = and ijoins, ioks
+    insert_ok_b = and verify_i_ok, insert_rows_ok
+    concurrent_insert_ok = and insert_ok_a, insert_ok_b
+
+    EXPAND PRINT_U64_LINE DB_SERIAL_QUERY, DB_SERIAL_QUERY_LEN, db_serial_query_ns
+    EXPAND PRINT_U64_LINE DB_CONCURRENT_QUERY, DB_CONCURRENT_QUERY_LEN, db_concurrent_query_ns
+    EXPAND PRINT_U64_LINE DB_CONCURRENT_INSERT, DB_CONCURRENT_INSERT_LEN, db_concurrent_insert_ns
+    EXPAND PRINT_U64_LINE DB_SERIAL_QUERY_OK, DB_SERIAL_QUERY_OK_LEN, serial_ok
+    EXPAND PRINT_U64_LINE DB_CONCURRENT_QUERY_OK, DB_CONCURRENT_QUERY_OK_LEN, concurrent_query_ok
+    EXPAND PRINT_U64_LINE DB_CONCURRENT_INSERT_OK, DB_CONCURRENT_INSERT_OK_LEN, concurrent_insert_ok
+    EXPAND PRINT_U64_LINE DB_CONCURRENT_INSERT_ROWS, DB_CONCURRENT_INSERT_ROWS_LEN, concurrent_insert_rows
+    EXPAND PRINT_U64_LINE QUERIES_LABEL, QUERIES_LABEL_LEN, TOTAL_QUERIES
+    EXPAND PRINT_U64_LINE THREADS_LABEL, THREADS_LABEL_LEN, THREADS
+    EXPAND PRINT_U64_LINE SUM_TOTAL_LABEL, SUM_TOTAL_LABEL_LEN, concurrent_sum_total
+
+    !remove_q_status
+    !init_q_status
+    !fill_q_status
+    !ingest_q_status
+    !serial_call
+    !t_serial0
+    !t_serial1
+    !db_serial_query_ns
+    !serial_ok
+    !serial_sum_total
+    !qt1
+    !qt2
+    !qt3
+    !qh0
+    !qh1
+    !qh2
+    !qh3
+    !qj0
+    !qj1
+    !qj2
+    !qj3
+    !t_conq0
+    !t_conq1
+    !db_concurrent_query_ns
+    !qok0
+    !qok1
+    !qok2
+    !qok3
+    !qsum0
+    !qsum1
+    !qsum2
+    !qsum3
+    !qsum01
+    !qsum23
+    !concurrent_sum_total
+    !qjoin0
+    !qjoin1
+    !qjoin2
+    !qjoin3
+    !qjoins01
+    !qjoins23
+    !qjoins
+    !qoks01
+    !qoks23
+    !qoks
+    !concurrent_query_ok
+    !remove_i_status
+    !init_i_status
+    !it1
+    !it2
+    !it3
+    !ih0
+    !ih1
+    !ih2
+    !ih3
+    !ij0
+    !ij1
+    !ij2
+    !ij3
+    !t_coni0
+    !t_coni1
+    !db_concurrent_insert_ns
+    !verify_i_status
+    !concurrent_insert_rows
+    !iok0
+    !iok1
+    !iok2
+    !iok3
+    !ijoin0
+    !ijoin1
+    !ijoin2
+    !ijoin3
+    !ijoins01
+    !ijoins23
+    !ijoins
+    !ioks01
+    !ioks23
+    !ioks
+    !verify_i_ok
+    !insert_rows_ok
+    !insert_ok_a
+    !insert_ok_b
+    !concurrent_insert_ok
+    !id_col
+    !plan_col
+    !status_col
+    !points_col
+    !serial_thread
+    !qthreads
+    !ithreads
+
+    return 0

@@ -1,0 +1,441 @@
+const std = @import("std");
+const table = @import("table.zig");
+
+const SA_DB_OK: u32 = 0;
+const SA_DB_ERR_INVALID_ARGUMENT: u32 = 1;
+const SA_DB_ERR_INVALID_FORMAT: u32 = 2;
+const SA_DB_ERR_NOT_FOUND: u32 = 3;
+const SA_DB_ERR_LOCKED: u32 = 4;
+const SA_DB_ERR_CURSOR_OVERFLOW: u32 = 5;
+const SA_DB_ERR_VERIFY_FAILED: u32 = 6;
+const SA_DB_ERR_OUT_OF_MEMORY: u32 = 7;
+const SA_DB_ERR_IO: u32 = 8;
+
+var mutation_mutex = std.Thread.Mutex{};
+var read_handle_mutex = std.Thread.Mutex{};
+var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
+
+const ReadHandleEntry = struct {
+    snapshot: *table.ReadSnapshot,
+    refs: usize = 0,
+};
+
+pub const SaDbTableInfo = extern struct {
+    row_count: u64,
+    segment_count: u64,
+    epoch: u64,
+    locked: u64,
+};
+
+pub const SaDbColumnInput = extern struct {
+    data: ?[*]const u8,
+    len: u64,
+};
+
+fn inputBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return &.{};
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
+fn requiredBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
+    const bytes = inputBytes(ptr, len) orelse return null;
+    if (bytes.len == 0) return null;
+    return bytes;
+}
+
+fn rootBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
+    const bytes = inputBytes(ptr, len) orelse return null;
+    if (bytes.len == 0) return ".";
+    return bytes;
+}
+
+fn tableStatus(err: table.TableError) u32 {
+    return switch (err) {
+        error.OutOfMemory => SA_DB_ERR_OUT_OF_MEMORY,
+        error.InvalidFormat, error.InvalidPath, error.SnapshotMissing => SA_DB_ERR_INVALID_FORMAT,
+        error.NotFound => SA_DB_ERR_NOT_FOUND,
+        error.Locked => SA_DB_ERR_LOCKED,
+        error.CursorOverflow => SA_DB_ERR_CURSOR_OVERFLOW,
+        error.VerifyFailed => SA_DB_ERR_VERIFY_FAILED,
+    };
+}
+
+fn fillInfo(out_info: ?*SaDbTableInfo, info: table.TableInfo) u32 {
+    const slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = .{
+        .row_count = info.row_count,
+        .segment_count = @intCast(info.segment_count),
+        .epoch = info.epoch,
+        .locked = if (info.locked) 1 else 0,
+    };
+    return SA_DB_OK;
+}
+
+fn readHandleKey(handle: ?*anyopaque) ?usize {
+    const ptr = handle orelse return null;
+    return @intFromPtr(ptr);
+}
+
+fn registerReadSnapshot(snapshot: *table.ReadSnapshot) bool {
+    const key = @intFromPtr(snapshot);
+    read_handle_mutex.lock();
+    defer read_handle_mutex.unlock();
+    read_handles.put(key, .{ .snapshot = snapshot }) catch return false;
+    return true;
+}
+
+fn acquireReadSnapshot(handle: ?*anyopaque) ?*table.ReadSnapshot {
+    const key = readHandleKey(handle) orelse return null;
+    read_handle_mutex.lock();
+    defer read_handle_mutex.unlock();
+    const entry = read_handles.getPtr(key) orelse return null;
+    entry.refs += 1;
+    return entry.snapshot;
+}
+
+fn releaseReadSnapshot(snapshot: *table.ReadSnapshot) void {
+    const key = @intFromPtr(snapshot);
+    read_handle_mutex.lock();
+    defer read_handle_mutex.unlock();
+    if (read_handles.getPtr(key)) |entry| {
+        if (entry.refs > 0) entry.refs -= 1;
+    }
+}
+
+fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapshot) u32 {
+    out_snapshot.* = null;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    read_handle_mutex.lock();
+    defer read_handle_mutex.unlock();
+    const entry = read_handles.getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (entry.refs != 0) return SA_DB_ERR_LOCKED;
+    out_snapshot.* = entry.snapshot;
+    _ = read_handles.remove(key);
+    return SA_DB_OK;
+}
+
+fn u64CompareOpFromAbi(op: u32) ?table.U64CompareOp {
+    return switch (op) {
+        0 => .eq,
+        1 => .ne,
+        2 => .lt,
+        3 => .le,
+        4 => .gt,
+        5 => .ge,
+        else => null,
+    };
+}
+
+pub export fn sa_db_init_schema(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    schema_path_ptr: ?[*]const u8,
+    schema_path_len: u64,
+    schema_ptr: ?[*]const u8,
+    schema_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const schema_path = requiredBytes(schema_path_ptr, schema_path_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const schema_source = requiredBytes(schema_ptr, schema_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.initTableFromSchemaBytes(gpa.allocator(), root, schema_path, schema_source) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_remove_table(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.removeTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_ingest_columns(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    row_count: u64,
+    columns_ptr: ?[*]const SaDbColumnInput,
+    columns_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (columns_len > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const n: usize = @intCast(columns_len);
+    if (n == 0) return SA_DB_ERR_INVALID_ARGUMENT;
+    const c_ptr = columns_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inputs = c_ptr[0..n];
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const raw_columns = allocator.alloc(table.RawColumnBytes, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    defer allocator.free(raw_columns);
+    for (inputs, 0..) |input, idx| {
+        raw_columns[idx] = .{ .bytes = inputBytes(input.data, input.len) orelse return SA_DB_ERR_INVALID_ARGUMENT };
+    }
+
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.ingestRawColumns(allocator, root, table_name, row_count, raw_columns) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_verify(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const info = table.verifyTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_compact(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.compactTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_lock(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.lockTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_unlock(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.unlockTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_update_u64_add(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    start_row: u64,
+    update_count: u64,
+    delta: u64,
+    out_updated: ?*u64,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const updated_slot = out_updated orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const updated = table.updateU64ColumnAdd(gpa.allocator(), root, table_name, @intCast(column_index), start_row, update_count, delta) catch |err| return tableStatus(err);
+    updated_slot.* = updated;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_open_read_table(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_handle: ?*?*anyopaque,
+) u32 {
+    const slot = out_handle orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = null;
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const snapshot = table.openReadSnapshot(std.heap.page_allocator, root, table_name) catch |err| return tableStatus(err);
+    if (!registerReadSnapshot(snapshot)) {
+        snapshot.destroy();
+        return SA_DB_ERR_OUT_OF_MEMORY;
+    }
+    slot.* = @ptrCast(snapshot);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_close_read_table(handle: ?*anyopaque) u32 {
+    var snapshot: ?*table.ReadSnapshot = null;
+    const status = unregisterReadSnapshot(handle, &snapshot);
+    if (status != SA_DB_OK) return status;
+    snapshot.?.destroy();
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_sum: ?*u64) u32 {
+    const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const sum = table.snapshotSumU64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    sum_slot.* = sum;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_count_u64_eq_handle(handle: ?*anyopaque, column_index: u64, expected: u64, out_count: ?*u64) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const count = table.snapshotCountU64Cmp(snapshot, @intCast(column_index), .eq, expected) catch |err| return tableStatus(err);
+    count_slot.* = count;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_count_u64_cmp_handle(handle: ?*anyopaque, column_index: u64, op: u32, expected: u64, out_count: ?*u64) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const cmp_op = u64CompareOpFromAbi(op) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const count = table.snapshotCountU64Cmp(snapshot, @intCast(column_index), cmp_op, expected) catch |err| return tableStatus(err);
+    count_slot.* = count;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_min_u64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*u64) u32 {
+    const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const min_value = table.snapshotMinU64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    min_slot.* = min_value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_max_u64_handle(handle: ?*anyopaque, column_index: u64, out_max: ?*u64) u32 {
+    const max_slot = out_max orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const max_value = table.snapshotMaxU64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    max_slot.* = max_value;
+    return SA_DB_OK;
+}
+
+test "db SA ABI creates ingests updates and scans raw columns" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "members.sadb-schema".ptr, "members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+    try std.testing.expectEqual(@as(u64, 0), info.row_count);
+
+    var ids = [_]u64{ 1, 2, 3 };
+    var points = [_]u64{ 10, 20, 30 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&points), .len = @sizeOf(@TypeOf(points)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "members".ptr, "members".len, ids.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &handle));
+    try std.testing.expect(handle != null);
+
+    var handle_sum: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
+    try std.testing.expectEqual(@as(u64, 60), handle_sum);
+    var handle_count: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_count_u64_cmp_handle(handle, 0, @intFromEnum(table.U64CompareOp.ge), 2, &handle_count));
+    try std.testing.expectEqual(@as(u64, 2), handle_count);
+    var handle_min: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_min_u64_handle(handle, 1, &handle_min));
+    try std.testing.expectEqual(@as(u64, 10), handle_min);
+    var handle_max: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_max_u64_handle(handle, 1, &handle_max));
+    try std.testing.expectEqual(@as(u64, 30), handle_max);
+
+    var updated: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_update_u64_add(root.ptr, root.len, "members".ptr, "members".len, 1, 0, 3, 5, &updated));
+    try std.testing.expectEqual(@as(u64, 3), updated);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
+    try std.testing.expectEqual(@as(u64, 60), handle_sum);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_sum_u64_handle(handle, 1, &handle_sum));
+
+    handle = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
+    try std.testing.expectEqual(@as(u64, 75), handle_sum);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_count_u64_eq_handle(handle, 0, 2, &handle_count));
+    try std.testing.expectEqual(@as(u64, 1), handle_count);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+}

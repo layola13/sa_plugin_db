@@ -1,0 +1,16 @@
+@extern sqlite3_libversion() -> ptr
+
+@main() -> i32:
+L_ENTRY:
+    version = call @sqlite3_libversion()
+    ok = ne version, 0
+    !version
+    br ok -> L_OK, L_ERR
+
+L_OK:
+    !ok
+    return 0
+
+L_ERR:
+    !ok
+    return 1

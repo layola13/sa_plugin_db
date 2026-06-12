@@ -19,6 +19,10 @@ pub const TableInfo = struct {
     locked: bool,
 };
 
+pub const RawColumnBytes = struct {
+    bytes: []const u8,
+};
+
 pub const ColumnMeta = struct {
     name: []const u8,
     stride: u32,
@@ -71,6 +75,40 @@ pub const TableMeta = struct {
         }
         allocator.free(self.segments);
         self.* = undefined;
+    }
+};
+
+pub const ReadColumnSnapshot = struct {
+    bytes: []const u8,
+};
+
+pub const ReadSegmentSnapshot = struct {
+    rows: u64,
+    columns: []ReadColumnSnapshot,
+};
+
+pub const U64CompareOp = enum(u32) {
+    eq = 0,
+    ne = 1,
+    lt = 2,
+    le = 3,
+    gt = 4,
+    ge = 5,
+};
+
+pub const ReadSnapshot = struct {
+    backing_allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    table_name: []const u8,
+    epoch: u64,
+    row_count: u64,
+    columns: []ColumnMeta,
+    segments: []ReadSegmentSnapshot,
+
+    pub fn destroy(self: *ReadSnapshot) void {
+        const backing_allocator = self.backing_allocator;
+        self.arena.deinit();
+        backing_allocator.destroy(self);
     }
 };
 
@@ -1045,6 +1083,379 @@ fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []c
     const json = std.json.stringifyAlloc(allocator, meta, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(json);
     try writeFile(path, json);
+}
+
+fn writeGeneratedIface(allocator: std.mem.Allocator, root_dir: []const u8, schema_obj: schema.Schema) TableError!void {
+    var iface = std.ArrayList(u8).init(allocator);
+    defer iface.deinit();
+    schema.writeIface(iface.writer(), schema_obj) catch |err| return mapFileError(err);
+
+    const basename = try allocPrintPath(allocator, "{s}.sai", .{schema_obj.table_name});
+    defer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(path, iface.items);
+}
+
+pub fn initTableFromSchemaBytes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    schema_path_hint: []const u8,
+    schema_source: []const u8,
+) TableError!TableInfo {
+    if (schema_path_hint.len == 0 or schema_source.len == 0) return TableError.InvalidFormat;
+
+    var schema_obj = schema.compile(allocator, schema_source, schema_path_hint) catch |err| return mapSchemaError(err);
+    defer schema_obj.deinit();
+
+    const schema_path = try schemaMetaPath(allocator, root_dir, schema_obj.table_name);
+    defer allocator.free(schema_path);
+    try writeFile(schema_path, schema_source);
+    try writeGeneratedIface(allocator, root_dir, schema_obj);
+
+    const schema_hash = try hashHexAlloc(allocator, schema_source);
+    defer allocator.free(schema_hash);
+
+    var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
+    defer meta.deinit(allocator);
+    try writeMeta(allocator, root_dir, schema_obj.table_name, meta);
+    return tableInfo(meta);
+}
+
+pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!TableInfo {
+    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(meta_path);
+
+    if (readFileAlloc(allocator, meta_path, 16 * 1024 * 1024)) |source| {
+        defer allocator.free(source);
+        if (parseTableMeta(allocator, source)) |parsed_meta| {
+            var parsed = parsed_meta;
+            defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.table_name, table_name)) {
+                for (parsed.value.segments) |segment| {
+                    for (segment.files) |file| {
+                        const path = try activePath(allocator, root_dir, file.path);
+                        defer allocator.free(path);
+                        try deleteIfExists(path);
+                    }
+                }
+            }
+        } else |_| {}
+    } else |err| switch (err) {
+        TableError.NotFound => {},
+        else => return err,
+    }
+
+    try deleteIfExists(meta_path);
+
+    const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(schema_path);
+    try deleteIfExists(schema_path);
+
+    const iface_basename = try allocPrintPath(allocator, "{s}.sai", .{table_name});
+    defer allocator.free(iface_basename);
+    const iface_path = try activePath(allocator, root_dir, iface_basename);
+    defer allocator.free(iface_path);
+    try deleteIfExists(iface_path);
+
+    const prefix = rootPrefix(root_dir);
+    const snapshot_path = if (prefix.len == 0)
+        try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name })
+    else
+        try joinPath(allocator, &.{ prefix, ".sa", "db", "snapshots", table_name });
+    defer allocator.free(snapshot_path);
+    try deleteTreeIfExists(snapshot_path);
+
+    return .{ .row_count = 0, .segment_count = 0, .epoch = 0, .locked = false };
+}
+
+pub fn ingestRawColumns(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    row_count: u64,
+    columns: []const RawColumnBytes,
+) TableError!TableInfo {
+    var schema_obj = try loadSchema(allocator, root_dir, table_name);
+    defer schema_obj.deinit();
+
+    const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(schema_path);
+    const schema_source = try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
+    defer allocator.free(schema_source);
+    const schema_hash = try hashHexAlloc(allocator, schema_source);
+    defer allocator.free(schema_hash);
+
+    var meta = try loadCurrentMeta(allocator, root_dir, table_name, schema_obj, schema_path, schema_hash);
+    defer meta.deinit(allocator);
+
+    if (meta.locked) return TableError.Locked;
+    if (columns.len != meta.columns.len) return TableError.InvalidFormat;
+    const total_rows = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
+    if (total_rows > meta.max_rows) return TableError.CursorOverflow;
+
+    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    errdefer {
+        for (buffers) |*buf| buf.deinit();
+        allocator.free(buffers);
+    }
+    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+
+    for (columns, 0..) |column, idx| {
+        const expected_len = std.math.mul(u64, row_count, meta.columns[idx].stride) catch return TableError.CursorOverflow;
+        if (column.bytes.len != expected_len) return TableError.InvalidFormat;
+        try buffers[idx].appendSlice(column.bytes);
+    }
+
+    try appendSegmentToMeta(allocator, root_dir, table_name, &meta, buffers, row_count);
+    try writeMeta(allocator, root_dir, table_name, meta);
+
+    for (buffers) |*buf| buf.deinit();
+    allocator.free(buffers);
+
+    return tableInfo(meta);
+}
+
+fn ensureU64Column(meta: TableMeta, column_index: usize) TableError!void {
+    if (column_index >= meta.columns.len) return TableError.InvalidFormat;
+    const column = meta.columns[column_index];
+    if (column.stride != 8 or !std.mem.eql(u8, column.ty, "u64")) return TableError.InvalidFormat;
+}
+
+fn readU64LE(bytes: []const u8, offset: usize) u64 {
+    return std.mem.readInt(u64, bytes[offset .. offset + 8][0..8], .little);
+}
+
+fn writeU64LE(bytes: []u8, offset: usize, value: u64) void {
+    std.mem.writeInt(u64, bytes[offset .. offset + 8][0..8], value, .little);
+}
+
+fn duplicateColumnMetasToArena(allocator: std.mem.Allocator, columns: []const ColumnMeta) TableError![]ColumnMeta {
+    const out = try allocator.alloc(ColumnMeta, columns.len);
+    for (columns, 0..) |column, idx| {
+        out[idx] = .{
+            .name = try allocator.dupe(u8, column.name),
+            .stride = column.stride,
+            .ty = try allocator.dupe(u8, column.ty),
+        };
+    }
+    return out;
+}
+
+fn expectedColumnBytes(segment_rows: u64, stride: u32) TableError!usize {
+    const expected = std.math.mul(u64, segment_rows, @as(u64, stride)) catch return TableError.CursorOverflow;
+    if (expected > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(expected);
+}
+
+pub fn openReadSnapshot(
+    backing_allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError!*ReadSnapshot {
+    const snapshot = backing_allocator.create(ReadSnapshot) catch return TableError.OutOfMemory;
+    snapshot.* = .{
+        .backing_allocator = backing_allocator,
+        .arena = std.heap.ArenaAllocator.init(backing_allocator),
+        .table_name = &.{},
+        .epoch = 0,
+        .row_count = 0,
+        .columns = &.{},
+        .segments = &.{},
+    };
+    errdefer snapshot.destroy();
+
+    const arena_allocator = snapshot.arena.allocator();
+    const meta_path = try tableMetaPath(backing_allocator, root_dir, table_name);
+    defer backing_allocator.free(meta_path);
+    const source = try readFileAlloc(backing_allocator, meta_path, 16 * 1024 * 1024);
+    defer backing_allocator.free(source);
+    var parsed = try parseTableMeta(backing_allocator, source);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
+
+    snapshot.table_name = try arena_allocator.dupe(u8, parsed.value.table_name);
+    snapshot.epoch = parsed.value.epoch;
+    snapshot.row_count = parsed.value.row_count;
+    snapshot.columns = try duplicateColumnMetasToArena(arena_allocator, parsed.value.columns);
+    snapshot.segments = try arena_allocator.alloc(ReadSegmentSnapshot, parsed.value.segments.len);
+
+    for (parsed.value.segments, 0..) |segment, segment_idx| {
+        const segment_columns = try arena_allocator.alloc(ReadColumnSnapshot, segment.files.len);
+        if (segment.files.len != parsed.value.columns.len) return TableError.InvalidFormat;
+        for (segment.files, 0..) |file_meta, column_idx| {
+            const expected_len = try expectedColumnBytes(segment.rows, parsed.value.columns[column_idx].stride);
+            if (file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+            const path = try activePath(backing_allocator, root_dir, file_meta.path);
+            defer backing_allocator.free(path);
+            const bytes = try readFileAlloc(arena_allocator, path, 1 << 30);
+            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            segment_columns[column_idx] = .{ .bytes = bytes };
+        }
+        snapshot.segments[segment_idx] = .{
+            .rows = segment.rows,
+            .columns = segment_columns,
+        };
+    }
+
+    return snapshot;
+}
+
+fn ensureSnapshotU64Column(snapshot: *const ReadSnapshot, column_index: usize) TableError!void {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    if (column.stride != 8 or !std.mem.eql(u8, column.ty, "u64")) return TableError.InvalidFormat;
+}
+
+fn compareU64(value: u64, op: U64CompareOp, expected: u64) bool {
+    return switch (op) {
+        .eq => value == expected,
+        .ne => value != expected,
+        .lt => value < expected,
+        .le => value <= expected,
+        .gt => value > expected,
+        .ge => value >= expected,
+    };
+}
+
+pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    var sum: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            sum = std.math.add(u64, sum, readU64LE(bytes, byte_offset)) catch return TableError.CursorOverflow;
+        }
+    }
+    return sum;
+}
+
+pub fn snapshotCountU64Cmp(snapshot: *const ReadSnapshot, column_index: usize, op: U64CompareOp, expected: u64) TableError!u64 {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    var count: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            if (compareU64(readU64LE(bytes, byte_offset), op, expected)) count += 1;
+        }
+    }
+    return count;
+}
+
+pub fn snapshotMinU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    var seen = false;
+    var min_value: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            const value = readU64LE(bytes, byte_offset);
+            if (!seen or value < min_value) {
+                min_value = value;
+                seen = true;
+            }
+        }
+    }
+    return min_value;
+}
+
+pub fn snapshotMaxU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    var seen = false;
+    var max_value: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            const value = readU64LE(bytes, byte_offset);
+            if (!seen or value > max_value) {
+                max_value = value;
+                seen = true;
+            }
+        }
+    }
+    return max_value;
+}
+
+pub fn updateU64ColumnAdd(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    start_row: u64,
+    update_count: u64,
+    delta: u64,
+) TableError!u64 {
+    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(meta_path);
+    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
+    defer allocator.free(source);
+    var parsed = try parseTableMeta(allocator, source);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
+    if (parsed.value.locked) return TableError.Locked;
+    try ensureU64Column(parsed.value, column_index);
+    const end_row = std.math.add(u64, start_row, update_count) catch return TableError.CursorOverflow;
+    if (end_row > parsed.value.row_count) return TableError.InvalidFormat;
+
+    var owned = try duplicateTableMeta(allocator, parsed.value);
+    defer owned.deinit(allocator);
+
+    var segment_start: u64 = 0;
+    var updated: u64 = 0;
+    for (owned.segments) |*segment| {
+        const segment_end = segment_start + segment.rows;
+        defer segment_start = segment_end;
+        if (end_row <= segment_start or start_row >= segment_end) continue;
+
+        const range_start = @max(start_row, segment_start);
+        const range_end = @min(end_row, segment_end);
+        const local_start = range_start - segment_start;
+        const local_count = range_end - range_start;
+
+        const file_meta = &segment.files[column_index];
+        const path = try activePath(allocator, root_dir, file_meta.path);
+        defer allocator.free(path);
+        const current = try readFileAlloc(allocator, path, 1 << 30);
+        defer allocator.free(current);
+        if (current.len != segment.rows * 8) return TableError.VerifyFailed;
+        const mutable = allocator.dupe(u8, current) catch return TableError.OutOfMemory;
+        defer allocator.free(mutable);
+
+        var i: u64 = 0;
+        while (i < local_count) : (i += 1) {
+            const byte_offset_u64 = (local_start + i) * 8;
+            const byte_offset: usize = @intCast(byte_offset_u64);
+            const value = readU64LE(mutable, byte_offset);
+            const next = std.math.add(u64, value, delta) catch return TableError.CursorOverflow;
+            writeU64LE(mutable, byte_offset, next);
+        }
+
+        try writeFile(path, mutable);
+        allocator.free(file_meta.sha256);
+        file_meta.sha256 = try hashHexAlloc(allocator, mutable);
+        file_meta.bytes = mutable.len;
+        updated += local_count;
+    }
+
+    owned.epoch += 1;
+    try writeMeta(allocator, root_dir, table_name, owned);
+    return updated;
 }
 
 pub fn ingestTable(

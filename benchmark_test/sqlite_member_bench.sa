@@ -1,0 +1,421 @@
+@import "sa_std/fmt.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/io/print.sai"
+@import "sa_std/time.sai"
+
+@extern sqlite3_open_v2(*filename: ptr, *out_db: ptr, flags: i32, *vfs: ptr) -> i32
+@extern sqlite3_close(*db: ptr) -> i32
+@extern sqlite3_exec(*db: ptr, *sql: ptr, *callback: ptr, *arg: ptr, *errmsg: ptr) -> i32
+@extern sqlite3_prepare_v2(*db: ptr, *sql: ptr, nbyte: i32, *out_stmt: ptr, *tail: ptr) -> i32
+@extern sqlite3_bind_int64(*stmt: ptr, idx: i32, value: u64) -> i32
+@extern sqlite3_step(*stmt: ptr) -> i32
+@extern sqlite3_reset(*stmt: ptr) -> i32
+@extern sqlite3_clear_bindings(*stmt: ptr) -> i32
+@extern sqlite3_finalize(*stmt: ptr) -> i32
+@extern sqlite3_column_int64(*stmt: ptr, col: i32) -> u64
+
+@const DB_PATH_FS = utf8:"sqlite_members.db"
+@const DB_PATH_C = utf8:"sqlite_members.db\0"
+@const SQL_PRAGMA = utf8:"PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;\0"
+@const SQL_CREATE = utf8:"CREATE TABLE members(id INTEGER PRIMARY KEY, plan INTEGER, status INTEGER, points INTEGER);\0"
+@const SQL_BEGIN = utf8:"BEGIN TRANSACTION;\0"
+@const SQL_COMMIT = utf8:"COMMIT;\0"
+@const SQL_INSERT = utf8:"INSERT INTO members(id, plan, status, points) VALUES(?, ?, ?, ?);\0"
+@const SQL_UPDATE = utf8:"UPDATE members SET points = points + 5;\0"
+@const SQL_SUM = utf8:"SELECT SUM(points) FROM members;\0"
+@const SQL_COUNT = utf8:"SELECT COUNT(*) FROM members WHERE plan = 1;\0"
+@const SQL_VACUUM = utf8:"VACUUM;\0"
+@const SQL_CHECK = utf8:"PRAGMA integrity_check;\0"
+
+@const NL = utf8:"\n"
+@const SQLITE_CREATE = utf8:"sqlite_create_ns="
+@const SQLITE_INSERT = utf8:"sqlite_insert_rows_ns="
+@const SQLITE_SUM1 = utf8:"sqlite_sum_before_ns="
+@const SQLITE_UPDATE = utf8:"sqlite_update_all_ns="
+@const SQLITE_SUM2 = utf8:"sqlite_sum_after_ns="
+@const SQLITE_COUNT = utf8:"sqlite_count_plan_one_ns="
+@const SQLITE_COMPACT = utf8:"sqlite_vacuum_ns="
+@const SQLITE_VERIFY = utf8:"sqlite_integrity_check_ns="
+@const ROWS_LABEL = utf8:"rows="
+@const SUM_BEFORE_LABEL = utf8:"sum_before="
+@const SUM_AFTER_LABEL = utf8:"sum_after="
+@const PLAN_ONE_LABEL = utf8:"plan_one_count="
+@const UPDATED_LABEL = utf8:"updated_rows="
+
+#def ROWS = 50000
+#def DB_PATH_FS_LEN = 17
+#def SQLITE_OPEN_READWRITE_CREATE = 6
+#def SQLITE_OK = 0
+#def SQLITE_ROW = 100
+#def SQLITE_DONE = 101
+#def FMT_BUF_BYTES = 32
+
+#def SQLITE_CREATE_LEN = 17
+#def SQLITE_INSERT_LEN = 22
+#def SQLITE_SUM1_LEN = 21
+#def SQLITE_UPDATE_LEN = 21
+#def SQLITE_SUM2_LEN = 20
+#def SQLITE_COUNT_LEN = 25
+#def SQLITE_COMPACT_LEN = 17
+#def SQLITE_VERIFY_LEN = 26
+#def ROWS_LABEL_LEN = 5
+#def SUM_BEFORE_LABEL_LEN = 11
+#def SUM_AFTER_LABEL_LEN = 10
+#def PLAN_ONE_LABEL_LEN = 15
+#def UPDATED_LABEL_LEN = 13
+
+[MACRO] PRINT_U64_LINE %label, %label_len, %value
+    __fmt_buf_%value = stack_alloc FMT_BUF_BYTES
+    __fmt_len_slot_%value = stack_alloc 8
+    __fmt_status_%value = call @sa_fmt_u64_into(%value, 10, __fmt_buf_%value, FMT_BUF_BYTES, &__fmt_len_slot_%value)
+    __fmt_len_%value = load __fmt_len_slot_%value+0 as u64
+    call @sa_print_bytes(&%label, %label_len)
+    call @sa_print_bytes(&__fmt_buf_%value, __fmt_len_%value)
+    call @sa_print_bytes(&NL, 1)
+    !__fmt_status_%value
+    !__fmt_len_%value
+[END_MACRO]
+
+@ffi_wrapper sqlite_member_bench_impl() -> i32:
+L_ENTRY:
+    db_slot = stack_alloc 8
+    stmt_slot = stack_alloc 8
+    null_slot = stack_alloc 8
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    store null_slot+0, 0 as ptr
+    null_ptr = load null_slot+0 as ptr
+    remove_file_status = call @sa_fs_remove_file(&DB_PATH_FS, DB_PATH_FS_LEN)
+    !remove_file_status
+
+    t_create0 = call @sa_time_instant_ns()
+    open_status = call @sqlite3_open_v2(*DB_PATH_C, *db_slot, SQLITE_OPEN_READWRITE_CREATE, *null_ptr)
+    db = load db_slot+0 as ptr
+    pragma_status = call @sqlite3_exec(*db, *SQL_PRAGMA, *null_ptr, *null_ptr, *null_ptr)
+    create_status = call @sqlite3_exec(*db, *SQL_CREATE, *null_ptr, *null_ptr, *null_ptr)
+    t_create1 = call @sa_time_instant_ns()
+    sqlite_create_ns = sub t_create1, t_create0
+
+    begin_status = call @sqlite3_exec(*db, *SQL_BEGIN, *null_ptr, *null_ptr, *null_ptr)
+    prepare_insert_status = call @sqlite3_prepare_v2(*db, *SQL_INSERT, -1, *stmt_slot, *null_ptr)
+    stmt_insert = load stmt_slot+0 as ptr
+    store i_slot+0, 0 as u64
+    store ok_slot+0, 1 as u64
+    t_insert0 = call @sa_time_instant_ns()
+    jmp L_INSERT_COND
+
+L_INSERT_COND:
+    i = load i_slot+0 as u64
+    insert_cond = ult i, ROWS
+    br insert_cond -> L_INSERT_BODY, L_INSERT_DONE
+
+L_INSERT_BODY:
+    id_value = add i, 1
+    plan_low = and i, 3
+    plan_value = add plan_low, 1
+    status_value = and i, 1
+    points_value = mul id_value, 10
+    bind1 = call @sqlite3_bind_int64(*stmt_insert, 1, id_value)
+    bind2 = call @sqlite3_bind_int64(*stmt_insert, 2, plan_value)
+    bind3 = call @sqlite3_bind_int64(*stmt_insert, 3, status_value)
+    bind4 = call @sqlite3_bind_int64(*stmt_insert, 4, points_value)
+    step_insert = call @sqlite3_step(*stmt_insert)
+    reset_insert = call @sqlite3_reset(*stmt_insert)
+    clear_insert = call @sqlite3_clear_bindings(*stmt_insert)
+    ok_bind1 = eq bind1, SQLITE_OK
+    ok_bind2 = eq bind2, SQLITE_OK
+    ok_bind3 = eq bind3, SQLITE_OK
+    ok_bind4 = eq bind4, SQLITE_OK
+    ok_step_insert = eq step_insert, SQLITE_DONE
+    ok_reset_insert = eq reset_insert, SQLITE_OK
+    ok_clear_insert = eq clear_insert, SQLITE_OK
+    ok_a = and ok_bind1, ok_bind2
+    ok_b = and ok_bind3, ok_bind4
+    ok_c = and ok_a, ok_b
+    ok_d = and ok_c, ok_step_insert
+    ok_e = and ok_d, ok_reset_insert
+    ok_row = and ok_e, ok_clear_insert
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_row
+    store ok_slot+0, ok_next as u64
+    next_i = add i, 1
+    store i_slot+0, next_i as u64
+    !i
+    !insert_cond
+    !id_value
+    !plan_low
+    !plan_value
+    !status_value
+    !points_value
+    !bind1
+    !bind2
+    !bind3
+    !bind4
+    !step_insert
+    !reset_insert
+    !clear_insert
+    !ok_bind1
+    !ok_bind2
+    !ok_bind3
+    !ok_bind4
+    !ok_step_insert
+    !ok_reset_insert
+    !ok_clear_insert
+    !ok_a
+    !ok_b
+    !ok_c
+    !ok_d
+    !ok_e
+    !ok_row
+    !ok_acc
+    !ok_next
+    !next_i
+    jmp L_INSERT_COND
+
+L_INSERT_DONE:
+    !i
+    !insert_cond
+    finalize_insert = call @sqlite3_finalize(*stmt_insert)
+    commit_status = call @sqlite3_exec(*db, *SQL_COMMIT, *null_ptr, *null_ptr, *null_ptr)
+    t_insert1 = call @sa_time_instant_ns()
+    sqlite_insert_rows_ns = sub t_insert1, t_insert0
+    insert_rows_ok = load ok_slot+0 as u64
+
+    t_sum10 = call @sa_time_instant_ns()
+    prepare_sum_status = call @sqlite3_prepare_v2(*db, *SQL_SUM, -1, *stmt_slot, *null_ptr)
+    stmt_sum = load stmt_slot+0 as ptr
+    step_sum = call @sqlite3_step(*stmt_sum)
+    points_sum_before = call @sqlite3_column_int64(*stmt_sum, 0)
+    finalize_sum = call @sqlite3_finalize(*stmt_sum)
+    t_sum11 = call @sa_time_instant_ns()
+    sqlite_sum_before_ns = sub t_sum11, t_sum10
+
+    t_update0 = call @sa_time_instant_ns()
+    update_status = call @sqlite3_exec(*db, *SQL_UPDATE, *null_ptr, *null_ptr, *null_ptr)
+    t_update1 = call @sa_time_instant_ns()
+    sqlite_update_all_ns = sub t_update1, t_update0
+
+    t_sum20 = call @sa_time_instant_ns()
+    prepare_sum2_status = call @sqlite3_prepare_v2(*db, *SQL_SUM, -1, *stmt_slot, *null_ptr)
+    stmt_sum2 = load stmt_slot+0 as ptr
+    step_sum2 = call @sqlite3_step(*stmt_sum2)
+    points_sum_after = call @sqlite3_column_int64(*stmt_sum2, 0)
+    finalize_sum2 = call @sqlite3_finalize(*stmt_sum2)
+    t_sum21 = call @sa_time_instant_ns()
+    sqlite_sum_after_ns = sub t_sum21, t_sum20
+
+    t_count0 = call @sa_time_instant_ns()
+    prepare_count_status = call @sqlite3_prepare_v2(*db, *SQL_COUNT, -1, *stmt_slot, *null_ptr)
+    stmt_count = load stmt_slot+0 as ptr
+    step_count = call @sqlite3_step(*stmt_count)
+    plan_one_count = call @sqlite3_column_int64(*stmt_count, 0)
+    finalize_count = call @sqlite3_finalize(*stmt_count)
+    t_count1 = call @sa_time_instant_ns()
+    sqlite_count_plan_one_ns = sub t_count1, t_count0
+
+    t_compact0 = call @sa_time_instant_ns()
+    vacuum_status = call @sqlite3_exec(*db, *SQL_VACUUM, *null_ptr, *null_ptr, *null_ptr)
+    t_compact1 = call @sa_time_instant_ns()
+    sqlite_vacuum_ns = sub t_compact1, t_compact0
+
+    t_verify0 = call @sa_time_instant_ns()
+    prepare_check_status = call @sqlite3_prepare_v2(*db, *SQL_CHECK, -1, *stmt_slot, *null_ptr)
+    stmt_check = load stmt_slot+0 as ptr
+    step_check = call @sqlite3_step(*stmt_check)
+    finalize_check = call @sqlite3_finalize(*stmt_check)
+    t_verify1 = call @sa_time_instant_ns()
+    sqlite_integrity_check_ns = sub t_verify1, t_verify0
+
+    close_status = call @sqlite3_close(*db)
+    rows_value = add ROWS, 0
+    updated_rows = add ROWS, 0
+
+    EXPAND PRINT_U64_LINE SQLITE_CREATE, SQLITE_CREATE_LEN, sqlite_create_ns
+    EXPAND PRINT_U64_LINE SQLITE_INSERT, SQLITE_INSERT_LEN, sqlite_insert_rows_ns
+    EXPAND PRINT_U64_LINE SQLITE_SUM1, SQLITE_SUM1_LEN, sqlite_sum_before_ns
+    EXPAND PRINT_U64_LINE SQLITE_UPDATE, SQLITE_UPDATE_LEN, sqlite_update_all_ns
+    EXPAND PRINT_U64_LINE SQLITE_SUM2, SQLITE_SUM2_LEN, sqlite_sum_after_ns
+    EXPAND PRINT_U64_LINE SQLITE_COUNT, SQLITE_COUNT_LEN, sqlite_count_plan_one_ns
+    EXPAND PRINT_U64_LINE SQLITE_COMPACT, SQLITE_COMPACT_LEN, sqlite_vacuum_ns
+    EXPAND PRINT_U64_LINE SQLITE_VERIFY, SQLITE_VERIFY_LEN, sqlite_integrity_check_ns
+    EXPAND PRINT_U64_LINE ROWS_LABEL, ROWS_LABEL_LEN, rows_value
+    EXPAND PRINT_U64_LINE SUM_BEFORE_LABEL, SUM_BEFORE_LABEL_LEN, points_sum_before
+    EXPAND PRINT_U64_LINE SUM_AFTER_LABEL, SUM_AFTER_LABEL_LEN, points_sum_after
+    EXPAND PRINT_U64_LINE PLAN_ONE_LABEL, PLAN_ONE_LABEL_LEN, plan_one_count
+    EXPAND PRINT_U64_LINE UPDATED_LABEL, UPDATED_LABEL_LEN, updated_rows
+
+    ok_open = eq open_status, SQLITE_OK
+    ok_pragma = eq pragma_status, SQLITE_OK
+    ok_create = eq create_status, SQLITE_OK
+    ok_begin = eq begin_status, SQLITE_OK
+    ok_prepare_insert = eq prepare_insert_status, SQLITE_OK
+    ok_insert_rows = eq insert_rows_ok, 1
+    ok_finalize_insert = eq finalize_insert, SQLITE_OK
+    ok_commit = eq commit_status, SQLITE_OK
+    ok_prepare_sum = eq prepare_sum_status, SQLITE_OK
+    ok_step_sum = eq step_sum, SQLITE_ROW
+    ok_finalize_sum = eq finalize_sum, SQLITE_OK
+    ok_update = eq update_status, SQLITE_OK
+    ok_prepare_sum2 = eq prepare_sum2_status, SQLITE_OK
+    ok_step_sum2 = eq step_sum2, SQLITE_ROW
+    ok_finalize_sum2 = eq finalize_sum2, SQLITE_OK
+    ok_prepare_count = eq prepare_count_status, SQLITE_OK
+    ok_step_count = eq step_count, SQLITE_ROW
+    ok_finalize_count = eq finalize_count, SQLITE_OK
+    ok_vacuum = eq vacuum_status, SQLITE_OK
+    ok_prepare_check = eq prepare_check_status, SQLITE_OK
+    ok_step_check = eq step_check, SQLITE_ROW
+    ok_finalize_check = eq finalize_check, SQLITE_OK
+    ok_close = eq close_status, SQLITE_OK
+    ok_sum_before = eq points_sum_before, 12500250000
+    ok_sum_after = eq points_sum_after, 12500500000
+    ok_count = eq plan_one_count, 12500
+    ok01 = and ok_open, ok_pragma
+    ok02 = and ok01, ok_create
+    ok03 = and ok02, ok_begin
+    ok04 = and ok03, ok_prepare_insert
+    ok05 = and ok04, ok_insert_rows
+    ok06 = and ok05, ok_finalize_insert
+    ok07 = and ok06, ok_commit
+    ok08 = and ok07, ok_prepare_sum
+    ok09 = and ok08, ok_step_sum
+    ok10 = and ok09, ok_finalize_sum
+    ok11 = and ok10, ok_update
+    ok12 = and ok11, ok_prepare_sum2
+    ok13 = and ok12, ok_step_sum2
+    ok14 = and ok13, ok_finalize_sum2
+    ok15 = and ok14, ok_prepare_count
+    ok16 = and ok15, ok_step_count
+    ok17 = and ok16, ok_finalize_count
+    ok18 = and ok17, ok_vacuum
+    ok19 = and ok18, ok_prepare_check
+    ok20 = and ok19, ok_step_check
+    ok21 = and ok20, ok_finalize_check
+    ok22 = and ok21, ok_close
+    ok23 = and ok22, ok_sum_before
+    ok24 = and ok23, ok_sum_after
+    ok = and ok24, ok_count
+
+    !open_status
+    !pragma_status
+    !create_status
+    !begin_status
+    !prepare_insert_status
+    !stmt_insert
+    !finalize_insert
+    !commit_status
+    !insert_rows_ok
+    !prepare_sum_status
+    !stmt_sum
+    !step_sum
+    !finalize_sum
+    !update_status
+    !prepare_sum2_status
+    !stmt_sum2
+    !step_sum2
+    !finalize_sum2
+    !prepare_count_status
+    !stmt_count
+    !step_count
+    !finalize_count
+    !vacuum_status
+    !prepare_check_status
+    !stmt_check
+    !step_check
+    !finalize_check
+    !close_status
+    !db
+    !null_ptr
+    !t_create0
+    !t_create1
+    !t_insert0
+    !t_insert1
+    !t_sum10
+    !t_sum11
+    !t_update0
+    !t_update1
+    !t_sum20
+    !t_sum21
+    !t_count0
+    !t_count1
+    !t_compact0
+    !t_compact1
+    !t_verify0
+    !t_verify1
+    !sqlite_create_ns
+    !sqlite_insert_rows_ns
+    !sqlite_sum_before_ns
+    !sqlite_update_all_ns
+    !sqlite_sum_after_ns
+    !sqlite_count_plan_one_ns
+    !sqlite_vacuum_ns
+    !sqlite_integrity_check_ns
+    !rows_value
+    !updated_rows
+    !points_sum_before
+    !points_sum_after
+    !plan_one_count
+    !ok_open
+    !ok_pragma
+    !ok_create
+    !ok_begin
+    !ok_prepare_insert
+    !ok_insert_rows
+    !ok_finalize_insert
+    !ok_commit
+    !ok_prepare_sum
+    !ok_step_sum
+    !ok_finalize_sum
+    !ok_update
+    !ok_prepare_sum2
+    !ok_step_sum2
+    !ok_finalize_sum2
+    !ok_prepare_count
+    !ok_step_count
+    !ok_finalize_count
+    !ok_vacuum
+    !ok_prepare_check
+    !ok_step_check
+    !ok_finalize_check
+    !ok_close
+    !ok_sum_before
+    !ok_sum_after
+    !ok_count
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9201)
+
+@main() -> i32:
+L_MAIN:
+    code = call @sqlite_member_bench_impl()
+    return code

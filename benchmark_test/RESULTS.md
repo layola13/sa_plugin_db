@@ -1,0 +1,89 @@
+# db 插件会员库性能评估
+
+测试对象：`/home/vscode/projects/sa_plugins/sa_plugin_db/sap.json`，SA 版本 `sa 0.0.3.3`。所有测试程序均用 SA 编写；SQLite 对照通过 SA `@extern sqlite3_*` 调用系统 SQLite。
+
+## 场景
+
+- 数据量：50,000 行会员数据。
+- 字段：`id`、`plan`、`status`、`points`，均按 `u64` 处理。
+- 单线程操作：新建/初始化表、批量插入、通过 read handle 做 `SUM(points)`、全量 `points += 5`、再次 SUM、`plan = 1` 计数、compact/vacuum、verify/integrity check。
+- 并发操作：4 个 worker，100 次全表 SUM 查询；4 个 worker，各插入 12,500 行，合计 50,000 行。
+- 正确性校验：单线程要求 `rows=50000`、`sum_before=12500250000`、`sum_after=12500500000`、`plan_one_count=12500`、`updated_rows=50000`；并发要求 query/insert ok 均为 1，插入行数 50,000。
+
+## 命令
+
+db 插件：
+
+```bash
+sa build-exe db_member_bench.sa -o db_member_bench.out --no-incremental
+./db_member_bench.out
+
+sa build-exe db_concurrent_bench.sa -o db_concurrent_bench.out --no-incremental
+./db_concurrent_bench.out
+```
+
+SQLite 对照：
+
+```bash
+rm -rf sqlite_link_std
+mkdir -p sqlite_link_std
+(cd sqlite_link_std && ar x /home/vscode/.sa/std/libsa_std.a)
+objcopy --redefine-sym sqlite3_prepare=sa_std_stub_sqlite3_prepare \
+  --redefine-sym sqlite3_step=sa_std_stub_sqlite3_step \
+  --redefine-sym sqlite3_finalize=sa_std_stub_sqlite3_finalize \
+  sqlite_link_std/libsa_std.a.o
+(cd sqlite_link_std && ar rcs libsa_std_no_sqlite_stub.a *.o)
+
+sa build-obj sqlite_member_bench.sa -o sqlite_member_bench.o --no-incremental
+zig cc -O1 sqlite_member_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.a \
+  /home/vscode/projects/sci/src/runtime/sa_pthread_host.c \
+  /lib/x86_64-linux-gnu/libsqlite3.so.0 \
+  -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_member_bench.out
+./sqlite_member_bench.out
+
+sa build-obj sqlite_concurrent_bench.sa -o sqlite_concurrent_bench.o --no-incremental
+zig cc -O1 sqlite_concurrent_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.a \
+  /home/vscode/projects/sci/src/runtime/sa_pthread_host.c \
+  /lib/x86_64-linux-gnu/libsqlite3.so.0 \
+  -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_concurrent_bench.out
+./sqlite_concurrent_bench.out
+```
+
+说明：`libsa_std.a` 当前仍导出 `sqlite3_prepare/sqlite3_step/sqlite3_finalize` stub，会覆盖系统 SQLite 同名符号。SQLite 对照使用重命名后的本地 std archive，并显式编入 `sa_pthread_host.c`。
+
+db 插件旧的 direct query ABI 已删除；SA-facing 查询接口现在只开放 read-handle API：`sa_db_open_read_table`、`sa_db_close_read_table`、`sa_db_sum_u64_handle`、`sa_db_count_u64_eq_handle`、`sa_db_count_u64_cmp_handle`、`sa_db_min_u64_handle`、`sa_db_max_u64_handle`。
+
+## 单线程结果
+
+5 轮运行取中位数，完整原始输出见 `db_member_bench_runs.txt` 和 `sqlite_member_bench_runs.txt`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| create/init | 6.711 ms | 0.596 ms | SQLite 约 11.3x |
+| prepare columns | 1.018 ms | N/A | db 专有成本 |
+| bulk insert | 19.012 ms | 41.081 ms | db 插件约 2.2x |
+| sum before | 5.359 ms | 3.256 ms | SQLite 约 1.6x |
+| update all | 8.897 ms | 9.838 ms | db 插件约 1.1x |
+| sum after | 3.683 ms | 2.803 ms | SQLite 约 1.3x |
+| count plan=1 | 1.108 ms | 2.253 ms | db 插件约 2.0x |
+| compact/vacuum | 20.293 ms | 5.597 ms | SQLite 约 3.6x |
+| verify/integrity | 11.624 ms | 3.518 ms | SQLite 约 3.3x |
+
+## 并发结果
+
+5 轮运行取中位数，完整原始输出见 `db_concurrent_bench_runs.txt` 和 `sqlite_concurrent_bench_runs.txt`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| serial query, 100x SUM | 122.111 ms | 308.089 ms | db 插件约 2.5x |
+| concurrent query, 4x25 SUM | 48.385 ms | 120.165 ms | db 插件约 2.5x |
+| concurrent insert, 4x12,500 rows | 55.618 ms | 90.713 ms | db 插件约 1.6x |
+
+## 结论
+
+- 查询速度：单次 read-handle SUM 仍会计入打开快照成本，SQLite 更快；复用 read-handle 的串行/并发全表 SUM，db 插件明显更快。
+- 并发插入：db 插件更快，但当前实现用进程内写互斥保证正确性，属于串行化 writer，不等价于 SQLite 的事务/WAL 能力。
+- 批量写入和全量列更新：db 插件更快，主要受益于列式 raw column ingest。
+- 初始化、compact、verify/integrity：SQLite 更成熟也更快。
+
+综合回答“哪个最快”：并发查询和并发插入在本 benchmark 都是 db 插件更快；如果需要 ACID、索引、SQL、崩溃恢复，仍应选 SQLite。

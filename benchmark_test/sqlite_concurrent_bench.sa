@@ -1,0 +1,616 @@
+@import "sa_std/fmt.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/io/print.sai"
+@import "sa_std/time.sai"
+
+@extern sqlite3_open_v2(*filename: ptr, *out_db: ptr, flags: i32, *vfs: ptr) -> i32
+@extern sqlite3_close(*db: ptr) -> i32
+@extern sqlite3_exec(*db: ptr, *sql: ptr, *callback: ptr, *arg: ptr, *errmsg: ptr) -> i32
+@extern sqlite3_prepare_v2(*db: ptr, *sql: ptr, nbyte: i32, *out_stmt: ptr, *tail: ptr) -> i32
+@extern sqlite3_bind_int64(*stmt: ptr, idx: i32, value: u64) -> i32
+@extern sqlite3_step(*stmt: ptr) -> i32
+@extern sqlite3_reset(*stmt: ptr) -> i32
+@extern sqlite3_clear_bindings(*stmt: ptr) -> i32
+@extern sqlite3_finalize(*stmt: ptr) -> i32
+@extern sqlite3_column_int64(*stmt: ptr, col: i32) -> u64
+@extern sqlite3_busy_timeout(*db: ptr, ms: i32) -> i32
+
+@extern pthread_spawn(*entry: ptr, *arg: ptr) -> i32
+@extern pthread_join(handle: i32, *out: ptr) -> i32
+@extern pthread_drop(handle: i32) -> void
+
+@const QUERY_WORKER_VT = vtable { call = @sqlite_query_worker }
+@const INSERT_WORKER_VT = vtable { call = @sqlite_insert_worker }
+
+@const DB_PATH_Q_C = utf8:"sqlite_members.db\0"
+@const DB_PATH_I_FS = utf8:"sqlite_members_ci.db"
+@const DB_PATH_I_C = utf8:"sqlite_members_ci.db\0"
+@const SQL_PRAGMA_WRITE = utf8:"PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;\0"
+@const SQL_CREATE = utf8:"CREATE TABLE members(id INTEGER PRIMARY KEY, plan INTEGER, status INTEGER, points INTEGER);\0"
+@const SQL_BEGIN = utf8:"BEGIN TRANSACTION;\0"
+@const SQL_COMMIT = utf8:"COMMIT;\0"
+@const SQL_INSERT = utf8:"INSERT INTO members(id, plan, status, points) VALUES(?, ?, ?, ?);\0"
+@const SQL_SUM = utf8:"SELECT SUM(points) FROM members;\0"
+@const SQL_COUNT_ALL = utf8:"SELECT COUNT(*) FROM members;\0"
+@const NL = utf8:"\n"
+
+@const SQLITE_SERIAL_QUERY = utf8:"sqlite_serial_query_ns="
+@const SQLITE_CONCURRENT_QUERY = utf8:"sqlite_concurrent_query_ns="
+@const SQLITE_CONCURRENT_INSERT = utf8:"sqlite_concurrent_insert_ns="
+@const SQLITE_SERIAL_QUERY_OK = utf8:"sqlite_serial_query_ok="
+@const SQLITE_CONCURRENT_QUERY_OK = utf8:"sqlite_concurrent_query_ok="
+@const SQLITE_CONCURRENT_INSERT_OK = utf8:"sqlite_concurrent_insert_ok="
+@const SQLITE_CONCURRENT_INSERT_ROWS = utf8:"sqlite_concurrent_insert_rows="
+@const QUERIES_LABEL = utf8:"queries="
+@const THREADS_LABEL = utf8:"threads="
+@const SUM_TOTAL_LABEL = utf8:"sum_total="
+
+#def DB_PATH_I_FS_LEN = 20
+#def SQLITE_OPEN_READWRITE = 2
+#def SQLITE_OPEN_READWRITE_CREATE = 6
+#def SQLITE_OK = 0
+#def SQLITE_ROW = 100
+#def SQLITE_DONE = 101
+#def ROWS = 50000
+#def BATCH_ROWS = 12500
+#def THREADS = 4
+#def QUERY_REPEATS = 25
+#def TOTAL_QUERIES = 100
+#def EXPECTED_QUERY_SUM = 12500500000
+#def FMT_BUF_BYTES = 32
+
+#def SQLITE_SERIAL_QUERY_LEN = 23
+#def SQLITE_CONCURRENT_QUERY_LEN = 27
+#def SQLITE_CONCURRENT_INSERT_LEN = 28
+#def SQLITE_SERIAL_QUERY_OK_LEN = 23
+#def SQLITE_CONCURRENT_QUERY_OK_LEN = 27
+#def SQLITE_CONCURRENT_INSERT_OK_LEN = 28
+#def SQLITE_CONCURRENT_INSERT_ROWS_LEN = 30
+#def QUERIES_LABEL_LEN = 8
+#def THREADS_LABEL_LEN = 8
+#def SUM_TOTAL_LABEL_LEN = 10
+
+#def QueryThread_SIZE = 32
+#def QueryThread_handle = +0
+#def QueryThread_iterations = +8
+#def QueryThread_ok = +16
+#def QueryThread_sum_total = +24
+
+#def InsertThread_SIZE = 40
+#def InsertThread_handle = +0
+#def InsertThread_start_base = +8
+#def InsertThread_rows = +16
+#def InsertThread_ok = +24
+#def InsertThread_inserted = +32
+
+[MACRO] PRINT_U64_LINE %label, %label_len, %value
+    __fmt_buf_%value = stack_alloc FMT_BUF_BYTES
+    __fmt_len_slot_%value = stack_alloc 8
+    __fmt_status_%value = call @sa_fmt_u64_into(%value, 10, __fmt_buf_%value, FMT_BUF_BYTES, &__fmt_len_slot_%value)
+    __fmt_len_%value = load __fmt_len_slot_%value+0 as u64
+    call @sa_print_bytes(&%label, %label_len)
+    call @sa_print_bytes(&__fmt_buf_%value, __fmt_len_%value)
+    call @sa_print_bytes(&NL, 1)
+    !__fmt_status_%value
+    !__fmt_len_%value
+[END_MACRO]
+
+@sqlite_query_worker(&slot: ptr) -> i32:
+L_ENTRY:
+    db_slot = stack_alloc 8
+    stmt_slot = stack_alloc 8
+    null_slot = stack_alloc 8
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    total_slot = stack_alloc 8
+    store null_slot+0, 0 as ptr
+    null_ptr = load null_slot+0 as ptr
+    iterations = load slot+QueryThread_iterations as u64
+    store i_slot+0, 0 as u64
+    store ok_slot+0, 1 as u64
+    store total_slot+0, 0 as u64
+    open_status = call @sqlite3_open_v2(*DB_PATH_Q_C, *db_slot, SQLITE_OPEN_READWRITE, *null_ptr)
+    db = load db_slot+0 as ptr
+    busy_status = call @sqlite3_busy_timeout(*db, 10000)
+    jmp L_QUERY_COND
+
+L_QUERY_COND:
+    i = load i_slot+0 as u64
+    query_cond = ult i, iterations
+    br query_cond -> L_QUERY_BODY, L_QUERY_DONE
+
+L_QUERY_BODY:
+    prepare_status = call @sqlite3_prepare_v2(*db, *SQL_SUM, -1, *stmt_slot, *null_ptr)
+    stmt = load stmt_slot+0 as ptr
+    step_status = call @sqlite3_step(*stmt)
+    sum_value = call @sqlite3_column_int64(*stmt, 0)
+    finalize_status = call @sqlite3_finalize(*stmt)
+    ok_prepare = eq prepare_status, SQLITE_OK
+    ok_step = eq step_status, SQLITE_ROW
+    ok_finalize = eq finalize_status, SQLITE_OK
+    ok_sum = eq sum_value, EXPECTED_QUERY_SUM
+    ok_a = and ok_prepare, ok_step
+    ok_b = and ok_finalize, ok_sum
+    ok_query = and ok_a, ok_b
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_query
+    total_acc = load total_slot+0 as u64
+    total_next = add total_acc, sum_value
+    next_i = add i, 1
+    store ok_slot+0, ok_next as u64
+    store total_slot+0, total_next as u64
+    store i_slot+0, next_i as u64
+    !i
+    !query_cond
+    !prepare_status
+    !stmt
+    !step_status
+    !sum_value
+    !finalize_status
+    !ok_prepare
+    !ok_step
+    !ok_finalize
+    !ok_sum
+    !ok_a
+    !ok_b
+    !ok_query
+    !ok_acc
+    !ok_next
+    !total_acc
+    !total_next
+    !next_i
+    jmp L_QUERY_COND
+
+L_QUERY_DONE:
+    final_ok0 = load ok_slot+0 as u64
+    final_total = load total_slot+0 as u64
+    close_status = call @sqlite3_close(*db)
+    ok_open = eq open_status, SQLITE_OK
+    ok_busy = eq busy_status, SQLITE_OK
+    ok_close = eq close_status, SQLITE_OK
+    ok_01 = and final_ok0, ok_open
+    ok_02 = and ok_01, ok_busy
+    final_ok = and ok_02, ok_close
+    store slot+QueryThread_ok, final_ok as u64
+    store slot+QueryThread_sum_total, final_total as u64
+    !i
+    !query_cond
+    !final_ok0
+    !final_total
+    !close_status
+    !ok_open
+    !ok_busy
+    !ok_close
+    !ok_01
+    !ok_02
+    !final_ok
+    !open_status
+    !busy_status
+    !db
+    !null_ptr
+    !iterations
+    !slot
+    return 0
+
+@sqlite_insert_worker(&slot: ptr) -> i32:
+L_ENTRY:
+    db_slot = stack_alloc 8
+    stmt_slot = stack_alloc 8
+    null_slot = stack_alloc 8
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    store null_slot+0, 0 as ptr
+    null_ptr = load null_slot+0 as ptr
+    start_base = load slot+InsertThread_start_base as u64
+    rows = load slot+InsertThread_rows as u64
+    store i_slot+0, 0 as u64
+    store ok_slot+0, 1 as u64
+    open_status = call @sqlite3_open_v2(*DB_PATH_I_C, *db_slot, SQLITE_OPEN_READWRITE_CREATE, *null_ptr)
+    db = load db_slot+0 as ptr
+    busy_status = call @sqlite3_busy_timeout(*db, 10000)
+    begin_status = call @sqlite3_exec(*db, *SQL_BEGIN, *null_ptr, *null_ptr, *null_ptr)
+    prepare_status = call @sqlite3_prepare_v2(*db, *SQL_INSERT, -1, *stmt_slot, *null_ptr)
+    stmt = load stmt_slot+0 as ptr
+    jmp L_INSERT_COND
+
+L_INSERT_COND:
+    i = load i_slot+0 as u64
+    insert_cond = ult i, rows
+    br insert_cond -> L_INSERT_BODY, L_INSERT_DONE
+
+L_INSERT_BODY:
+    global_i = add start_base, i
+    id_value = add global_i, 1
+    plan_low = and global_i, 3
+    plan_value = add plan_low, 1
+    status_value = and global_i, 1
+    points_value = mul id_value, 10
+    bind1 = call @sqlite3_bind_int64(*stmt, 1, id_value)
+    bind2 = call @sqlite3_bind_int64(*stmt, 2, plan_value)
+    bind3 = call @sqlite3_bind_int64(*stmt, 3, status_value)
+    bind4 = call @sqlite3_bind_int64(*stmt, 4, points_value)
+    step_insert = call @sqlite3_step(*stmt)
+    reset_insert = call @sqlite3_reset(*stmt)
+    clear_insert = call @sqlite3_clear_bindings(*stmt)
+    ok_bind1 = eq bind1, SQLITE_OK
+    ok_bind2 = eq bind2, SQLITE_OK
+    ok_bind3 = eq bind3, SQLITE_OK
+    ok_bind4 = eq bind4, SQLITE_OK
+    ok_step_insert = eq step_insert, SQLITE_DONE
+    ok_reset_insert = eq reset_insert, SQLITE_OK
+    ok_clear_insert = eq clear_insert, SQLITE_OK
+    ok_a = and ok_bind1, ok_bind2
+    ok_b = and ok_bind3, ok_bind4
+    ok_c = and ok_a, ok_b
+    ok_d = and ok_c, ok_step_insert
+    ok_e = and ok_d, ok_reset_insert
+    ok_row = and ok_e, ok_clear_insert
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_row
+    next_i = add i, 1
+    store ok_slot+0, ok_next as u64
+    store i_slot+0, next_i as u64
+    !i
+    !insert_cond
+    !global_i
+    !id_value
+    !plan_low
+    !plan_value
+    !status_value
+    !points_value
+    !bind1
+    !bind2
+    !bind3
+    !bind4
+    !step_insert
+    !reset_insert
+    !clear_insert
+    !ok_bind1
+    !ok_bind2
+    !ok_bind3
+    !ok_bind4
+    !ok_step_insert
+    !ok_reset_insert
+    !ok_clear_insert
+    !ok_a
+    !ok_b
+    !ok_c
+    !ok_d
+    !ok_e
+    !ok_row
+    !ok_acc
+    !ok_next
+    !next_i
+    jmp L_INSERT_COND
+
+L_INSERT_DONE:
+    row_ok = load ok_slot+0 as u64
+    finalize_status = call @sqlite3_finalize(*stmt)
+    commit_status = call @sqlite3_exec(*db, *SQL_COMMIT, *null_ptr, *null_ptr, *null_ptr)
+    close_status = call @sqlite3_close(*db)
+    ok_open = eq open_status, SQLITE_OK
+    ok_busy = eq busy_status, SQLITE_OK
+    ok_begin = eq begin_status, SQLITE_OK
+    ok_prepare = eq prepare_status, SQLITE_OK
+    ok_finalize = eq finalize_status, SQLITE_OK
+    ok_commit = eq commit_status, SQLITE_OK
+    ok_close = eq close_status, SQLITE_OK
+    ok01 = and ok_open, ok_busy
+    ok02 = and ok01, ok_begin
+    ok03 = and ok02, ok_prepare
+    ok04 = and ok03, row_ok
+    ok05 = and ok04, ok_finalize
+    ok06 = and ok05, ok_commit
+    ok = and ok06, ok_close
+    store slot+InsertThread_ok, ok as u64
+    store slot+InsertThread_inserted, rows as u64
+    !i
+    !insert_cond
+    !row_ok
+    !finalize_status
+    !commit_status
+    !close_status
+    !ok_open
+    !ok_busy
+    !ok_begin
+    !ok_prepare
+    !ok_finalize
+    !ok_commit
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok
+    !open_status
+    !busy_status
+    !begin_status
+    !prepare_status
+    !stmt
+    !db
+    !null_ptr
+    !start_base
+    !rows
+    !slot
+    return 0
+
+@ffi_wrapper spawn_query_worker(*slot: ptr) -> i32:
+L_ENTRY:
+    worker_vt = &QUERY_WORKER_VT
+    worker_fn = load worker_vt+0 as ptr
+    worker_safe = assume_safe worker_fn
+    handle = call @pthread_spawn(*worker_safe, *slot)
+    !slot
+    return handle
+
+@ffi_wrapper spawn_insert_worker(*slot: ptr) -> i32:
+L_ENTRY:
+    worker_vt = &INSERT_WORKER_VT
+    worker_fn = load worker_vt+0 as ptr
+    worker_safe = assume_safe worker_fn
+    handle = call @pthread_spawn(*worker_safe, *slot)
+    !slot
+    return handle
+
+@ffi_wrapper join_worker(handle: i32, *slot: ptr) -> i32:
+L_ENTRY:
+    joined = call @pthread_join(handle, *slot)
+    !slot
+    !handle
+    return joined
+
+@main() -> i32:
+L_ENTRY:
+    serial_thread = alloc QueryThread_SIZE
+    store serial_thread+QueryThread_iterations, TOTAL_QUERIES as u64
+    store serial_thread+QueryThread_ok, 0 as u64
+    store serial_thread+QueryThread_sum_total, 0 as u64
+    t_serial0 = call @sa_time_instant_ns()
+    serial_call = call @sqlite_query_worker(&serial_thread)
+    t_serial1 = call @sa_time_instant_ns()
+    sqlite_serial_query_ns = sub t_serial1, t_serial0
+    serial_ok = load serial_thread+QueryThread_ok as u64
+
+    qthreads = alloc 128
+    store qthreads+QueryThread_iterations, QUERY_REPEATS as u64
+    store qthreads+QueryThread_ok, 0 as u64
+    store qthreads+QueryThread_sum_total, 0 as u64
+    qt1 = ptr_add qthreads, QueryThread_SIZE
+    store qt1+QueryThread_iterations, QUERY_REPEATS as u64
+    store qt1+QueryThread_ok, 0 as u64
+    store qt1+QueryThread_sum_total, 0 as u64
+    qt2 = ptr_add qthreads, 64
+    store qt2+QueryThread_iterations, QUERY_REPEATS as u64
+    store qt2+QueryThread_ok, 0 as u64
+    store qt2+QueryThread_sum_total, 0 as u64
+    qt3 = ptr_add qthreads, 96
+    store qt3+QueryThread_iterations, QUERY_REPEATS as u64
+    store qt3+QueryThread_ok, 0 as u64
+    store qt3+QueryThread_sum_total, 0 as u64
+    t_conq0 = call @sa_time_instant_ns()
+    qh0 = call @spawn_query_worker(*qthreads)
+    qh1 = call @spawn_query_worker(*qt1)
+    qh2 = call @spawn_query_worker(*qt2)
+    qh3 = call @spawn_query_worker(*qt3)
+    qj0 = call @join_worker(qh0, *qthreads)
+    qj1 = call @join_worker(qh1, *qt1)
+    qj2 = call @join_worker(qh2, *qt2)
+    qj3 = call @join_worker(qh3, *qt3)
+    t_conq1 = call @sa_time_instant_ns()
+    sqlite_concurrent_query_ns = sub t_conq1, t_conq0
+    qok0 = load qthreads+QueryThread_ok as u64
+    qok1 = load qt1+QueryThread_ok as u64
+    qok2 = load qt2+QueryThread_ok as u64
+    qok3 = load qt3+QueryThread_ok as u64
+    qsum0 = load qthreads+QueryThread_sum_total as u64
+    qsum1 = load qt1+QueryThread_sum_total as u64
+    qsum2 = load qt2+QueryThread_sum_total as u64
+    qsum3 = load qt3+QueryThread_sum_total as u64
+    qsum01 = add qsum0, qsum1
+    qsum23 = add qsum2, qsum3
+    concurrent_sum_total = add qsum01, qsum23
+    qjoin0 = eq qj0, 0
+    qjoin1 = eq qj1, 0
+    qjoin2 = eq qj2, 0
+    qjoin3 = eq qj3, 0
+    qjoins01 = and qjoin0, qjoin1
+    qjoins23 = and qjoin2, qjoin3
+    qjoins = and qjoins01, qjoins23
+    qoks01 = and qok0, qok1
+    qoks23 = and qok2, qok3
+    qoks = and qoks01, qoks23
+    sqlite_concurrent_query_ok = and qjoins, qoks
+
+    remove_status = call @sa_fs_remove_file(&DB_PATH_I_FS, DB_PATH_I_FS_LEN)
+    !remove_status
+    db_slot = stack_alloc 8
+    stmt_slot = stack_alloc 8
+    null_slot = stack_alloc 8
+    store null_slot+0, 0 as ptr
+    null_ptr = load null_slot+0 as ptr
+    setup_open = call @sqlite3_open_v2(*DB_PATH_I_C, *db_slot, SQLITE_OPEN_READWRITE_CREATE, *null_ptr)
+    setup_db = load db_slot+0 as ptr
+    setup_busy = call @sqlite3_busy_timeout(*setup_db, 10000)
+    setup_pragma = call @sqlite3_exec(*setup_db, *SQL_PRAGMA_WRITE, *null_ptr, *null_ptr, *null_ptr)
+    setup_create = call @sqlite3_exec(*setup_db, *SQL_CREATE, *null_ptr, *null_ptr, *null_ptr)
+    setup_close = call @sqlite3_close(*setup_db)
+
+    ithreads = alloc 160
+    store ithreads+InsertThread_start_base, 0 as u64
+    store ithreads+InsertThread_rows, BATCH_ROWS as u64
+    store ithreads+InsertThread_ok, 0 as u64
+    it1 = ptr_add ithreads, InsertThread_SIZE
+    store it1+InsertThread_start_base, BATCH_ROWS as u64
+    store it1+InsertThread_rows, BATCH_ROWS as u64
+    store it1+InsertThread_ok, 0 as u64
+    it2 = ptr_add ithreads, 80
+    store it2+InsertThread_start_base, 25000 as u64
+    store it2+InsertThread_rows, BATCH_ROWS as u64
+    store it2+InsertThread_ok, 0 as u64
+    it3 = ptr_add ithreads, 120
+    store it3+InsertThread_start_base, 37500 as u64
+    store it3+InsertThread_rows, BATCH_ROWS as u64
+    store it3+InsertThread_ok, 0 as u64
+    t_coni0 = call @sa_time_instant_ns()
+    ih0 = call @spawn_insert_worker(*ithreads)
+    ih1 = call @spawn_insert_worker(*it1)
+    ih2 = call @spawn_insert_worker(*it2)
+    ih3 = call @spawn_insert_worker(*it3)
+    ij0 = call @join_worker(ih0, *ithreads)
+    ij1 = call @join_worker(ih1, *it1)
+    ij2 = call @join_worker(ih2, *it2)
+    ij3 = call @join_worker(ih3, *it3)
+    t_coni1 = call @sa_time_instant_ns()
+    sqlite_concurrent_insert_ns = sub t_coni1, t_coni0
+
+    count_open = call @sqlite3_open_v2(*DB_PATH_I_C, *db_slot, SQLITE_OPEN_READWRITE, *null_ptr)
+    count_db = load db_slot+0 as ptr
+    count_prepare = call @sqlite3_prepare_v2(*count_db, *SQL_COUNT_ALL, -1, *stmt_slot, *null_ptr)
+    count_stmt = load stmt_slot+0 as ptr
+    count_step = call @sqlite3_step(*count_stmt)
+    concurrent_insert_rows = call @sqlite3_column_int64(*count_stmt, 0)
+    count_finalize = call @sqlite3_finalize(*count_stmt)
+    count_close = call @sqlite3_close(*count_db)
+    iok0 = load ithreads+InsertThread_ok as u64
+    iok1 = load it1+InsertThread_ok as u64
+    iok2 = load it2+InsertThread_ok as u64
+    iok3 = load it3+InsertThread_ok as u64
+    ijoin0 = eq ij0, 0
+    ijoin1 = eq ij1, 0
+    ijoin2 = eq ij2, 0
+    ijoin3 = eq ij3, 0
+    ijoins01 = and ijoin0, ijoin1
+    ijoins23 = and ijoin2, ijoin3
+    ijoins = and ijoins01, ijoins23
+    ioks01 = and iok0, iok1
+    ioks23 = and iok2, iok3
+    ioks = and ioks01, ioks23
+    count_ok_open = eq count_open, SQLITE_OK
+    count_ok_prepare = eq count_prepare, SQLITE_OK
+    count_ok_step = eq count_step, SQLITE_ROW
+    count_ok_finalize = eq count_finalize, SQLITE_OK
+    count_ok_close = eq count_close, SQLITE_OK
+    count_rows_ok = eq concurrent_insert_rows, ROWS
+    count_ok01 = and count_ok_open, count_ok_prepare
+    count_ok02 = and count_ok01, count_ok_step
+    count_ok03 = and count_ok02, count_ok_finalize
+    count_ok04 = and count_ok03, count_ok_close
+    count_ok = and count_ok04, count_rows_ok
+    insert_ok_a = and ijoins, ioks
+    sqlite_concurrent_insert_ok = and insert_ok_a, count_ok
+
+    EXPAND PRINT_U64_LINE SQLITE_SERIAL_QUERY, SQLITE_SERIAL_QUERY_LEN, sqlite_serial_query_ns
+    EXPAND PRINT_U64_LINE SQLITE_CONCURRENT_QUERY, SQLITE_CONCURRENT_QUERY_LEN, sqlite_concurrent_query_ns
+    EXPAND PRINT_U64_LINE SQLITE_CONCURRENT_INSERT, SQLITE_CONCURRENT_INSERT_LEN, sqlite_concurrent_insert_ns
+    EXPAND PRINT_U64_LINE SQLITE_SERIAL_QUERY_OK, SQLITE_SERIAL_QUERY_OK_LEN, serial_ok
+    EXPAND PRINT_U64_LINE SQLITE_CONCURRENT_QUERY_OK, SQLITE_CONCURRENT_QUERY_OK_LEN, sqlite_concurrent_query_ok
+    EXPAND PRINT_U64_LINE SQLITE_CONCURRENT_INSERT_OK, SQLITE_CONCURRENT_INSERT_OK_LEN, sqlite_concurrent_insert_ok
+    EXPAND PRINT_U64_LINE SQLITE_CONCURRENT_INSERT_ROWS, SQLITE_CONCURRENT_INSERT_ROWS_LEN, concurrent_insert_rows
+    EXPAND PRINT_U64_LINE QUERIES_LABEL, QUERIES_LABEL_LEN, TOTAL_QUERIES
+    EXPAND PRINT_U64_LINE THREADS_LABEL, THREADS_LABEL_LEN, THREADS
+    EXPAND PRINT_U64_LINE SUM_TOTAL_LABEL, SUM_TOTAL_LABEL_LEN, concurrent_sum_total
+
+    !serial_thread
+    !t_serial0
+    !t_serial1
+    !serial_call
+    !sqlite_serial_query_ns
+    !serial_ok
+    !qthreads
+    !qt1
+    !qt2
+    !qt3
+    !t_conq0
+    !t_conq1
+    !qh0
+    !qh1
+    !qh2
+    !qh3
+    !qj0
+    !qj1
+    !qj2
+    !qj3
+    !sqlite_concurrent_query_ns
+    !qok0
+    !qok1
+    !qok2
+    !qok3
+    !qsum0
+    !qsum1
+    !qsum2
+    !qsum3
+    !qsum01
+    !qsum23
+    !concurrent_sum_total
+    !qjoin0
+    !qjoin1
+    !qjoin2
+    !qjoin3
+    !qjoins01
+    !qjoins23
+    !qjoins
+    !qoks01
+    !qoks23
+    !qoks
+    !sqlite_concurrent_query_ok
+    !null_ptr
+    !setup_open
+    !setup_db
+    !setup_busy
+    !setup_pragma
+    !setup_create
+    !setup_close
+    !ithreads
+    !it1
+    !it2
+    !it3
+    !t_coni0
+    !t_coni1
+    !ih0
+    !ih1
+    !ih2
+    !ih3
+    !ij0
+    !ij1
+    !ij2
+    !ij3
+    !sqlite_concurrent_insert_ns
+    !count_open
+    !count_db
+    !count_prepare
+    !count_stmt
+    !count_step
+    !concurrent_insert_rows
+    !count_finalize
+    !count_close
+    !iok0
+    !iok1
+    !iok2
+    !iok3
+    !ijoin0
+    !ijoin1
+    !ijoin2
+    !ijoin3
+    !ijoins01
+    !ijoins23
+    !ijoins
+    !ioks01
+    !ioks23
+    !ioks
+    !count_ok_open
+    !count_ok_prepare
+    !count_ok_step
+    !count_ok_finalize
+    !count_ok_close
+    !count_rows_ok
+    !count_ok01
+    !count_ok02
+    !count_ok03
+    !count_ok04
+    !count_ok
+    !insert_ok_a
+    !sqlite_concurrent_insert_ok
+
+    return 0

@@ -1,0 +1,202 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"members"
+@const SCHEMA_PATH = utf8:"members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 16\n#def COL_ID_STRIDE = 8 // u64\n#def COL_PLAN_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 7
+#def SCHEMA_PATH_LEN = 19
+#def SCHEMA_LEN = 149
+#def ROWS = 4
+#def COL_BYTES = 32
+#def COLUMN_COUNT = 4
+#def COLUMNS_BYTES = 64
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc COL_BYTES
+    plan_col = alloc COL_BYTES
+    status_col = alloc COL_BYTES
+    points_col = alloc COL_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+    store plan_col+0, 1 as u64
+    store plan_col+8, 2 as u64
+    store plan_col+16, 1 as u64
+    store plan_col+24, 3 as u64
+    store status_col+0, 1 as u64
+    store status_col+8, 1 as u64
+    store status_col+16, 0 as u64
+    store status_col+24, 1 as u64
+    store points_col+0, 10 as u64
+    store points_col+8, 20 as u64
+    store points_col+16, 30 as u64
+    store points_col+24, 40 as u64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, plan_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, status_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_INFO_ROW_COUNT rows, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SUM_U64_HANDLE handle_sum_status, handle_points_sum_before, read_handle, 3
+    EXPAND DB_COUNT_U64_CMP_HANDLE handle_count_status, handle_plan_ge_count, read_handle, 1, SA_DB_CMP_GE, 2
+    EXPAND DB_MIN_U64_HANDLE handle_min_status, handle_points_min, read_handle, 3
+    EXPAND DB_MAX_U64_HANDLE handle_max_status, handle_points_max, read_handle, 3
+    EXPAND DB_UPDATE_U64_ADD update_status, updated_rows, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 0, ROWS, 5
+    EXPAND DB_SUM_U64_HANDLE stale_handle_sum_status, stale_handle_points_sum, read_handle, 3
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_OPEN_READ_TABLE open_after_status, read_handle_after, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SUM_U64_HANDLE sum_after_status, points_sum_after, read_handle_after, 3
+    EXPAND DB_COUNT_U64_EQ_HANDLE count_status, plan_one_count, read_handle_after, 1, 1
+    EXPAND DB_CLOSE_READ_TABLE close_after_status, read_handle_after
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_rows = eq rows, ROWS
+    ok_open_status = eq open_status, SA_DB_OK
+    ok_handle_sum_status = eq handle_sum_status, SA_DB_OK
+    ok_handle_sum = eq handle_points_sum_before, 100
+    ok_handle_count_status = eq handle_count_status, SA_DB_OK
+    ok_handle_count = eq handle_plan_ge_count, 2
+    ok_handle_min_status = eq handle_min_status, SA_DB_OK
+    ok_handle_min = eq handle_points_min, 10
+    ok_handle_max_status = eq handle_max_status, SA_DB_OK
+    ok_handle_max = eq handle_points_max, 40
+    ok_update_status = eq update_status, SA_DB_OK
+    ok_updated_rows = eq updated_rows, ROWS
+    ok_stale_sum_status = eq stale_handle_sum_status, SA_DB_OK
+    ok_stale_sum = eq stale_handle_points_sum, 100
+    ok_close_status = eq close_status, SA_DB_OK
+    ok_open_after_status = eq open_after_status, SA_DB_OK
+    ok_sum_after_status = eq sum_after_status, SA_DB_OK
+    ok_sum_after = eq points_sum_after, 120
+    ok_count_status = eq count_status, SA_DB_OK
+    ok_count = eq plan_one_count, 2
+    ok_close_after_status = eq close_after_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_rows
+    ok04 = and ok03, ok_open_status
+    ok05 = and ok04, ok_handle_sum_status
+    ok06 = and ok05, ok_handle_sum
+    ok07 = and ok06, ok_handle_count_status
+    ok08 = and ok07, ok_handle_count
+    ok09 = and ok08, ok_handle_min_status
+    ok10 = and ok09, ok_handle_min
+    ok11 = and ok10, ok_handle_max_status
+    ok12 = and ok11, ok_handle_max
+    ok13 = and ok12, ok_update_status
+    ok14 = and ok13, ok_updated_rows
+    ok15 = and ok14, ok_stale_sum_status
+    ok16 = and ok15, ok_stale_sum
+    ok17 = and ok16, ok_close_status
+    ok18 = and ok17, ok_open_after_status
+    ok19 = and ok18, ok_sum_after_status
+    ok20 = and ok19, ok_sum_after
+    ok21 = and ok20, ok_count_status
+    ok22 = and ok21, ok_count
+    ok23 = and ok22, ok_close_after_status
+    ok = and ok23, ok_verify
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !rows
+    !open_status
+    !read_handle
+    !handle_sum_status
+    !handle_points_sum_before
+    !handle_count_status
+    !handle_plan_ge_count
+    !handle_min_status
+    !handle_points_min
+    !handle_max_status
+    !handle_points_max
+    !update_status
+    !updated_rows
+    !stale_handle_sum_status
+    !stale_handle_points_sum
+    !close_status
+    !open_after_status
+    !read_handle_after
+    !sum_after_status
+    !points_sum_after
+    !count_status
+    !plan_one_count
+    !close_after_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_rows
+    !ok_open_status
+    !ok_handle_sum_status
+    !ok_handle_sum
+    !ok_handle_count_status
+    !ok_handle_count
+    !ok_handle_min_status
+    !ok_handle_min
+    !ok_handle_max_status
+    !ok_handle_max
+    !ok_update_status
+    !ok_updated_rows
+    !ok_stale_sum_status
+    !ok_stale_sum
+    !ok_close_status
+    !ok_open_after_status
+    !ok_sum_after_status
+    !ok_sum_after
+    !ok_count_status
+    !ok_count
+    !ok_close_after_status
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !id_col
+    !plan_col
+    !status_col
+    !points_col
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9001)

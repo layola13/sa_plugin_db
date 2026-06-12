@@ -3,6 +3,7 @@ const plugin = @import("plugin_api");
 const qmod = @import("db_stub.zig");
 const schema = @import("schema.zig");
 const table = @import("table.zig");
+pub usingnamespace @import("db_saasm_api.zig");
 
 const skills = [_]plugin.SkillSection{
     .{

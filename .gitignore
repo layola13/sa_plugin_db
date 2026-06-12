@@ -18,3 +18,14 @@ Thumbs.db
 .codex/skills/
 .opencode/skills/
 # end code-index generated artifacts
+
+# benchmark generated artifacts
+benchmark_test/*.out
+benchmark_test/*.bc
+benchmark_test/*.dat
+benchmark_test/*.meta
+benchmark_test/*.db
+benchmark_test/*.db-*
+benchmark_test/members*.sai
+benchmark_test/members*.sadb-schema
+benchmark_test/db_concurrent_bench

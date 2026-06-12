@@ -1,0 +1,132 @@
+// SA database plugin macro facade.
+@import "db.sai"
+
+#def SA_DB_OK = 0
+#def SA_DB_ERR_INVALID_ARGUMENT = 1
+#def SA_DB_ERR_INVALID_FORMAT = 2
+#def SA_DB_ERR_NOT_FOUND = 3
+#def SA_DB_ERR_LOCKED = 4
+#def SA_DB_ERR_CURSOR_OVERFLOW = 5
+#def SA_DB_ERR_VERIFY_FAILED = 6
+#def SA_DB_ERR_OUT_OF_MEMORY = 7
+#def SA_DB_ERR_IO = 8
+
+#def SA_DB_CMP_EQ = 0
+#def SA_DB_CMP_NE = 1
+#def SA_DB_CMP_LT = 2
+#def SA_DB_CMP_LE = 3
+#def SA_DB_CMP_GT = 4
+#def SA_DB_CMP_GE = 5
+
+#def SaDbTableInfo_SIZE = 32
+#def SaDbTableInfo_row_count = +0
+#def SaDbTableInfo_segment_count = +8
+#def SaDbTableInfo_epoch = +16
+#def SaDbTableInfo_locked = +24
+
+#def SaDbColumnInput_SIZE = 16
+#def SaDbColumnInput_data = +0
+#def SaDbColumnInput_len = +8
+
+[MACRO] DB_STATUS_IS_OK %out_bool, %status
+    %out_bool = eq %status, SA_DB_OK
+[END_MACRO]
+
+[MACRO] DB_COLUMN_INPUT_SET %columns, %index, %data, %len
+    __db_col_off_%columns_%index = mul %index, SaDbColumnInput_SIZE
+    __db_col_ptr_%columns_%index = ptr_add %columns, __db_col_off_%columns_%index
+    store __db_col_ptr_%columns_%index+SaDbColumnInput_data, %data as ptr
+    store __db_col_ptr_%columns_%index+SaDbColumnInput_len, %len as u64
+    !__db_col_ptr_%columns_%index
+    !__db_col_off_%columns_%index
+[END_MACRO]
+
+[MACRO] DB_INFO_ROW_COUNT %out_rows, %info
+    %out_rows = load %info+SaDbTableInfo_row_count as u64
+[END_MACRO]
+
+[MACRO] DB_INFO_SEGMENT_COUNT %out_segments, %info
+    %out_segments = load %info+SaDbTableInfo_segment_count as u64
+[END_MACRO]
+
+[MACRO] DB_INFO_EPOCH %out_epoch, %info
+    %out_epoch = load %info+SaDbTableInfo_epoch as u64
+[END_MACRO]
+
+[MACRO] DB_INFO_LOCKED %out_locked, %info
+    %out_locked = load %info+SaDbTableInfo_locked as u64
+[END_MACRO]
+
+[MACRO] DB_INIT_SCHEMA %out_status, %root, %root_len, %schema_path, %schema_path_len, %schema_source, %schema_source_len, %out_info
+    %out_status = call @sa_db_init_schema(&%root, %root_len, &%schema_path, %schema_path_len, &%schema_source, %schema_source_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_REMOVE_TABLE %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_remove_table(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_INGEST_COLUMNS %out_status, %root, %root_len, %table_name, %table_name_len, %row_count, %columns, %columns_len, %out_info
+    %out_status = call @sa_db_ingest_columns(&%root, %root_len, &%table_name, %table_name_len, %row_count, %columns, %columns_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_VERIFY %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_verify(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_COMPACT %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_compact(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_LOCK %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_lock(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_UNLOCK %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_unlock(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_UPDATE_U64_ADD %out_status, %out_updated, %root, %root_len, %table_name, %table_name_len, %column_index, %start_row, %update_count, %delta
+    __db_update_slot_%out_updated = stack_alloc 8
+    %out_status = call @sa_db_update_u64_add(&%root, %root_len, &%table_name, %table_name_len, %column_index, %start_row, %update_count, %delta, &__db_update_slot_%out_updated)
+    %out_updated = load __db_update_slot_%out_updated+0 as u64
+[END_MACRO]
+
+[MACRO] DB_OPEN_READ_TABLE %out_status, %out_handle, %root, %root_len, %table_name, %table_name_len
+    __db_handle_slot_%out_handle = stack_alloc 8
+    %out_status = call @sa_db_open_read_table(&%root, %root_len, &%table_name, %table_name_len, &__db_handle_slot_%out_handle)
+    %out_handle = load __db_handle_slot_%out_handle+0 as ptr
+[END_MACRO]
+
+[MACRO] DB_CLOSE_READ_TABLE %out_status, %handle
+    %out_status = call @sa_db_close_read_table(%handle)
+[END_MACRO]
+
+[MACRO] DB_SUM_U64_HANDLE %out_status, %out_sum, %handle, %column_index
+    __db_handle_sum_slot_%out_sum = stack_alloc 8
+    %out_status = call @sa_db_sum_u64_handle(%handle, %column_index, &__db_handle_sum_slot_%out_sum)
+    %out_sum = load __db_handle_sum_slot_%out_sum+0 as u64
+[END_MACRO]
+
+[MACRO] DB_COUNT_U64_EQ_HANDLE %out_status, %out_count, %handle, %column_index, %expected
+    __db_handle_count_slot_%out_count = stack_alloc 8
+    %out_status = call @sa_db_count_u64_eq_handle(%handle, %column_index, %expected, &__db_handle_count_slot_%out_count)
+    %out_count = load __db_handle_count_slot_%out_count+0 as u64
+[END_MACRO]
+
+[MACRO] DB_COUNT_U64_CMP_HANDLE %out_status, %out_count, %handle, %column_index, %op, %expected
+    __db_handle_cmp_slot_%out_count = stack_alloc 8
+    %out_status = call @sa_db_count_u64_cmp_handle(%handle, %column_index, %op, %expected, &__db_handle_cmp_slot_%out_count)
+    %out_count = load __db_handle_cmp_slot_%out_count+0 as u64
+[END_MACRO]
+
+[MACRO] DB_MIN_U64_HANDLE %out_status, %out_min, %handle, %column_index
+    __db_handle_min_slot_%out_min = stack_alloc 8
+    %out_status = call @sa_db_min_u64_handle(%handle, %column_index, &__db_handle_min_slot_%out_min)
+    %out_min = load __db_handle_min_slot_%out_min+0 as u64
+[END_MACRO]
+
+[MACRO] DB_MAX_U64_HANDLE %out_status, %out_max, %handle, %column_index
+    __db_handle_max_slot_%out_max = stack_alloc 8
+    %out_status = call @sa_db_max_u64_handle(%handle, %column_index, &__db_handle_max_slot_%out_max)
+    %out_max = load __db_handle_max_slot_%out_max+0 as u64
+[END_MACRO]
