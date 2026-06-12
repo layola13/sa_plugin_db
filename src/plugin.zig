@@ -18,6 +18,7 @@ const skills = [_]plugin.SkillSection{
             "db status <table>",
             "db snapshot <table>",
             "db restore <table> <epoch>",
+            "db recover <table>",
             "db verify <table>",
             "db compact <table>",
             "db lock <table>",
@@ -61,7 +62,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
     const sub = if (argv.len >= 3) argv[2] else "";
     return switch (err) {
         error.MissingSourcePath => if (sub.len == 0)
-            "usage: sa db <init|register|exec|ingest|inspect|status|snapshot|restore|verify|compact|lock|unlock> ..."
+            "usage: sa db <init|register|exec|ingest|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ..."
         else if (std.mem.eql(u8, sub, "init"))
             "usage: sa db init <schema.sadb-schema>"
         else if (std.mem.eql(u8, sub, "register"))
@@ -72,8 +73,10 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
             "usage: sa db ingest <table> <csv|jsonl>"
         else if (std.mem.eql(u8, sub, "restore"))
             "usage: sa db restore <table> <epoch>"
+        else if (std.mem.eql(u8, sub, "recover"))
+            "usage: sa db recover <table>"
         else
-            "usage: sa db <init|register|exec|ingest|inspect|status|snapshot|restore|verify|compact|lock|unlock> ...",
+            "usage: sa db <init|register|exec|ingest|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ...",
         error.UnexpectedArgument => "remove the extra DB argument",
         error.InvalidPath => "check the DB schema or table path",
         error.FileNotFound, error.NotDir => "check that the DB schema file exists",
@@ -304,6 +307,14 @@ fn runDbRestore(allocator: std.mem.Allocator, argv: []const []const u8, stdout: 
     return 0;
 }
 
+fn runDbRecover(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+    if (argv.len < 4) return error.MissingSourcePath;
+    if (argv.len > 4) return error.UnexpectedArgument;
+    const info = table.recoverTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
+    try printInfo(stdout, info);
+    return 0;
+}
+
 fn runDbVerify(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
@@ -351,6 +362,7 @@ fn runDbCommandImpl(allocator: std.mem.Allocator, argv: []const []const u8, stdo
     if (std.mem.eql(u8, sub, "inspect") or std.mem.eql(u8, sub, "status")) return try runDbInspect(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "snapshot")) return try runDbSnapshot(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "restore")) return try runDbRestore(allocator, argv, stdout);
+    if (std.mem.eql(u8, sub, "recover")) return try runDbRecover(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "verify")) return try runDbVerify(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "compact")) return try runDbCompact(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "lock")) return try runDbLock(allocator, argv, stdout);
@@ -443,9 +455,10 @@ test "db plugin wrapper exports runtime descriptor" {
     try std.testing.expectEqualStrings("db", std.mem.span(exported.name));
     try std.testing.expectEqual(@as(usize, 1), exported.skills_len);
     const items = exported.skills_ptr[0].items;
-    try std.testing.expectEqual(@as(usize, 12), items.len);
+    try std.testing.expectEqual(@as(usize, 13), items.len);
     try std.testing.expectEqualStrings("db init <schema.sadb-schema>", items[0]);
-    try std.testing.expectEqualStrings("db unlock <table>", items[11]);
+    try std.testing.expectEqualStrings("db recover <table>", items[8]);
+    try std.testing.expectEqualStrings("db unlock <table>", items[12]);
 }
 
 test "db plugin wrapper abi maps missing init schema to cli diagnostic" {

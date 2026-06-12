@@ -41,6 +41,9 @@ Core native calls:
 - `sa_db_init_schema`
 - `sa_db_remove_table`
 - `sa_db_ingest_columns`
+- `sa_db_snapshot`
+- `sa_db_restore`
+- `sa_db_recover`
 - `sa_db_verify`
 - `sa_db_compact`
 - `sa_db_lock`
@@ -65,8 +68,8 @@ Removed calls:
 - `DB_COUNT_U64_EQ`
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
-`DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_MIN_U64_HANDLE`, and
-`DB_MAX_U64_HANDLE`.
+`DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_MIN_U64_HANDLE`,
+`DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and `DB_RECOVER`.
 
 ## Query Model
 
@@ -92,7 +95,9 @@ versioned column file and then advances the manifest, so a crash before manifest
 replacement leaves the previous epoch readable. Qmod read/write paths use the
 same active-manifest protocol as the public table APIs. Segment metadata records
 SHA-256 and byte counts, and verification checks schema hash, segment hash,
-recorded size, and the expected `rows * column_stride` size.
+recorded size, and the expected `rows * column_stride` size. `recover` scans
+versioned metadata files and rebuilds the manifest to the highest valid epoch,
+which covers corrupted or missing manifest files after an interrupted commit.
 
 This is still not a replacement for SQLite-style ACID, WAL, primary/secondary
 indexes, or multi-process transaction isolation. The v0.2 ERP foundation work is

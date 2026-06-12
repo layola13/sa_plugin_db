@@ -3,6 +3,9 @@
 @extern sa_db_init_schema(&root: ptr, root_len: u64, &schema_path: ptr, schema_path_len: u64, &schema_source: ptr, schema_source_len: u64, &out_info: ptr) -> u32
 @extern sa_db_remove_table(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_ingest_columns(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, row_count: u64, columns: ptr, columns_len: u64, &out_info: ptr) -> u32
+@extern sa_db_snapshot(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
+@extern sa_db_restore(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, epoch: u64, &out_info: ptr) -> u32
+@extern sa_db_recover(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_verify(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_compact(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_lock(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32

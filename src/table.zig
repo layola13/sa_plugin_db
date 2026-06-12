@@ -909,6 +909,63 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     }
 }
 
+fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    if (!std.mem.eql(u8, meta.table_name, table_name)) return TableError.InvalidFormat;
+    const schema_hash = try schemaHashFromFile(allocator, root_dir, table_name);
+    defer allocator.free(schema_hash);
+    if (!std.mem.eql(u8, meta.schema_hash, schema_hash)) return TableError.VerifyFailed;
+    var schema_obj = try loadSchema(allocator, root_dir, table_name);
+    defer schema_obj.deinit();
+    try verifySchemaAgainstMeta(schema_obj, meta);
+    try validateSegmentHashes(allocator, root_dir, meta);
+}
+
+fn maybeSelectRecoveryMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    path: []const u8,
+    best: *?TableMeta,
+) TableError!void {
+    const source = readFileAlloc(allocator, path, 16 * 1024 * 1024) catch return;
+    defer allocator.free(source);
+    var parsed = parseTableMeta(allocator, source) catch return;
+    defer parsed.deinit();
+    validateRecoverCandidate(allocator, root_dir, table_name, parsed.value) catch return;
+    if (best.*) |current| {
+        if (parsed.value.epoch <= current.epoch) return;
+        var old = best.*.?;
+        old.deinit(allocator);
+        best.* = null;
+    }
+    best.* = try duplicateTableMeta(allocator, parsed.value);
+}
+
+fn scanVersionedRecoveryMetas(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    best: *?TableMeta,
+) TableError!void {
+    const dir_path = rootPrefix(root_dir);
+    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
+    defer dir.close();
+
+    const prefix = try allocPrintPath(allocator, "{s}.meta.", .{table_name});
+    defer allocator.free(prefix);
+    var it = dir.iterate();
+    while (it.next() catch |err| return mapFileError(err)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        const epoch_text = entry.name[prefix.len..];
+        if (epoch_text.len == 0) continue;
+        _ = std.fmt.parseInt(u64, epoch_text, 10) catch continue;
+        const path = try activePath(allocator, root_dir, entry.name);
+        defer allocator.free(path);
+        try maybeSelectRecoveryMeta(allocator, root_dir, table_name, path, best);
+    }
+}
+
 fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
     const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(schema_path);
@@ -1771,6 +1828,25 @@ pub fn restoreTable(
     };
 }
 
+pub fn recoverTable(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError!TableInfo {
+    var best: ?TableMeta = null;
+    defer if (best) |*meta| meta.deinit(allocator);
+
+    try scanVersionedRecoveryMetas(allocator, root_dir, table_name, &best);
+
+    const compat_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(compat_path);
+    try maybeSelectRecoveryMeta(allocator, root_dir, table_name, compat_path, &best);
+
+    const recovered = best orelse return TableError.VerifyFailed;
+    try writeMeta(allocator, root_dir, table_name, recovered);
+    return tableInfo(recovered);
+}
+
 pub fn verifyTable(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -1962,6 +2038,56 @@ test "table manifest selects active epoch over compatibility meta" {
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 500), try snapshotSumU64(snapshot, 1));
+}
+
+test "table recover rebuilds manifest from highest valid versioned meta" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "recover_orders";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_TOTAL_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "recover_orders.sadb-schema", schema_source);
+
+    var ids1 = [_]u64{1};
+    var totals1 = [_]u64{100};
+    const first_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids1[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals1[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, 1, &first_columns);
+
+    var ids2 = [_]u64{2};
+    var totals2 = [_]u64{200};
+    const second_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids2[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals2[0..]) },
+    };
+    const second = try ingestRawColumns(std.testing.allocator, ".", table_name, 1, &second_columns);
+    try std.testing.expectEqual(@as(u64, 2), second.row_count);
+
+    const manifest_path = try tableManifestPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(manifest_path);
+    try writeFile(std.testing.allocator, manifest_path, "{not-json}\n");
+    try std.testing.expectError(TableError.InvalidFormat, verifyTable(std.testing.allocator, ".", table_name));
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 2), recovered.epoch);
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 300), try snapshotSumU64(snapshot, 1));
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {

@@ -48,12 +48,15 @@ L_ENTRY:
     EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, COL_BYTES
     EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
     EXPAND DB_INFO_ROW_COUNT rows, info
+    EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_EPOCH snapshot_epoch, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
     EXPAND DB_SUM_U64_HANDLE handle_sum_status, handle_points_sum_before, read_handle, 3
     EXPAND DB_COUNT_U64_CMP_HANDLE handle_count_status, handle_plan_ge_count, read_handle, 1, SA_DB_CMP_GE, 2
     EXPAND DB_MIN_U64_HANDLE handle_min_status, handle_points_min, read_handle, 3
     EXPAND DB_MAX_U64_HANDLE handle_max_status, handle_points_max, read_handle, 3
     EXPAND DB_UPDATE_U64_ADD update_status, updated_rows, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 0, ROWS, 5
+    EXPAND DB_RECOVER recover_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_SUM_U64_HANDLE stale_handle_sum_status, stale_handle_points_sum, read_handle, 3
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
     EXPAND DB_OPEN_READ_TABLE open_after_status, read_handle_after, ROOT, ROOT_LEN, TABLE, TABLE_LEN
@@ -61,11 +64,17 @@ L_ENTRY:
     EXPAND DB_COUNT_U64_EQ_HANDLE count_status, plan_one_count, read_handle_after, 1, 1
     EXPAND DB_CLOSE_READ_TABLE close_after_status, read_handle_after
     EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_RESTORE restore_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, snapshot_epoch, info
+    EXPAND DB_OPEN_READ_TABLE open_restore_status, read_handle_restore, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SUM_U64_HANDLE restore_sum_status, points_sum_restore, read_handle_restore, 3
+    EXPAND DB_CLOSE_READ_TABLE close_restore_status, read_handle_restore
 
     ok_remove = eq remove_status, SA_DB_OK
     ok_init = eq init_status, SA_DB_OK
     ok_ingest = eq ingest_status, SA_DB_OK
     ok_rows = eq rows, ROWS
+    ok_snapshot_status = eq snapshot_status, SA_DB_OK
+    ok_snapshot_epoch = eq snapshot_epoch, 1
     ok_open_status = eq open_status, SA_DB_OK
     ok_handle_sum_status = eq handle_sum_status, SA_DB_OK
     ok_handle_sum = eq handle_points_sum_before, 100
@@ -77,6 +86,7 @@ L_ENTRY:
     ok_handle_max = eq handle_points_max, 40
     ok_update_status = eq update_status, SA_DB_OK
     ok_updated_rows = eq updated_rows, ROWS
+    ok_recover_status = eq recover_status, SA_DB_OK
     ok_stale_sum_status = eq stale_handle_sum_status, SA_DB_OK
     ok_stale_sum = eq stale_handle_points_sum, 100
     ok_close_status = eq close_status, SA_DB_OK
@@ -87,35 +97,50 @@ L_ENTRY:
     ok_count = eq plan_one_count, 2
     ok_close_after_status = eq close_after_status, SA_DB_OK
     ok_verify = eq verify_status, SA_DB_OK
+    ok_restore_status = eq restore_status, SA_DB_OK
+    ok_open_restore_status = eq open_restore_status, SA_DB_OK
+    ok_restore_sum_status = eq restore_sum_status, SA_DB_OK
+    ok_restore_sum = eq points_sum_restore, 100
+    ok_close_restore_status = eq close_restore_status, SA_DB_OK
     ok01 = and ok_remove, ok_init
     ok02 = and ok01, ok_ingest
     ok03 = and ok02, ok_rows
-    ok04 = and ok03, ok_open_status
-    ok05 = and ok04, ok_handle_sum_status
-    ok06 = and ok05, ok_handle_sum
-    ok07 = and ok06, ok_handle_count_status
-    ok08 = and ok07, ok_handle_count
-    ok09 = and ok08, ok_handle_min_status
-    ok10 = and ok09, ok_handle_min
-    ok11 = and ok10, ok_handle_max_status
-    ok12 = and ok11, ok_handle_max
-    ok13 = and ok12, ok_update_status
-    ok14 = and ok13, ok_updated_rows
-    ok15 = and ok14, ok_stale_sum_status
-    ok16 = and ok15, ok_stale_sum
-    ok17 = and ok16, ok_close_status
-    ok18 = and ok17, ok_open_after_status
-    ok19 = and ok18, ok_sum_after_status
-    ok20 = and ok19, ok_sum_after
-    ok21 = and ok20, ok_count_status
-    ok22 = and ok21, ok_count
-    ok23 = and ok22, ok_close_after_status
-    ok = and ok23, ok_verify
+    ok04 = and ok03, ok_snapshot_status
+    ok05 = and ok04, ok_snapshot_epoch
+    ok06 = and ok05, ok_open_status
+    ok07 = and ok06, ok_handle_sum_status
+    ok08 = and ok07, ok_handle_sum
+    ok09 = and ok08, ok_handle_count_status
+    ok10 = and ok09, ok_handle_count
+    ok11 = and ok10, ok_handle_min_status
+    ok12 = and ok11, ok_handle_min
+    ok13 = and ok12, ok_handle_max_status
+    ok14 = and ok13, ok_handle_max
+    ok15 = and ok14, ok_update_status
+    ok16 = and ok15, ok_updated_rows
+    ok17 = and ok16, ok_recover_status
+    ok18 = and ok17, ok_stale_sum_status
+    ok19 = and ok18, ok_stale_sum
+    ok20 = and ok19, ok_close_status
+    ok21 = and ok20, ok_open_after_status
+    ok22 = and ok21, ok_sum_after_status
+    ok23 = and ok22, ok_sum_after
+    ok24 = and ok23, ok_count_status
+    ok25 = and ok24, ok_count
+    ok26 = and ok25, ok_close_after_status
+    ok27 = and ok26, ok_verify
+    ok28 = and ok27, ok_restore_status
+    ok29 = and ok28, ok_open_restore_status
+    ok30 = and ok29, ok_restore_sum_status
+    ok31 = and ok30, ok_restore_sum
+    ok = and ok31, ok_close_restore_status
 
     !remove_status
     !init_status
     !ingest_status
     !rows
+    !snapshot_status
+    !snapshot_epoch
     !open_status
     !read_handle
     !handle_sum_status
@@ -128,6 +153,7 @@ L_ENTRY:
     !handle_points_max
     !update_status
     !updated_rows
+    !recover_status
     !stale_handle_sum_status
     !stale_handle_points_sum
     !close_status
@@ -139,10 +165,18 @@ L_ENTRY:
     !plan_one_count
     !close_after_status
     !verify_status
+    !restore_status
+    !open_restore_status
+    !read_handle_restore
+    !restore_sum_status
+    !points_sum_restore
+    !close_restore_status
     !ok_remove
     !ok_init
     !ok_ingest
     !ok_rows
+    !ok_snapshot_status
+    !ok_snapshot_epoch
     !ok_open_status
     !ok_handle_sum_status
     !ok_handle_sum
@@ -154,6 +188,7 @@ L_ENTRY:
     !ok_handle_max
     !ok_update_status
     !ok_updated_rows
+    !ok_recover_status
     !ok_stale_sum_status
     !ok_stale_sum
     !ok_close_status
@@ -164,6 +199,11 @@ L_ENTRY:
     !ok_count
     !ok_close_after_status
     !ok_verify
+    !ok_restore_status
+    !ok_open_restore_status
+    !ok_restore_sum_status
+    !ok_restore_sum
+    !ok_close_restore_status
     !ok01
     !ok02
     !ok03
@@ -187,6 +227,14 @@ L_ENTRY:
     !ok21
     !ok22
     !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
     !id_col
     !plan_col
     !status_col

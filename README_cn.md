@@ -127,7 +127,7 @@ Schema 文件采用类似 C 语言宏定义的指令集（`#def`）：
 
 ### 当前可靠性状态
 
-当前版本已经具备文件级原子替换：写入 schema、meta、列段文件、snapshot/restore 目标文件时，会先写入同目录临时文件，执行文件同步，再通过原子 rename 替换活跃文件；在 Linux 上会尽力同步父目录。表提交由 active manifest 选择，manifest 指向版本化元数据文件（`<table>.meta.<epoch>`）；修改已有列数据时会写入新的版本化列文件，再推进 manifest，因此 manifest 替换前崩溃仍可读取旧 epoch。Qmod 读写路径也使用同一套 active-manifest 协议。`verify` 会校验 schema 哈希、列段 SHA-256、元数据记录字节数，以及 `segment.rows * column.stride` 推导出的期望字节数。
+当前版本已经具备文件级原子替换：写入 schema、meta、列段文件、snapshot/restore 目标文件时，会先写入同目录临时文件，执行文件同步，再通过原子 rename 替换活跃文件；在 Linux 上会尽力同步父目录。表提交由 active manifest 选择，manifest 指向版本化元数据文件（`<table>.meta.<epoch>`）；修改已有列数据时会写入新的版本化列文件，再推进 manifest，因此 manifest 替换前崩溃仍可读取旧 epoch。Qmod 读写路径也使用同一套 active-manifest 协议。`verify` 会校验 schema 哈希、列段 SHA-256、元数据记录字节数，以及 `segment.rows * column.stride` 推导出的期望字节数。`recover` 会扫描版本化元数据文件，选择最高的有效 epoch 重建 manifest，用于处理中断提交后 manifest 损坏或丢失的情况。
 
 这仍不是完整的 SQLite 级 ACID/WAL。面向中小型 ERP 的下一阶段需要继续补齐事务提交语义、主键/二级索引、行级 insert/upsert/get/delete、范围查询 handle、nullable/decimal/date/string-dict 类型，以及 SA 编写的 ERP 场景 benchmark。
 

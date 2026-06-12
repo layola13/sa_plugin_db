@@ -69,6 +69,18 @@
     %out_status = call @sa_db_ingest_columns(&%root, %root_len, &%table_name, %table_name_len, %row_count, %columns, %columns_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_SNAPSHOT %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_snapshot(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_RESTORE %out_status, %root, %root_len, %table_name, %table_name_len, %epoch, %out_info
+    %out_status = call @sa_db_restore(&%root, %root_len, &%table_name, %table_name_len, %epoch, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_RECOVER %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
+    %out_status = call @sa_db_recover(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_VERIFY %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
     %out_status = call @sa_db_verify(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
 [END_MACRO]
