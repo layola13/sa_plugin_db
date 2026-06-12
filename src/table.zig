@@ -144,6 +144,11 @@ pub const U64FindResult = struct {
     row_index: u64,
 };
 
+pub const U64RangeResult = struct {
+    written: u64,
+    total: u64,
+};
+
 pub const ReadSnapshot = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -2476,6 +2481,42 @@ pub fn snapshotFindU64(snapshot: *const ReadSnapshot, column_index: usize, expec
     return .{ .found = false, .row_index = 0 };
 }
 
+pub fn snapshotRangeU64Rows(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u64,
+    max_value: u64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    const index = snapshotIndexForU64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+
+    const start = lowerBoundU64Index(index, min_value);
+    const end = upperBoundU64Index(index, max_value);
+    const total = end - start;
+    if (offset >= @as(u64, @intCast(total)) or limit == 0 or out_rows.len == 0) {
+        return .{ .written = 0, .total = @intCast(total) };
+    }
+
+    const offset_usize: usize = @intCast(offset);
+    const page_start = start + offset_usize;
+    const available = end - page_start;
+    const capped_by_limit: usize = if (limit > @as(u64, @intCast(std.math.maxInt(usize))))
+        available
+    else
+        @min(available, @as(usize, @intCast(limit)));
+    const write_count = @min(capped_by_limit, out_rows.len);
+
+    var i: usize = 0;
+    while (i < write_count) : (i += 1) {
+        out_rows[i] = readIndexRow(index.entries, page_start + i);
+    }
+    return .{ .written = @intCast(write_count), .total = @intCast(total) };
+}
+
 pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
     try ensureSnapshotU64Column(snapshot, column_index);
     if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
@@ -2989,6 +3030,16 @@ test "table persistent u64 index tracks ingest update and corruption" {
         defer snapshot.destroy();
         try std.testing.expectEqual(@as(u64, 5), snapshot.row_count);
         try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 5));
+        var range_rows = [_]u64{ 99, 99, 99 };
+        const range = try snapshotRangeU64Rows(snapshot, 0, 2, 5, 1, 2, &range_rows);
+        try std.testing.expectEqual(@as(u64, 4), range.total);
+        try std.testing.expectEqual(@as(u64, 2), range.written);
+        try std.testing.expectEqual(@as(u64, 2), range_rows[0]);
+        try std.testing.expectEqual(@as(u64, 3), range_rows[1]);
+        const empty_range = try snapshotRangeU64Rows(snapshot, 0, 9, 2, 0, 2, &range_rows);
+        try std.testing.expectEqual(@as(u64, 0), empty_range.total);
+        try std.testing.expectEqual(@as(u64, 0), empty_range.written);
+        try std.testing.expectError(TableError.InvalidFormat, snapshotRangeU64Rows(snapshot, 1, 10, 50, 0, 2, &range_rows));
         var fetched_row: [16]u8 = undefined;
         try snapshotGetRowU64Key(snapshot, 0, 5, &fetched_row);
         try std.testing.expectEqual(@as(u64, 50), readU64LE(&fetched_row, 8));

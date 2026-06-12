@@ -49,6 +49,14 @@ fn outputBytes(ptr: ?[*]u8, len: u64) ?[]u8 {
     return p[0..n];
 }
 
+fn outputU64s(ptr: ?[*]u64, len: u64) ?[]u64 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return null;
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
 fn requiredBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
     const bytes = inputBytes(ptr, len) orelse return null;
     if (bytes.len == 0) return null;
@@ -528,6 +536,32 @@ pub export fn sa_db_find_u64_handle(handle: ?*anyopaque, column_index: u64, expe
     return SA_DB_OK;
 }
 
+pub export fn sa_db_range_u64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_value: u64,
+    max_value: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotRangeU64Rows(snapshot, @intCast(column_index), min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u64) u32 {
     const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -639,6 +673,15 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     var handle_count: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_count_u64_cmp_handle(handle, 0, @intFromEnum(table.U64CompareOp.ge), 2, &handle_count));
     try std.testing.expectEqual(@as(u64, 4), handle_count);
+    var range_rows = [_]u64{ 99, 99 };
+    var range_written: u64 = 0;
+    var range_total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_handle(handle, 0, 2, 5, 1, 2, &range_rows, range_rows.len, &range_written, &range_total));
+    try std.testing.expectEqual(@as(u64, 4), range_total);
+    try std.testing.expectEqual(@as(u64, 2), range_written);
+    try std.testing.expectEqual(@as(u64, 2), range_rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), range_rows[1]);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_range_u64_handle(handle, 1, 10, 50, 0, 2, &range_rows, range_rows.len, &range_written, &range_total));
     var found: u64 = 0;
     var row_index: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(handle, 0, 3, &found, &row_index));

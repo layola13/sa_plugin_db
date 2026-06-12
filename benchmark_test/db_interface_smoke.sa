@@ -14,6 +14,8 @@
 #def UPSERT_ROWS = 6
 #def COL_BYTES = 32
 #def ROW_BYTES = 32
+#def RANGE_ROWS_CAP = 4
+#def RANGE_ROWS_BYTES = 32
 #def COLUMN_COUNT = 4
 #def COLUMNS_BYTES = 64
 
@@ -27,6 +29,7 @@ L_ENTRY:
     points_col = alloc COL_BYTES
     new_row = alloc ROW_BYTES
     fetched_row = alloc ROW_BYTES
+    range_rows = alloc RANGE_ROWS_BYTES
 
     store id_col+0, 1 as u64
     store id_col+8, 2 as u64
@@ -79,6 +82,9 @@ L_ENTRY:
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
     EXPAND DB_SUM_U64_HANDLE handle_sum_status, handle_points_sum_before, read_handle, 3
     EXPAND DB_COUNT_U64_CMP_HANDLE handle_count_status, handle_plan_ge_count, read_handle, 1, SA_DB_CMP_GE, 2
+    EXPAND DB_RANGE_U64_HANDLE range_status, range_written, range_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 2, 5, 1, 2
+    range_row0 = load range_rows+0 as u64
+    range_row1 = load range_rows+8 as u64
     EXPAND DB_FIND_U64_HANDLE find_status, found_member, found_row, read_handle, 0, 5
     EXPAND DB_GET_U64_HANDLE get_status, found_points, read_handle, 3, found_row
     EXPAND DB_GET_ROW_U64_KEY_HANDLE get_row_key_status, read_handle, 0, 5, fetched_row, ROW_BYTES
@@ -129,6 +135,11 @@ L_ENTRY:
     ok_handle_sum = eq handle_points_sum_before, 215
     ok_handle_count_status = eq handle_count_status, SA_DB_OK
     ok_handle_count = eq handle_plan_ge_count, 4
+    ok_range_status = eq range_status, SA_DB_OK
+    ok_range_written = eq range_written, 2
+    ok_range_total = eq range_total, 4
+    ok_range_row0 = eq range_row0, 2
+    ok_range_row1 = eq range_row1, 3
     ok_find_status = eq find_status, SA_DB_OK
     ok_find_found = eq found_member, 1
     ok_find_row = eq found_row, 4
@@ -187,7 +198,12 @@ L_ENTRY:
     ok11 = and ok10, ok_handle_sum
     ok12 = and ok11, ok_handle_count_status
     ok13 = and ok12, ok_handle_count
-    ok14 = and ok13, ok_find_status
+    ok13a = and ok13, ok_range_status
+    ok13b = and ok13a, ok_range_written
+    ok13c = and ok13b, ok_range_total
+    ok13d = and ok13c, ok_range_row0
+    ok13e = and ok13d, ok_range_row1
+    ok14 = and ok13e, ok_find_status
     ok15 = and ok14, ok_find_found
     ok16 = and ok15, ok_find_row
     ok17 = and ok16, ok_get_status
@@ -248,6 +264,11 @@ L_ENTRY:
     !handle_points_sum_before
     !handle_count_status
     !handle_plan_ge_count
+    !range_status
+    !range_written
+    !range_total
+    !range_row0
+    !range_row1
     !find_status
     !found_member
     !found_row
@@ -309,6 +330,11 @@ L_ENTRY:
     !ok_handle_sum
     !ok_handle_count_status
     !ok_handle_count
+    !ok_range_status
+    !ok_range_written
+    !ok_range_total
+    !ok_range_row0
+    !ok_range_row1
     !ok_find_status
     !ok_find_found
     !ok_find_row
@@ -367,6 +393,11 @@ L_ENTRY:
     !ok11
     !ok12
     !ok13
+    !ok13a
+    !ok13b
+    !ok13c
+    !ok13d
+    !ok13e
     !ok14
     !ok15
     !ok16
@@ -409,6 +440,7 @@ L_ENTRY:
     !points_col
     !new_row
     !fetched_row
+    !range_rows
     br ok -> L_OK, L_FAIL
 
 L_OK:
