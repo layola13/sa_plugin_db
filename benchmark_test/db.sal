@@ -19,11 +19,39 @@
 #def SA_DB_CMP_GT = 4
 #def SA_DB_CMP_GE = 5
 
+#def SA_DB_TYPE_VOID = 0
+#def SA_DB_TYPE_I1 = 1
+#def SA_DB_TYPE_I8 = 2
+#def SA_DB_TYPE_I16 = 3
+#def SA_DB_TYPE_I32 = 4
+#def SA_DB_TYPE_I64 = 5
+#def SA_DB_TYPE_U8 = 6
+#def SA_DB_TYPE_U16 = 7
+#def SA_DB_TYPE_U32 = 8
+#def SA_DB_TYPE_U64 = 9
+#def SA_DB_TYPE_F32 = 10
+#def SA_DB_TYPE_F64 = 11
+#def SA_DB_TYPE_PTR = 12
+#def SA_DB_TYPE_BLOB_HANDLE = 13
+#def SA_DB_TYPE_V128 = 14
+
 #def SaDbTableInfo_SIZE = 32
 #def SaDbTableInfo_row_count = +0
 #def SaDbTableInfo_segment_count = +8
 #def SaDbTableInfo_epoch = +16
 #def SaDbTableInfo_locked = +24
+
+#def SaDbSnapshotInfo_SIZE = 32
+#def SaDbSnapshotInfo_row_count = +0
+#def SaDbSnapshotInfo_column_count = +8
+#def SaDbSnapshotInfo_row_bytes = +16
+#def SaDbSnapshotInfo_epoch = +24
+
+#def SaDbColumnInfo_SIZE = 32
+#def SaDbColumnInfo_stride = +0
+#def SaDbColumnInfo_type_code = +8
+#def SaDbColumnInfo_name_len = +16
+#def SaDbColumnInfo_type_name_len = +24
 
 #def SaDbColumnInput_SIZE = 16
 #def SaDbColumnInput_data = +0
@@ -130,6 +158,46 @@
 
 [MACRO] DB_CLOSE_READ_TABLE %out_status, %handle
     %out_status = call @sa_db_close_read_table(%handle)
+[END_MACRO]
+
+[MACRO] DB_SNAPSHOT_INFO_HANDLE %out_status, %handle, %out_info
+    %out_status = call @sa_db_snapshot_info_handle(%handle, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_SNAPSHOT_INFO_ROW_COUNT %out_rows, %info
+    %out_rows = load %info+SaDbSnapshotInfo_row_count as u64
+[END_MACRO]
+
+[MACRO] DB_SNAPSHOT_INFO_COLUMN_COUNT %out_columns, %info
+    %out_columns = load %info+SaDbSnapshotInfo_column_count as u64
+[END_MACRO]
+
+[MACRO] DB_SNAPSHOT_INFO_ROW_BYTES %out_row_bytes, %info
+    %out_row_bytes = load %info+SaDbSnapshotInfo_row_bytes as u64
+[END_MACRO]
+
+[MACRO] DB_SNAPSHOT_INFO_EPOCH %out_epoch, %info
+    %out_epoch = load %info+SaDbSnapshotInfo_epoch as u64
+[END_MACRO]
+
+[MACRO] DB_COLUMN_INFO_HANDLE %out_status, %handle, %column_index, %out_info
+    %out_status = call @sa_db_column_info_handle(%handle, %column_index, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_COLUMN_INFO_STRIDE %out_stride, %info
+    %out_stride = load %info+SaDbColumnInfo_stride as u64
+[END_MACRO]
+
+[MACRO] DB_COLUMN_INFO_TYPE_CODE %out_type_code, %info
+    %out_type_code = load %info+SaDbColumnInfo_type_code as u64
+[END_MACRO]
+
+[MACRO] DB_COLUMN_INFO_NAME_LEN %out_name_len, %info
+    %out_name_len = load %info+SaDbColumnInfo_name_len as u64
+[END_MACRO]
+
+[MACRO] DB_COLUMN_INFO_TYPE_NAME_LEN %out_type_name_len, %info
+    %out_type_name_len = load %info+SaDbColumnInfo_type_name_len as u64
 [END_MACRO]
 
 [MACRO] DB_SUM_U64_HANDLE %out_status, %out_sum, %handle, %column_index

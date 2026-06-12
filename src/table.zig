@@ -154,6 +154,20 @@ pub const ProjectRowsResult = struct {
     required_bytes: u64,
 };
 
+pub const SnapshotInfo = struct {
+    row_count: u64,
+    column_count: u64,
+    row_bytes: u64,
+    epoch: u64,
+};
+
+pub const ColumnInfo = struct {
+    stride: u64,
+    type_code: u64,
+    name_len: u64,
+    type_name_len: u64,
+};
+
 pub const ReadSnapshot = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -2126,6 +2140,28 @@ fn snapshotRowBytes(snapshot: *const ReadSnapshot) TableError!usize {
     return @intCast(total);
 }
 
+pub fn snapshotInfo(snapshot: *const ReadSnapshot) TableError!SnapshotInfo {
+    const row_bytes = try snapshotRowBytes(snapshot);
+    return .{
+        .row_count = snapshot.row_count,
+        .column_count = @intCast(snapshot.columns.len),
+        .row_bytes = @intCast(row_bytes),
+        .epoch = snapshot.epoch,
+    };
+}
+
+pub fn snapshotColumnInfo(snapshot: *const ReadSnapshot, column_index: usize) TableError!ColumnInfo {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    const ty = try parsePrimTypeTable(column.ty);
+    return .{
+        .stride = column.stride,
+        .type_code = @intFromEnum(ty),
+        .name_len = column.name.len,
+        .type_name_len = column.ty.len,
+    };
+}
+
 fn snapshotCopyRow(snapshot: *const ReadSnapshot, row_index: u64, out_row: []u8) TableError!void {
     if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
     const row_bytes = try snapshotRowBytes(snapshot);
@@ -3103,6 +3139,15 @@ test "table persistent u64 index tracks ingest update and corruption" {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
         try std.testing.expectEqual(@as(u64, 5), snapshot.row_count);
+        const info = try snapshotInfo(snapshot);
+        try std.testing.expectEqual(@as(u64, 5), info.row_count);
+        try std.testing.expectEqual(@as(u64, 2), info.column_count);
+        try std.testing.expectEqual(@as(u64, 16), info.row_bytes);
+        const points_info = try snapshotColumnInfo(snapshot, 1);
+        try std.testing.expectEqual(@as(u64, 8), points_info.stride);
+        try std.testing.expectEqual(@as(u64, @intFromEnum(schema.PrimType.u64)), points_info.type_code);
+        try std.testing.expectEqual(@as(u64, 6), points_info.name_len);
+        try std.testing.expectEqual(@as(u64, 3), points_info.type_name_len);
         try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 5));
         var range_rows = [_]u64{ 99, 99, 99 };
         const range = try snapshotRangeU64Rows(snapshot, 0, 2, 5, 1, 2, &range_rows);

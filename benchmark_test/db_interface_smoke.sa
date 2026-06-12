@@ -25,6 +25,8 @@
 @main() -> i32:
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
+    snapshot_info = stack_alloc SaDbSnapshotInfo_SIZE
+    column_info = stack_alloc SaDbColumnInfo_SIZE
     columns = stack_alloc COLUMNS_BYTES
     id_col = alloc COL_BYTES
     plan_col = alloc COL_BYTES
@@ -87,6 +89,16 @@ L_ENTRY:
     EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INFO_EPOCH snapshot_epoch, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SNAPSHOT_INFO_HANDLE shape_status, read_handle, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_COUNT shape_rows, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_COLUMN_COUNT shape_columns, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_BYTES shape_row_bytes, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_EPOCH shape_epoch, snapshot_info
+    EXPAND DB_COLUMN_INFO_HANDLE column_info_status, read_handle, 3, column_info
+    EXPAND DB_COLUMN_INFO_STRIDE column_stride, column_info
+    EXPAND DB_COLUMN_INFO_TYPE_CODE column_type, column_info
+    EXPAND DB_COLUMN_INFO_NAME_LEN column_name_len, column_info
+    EXPAND DB_COLUMN_INFO_TYPE_NAME_LEN column_type_name_len, column_info
     EXPAND DB_SUM_U64_HANDLE handle_sum_status, handle_points_sum_before, read_handle, 3
     EXPAND DB_COUNT_U64_CMP_HANDLE handle_count_status, handle_plan_ge_count, read_handle, 1, SA_DB_CMP_GE, 2
     EXPAND DB_RANGE_U64_HANDLE range_status, range_written, range_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 2, 5, 1, 2
@@ -146,6 +158,16 @@ L_ENTRY:
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
     ok_snapshot_epoch = eq snapshot_epoch, 5
     ok_open_status = eq open_status, SA_DB_OK
+    ok_shape_status = eq shape_status, SA_DB_OK
+    ok_shape_rows = eq shape_rows, UPSERT_ROWS
+    ok_shape_columns = eq shape_columns, COLUMN_COUNT
+    ok_shape_row_bytes = eq shape_row_bytes, ROW_BYTES
+    ok_shape_epoch = eq shape_epoch, 5
+    ok_column_info_status = eq column_info_status, SA_DB_OK
+    ok_column_stride = eq column_stride, 8
+    ok_column_type = eq column_type, SA_DB_TYPE_U64
+    ok_column_name_len = eq column_name_len, 6
+    ok_column_type_name_len = eq column_type_name_len, 3
     ok_handle_sum_status = eq handle_sum_status, SA_DB_OK
     ok_handle_sum = eq handle_points_sum_before, 215
     ok_handle_count_status = eq handle_count_status, SA_DB_OK
@@ -219,7 +241,17 @@ L_ENTRY:
     ok07 = and ok06h, ok_snapshot_status
     ok08 = and ok07, ok_snapshot_epoch
     ok09 = and ok08, ok_open_status
-    ok10 = and ok09, ok_handle_sum_status
+    ok09a = and ok09, ok_shape_status
+    ok09b = and ok09a, ok_shape_rows
+    ok09c = and ok09b, ok_shape_columns
+    ok09d = and ok09c, ok_shape_row_bytes
+    ok09e = and ok09d, ok_shape_epoch
+    ok09f = and ok09e, ok_column_info_status
+    ok09g = and ok09f, ok_column_stride
+    ok09h = and ok09g, ok_column_type
+    ok09i = and ok09h, ok_column_name_len
+    ok09j = and ok09i, ok_column_type_name_len
+    ok10 = and ok09j, ok_handle_sum_status
     ok11 = and ok10, ok_handle_sum
     ok12 = and ok11, ok_handle_count_status
     ok13 = and ok12, ok_handle_count
@@ -295,6 +327,16 @@ L_ENTRY:
     !snapshot_epoch
     !open_status
     !read_handle
+    !shape_status
+    !shape_rows
+    !shape_columns
+    !shape_row_bytes
+    !shape_epoch
+    !column_info_status
+    !column_stride
+    !column_type
+    !column_name_len
+    !column_type_name_len
     !handle_sum_status
     !handle_points_sum_before
     !handle_count_status
@@ -371,6 +413,16 @@ L_ENTRY:
     !ok_snapshot_status
     !ok_snapshot_epoch
     !ok_open_status
+    !ok_shape_status
+    !ok_shape_rows
+    !ok_shape_columns
+    !ok_shape_row_bytes
+    !ok_shape_epoch
+    !ok_column_info_status
+    !ok_column_stride
+    !ok_column_type
+    !ok_column_name_len
+    !ok_column_type_name_len
     !ok_handle_sum_status
     !ok_handle_sum
     !ok_handle_count_status
@@ -444,6 +496,16 @@ L_ENTRY:
     !ok07
     !ok08
     !ok09
+    !ok09a
+    !ok09b
+    !ok09c
+    !ok09d
+    !ok09e
+    !ok09f
+    !ok09g
+    !ok09h
+    !ok09i
+    !ok09j
     !ok10
     !ok11
     !ok12

@@ -17,6 +17,8 @@
 @extern sa_db_update_u64_add(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, start_row: u64, update_count: u64, delta: u64, &out_updated: ptr) -> u32
 @extern sa_db_open_read_table(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_handle: ptr) -> u32
 @extern sa_db_close_read_table(handle: ptr) -> u32
+@extern sa_db_snapshot_info_handle(handle: ptr, &out_info: ptr) -> u32
+@extern sa_db_column_info_handle(handle: ptr, column_index: u64, &out_info: ptr) -> u32
 @extern sa_db_sum_u64_handle(handle: ptr, column_index: u64, &out_sum: ptr) -> u32
 @extern sa_db_count_u64_eq_handle(handle: ptr, column_index: u64, expected: u64, &out_count: ptr) -> u32
 @extern sa_db_count_u64_cmp_handle(handle: ptr, column_index: u64, op: u32, expected: u64, &out_count: ptr) -> u32

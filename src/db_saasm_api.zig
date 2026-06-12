@@ -28,6 +28,20 @@ pub const SaDbTableInfo = extern struct {
     locked: u64,
 };
 
+pub const SaDbSnapshotInfo = extern struct {
+    row_count: u64,
+    column_count: u64,
+    row_bytes: u64,
+    epoch: u64,
+};
+
+pub const SaDbColumnInfo = extern struct {
+    stride: u64,
+    type_code: u64,
+    name_len: u64,
+    type_name_len: u64,
+};
+
 pub const SaDbColumnInput = extern struct {
     data: ?[*]const u8,
     len: u64,
@@ -96,6 +110,28 @@ fn fillInfo(out_info: ?*SaDbTableInfo, info: table.TableInfo) u32 {
         .segment_count = @intCast(info.segment_count),
         .epoch = info.epoch,
         .locked = if (info.locked) 1 else 0,
+    };
+    return SA_DB_OK;
+}
+
+fn fillSnapshotInfo(out_info: ?*SaDbSnapshotInfo, info: table.SnapshotInfo) u32 {
+    const slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = .{
+        .row_count = info.row_count,
+        .column_count = info.column_count,
+        .row_bytes = info.row_bytes,
+        .epoch = info.epoch,
+    };
+    return SA_DB_OK;
+}
+
+fn fillColumnInfo(out_info: ?*SaDbColumnInfo, info: table.ColumnInfo) u32 {
+    const slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = .{
+        .stride = info.stride,
+        .type_code = info.type_code,
+        .name_len = info.name_len,
+        .type_name_len = info.type_name_len,
     };
     return SA_DB_OK;
 }
@@ -499,6 +535,21 @@ pub export fn sa_db_close_read_table(handle: ?*anyopaque) u32 {
     return SA_DB_OK;
 }
 
+pub export fn sa_db_snapshot_info_handle(handle: ?*anyopaque, out_info: ?*SaDbSnapshotInfo) u32 {
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const info = table.snapshotInfo(snapshot) catch |err| return tableStatus(err);
+    return fillSnapshotInfo(out_info, info);
+}
+
+pub export fn sa_db_column_info_handle(handle: ?*anyopaque, column_index: u64, out_info: ?*SaDbColumnInfo) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const info = table.snapshotColumnInfo(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    return fillColumnInfo(out_info, info);
+}
+
 pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_sum: ?*u64) u32 {
     const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -719,6 +770,20 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &handle));
     try std.testing.expect(handle != null);
+
+    var snapshot_info: SaDbSnapshotInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_snapshot_info_handle(handle, &snapshot_info));
+    try std.testing.expectEqual(@as(u64, 5), snapshot_info.row_count);
+    try std.testing.expectEqual(@as(u64, 2), snapshot_info.column_count);
+    try std.testing.expectEqual(@as(u64, 16), snapshot_info.row_bytes);
+    try std.testing.expectEqual(@as(u64, 5), snapshot_info.epoch);
+    var column_info: SaDbColumnInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_column_info_handle(handle, 1, &column_info));
+    try std.testing.expectEqual(@as(u64, 8), column_info.stride);
+    try std.testing.expectEqual(@as(u64, 9), column_info.type_code);
+    try std.testing.expectEqual(@as(u64, 6), column_info.name_len);
+    try std.testing.expectEqual(@as(u64, 3), column_info.type_name_len);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_column_info_handle(handle, 99, &column_info));
 
     var handle_sum: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
