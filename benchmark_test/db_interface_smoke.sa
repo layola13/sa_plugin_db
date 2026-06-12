@@ -11,6 +11,7 @@
 #def SCHEMA_LEN = 149
 #def ROWS = 4
 #def TOTAL_ROWS = 5
+#def UPSERT_ROWS = 6
 #def COL_BYTES = 32
 #def ROW_BYTES = 32
 #def COLUMN_COUNT = 4
@@ -61,6 +62,18 @@ L_ENTRY:
     EXPAND DB_INFO_ROW_COUNT rows_after_insert, info
     EXPAND DB_INSERT_ROW duplicate_insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_duplicate, info
+    store new_row+0, 5 as u64
+    store new_row+8, 4 as u64
+    store new_row+16, 1 as u64
+    store new_row+24, 55 as u64
+    EXPAND DB_UPSERT_ROW_U64_KEY upsert_existing_status, upsert_existing_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 5, new_row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_upsert_existing, info
+    store new_row+0, 6 as u64
+    store new_row+8, 5 as u64
+    store new_row+16, 0 as u64
+    store new_row+24, 60 as u64
+    EXPAND DB_UPSERT_ROW_U64_KEY upsert_new_status, upsert_new_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 6, new_row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_upsert_new, info
     EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INFO_EPOCH snapshot_epoch, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
@@ -103,41 +116,47 @@ L_ENTRY:
     ok_rows_after_insert = eq rows_after_insert, TOTAL_ROWS
     ok_duplicate_insert_status = eq duplicate_insert_status, SA_DB_ERR_CONSTRAINT
     ok_rows_after_duplicate = eq rows_after_duplicate, TOTAL_ROWS
+    ok_upsert_existing_status = eq upsert_existing_status, SA_DB_OK
+    ok_upsert_existing_inserted = eq upsert_existing_inserted, 0
+    ok_rows_after_upsert_existing = eq rows_after_upsert_existing, TOTAL_ROWS
+    ok_upsert_new_status = eq upsert_new_status, SA_DB_OK
+    ok_upsert_new_inserted = eq upsert_new_inserted, 1
+    ok_rows_after_upsert_new = eq rows_after_upsert_new, UPSERT_ROWS
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
-    ok_snapshot_epoch = eq snapshot_epoch, 3
+    ok_snapshot_epoch = eq snapshot_epoch, 5
     ok_open_status = eq open_status, SA_DB_OK
     ok_handle_sum_status = eq handle_sum_status, SA_DB_OK
-    ok_handle_sum = eq handle_points_sum_before, 150
+    ok_handle_sum = eq handle_points_sum_before, 215
     ok_handle_count_status = eq handle_count_status, SA_DB_OK
-    ok_handle_count = eq handle_plan_ge_count, 3
+    ok_handle_count = eq handle_plan_ge_count, 4
     ok_find_status = eq find_status, SA_DB_OK
     ok_find_found = eq found_member, 1
     ok_find_row = eq found_row, 4
     ok_get_status = eq get_status, SA_DB_OK
-    ok_get_points = eq found_points, 50
+    ok_get_points = eq found_points, 55
     ok_get_row_key_status = eq get_row_key_status, SA_DB_OK
     ok_fetched_id = eq fetched_id, 5
     ok_fetched_plan = eq fetched_plan, 4
     ok_fetched_status = eq fetched_status, 1
-    ok_fetched_points = eq fetched_points, 50
+    ok_fetched_points = eq fetched_points, 55
     ok_get_row_missing_status = eq get_row_missing_status, SA_DB_ERR_NOT_FOUND
     ok_handle_min_status = eq handle_min_status, SA_DB_OK
     ok_handle_min = eq handle_points_min, 10
     ok_handle_max_status = eq handle_max_status, SA_DB_OK
-    ok_handle_max = eq handle_points_max, 50
+    ok_handle_max = eq handle_points_max, 60
     ok_update_status = eq update_status, SA_DB_OK
     ok_updated_rows = eq updated_rows, ROWS
     ok_recover_status = eq recover_status, SA_DB_OK
     ok_stale_sum_status = eq stale_handle_sum_status, SA_DB_OK
-    ok_stale_sum = eq stale_handle_points_sum, 150
+    ok_stale_sum = eq stale_handle_points_sum, 215
     ok_close_status = eq close_status, SA_DB_OK
     ok_delete_status = eq delete_status, SA_DB_OK
-    ok_rows_after_delete = eq rows_after_delete, ROWS
+    ok_rows_after_delete = eq rows_after_delete, TOTAL_ROWS
     ok_delete_missing_status = eq delete_missing_status, SA_DB_ERR_NOT_FOUND
-    ok_rows_after_delete_missing = eq rows_after_delete_missing, ROWS
+    ok_rows_after_delete_missing = eq rows_after_delete_missing, TOTAL_ROWS
     ok_open_after_status = eq open_after_status, SA_DB_OK
     ok_sum_after_status = eq sum_after_status, SA_DB_OK
-    ok_sum_after = eq points_sum_after, 120
+    ok_sum_after = eq points_sum_after, 180
     ok_count_status = eq count_status, SA_DB_OK
     ok_count = eq plan_one_count, 2
     ok_close_after_status = eq close_after_status, SA_DB_OK
@@ -145,7 +164,7 @@ L_ENTRY:
     ok_restore_status = eq restore_status, SA_DB_OK
     ok_open_restore_status = eq open_restore_status, SA_DB_OK
     ok_restore_sum_status = eq restore_sum_status, SA_DB_OK
-    ok_restore_sum = eq points_sum_restore, 150
+    ok_restore_sum = eq points_sum_restore, 215
     ok_close_restore_status = eq close_restore_status, SA_DB_OK
     ok01 = and ok_remove, ok_init
     ok02 = and ok01, ok_ingest
@@ -155,7 +174,13 @@ L_ENTRY:
     ok06 = and ok05, ok_rows_after_insert
     ok06a = and ok06, ok_duplicate_insert_status
     ok06b = and ok06a, ok_rows_after_duplicate
-    ok07 = and ok06b, ok_snapshot_status
+    ok06c = and ok06b, ok_upsert_existing_status
+    ok06d = and ok06c, ok_upsert_existing_inserted
+    ok06e = and ok06d, ok_rows_after_upsert_existing
+    ok06f = and ok06e, ok_upsert_new_status
+    ok06g = and ok06f, ok_upsert_new_inserted
+    ok06h = and ok06g, ok_rows_after_upsert_new
+    ok07 = and ok06h, ok_snapshot_status
     ok08 = and ok07, ok_snapshot_epoch
     ok09 = and ok08, ok_open_status
     ok10 = and ok09, ok_handle_sum_status
@@ -209,6 +234,12 @@ L_ENTRY:
     !rows_after_insert
     !duplicate_insert_status
     !rows_after_duplicate
+    !upsert_existing_status
+    !upsert_existing_inserted
+    !rows_after_upsert_existing
+    !upsert_new_status
+    !upsert_new_inserted
+    !rows_after_upsert_new
     !snapshot_status
     !snapshot_epoch
     !open_status
@@ -265,6 +296,12 @@ L_ENTRY:
     !ok_rows_after_insert
     !ok_duplicate_insert_status
     !ok_rows_after_duplicate
+    !ok_upsert_existing_status
+    !ok_upsert_existing_inserted
+    !ok_rows_after_upsert_existing
+    !ok_upsert_new_status
+    !ok_upsert_new_inserted
+    !ok_rows_after_upsert_new
     !ok_snapshot_status
     !ok_snapshot_epoch
     !ok_open_status
@@ -317,6 +354,12 @@ L_ENTRY:
     !ok06
     !ok06a
     !ok06b
+    !ok06c
+    !ok06d
+    !ok06e
+    !ok06f
+    !ok06g
+    !ok06h
     !ok07
     !ok08
     !ok09

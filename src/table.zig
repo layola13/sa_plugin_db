@@ -23,6 +23,11 @@ pub const TableInfo = struct {
     locked: bool,
 };
 
+pub const UpsertResult = struct {
+    info: TableInfo,
+    inserted: bool,
+};
+
 pub const RawColumnBytes = struct {
     bytes: []const u8,
 };
@@ -1651,11 +1656,38 @@ pub fn insertRawRow(
 ) TableError!TableInfo {
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-    if (meta.row_bytes > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
-    if (row_bytes.len != @as(usize, @intCast(meta.row_bytes))) return TableError.InvalidFormat;
-
-    const columns = try allocator.alloc(RawColumnBytes, meta.columns.len);
+    const columns = try splitRawRowColumns(allocator, meta, row_bytes);
     defer allocator.free(columns);
+
+    return try ingestRawColumns(allocator, root_dir, table_name, 1, columns);
+}
+
+fn fixedRowBytes(meta: TableMeta) TableError!usize {
+    if (meta.row_bytes > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(meta.row_bytes);
+}
+
+fn rowColumnOffset(meta: TableMeta, column_index: usize) TableError!usize {
+    if (column_index >= meta.columns.len) return TableError.InvalidFormat;
+    var offset: u64 = 0;
+    for (meta.columns[0..column_index]) |column| {
+        offset = std.math.add(u64, offset, column.stride) catch return TableError.CursorOverflow;
+    }
+    if (offset > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(offset);
+}
+
+fn rowU64KeyValue(meta: TableMeta, column_index: usize, row_bytes: []const u8) TableError!u64 {
+    try ensureU64Column(meta, column_index);
+    if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
+    const offset = try rowColumnOffset(meta, column_index);
+    return readU64LE(row_bytes, offset);
+}
+
+fn splitRawRowColumns(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]RawColumnBytes {
+    if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
+    const columns = try allocator.alloc(RawColumnBytes, meta.columns.len);
+    errdefer allocator.free(columns);
 
     var offset: usize = 0;
     for (meta.columns, 0..) |column, idx| {
@@ -1666,8 +1698,24 @@ pub fn insertRawRow(
         offset = next_offset;
     }
     if (offset != row_bytes.len) return TableError.InvalidFormat;
+    return columns;
+}
 
-    return try ingestRawColumns(allocator, root_dir, table_name, 1, columns);
+fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]std.ArrayList(u8) {
+    const columns = try splitRawRowColumns(allocator, meta, row_bytes);
+    defer allocator.free(columns);
+
+    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    errdefer allocator.free(buffers);
+    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    errdefer {
+        for (buffers) |*buf| buf.deinit();
+    }
+
+    for (columns, 0..) |column, idx| {
+        try buffers[idx].appendSlice(column.bytes);
+    }
+    return buffers;
 }
 
 pub fn createU64Index(
@@ -2181,6 +2229,102 @@ fn buildColumnBuffersWithoutRow(
     return buffers;
 }
 
+fn buildColumnBuffersReplacingRow(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    replace_row_index: u64,
+    row_bytes: []const u8,
+) TableError![]std.ArrayList(u8) {
+    if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
+    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    errdefer allocator.free(buffers);
+    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    errdefer {
+        for (buffers) |*buf| buf.deinit();
+    }
+
+    var row_offset: usize = 0;
+    for (meta.columns, 0..) |column, col_idx| {
+        const stride: usize = @intCast(column.stride);
+        const next_row_offset = std.math.add(usize, row_offset, stride) catch return TableError.CursorOverflow;
+        if (next_row_offset > row_bytes.len) return TableError.InvalidFormat;
+        const replacement = row_bytes[row_offset..next_row_offset];
+
+        var row_base: u64 = 0;
+        for (meta.segments) |segment| {
+            const file_meta = segment.files[col_idx];
+            const path = try activePath(allocator, root_dir, file_meta.path);
+            defer allocator.free(path);
+            const bytes = try readFileAlloc(allocator, path, 1 << 30);
+            defer allocator.free(bytes);
+            const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+            if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+
+            var local_row: u64 = 0;
+            while (local_row < segment.rows) : (local_row += 1) {
+                const global_row = std.math.add(u64, row_base, local_row) catch return TableError.CursorOverflow;
+                if (global_row == replace_row_index) {
+                    try buffers[col_idx].appendSlice(replacement);
+                    continue;
+                }
+                const offset_u64 = std.math.mul(u64, local_row, @as(u64, column.stride)) catch return TableError.CursorOverflow;
+                const offset: usize = @intCast(offset_u64);
+                try buffers[col_idx].appendSlice(bytes[offset .. offset + stride]);
+            }
+            row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        }
+        if (row_base != meta.row_count) return TableError.VerifyFailed;
+        row_offset = next_row_offset;
+    }
+    if (row_offset != row_bytes.len) return TableError.InvalidFormat;
+
+    return buffers;
+}
+
+fn replaceRowAtIndex(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    row_index: u64,
+    row_bytes: []const u8,
+) TableError!TableInfo {
+    if (row_index >= meta.row_count) return TableError.InvalidFormat;
+    const buffers = try buildColumnBuffersReplacingRow(allocator, root_dir, meta.*, row_index, row_bytes);
+    defer {
+        for (buffers) |*buf| buf.deinit();
+        allocator.free(buffers);
+    }
+
+    const new_segments = try allocator.alloc(SegmentMeta, 1);
+    var new_files: ?[]FileMeta = null;
+    var assigned_segments = false;
+    errdefer if (!assigned_segments) {
+        if (new_files) |files| freeFileMetas(allocator, files);
+        allocator.free(new_segments);
+    };
+
+    const files = try writeSegmentFiles(allocator, root_dir, table_name, meta.next_segment_id, buffers);
+    new_files = files;
+    new_segments[0] = .{
+        .id = meta.next_segment_id,
+        .rows = meta.row_count,
+        .files = files,
+    };
+    new_files = null;
+    meta.next_segment_id += 1;
+
+    const old_segments = meta.segments;
+    meta.segments = new_segments;
+    assigned_segments = true;
+    freeSegmentMetas(allocator, old_segments);
+    meta.epoch += 1;
+    try rebuildIndexes(allocator, root_dir, meta);
+    try writeMeta(allocator, root_dir, table_name, meta.*);
+    return tableInfo(meta.*);
+}
+
 fn deleteRowAtIndex(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -2239,6 +2383,40 @@ pub fn deleteU64Key(
     const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
     if (!found.found) return TableError.NotFound;
     return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+}
+
+pub fn upsertRawRowU64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected: u64,
+    row_bytes: []const u8,
+) TableError!UpsertResult {
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const key_value = try rowU64KeyValue(owned, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+
+    const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
+    if (found.found) {
+        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+        return .{ .info = info, .inserted = false };
+    }
+
+    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
+    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
+    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
+    defer {
+        for (buffers) |*buf| buf.deinit();
+        allocator.free(buffers);
+    }
+
+    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
+    try rebuildIndexes(allocator, root_dir, &owned);
+    try writeMeta(allocator, root_dir, table_name, owned);
+    return .{ .info = tableInfo(owned), .inserted = true };
 }
 
 pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
@@ -2778,6 +2956,44 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 4));
     }
 
+    var upsert_existing_row: [16]u8 = undefined;
+    writeU64LE(&upsert_existing_row, 0, 4);
+    writeU64LE(&upsert_existing_row, 8, 44);
+    const upsert_existing = try upsertRawRowU64Key(std.testing.allocator, ".", table_name, 0, 4, &upsert_existing_row);
+    try std.testing.expect(!upsert_existing.inserted);
+    try std.testing.expectEqual(@as(u64, 4), upsert_existing.info.row_count);
+    try std.testing.expectEqual(@as(usize, 1), upsert_existing.info.segment_count);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 4), snapshot.row_count);
+        var fetched_row: [16]u8 = undefined;
+        try snapshotGetRowU64Key(snapshot, 0, 4, &fetched_row);
+        try std.testing.expectEqual(@as(u64, 4), readU64LE(&fetched_row, 0));
+        try std.testing.expectEqual(@as(u64, 44), readU64LE(&fetched_row, 8));
+    }
+
+    var mismatched_upsert_row: [16]u8 = undefined;
+    writeU64LE(&mismatched_upsert_row, 0, 6);
+    writeU64LE(&mismatched_upsert_row, 8, 60);
+    try std.testing.expectError(TableError.InvalidFormat, upsertRawRowU64Key(std.testing.allocator, ".", table_name, 0, 4, &mismatched_upsert_row));
+
+    var upsert_new_row: [16]u8 = undefined;
+    writeU64LE(&upsert_new_row, 0, 5);
+    writeU64LE(&upsert_new_row, 8, 50);
+    const upsert_new = try upsertRawRowU64Key(std.testing.allocator, ".", table_name, 0, 5, &upsert_new_row);
+    try std.testing.expect(upsert_new.inserted);
+    try std.testing.expectEqual(@as(u64, 5), upsert_new.info.row_count);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 5), snapshot.row_count);
+        try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 5));
+        var fetched_row: [16]u8 = undefined;
+        try snapshotGetRowU64Key(snapshot, 0, 5, &fetched_row);
+        try std.testing.expectEqual(@as(u64, 50), readU64LE(&fetched_row, 8));
+    }
+
     var duplicate_ids = [_]u64{4};
     var duplicate_points = [_]u64{400};
     const duplicate_columns = [_]RawColumnBytes{
@@ -2788,7 +3004,7 @@ test "table persistent u64 index tracks ingest update and corruption" {
     {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
-        try std.testing.expectEqual(@as(u64, 4), snapshot.row_count);
+        try std.testing.expectEqual(@as(u64, 5), snapshot.row_count);
         try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 4));
     }
 
@@ -2801,7 +3017,7 @@ test "table persistent u64 index tracks ingest update and corruption" {
         const new_id = try snapshotFindU64(snapshot, 0, 11);
         try std.testing.expect(new_id.found);
         try std.testing.expectEqual(@as(u64, 0), new_id.row_index);
-        try std.testing.expectEqual(@as(u64, 3), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
+        try std.testing.expectEqual(@as(u64, 4), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
         try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .le, 1));
     }
 
@@ -2814,16 +3030,16 @@ test "table persistent u64 index tracks ingest update and corruption" {
     }
 
     const deleted = try deleteU64Key(std.testing.allocator, ".", table_name, 0, 4);
-    try std.testing.expectEqual(@as(u64, 3), deleted.row_count);
+    try std.testing.expectEqual(@as(u64, 4), deleted.row_count);
     try std.testing.expectEqual(@as(usize, 1), deleted.segment_count);
     {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
-        try std.testing.expectEqual(@as(u64, 3), snapshot.row_count);
+        try std.testing.expectEqual(@as(u64, 4), snapshot.row_count);
         const deleted_id = try snapshotFindU64(snapshot, 0, 4);
         try std.testing.expect(!deleted_id.found);
         try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .eq, 4));
-        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
+        try std.testing.expectEqual(@as(u64, 3), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
     }
     try std.testing.expectError(TableError.NotFound, deleteU64Key(std.testing.allocator, ".", table_name, 0, 4));
 

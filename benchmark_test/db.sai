@@ -4,6 +4,7 @@
 @extern sa_db_remove_table(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_ingest_columns(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, row_count: u64, columns: ptr, columns_len: u64, &out_info: ptr) -> u32
 @extern sa_db_insert_row(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_upsert_row_u64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_create_u64_index(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, unique: u32, &out_info: ptr) -> u32
 @extern sa_db_delete_u64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u64, &out_info: ptr) -> u32
 @extern sa_db_snapshot(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32

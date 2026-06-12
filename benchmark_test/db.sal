@@ -74,6 +74,12 @@
     %out_status = call @sa_db_insert_row(&%root, %root_len, &%table_name, %table_name_len, &%row, %row_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_UPSERT_ROW_U64_KEY %out_status, %out_inserted, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %row, %row_len, %out_info
+    __db_upsert_inserted_slot_%out_inserted = stack_alloc 8
+    %out_status = call @sa_db_upsert_row_u64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%row, %row_len, &__db_upsert_inserted_slot_%out_inserted, &%out_info)
+    %out_inserted = load __db_upsert_inserted_slot_%out_inserted+0 as u64
+[END_MACRO]
+
 [MACRO] DB_CREATE_U64_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %unique, %out_info
     %out_status = call @sa_db_create_u64_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
 [END_MACRO]

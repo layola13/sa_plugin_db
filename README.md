@@ -42,6 +42,7 @@ Core native calls:
 - `sa_db_remove_table`
 - `sa_db_ingest_columns`
 - `sa_db_insert_row`
+- `sa_db_upsert_row_u64_key`
 - `sa_db_create_u64_index`
 - `sa_db_delete_u64_key`
 - `sa_db_snapshot`
@@ -79,7 +80,7 @@ Removed calls:
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
 `DB_GET_U64_HANDLE`, `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`,
-`DB_INSERT_ROW`, `DB_CREATE_U64_INDEX`, `DB_DELETE_U64_KEY`,
+`DB_INSERT_ROW`, `DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_DELETE_U64_KEY`,
 `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
 `DB_RECOVER`.
 
@@ -128,6 +129,15 @@ fixed-width row laid out exactly as the active schema's column strides. The
 implementation splits the row into column slices and commits through the same
 column ingest path, so the write advances the table epoch and rebuilds any
 persisted `u64` indexes.
+
+`sa_db_upsert_row_u64_key` / `DB_UPSERT_ROW_U64_KEY` upserts one fixed-width row
+by a unique `u64` key. The target column must already have a unique `u64` index.
+When the key exists, the existing row is atomically replaced by rewriting the
+table into a new column segment, rebuilding indexes, and advancing the epoch;
+`out_inserted` is `0`. When the key is absent, the row is appended through the
+same indexed ingest path and `out_inserted` is `1`. The `expected` key must match
+the `u64` value encoded in the row's key column, otherwise the call returns
+`SA_DB_ERR_INVALID_FORMAT` without committing a new epoch.
 
 `sa_db_delete_u64_key` / `DB_DELETE_U64_KEY` deletes one row by a unique `u64`
 key. The target column must already have a unique `u64` index, so the operation
