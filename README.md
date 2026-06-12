@@ -44,6 +44,7 @@ Core native calls:
 - `sa_db_insert_row`
 - `sa_db_upsert_row_u64_key`
 - `sa_db_create_u64_index`
+- `sa_db_create_i64_index`
 - `sa_db_delete_u64_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
@@ -63,14 +64,20 @@ Read-handle query calls:
 - `sa_db_sum_u64_handle`
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
+- `sa_db_count_i64_cmp_handle`
 - `sa_db_find_u64_handle`
+- `sa_db_find_i64_handle`
 - `sa_db_range_u64_handle`
+- `sa_db_range_i64_handle`
 - `sa_db_get_u64_handle`
+- `sa_db_get_i64_handle`
 - `sa_db_project_rows_handle`
 - `sa_db_get_row_handle`
 - `sa_db_get_row_u64_key_handle`
 - `sa_db_min_u64_handle`
 - `sa_db_max_u64_handle`
+- `sa_db_min_i64_handle`
+- `sa_db_max_i64_handle`
 
 Public status constants include `SA_DB_ERR_CONSTRAINT` for writes that violate
 unique indexes.
@@ -84,12 +91,14 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
-`DB_COUNT_U64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`, `DB_RANGE_U64_HANDLE`,
-`DB_GET_U64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
+`DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
+`DB_FIND_I64_HANDLE`, `DB_RANGE_U64_HANDLE`, `DB_RANGE_I64_HANDLE`,
+`DB_GET_U64_HANDLE`, `DB_GET_I64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
-`DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_DELETE_U64_KEY`,
-`DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`,
-and `DB_RECOVER`.
+`DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
+`DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
+`DB_RECOVER`.
 
 ## Query Model
 
@@ -102,7 +111,10 @@ Read queries now use snapshots:
    and metadata string lengths without requiring callers to parse JSON meta.
 3. `*_handle` query functions scan the in-memory snapshot; `find_u64` and
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
-   the column. `project_rows_handle` copies only selected columns for a batch of
+   the column. Signed `i64` columns now have the same point/range/count/min/max
+   read-handle surface through a persisted signed-order index, which is suitable
+   for ERP amount cents, balances, and timestamp encodings. `project_rows_handle`
+   copies only selected columns for a batch of
    row indices. `get_row_handle` copies a full fixed-width row by snapshot row
    index, while `get_row_u64_key_handle` requires a unique `u64` index and copies
    the matching row into the caller's row buffer.
@@ -122,6 +134,9 @@ indices in index order. The target column must have a persisted `u64` index, so
 range pagination uses binary-search bounds instead of a full scan.
 Use `sa_db_get_row_handle` / `DB_GET_ROW_HANDLE` to materialize any returned row
 index into a fixed-width row buffer.
+`sa_db_range_i64_handle` / `DB_RANGE_I64_HANDLE` behaves the same for indexed
+`i64` columns, but uses signed ordering so negative values sort before zero and
+positive values.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested

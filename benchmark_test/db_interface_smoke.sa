@@ -3,24 +3,24 @@
 @const ROOT = utf8:"."
 @const TABLE = utf8:"members"
 @const SCHEMA_PATH = utf8:"members.sadb-schema"
-@const SCHEMA = utf8:"#def MAX_ROWS = 16\n#def COL_ID_STRIDE = 8 // u64\n#def COL_PLAN_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+@const SCHEMA = utf8:"#def MAX_ROWS = 16\n#def COL_ID_STRIDE = 8 // u64\n#def COL_PLAN_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n#def COL_BALANCE_CENTS_STRIDE = 8 // i64\n"
 
 #def ROOT_LEN = 1
 #def TABLE_LEN = 7
 #def SCHEMA_PATH_LEN = 19
-#def SCHEMA_LEN = 149
+#def SCHEMA_LEN = 190
 #def ROWS = 4
 #def TOTAL_ROWS = 5
 #def UPSERT_ROWS = 6
 #def COL_BYTES = 32
-#def ROW_BYTES = 32
+#def ROW_BYTES = 40
 #def RANGE_ROWS_CAP = 4
 #def RANGE_ROWS_BYTES = 32
 #def PROJECT_COLUMNS = 2
 #def PROJECT_COLUMNS_BYTES = 16
 #def PROJECTED_ROWS_BYTES = 32
-#def COLUMN_COUNT = 4
-#def COLUMNS_BYTES = 64
+#def COLUMN_COUNT = 5
+#def COLUMNS_BYTES = 80
 
 @main() -> i32:
 L_ENTRY:
@@ -32,9 +32,11 @@ L_ENTRY:
     plan_col = alloc COL_BYTES
     status_col = alloc COL_BYTES
     points_col = alloc COL_BYTES
+    balance_col = alloc COL_BYTES
     new_row = alloc ROW_BYTES
     fetched_row = alloc ROW_BYTES
     range_rows = alloc RANGE_ROWS_BYTES
+    balance_range_rows = alloc RANGE_ROWS_BYTES
     project_columns = alloc PROJECT_COLUMNS_BYTES
     projected_rows = alloc PROJECTED_ROWS_BYTES
 
@@ -54,10 +56,15 @@ L_ENTRY:
     store points_col+8, 20 as u64
     store points_col+16, 30 as u64
     store points_col+24, 40 as u64
+    store balance_col+0, -100 as i64
+    store balance_col+8, 0 as i64
+    store balance_col+16, 50 as i64
+    store balance_col+24, -25 as i64
     store new_row+0, 5 as u64
     store new_row+8, 4 as u64
     store new_row+16, 1 as u64
     store new_row+24, 50 as u64
+    store new_row+32, 125 as i64
     store project_columns+0, 0 as u64
     store project_columns+8, 3 as u64
 
@@ -67,9 +74,11 @@ L_ENTRY:
     EXPAND DB_COLUMN_INPUT_SET columns, 1, plan_col, COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 2, status_col, COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, balance_col, COL_BYTES
     EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
     EXPAND DB_INFO_ROW_COUNT rows, info
     EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+    EXPAND DB_CREATE_I64_INDEX create_i64_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 4, 0, info
     EXPAND DB_INSERT_ROW insert_row_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_insert, info
     EXPAND DB_INSERT_ROW duplicate_insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
@@ -78,12 +87,14 @@ L_ENTRY:
     store new_row+8, 4 as u64
     store new_row+16, 1 as u64
     store new_row+24, 55 as u64
+    store new_row+32, 150 as i64
     EXPAND DB_UPSERT_ROW_U64_KEY upsert_existing_status, upsert_existing_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 5, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_upsert_existing, info
     store new_row+0, 6 as u64
     store new_row+8, 5 as u64
     store new_row+16, 0 as u64
     store new_row+24, 60 as u64
+    store new_row+32, -75 as i64
     EXPAND DB_UPSERT_ROW_U64_KEY upsert_new_status, upsert_new_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 6, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_upsert_new, info
     EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
@@ -112,6 +123,15 @@ L_ENTRY:
     project_points0 = load projected_rows+8 as u64
     project_id1 = load projected_rows+16 as u64
     project_points1 = load projected_rows+24 as u64
+    EXPAND DB_RANGE_I64_HANDLE balance_range_status, balance_range_written, balance_range_total, balance_range_rows, RANGE_ROWS_CAP, read_handle, 4, -80, 10, 0, 3
+    balance_range_row0 = load balance_range_rows+0 as u64
+    balance_range_row1 = load balance_range_rows+8 as u64
+    balance_range_row2 = load balance_range_rows+16 as u64
+    EXPAND DB_COUNT_I64_CMP_HANDLE balance_count_status, balance_nonnegative_count, read_handle, 4, SA_DB_CMP_GE, 0
+    EXPAND DB_FIND_I64_HANDLE balance_find_status, balance_found, balance_found_row, read_handle, 4, -25
+    EXPAND DB_GET_I64_HANDLE balance_get_status, balance_value, read_handle, 4, balance_found_row
+    EXPAND DB_MIN_I64_HANDLE balance_min_status, balance_min, read_handle, 4
+    EXPAND DB_MAX_I64_HANDLE balance_max_status, balance_max, read_handle, 4
     EXPAND DB_FIND_U64_HANDLE find_status, found_member, found_row, read_handle, 0, 5
     EXPAND DB_GET_U64_HANDLE get_status, found_points, read_handle, 3, found_row
     EXPAND DB_GET_ROW_U64_KEY_HANDLE get_row_key_status, read_handle, 0, 5, fetched_row, ROW_BYTES
@@ -145,6 +165,7 @@ L_ENTRY:
     ok_ingest = eq ingest_status, SA_DB_OK
     ok_rows = eq rows, ROWS
     ok_create_index_status = eq create_index_status, SA_DB_OK
+    ok_create_i64_index_status = eq create_i64_index_status, SA_DB_OK
     ok_insert_row_status = eq insert_row_status, SA_DB_OK
     ok_rows_after_insert = eq rows_after_insert, TOTAL_ROWS
     ok_duplicate_insert_status = eq duplicate_insert_status, SA_DB_ERR_CONSTRAINT
@@ -156,13 +177,13 @@ L_ENTRY:
     ok_upsert_new_inserted = eq upsert_new_inserted, 1
     ok_rows_after_upsert_new = eq rows_after_upsert_new, UPSERT_ROWS
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
-    ok_snapshot_epoch = eq snapshot_epoch, 5
+    ok_snapshot_epoch = eq snapshot_epoch, 6
     ok_open_status = eq open_status, SA_DB_OK
     ok_shape_status = eq shape_status, SA_DB_OK
     ok_shape_rows = eq shape_rows, UPSERT_ROWS
     ok_shape_columns = eq shape_columns, COLUMN_COUNT
     ok_shape_row_bytes = eq shape_row_bytes, ROW_BYTES
-    ok_shape_epoch = eq shape_epoch, 5
+    ok_shape_epoch = eq shape_epoch, 6
     ok_column_info_status = eq column_info_status, SA_DB_OK
     ok_column_stride = eq column_stride, 8
     ok_column_type = eq column_type, SA_DB_TYPE_U64
@@ -187,6 +208,23 @@ L_ENTRY:
     ok_project_points0 = eq project_points0, 30
     ok_project_id1 = eq project_id1, 4
     ok_project_points1 = eq project_points1, 40
+    ok_balance_range_status = eq balance_range_status, SA_DB_OK
+    ok_balance_range_written = eq balance_range_written, 3
+    ok_balance_range_total = eq balance_range_total, 3
+    ok_balance_range_row0 = eq balance_range_row0, 5
+    ok_balance_range_row1 = eq balance_range_row1, 3
+    ok_balance_range_row2 = eq balance_range_row2, 1
+    ok_balance_count_status = eq balance_count_status, SA_DB_OK
+    ok_balance_nonnegative_count = eq balance_nonnegative_count, 3
+    ok_balance_find_status = eq balance_find_status, SA_DB_OK
+    ok_balance_found = eq balance_found, 1
+    ok_balance_found_row = eq balance_found_row, 3
+    ok_balance_get_status = eq balance_get_status, SA_DB_OK
+    ok_balance_value = eq balance_value, -25
+    ok_balance_min_status = eq balance_min_status, SA_DB_OK
+    ok_balance_min = eq balance_min, -100
+    ok_balance_max_status = eq balance_max_status, SA_DB_OK
+    ok_balance_max = eq balance_max, 150
     ok_find_status = eq find_status, SA_DB_OK
     ok_find_found = eq found_member, 1
     ok_find_row = eq found_row, 4
@@ -228,7 +266,8 @@ L_ENTRY:
     ok02 = and ok01, ok_ingest
     ok03 = and ok02, ok_rows
     ok04 = and ok03, ok_create_index_status
-    ok05 = and ok04, ok_insert_row_status
+    ok04a = and ok04, ok_create_i64_index_status
+    ok05 = and ok04a, ok_insert_row_status
     ok06 = and ok05, ok_rows_after_insert
     ok06a = and ok06, ok_duplicate_insert_status
     ok06b = and ok06a, ok_rows_after_duplicate
@@ -270,7 +309,24 @@ L_ENTRY:
     ok13m = and ok13l, ok_project_points0
     ok13n = and ok13m, ok_project_id1
     ok13o = and ok13n, ok_project_points1
-    ok14 = and ok13o, ok_find_status
+    ok13p = and ok13o, ok_balance_range_status
+    ok13q = and ok13p, ok_balance_range_written
+    ok13r = and ok13q, ok_balance_range_total
+    ok13s = and ok13r, ok_balance_range_row0
+    ok13t = and ok13s, ok_balance_range_row1
+    ok13u = and ok13t, ok_balance_range_row2
+    ok13v = and ok13u, ok_balance_count_status
+    ok13w = and ok13v, ok_balance_nonnegative_count
+    ok13x = and ok13w, ok_balance_find_status
+    ok13y = and ok13x, ok_balance_found
+    ok13z = and ok13y, ok_balance_found_row
+    ok13aa = and ok13z, ok_balance_get_status
+    ok13ab = and ok13aa, ok_balance_value
+    ok13ac = and ok13ab, ok_balance_min_status
+    ok13ad = and ok13ac, ok_balance_min
+    ok13ae = and ok13ad, ok_balance_max_status
+    ok13af = and ok13ae, ok_balance_max
+    ok14 = and ok13af, ok_find_status
     ok15 = and ok14, ok_find_found
     ok16 = and ok15, ok_find_row
     ok17 = and ok16, ok_get_status
@@ -313,6 +369,7 @@ L_ENTRY:
     !ingest_status
     !rows
     !create_index_status
+    !create_i64_index_status
     !insert_row_status
     !rows_after_insert
     !duplicate_insert_status
@@ -356,6 +413,23 @@ L_ENTRY:
     !project_points0
     !project_id1
     !project_points1
+    !balance_range_status
+    !balance_range_written
+    !balance_range_total
+    !balance_range_row0
+    !balance_range_row1
+    !balance_range_row2
+    !balance_count_status
+    !balance_nonnegative_count
+    !balance_find_status
+    !balance_found
+    !balance_found_row
+    !balance_get_status
+    !balance_value
+    !balance_min_status
+    !balance_min
+    !balance_max_status
+    !balance_max
     !find_status
     !found_member
     !found_row
@@ -400,6 +474,7 @@ L_ENTRY:
     !ok_ingest
     !ok_rows
     !ok_create_index_status
+    !ok_create_i64_index_status
     !ok_insert_row_status
     !ok_rows_after_insert
     !ok_duplicate_insert_status
@@ -442,6 +517,23 @@ L_ENTRY:
     !ok_project_points0
     !ok_project_id1
     !ok_project_points1
+    !ok_balance_range_status
+    !ok_balance_range_written
+    !ok_balance_range_total
+    !ok_balance_range_row0
+    !ok_balance_range_row1
+    !ok_balance_range_row2
+    !ok_balance_count_status
+    !ok_balance_nonnegative_count
+    !ok_balance_find_status
+    !ok_balance_found
+    !ok_balance_found_row
+    !ok_balance_get_status
+    !ok_balance_value
+    !ok_balance_min_status
+    !ok_balance_min
+    !ok_balance_max_status
+    !ok_balance_max
     !ok_find_status
     !ok_find_found
     !ok_find_row
@@ -483,6 +575,7 @@ L_ENTRY:
     !ok02
     !ok03
     !ok04
+    !ok04a
     !ok05
     !ok06
     !ok06a
@@ -525,6 +618,23 @@ L_ENTRY:
     !ok13m
     !ok13n
     !ok13o
+    !ok13p
+    !ok13q
+    !ok13r
+    !ok13s
+    !ok13t
+    !ok13u
+    !ok13v
+    !ok13w
+    !ok13x
+    !ok13y
+    !ok13z
+    !ok13aa
+    !ok13ab
+    !ok13ac
+    !ok13ad
+    !ok13ae
+    !ok13af
     !ok14
     !ok15
     !ok16
@@ -565,9 +675,11 @@ L_ENTRY:
     !plan_col
     !status_col
     !points_col
+    !balance_col
     !new_row
     !fetched_row
     !range_rows
+    !balance_range_rows
     !project_columns
     !projected_rows
     br ok -> L_OK, L_FAIL

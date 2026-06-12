@@ -125,6 +125,7 @@ pub const ReadSegmentSnapshot = struct {
 };
 
 pub const ReadIndexSnapshot = struct {
+    kind: []const u8,
     column_index: u64,
     unique: bool,
     entries: []const u8,
@@ -291,8 +292,8 @@ fn segmentFileName(allocator: std.mem.Allocator, table_name: []const u8, seg_id:
     return allocPrintPath(allocator, "{s}.col{d}.{d}.dat", .{ table_name, column_index, seg_id });
 }
 
-fn indexFileName(allocator: std.mem.Allocator, table_name: []const u8, column_index: u64, epoch: u64) TableError![]u8 {
-    return allocPrintPath(allocator, "{s}.idx.u64.{d}.{d}.dat", .{ table_name, column_index, epoch });
+fn indexFileName(allocator: std.mem.Allocator, table_name: []const u8, kind: []const u8, column_index: u64, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.idx.{s}.{d}.{d}.dat", .{ table_name, kind, column_index, epoch });
 }
 
 fn snapshotDir(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
@@ -971,10 +972,15 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
 
 fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
     for (meta.indexes) |index| {
-        if (!std.mem.eql(u8, index.kind, "u64")) return TableError.VerifyFailed;
         if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
         const column_index: usize = @intCast(index.column_index);
-        try ensureU64Column(meta, column_index);
+        if (std.mem.eql(u8, index.kind, "u64")) {
+            try ensureU64Column(meta, column_index);
+        } else if (std.mem.eql(u8, index.kind, "i64")) {
+            try ensureI64Column(meta, column_index);
+        } else {
+            return TableError.VerifyFailed;
+        }
         if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
         const path = try activePath(allocator, root_dir, index.path);
         defer allocator.free(path);
@@ -985,7 +991,10 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
         const hex = std.fmt.bytesToHex(hash, .lower);
         if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
         try validateIndexBytesShape(bytes, meta.row_count, index.unique);
-        const expected = try buildU64IndexBytes(allocator, root_dir, meta, column_index, index.unique);
+        const expected = if (std.mem.eql(u8, index.kind, "u64"))
+            try buildU64IndexBytes(allocator, root_dir, meta, column_index, index.unique)
+        else
+            try buildI64IndexBytes(allocator, root_dir, meta, column_index, index.unique);
         defer allocator.free(expected);
         if (!std.mem.eql(u8, bytes, expected)) return TableError.VerifyFailed;
     }
@@ -1120,6 +1129,23 @@ fn scanVersionedRecoveryMetas(
         const path = try activePath(allocator, root_dir, entry.name);
         defer allocator.free(path);
         try maybeSelectRecoveryMeta(allocator, root_dir, table_name, path, best);
+    }
+}
+
+fn deleteRootTableArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    const dir_path = rootPrefix(root_dir);
+    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
+    defer dir.close();
+
+    const prefix = try allocPrintPath(allocator, "{s}.", .{table_name});
+    defer allocator.free(prefix);
+    var it = dir.iterate();
+    while (it.next() catch |err| return mapFileError(err)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        const path = try activePath(allocator, root_dir, entry.name);
+        defer allocator.free(path);
+        try deleteIfExists(path);
     }
 }
 
@@ -1595,6 +1621,8 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
         else => return err,
     }
 
+    try deleteRootTableArtifacts(allocator, root_dir, table_name);
+
     const meta_path = try tableMetaPath(allocator, root_dir, table_name);
     defer allocator.free(meta_path);
     try deleteIfExists(meta_path);
@@ -1807,18 +1835,102 @@ pub fn createU64Index(
     return tableInfo(meta);
 }
 
+pub fn createI64Index(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    unique: bool,
+) TableError!TableInfo {
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+    try ensureI64Column(meta, column_index);
+
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i64") and index.column_index == @as(u64, @intCast(column_index))) {
+            if (index.unique == unique) return tableInfo(meta);
+            return TableError.InvalidFormat;
+        }
+    }
+
+    const old_indexes = meta.indexes;
+    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
+    for (new_indexes) |*index| index.* = .{
+        .name = &.{},
+        .kind = &.{},
+        .column_index = 0,
+        .unique = false,
+        .path = &.{},
+        .sha256 = &.{},
+        .bytes = 0,
+    };
+    var assigned_indexes = false;
+    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
+
+    for (old_indexes, 0..) |index, idx| {
+        new_indexes[idx] = .{
+            .name = try allocator.dupe(u8, index.name),
+            .kind = try allocator.dupe(u8, index.kind),
+            .column_index = index.column_index,
+            .unique = index.unique,
+            .path = try allocator.dupe(u8, index.path),
+            .sha256 = try allocator.dupe(u8, index.sha256),
+            .bytes = index.bytes,
+        };
+    }
+
+    const new_index = &new_indexes[old_indexes.len];
+    new_index.* = .{
+        .name = try allocPrintPath(allocator, "i64_col{d}", .{column_index}),
+        .kind = try allocator.dupe(u8, "i64"),
+        .column_index = @intCast(column_index),
+        .unique = unique,
+        .path = try allocator.dupe(u8, ""),
+        .sha256 = try allocator.dupe(u8, ""),
+        .bytes = 0,
+    };
+
+    freeIndexMetas(allocator, old_indexes);
+    meta.indexes = new_indexes;
+    assigned_indexes = true;
+    meta.epoch += 1;
+    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
+    try writeMeta(allocator, root_dir, table_name, meta);
+    return tableInfo(meta);
+}
+
 fn ensureU64Column(meta: TableMeta, column_index: usize) TableError!void {
     if (column_index >= meta.columns.len) return TableError.InvalidFormat;
     const column = meta.columns[column_index];
     if (column.stride != 8 or !std.mem.eql(u8, column.ty, "u64")) return TableError.InvalidFormat;
 }
 
+fn ensureI64Column(meta: TableMeta, column_index: usize) TableError!void {
+    if (column_index >= meta.columns.len) return TableError.InvalidFormat;
+    const column = meta.columns[column_index];
+    if (column.stride != 8 or !std.mem.eql(u8, column.ty, "i64")) return TableError.InvalidFormat;
+}
+
 fn readU64LE(bytes: []const u8, offset: usize) u64 {
     return std.mem.readInt(u64, bytes[offset .. offset + 8][0..8], .little);
 }
 
+fn readI64LE(bytes: []const u8, offset: usize) i64 {
+    return std.mem.readInt(i64, bytes[offset .. offset + 8][0..8], .little);
+}
+
 fn writeU64LE(bytes: []u8, offset: usize, value: u64) void {
     std.mem.writeInt(u64, bytes[offset .. offset + 8][0..8], value, .little);
+}
+
+fn writeI64LE(bytes: []u8, offset: usize, value: i64) void {
+    std.mem.writeInt(i64, bytes[offset .. offset + 8][0..8], value, .little);
+}
+
+fn sortableI64Key(value: i64) u64 {
+    const bits: u64 = @bitCast(value);
+    return bits ^ (@as(u64, 1) << 63);
 }
 
 fn duplicateColumnMetasToArena(allocator: std.mem.Allocator, columns: []const ColumnMeta) TableError![]ColumnMeta {
@@ -1937,14 +2049,62 @@ fn buildU64IndexBytes(
     return out;
 }
 
+fn buildI64IndexBytes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    unique: bool,
+) TableError![]u8 {
+    try ensureI64Column(meta, column_index);
+    if (meta.row_count > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const entries = try allocator.alloc(IndexEntry, @intCast(meta.row_count));
+    defer allocator.free(entries);
+
+    var row_base: u64 = 0;
+    var entry_idx: usize = 0;
+    for (meta.segments) |segment| {
+        const file_meta = segment.files[column_index];
+        const path = try activePath(allocator, root_dir, file_meta.path);
+        defer allocator.free(path);
+        const bytes = try readFileAlloc(allocator, path, 1 << 30);
+        defer allocator.free(bytes);
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            entries[entry_idx] = .{ .key = sortableI64Key(readI64LE(bytes, byte_offset)), .row = row_base + i };
+            entry_idx += 1;
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    if (entry_idx != entries.len or row_base != meta.row_count) return TableError.VerifyFailed;
+
+    std.sort.block(IndexEntry, entries, {}, indexEntryLessThan);
+    if (unique and entries.len > 1) {
+        for (entries[1..], 1..) |entry, idx| {
+            if (entry.key == entries[idx - 1].key) return TableError.ConstraintViolation;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedIndexBytes(meta.row_count));
+    for (entries, 0..) |entry, idx| writeIndexEntry(out, idx, entry);
+    return out;
+}
+
 fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, index_idx: usize) TableError!void {
     const index = &meta.indexes[index_idx];
-    if (!std.mem.eql(u8, index.kind, "u64")) return TableError.InvalidFormat;
     if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
     const column_index: usize = @intCast(index.column_index);
-    const bytes = try buildU64IndexBytes(allocator, root_dir, meta.*, column_index, index.unique);
+    const bytes = if (std.mem.eql(u8, index.kind, "u64"))
+        try buildU64IndexBytes(allocator, root_dir, meta.*, column_index, index.unique)
+    else if (std.mem.eql(u8, index.kind, "i64"))
+        try buildI64IndexBytes(allocator, root_dir, meta.*, column_index, index.unique)
+    else
+        return TableError.InvalidFormat;
     defer allocator.free(bytes);
-    const basename = try indexFileName(allocator, meta.table_name, index.column_index, meta.epoch);
+    const basename = try indexFileName(allocator, meta.table_name, index.kind, index.column_index, meta.epoch);
     defer allocator.free(basename);
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
@@ -2015,10 +2175,15 @@ pub fn openReadSnapshot(
     }
 
     for (parsed.value.indexes, 0..) |index, index_idx| {
-        if (!std.mem.eql(u8, index.kind, "u64")) return TableError.InvalidFormat;
         if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
         const column_index: usize = @intCast(index.column_index);
-        try ensureSnapshotU64Column(snapshot, column_index);
+        if (std.mem.eql(u8, index.kind, "u64")) {
+            try ensureSnapshotU64Column(snapshot, column_index);
+        } else if (std.mem.eql(u8, index.kind, "i64")) {
+            try ensureSnapshotI64Column(snapshot, column_index);
+        } else {
+            return TableError.InvalidFormat;
+        }
         if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(parsed.value.row_count)))) return TableError.VerifyFailed;
         const path = try activePath(backing_allocator, root_dir, index.path);
         defer backing_allocator.free(path);
@@ -2029,6 +2194,7 @@ pub fn openReadSnapshot(
         if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
         try validateIndexBytesShape(bytes, parsed.value.row_count, index.unique);
         snapshot.indexes[index_idx] = .{
+            .kind = try arena_allocator.dupe(u8, index.kind),
             .column_index = index.column_index,
             .unique = index.unique,
             .entries = bytes,
@@ -2044,7 +2210,24 @@ fn ensureSnapshotU64Column(snapshot: *const ReadSnapshot, column_index: usize) T
     if (column.stride != 8 or !std.mem.eql(u8, column.ty, "u64")) return TableError.InvalidFormat;
 }
 
+fn ensureSnapshotI64Column(snapshot: *const ReadSnapshot, column_index: usize) TableError!void {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    if (column.stride != 8 or !std.mem.eql(u8, column.ty, "i64")) return TableError.InvalidFormat;
+}
+
 fn compareU64(value: u64, op: U64CompareOp, expected: u64) bool {
+    return switch (op) {
+        .eq => value == expected,
+        .ne => value != expected,
+        .lt => value < expected,
+        .le => value <= expected,
+        .gt => value > expected,
+        .ge => value >= expected,
+    };
+}
+
+fn compareI64(value: i64, op: U64CompareOp, expected: i64) bool {
     return switch (op) {
         .eq => value == expected,
         .ne => value != expected,
@@ -2057,14 +2240,21 @@ fn compareU64(value: u64, op: U64CompareOp, expected: u64) bool {
 
 fn snapshotIndexForU64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
-        if (index.column_index == @as(u64, @intCast(column_index))) return index;
+        if (std.mem.eql(u8, index.kind, "u64") and index.column_index == @as(u64, @intCast(column_index))) return index;
     }
     return null;
 }
 
 fn snapshotUniqueIndexForU64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
-        if (index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+        if (std.mem.eql(u8, index.kind, "u64") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
+fn snapshotIndexForI64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i64") and index.column_index == @as(u64, @intCast(column_index))) return index;
     }
     return null;
 }
@@ -2086,6 +2276,10 @@ fn findU64InIndex(index: ReadIndexSnapshot, expected: u64) U64FindResult {
         return .{ .found = true, .row_index = readIndexRow(index.entries, lo) };
     }
     return .{ .found = false, .row_index = 0 };
+}
+
+fn findI64InIndex(index: ReadIndexSnapshot, expected: i64) U64FindResult {
+    return findU64InIndex(index, sortableI64Key(expected));
 }
 
 fn lowerBoundU64Index(index: ReadIndexSnapshot, expected: u64) usize {
@@ -2129,6 +2323,10 @@ fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64)
         .gt => @intCast(n - upper),
         .ge => @intCast(n - lower),
     };
+}
+
+fn countI64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: i64) u64 {
+    return countU64CmpInIndex(index, op, sortableI64Key(expected));
 }
 
 fn snapshotRowBytes(snapshot: *const ReadSnapshot) TableError!usize {
@@ -2298,6 +2496,7 @@ fn findUniqueU64KeyRow(
     try validateIndexBytesShape(bytes, meta.row_count, true);
 
     return findU64InIndex(.{
+        .kind = "u64",
         .column_index = @intCast(column_index),
         .unique = true,
         .entries = bytes,
@@ -2591,6 +2790,47 @@ pub fn snapshotFindU64(snapshot: *const ReadSnapshot, column_index: usize, expec
     return .{ .found = false, .row_index = 0 };
 }
 
+pub fn snapshotCountI64Cmp(snapshot: *const ReadSnapshot, column_index: usize, op: U64CompareOp, expected: i64) TableError!u64 {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    if (snapshotIndexForI64Column(snapshot, column_index)) |index| {
+        return countI64CmpInIndex(index, op, expected);
+    }
+    var count: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            if (compareI64(readI64LE(bytes, byte_offset), op, expected)) count += 1;
+        }
+    }
+    return count;
+}
+
+pub fn snapshotFindI64(snapshot: *const ReadSnapshot, column_index: usize, expected: i64) TableError!U64FindResult {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    if (snapshotIndexForI64Column(snapshot, column_index)) |index| {
+        return findI64InIndex(index, expected);
+    }
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            if (readI64LE(bytes, byte_offset) == expected) {
+                return .{ .found = true, .row_index = row_base + i };
+            }
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    return .{ .found = false, .row_index = 0 };
+}
+
 pub fn snapshotRangeU64Rows(
     snapshot: *const ReadSnapshot,
     column_index: usize,
@@ -2606,6 +2846,42 @@ pub fn snapshotRangeU64Rows(
 
     const start = lowerBoundU64Index(index, min_value);
     const end = upperBoundU64Index(index, max_value);
+    const total = end - start;
+    if (offset >= @as(u64, @intCast(total)) or limit == 0 or out_rows.len == 0) {
+        return .{ .written = 0, .total = @intCast(total) };
+    }
+
+    const offset_usize: usize = @intCast(offset);
+    const page_start = start + offset_usize;
+    const available = end - page_start;
+    const capped_by_limit: usize = if (limit > @as(u64, @intCast(std.math.maxInt(usize))))
+        available
+    else
+        @min(available, @as(usize, @intCast(limit)));
+    const write_count = @min(capped_by_limit, out_rows.len);
+
+    var i: usize = 0;
+    while (i < write_count) : (i += 1) {
+        out_rows[i] = readIndexRow(index.entries, page_start + i);
+    }
+    return .{ .written = @intCast(write_count), .total = @intCast(total) };
+}
+
+pub fn snapshotRangeI64Rows(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i64,
+    max_value: i64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    const index = snapshotIndexForI64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+
+    const start = lowerBoundU64Index(index, sortableI64Key(min_value));
+    const end = upperBoundU64Index(index, sortableI64Key(max_value));
     const total = end - start;
     if (offset >= @as(u64, @intCast(total)) or limit == 0 or out_rows.len == 0) {
         return .{ .written = 0, .total = @intCast(total) };
@@ -2646,6 +2922,25 @@ pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_in
     return TableError.InvalidFormat;
 }
 
+pub fn snapshotGetI64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!i64 {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const bytes = segment.columns[column_index].bytes;
+            const expected_len = try expectedColumnBytes(segment.rows, 8);
+            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            const local_row = row_index - row_base;
+            const byte_offset: usize = @intCast(local_row * 8);
+            return readI64LE(bytes, byte_offset);
+        }
+        row_base = segment_end;
+    }
+    return TableError.InvalidFormat;
+}
+
 pub fn snapshotMinU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
     try ensureSnapshotU64Column(snapshot, column_index);
     var seen = false;
@@ -2679,6 +2974,48 @@ pub fn snapshotMaxU64(snapshot: *const ReadSnapshot, column_index: usize) TableE
         while (i < segment.rows) : (i += 1) {
             const byte_offset: usize = @intCast(i * 8);
             const value = readU64LE(bytes, byte_offset);
+            if (!seen or value > max_value) {
+                max_value = value;
+                seen = true;
+            }
+        }
+    }
+    return max_value;
+}
+
+pub fn snapshotMinI64(snapshot: *const ReadSnapshot, column_index: usize) TableError!i64 {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    var seen = false;
+    var min_value: i64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            const value = readI64LE(bytes, byte_offset);
+            if (!seen or value < min_value) {
+                min_value = value;
+                seen = true;
+            }
+        }
+    }
+    return min_value;
+}
+
+pub fn snapshotMaxI64(snapshot: *const ReadSnapshot, column_index: usize) TableError!i64 {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    var seen = false;
+    var max_value: i64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            const value = readI64LE(bytes, byte_offset);
             if (!seen or value > max_value) {
                 max_value = value;
                 seen = true;
@@ -3270,6 +3607,55 @@ test "table unique u64 index rejects duplicate existing data" {
     try std.testing.expectEqual(@as(u64, 2), verified.row_count);
 }
 
+test "table persistent i64 index uses signed ordering" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "ledger_entries";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "ledger_entries.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_BALANCE_CENTS_STRIDE = 8 // i64
+    );
+
+    var ids = [_]u64{ 1, 2, 3, 4 };
+    var balances = [_]i64{ -100, 0, 50, -25 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(balances[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    const indexed = try createI64Index(std.testing.allocator, ".", table_name, 1, false);
+    try std.testing.expectEqual(@as(u64, 4), indexed.row_count);
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 4), verified.row_count);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+
+    try std.testing.expectEqual(@as(u64, 2), try snapshotCountI64Cmp(snapshot, 1, .lt, 0));
+    try std.testing.expectEqual(@as(u64, 2), try snapshotCountI64Cmp(snapshot, 1, .ge, 0));
+    const found = try snapshotFindI64(snapshot, 1, -25);
+    try std.testing.expect(found.found);
+    try std.testing.expectEqual(@as(u64, 3), found.row_index);
+    try std.testing.expectEqual(@as(i64, -25), try snapshotGetI64(snapshot, 1, found.row_index));
+
+    var range_rows = [_]u64{ 99, 99, 99, 99 };
+    const range = try snapshotRangeI64Rows(snapshot, 1, -30, 10, 0, 4, &range_rows);
+    try std.testing.expectEqual(@as(u64, 2), range.total);
+    try std.testing.expectEqual(@as(u64, 2), range.written);
+    try std.testing.expectEqual(@as(u64, 3), range_rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), range_rows[1]);
+    try std.testing.expectEqual(@as(i64, -100), try snapshotMinI64(snapshot, 1));
+    try std.testing.expectEqual(@as(i64, 50), try snapshotMaxI64(snapshot, 1));
+}
+
 test "table delete u64 key can empty a table" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();
@@ -3405,6 +3791,52 @@ test "table recover rebuilds manifest from highest valid versioned meta" {
     const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 300), try snapshotSumU64(snapshot, 1));
+}
+
+test "table remove clears stale versioned files before reuse" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "reused_orders";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_TOTAL_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "reused_orders.sadb-schema", schema_source);
+    var old_ids = [_]u64{ 1, 2 };
+    var old_totals = [_]u64{ 100, 200 };
+    const old_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(old_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(old_totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, old_ids.len, &old_columns);
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    _ = try removeTable(std.testing.allocator, ".", table_name);
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "reused_orders.sadb-schema", schema_source);
+    var new_ids = [_]u64{9};
+    var new_totals = [_]u64{900};
+    const new_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(new_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(new_totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, new_ids.len, &new_columns);
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 1), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.epoch);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 900), try snapshotSumU64(snapshot, 1));
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {
