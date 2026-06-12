@@ -73,6 +73,10 @@ L_ENTRY:
     EXPAND DB_RECOVER recover_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_SUM_U64_HANDLE stale_handle_sum_status, stale_handle_points_sum, read_handle, 3
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_DELETE_U64_KEY delete_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 5, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_delete, info
+    EXPAND DB_DELETE_U64_KEY delete_missing_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 5, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_delete_missing, info
     EXPAND DB_OPEN_READ_TABLE open_after_status, read_handle_after, ROOT, ROOT_LEN, TABLE, TABLE_LEN
     EXPAND DB_SUM_U64_HANDLE sum_after_status, points_sum_after, read_handle_after, 3
     EXPAND DB_COUNT_U64_EQ_HANDLE count_status, plan_one_count, read_handle_after, 1, 1
@@ -114,9 +118,13 @@ L_ENTRY:
     ok_stale_sum_status = eq stale_handle_sum_status, SA_DB_OK
     ok_stale_sum = eq stale_handle_points_sum, 150
     ok_close_status = eq close_status, SA_DB_OK
+    ok_delete_status = eq delete_status, SA_DB_OK
+    ok_rows_after_delete = eq rows_after_delete, ROWS
+    ok_delete_missing_status = eq delete_missing_status, SA_DB_ERR_NOT_FOUND
+    ok_rows_after_delete_missing = eq rows_after_delete_missing, ROWS
     ok_open_after_status = eq open_after_status, SA_DB_OK
     ok_sum_after_status = eq sum_after_status, SA_DB_OK
-    ok_sum_after = eq points_sum_after, 170
+    ok_sum_after = eq points_sum_after, 120
     ok_count_status = eq count_status, SA_DB_OK
     ok_count = eq plan_one_count, 2
     ok_close_after_status = eq close_after_status, SA_DB_OK
@@ -156,7 +164,11 @@ L_ENTRY:
     ok26 = and ok25, ok_stale_sum_status
     ok27 = and ok26, ok_stale_sum
     ok28 = and ok27, ok_close_status
-    ok29 = and ok28, ok_open_after_status
+    ok28a = and ok28, ok_delete_status
+    ok28b = and ok28a, ok_rows_after_delete
+    ok28c = and ok28b, ok_delete_missing_status
+    ok28d = and ok28c, ok_rows_after_delete_missing
+    ok29 = and ok28d, ok_open_after_status
     ok30 = and ok29, ok_sum_after_status
     ok31 = and ok30, ok_sum_after
     ok32 = and ok31, ok_count_status
@@ -201,6 +213,10 @@ L_ENTRY:
     !stale_handle_sum_status
     !stale_handle_points_sum
     !close_status
+    !delete_status
+    !rows_after_delete
+    !delete_missing_status
+    !rows_after_delete_missing
     !open_after_status
     !read_handle_after
     !sum_after_status
@@ -246,6 +262,10 @@ L_ENTRY:
     !ok_stale_sum_status
     !ok_stale_sum
     !ok_close_status
+    !ok_delete_status
+    !ok_rows_after_delete
+    !ok_delete_missing_status
+    !ok_rows_after_delete_missing
     !ok_open_after_status
     !ok_sum_after_status
     !ok_sum_after
@@ -288,6 +308,10 @@ L_ENTRY:
     !ok26
     !ok27
     !ok28
+    !ok28a
+    !ok28b
+    !ok28c
+    !ok28d
     !ok29
     !ok30
     !ok31

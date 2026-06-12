@@ -43,6 +43,7 @@ Core native calls:
 - `sa_db_ingest_columns`
 - `sa_db_insert_row`
 - `sa_db_create_u64_index`
+- `sa_db_delete_u64_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
 - `sa_db_recover`
@@ -77,8 +78,8 @@ Removed calls:
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
 `DB_GET_U64_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
-`DB_CREATE_U64_INDEX`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
-`DB_SNAPSHOT`, `DB_RESTORE`, and `DB_RECOVER`.
+`DB_CREATE_U64_INDEX`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`,
+`DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and `DB_RECOVER`.
 
 ## Query Model
 
@@ -125,6 +126,12 @@ implementation splits the row into column slices and commits through the same
 column ingest path, so the write advances the table epoch and rebuilds any
 persisted `u64` indexes.
 
+`sa_db_delete_u64_key` / `DB_DELETE_U64_KEY` deletes one row by a unique `u64`
+key. The target column must already have a unique `u64` index, so the operation
+has primary-key semantics instead of deleting an arbitrary non-unique match. The
+delete rewrites the remaining rows into a new column segment, rebuilds indexes,
+advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
+
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-process transaction isolation. The
 v0.2 ERP foundation work is to add those missing database semantics without
@@ -141,8 +148,8 @@ benchmarks. The required baseline is:
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
   and dictionary-encoded strings.
 - Row-oriented public operations on top of the column store: fixed-width insert
-  exists now; next are upsert, get/delete by primary key, range query handles,
-  and projected batch reads.
+  and delete by unique `u64` key exist now; next are upsert, get by primary key,
+  range query handles, and projected batch reads.
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64` point-lookup/unique index, including date/customer/product filters and
   inventory/order workflows.

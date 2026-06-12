@@ -78,6 +78,10 @@
     %out_status = call @sa_db_create_u64_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_DELETE_U64_KEY %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %out_info
+    %out_status = call @sa_db_delete_u64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_SNAPSHOT %out_status, %root, %root_len, %table_name, %table_name_len, %out_info
     %out_status = call @sa_db_snapshot(&%root, %root_len, &%table_name, %table_name_len, &%out_info)
 [END_MACRO]

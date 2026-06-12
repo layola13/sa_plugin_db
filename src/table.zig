@@ -2052,6 +2052,141 @@ fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64)
     };
 }
 
+fn findUniqueU64KeyRow(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    expected: u64,
+) TableError!U64FindResult {
+    try ensureU64Column(meta, column_index);
+    var selected: ?IndexMeta = null;
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u64") and index.unique and index.column_index == @as(u64, @intCast(column_index))) {
+            selected = index;
+            break;
+        }
+    }
+    const index = selected orelse return TableError.InvalidFormat;
+    if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+
+    const path = try activePath(allocator, root_dir, index.path);
+    defer allocator.free(path);
+    const bytes = try readFileAlloc(allocator, path, 1 << 30);
+    defer allocator.free(bytes);
+    if (bytes.len != index.bytes) return TableError.VerifyFailed;
+    const actual_hash = hashBytes(bytes);
+    const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
+    if (!std.mem.eql(u8, actual_hex[0..], index.sha256)) return TableError.VerifyFailed;
+    try validateIndexBytesShape(bytes, meta.row_count, true);
+
+    return findU64InIndex(.{
+        .column_index = @intCast(column_index),
+        .unique = true,
+        .entries = bytes,
+    }, expected);
+}
+
+fn buildColumnBuffersWithoutRow(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    delete_row_index: u64,
+) TableError![]std.ArrayList(u8) {
+    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    errdefer allocator.free(buffers);
+    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    errdefer {
+        for (buffers) |*buf| buf.deinit();
+    }
+
+    for (meta.columns, 0..) |column, col_idx| {
+        var row_base: u64 = 0;
+        for (meta.segments) |segment| {
+            const file_meta = segment.files[col_idx];
+            const path = try activePath(allocator, root_dir, file_meta.path);
+            defer allocator.free(path);
+            const bytes = try readFileAlloc(allocator, path, 1 << 30);
+            defer allocator.free(bytes);
+            const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+            if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+
+            const stride: usize = @intCast(column.stride);
+            var local_row: u64 = 0;
+            while (local_row < segment.rows) : (local_row += 1) {
+                if (row_base + local_row == delete_row_index) continue;
+                const offset_u64 = std.math.mul(u64, local_row, @as(u64, column.stride)) catch return TableError.CursorOverflow;
+                const offset: usize = @intCast(offset_u64);
+                try buffers[col_idx].appendSlice(bytes[offset .. offset + stride]);
+            }
+            row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        }
+        if (row_base != meta.row_count) return TableError.VerifyFailed;
+    }
+
+    return buffers;
+}
+
+fn deleteRowAtIndex(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    row_index: u64,
+) TableError!TableInfo {
+    if (row_index >= meta.row_count) return TableError.InvalidFormat;
+    const next_row_count = meta.row_count - 1;
+    const buffers = try buildColumnBuffersWithoutRow(allocator, root_dir, meta.*, row_index);
+    defer {
+        for (buffers) |*buf| buf.deinit();
+        allocator.free(buffers);
+    }
+
+    const new_segments = try allocator.alloc(SegmentMeta, if (next_row_count > 0) 1 else 0);
+    var new_files: ?[]FileMeta = null;
+    var assigned_segments = false;
+    errdefer if (!assigned_segments) {
+        if (new_files) |files| freeFileMetas(allocator, files);
+        allocator.free(new_segments);
+    };
+    if (next_row_count > 0) {
+        const files = try writeSegmentFiles(allocator, root_dir, table_name, meta.next_segment_id, buffers);
+        new_files = files;
+        new_segments[0] = .{
+            .id = meta.next_segment_id,
+            .rows = next_row_count,
+            .files = files,
+        };
+        new_files = null;
+        meta.next_segment_id += 1;
+    }
+
+    const old_segments = meta.segments;
+    meta.segments = new_segments;
+    assigned_segments = true;
+    freeSegmentMetas(allocator, old_segments);
+    meta.row_count = next_row_count;
+    meta.epoch += 1;
+    try rebuildIndexes(allocator, root_dir, meta);
+    try writeMeta(allocator, root_dir, table_name, meta.*);
+    return tableInfo(meta.*);
+}
+
+pub fn deleteU64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected: u64,
+) TableError!TableInfo {
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+}
+
 pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
     try ensureSnapshotU64Column(snapshot, column_index);
     var sum: u64 = 0;
@@ -2619,6 +2754,20 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 3));
     }
 
+    const deleted = try deleteU64Key(std.testing.allocator, ".", table_name, 0, 4);
+    try std.testing.expectEqual(@as(u64, 3), deleted.row_count);
+    try std.testing.expectEqual(@as(usize, 1), deleted.segment_count);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 3), snapshot.row_count);
+        const deleted_id = try snapshotFindU64(snapshot, 0, 4);
+        try std.testing.expect(!deleted_id.found);
+        try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .eq, 4));
+        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
+    }
+    try std.testing.expectError(TableError.NotFound, deleteU64Key(std.testing.allocator, ".", table_name, 0, 4));
+
     {
         var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
         defer meta.deinit(std.testing.allocator);
@@ -2658,6 +2807,42 @@ test "table unique u64 index rejects duplicate existing data" {
     try std.testing.expectEqual(@as(u64, 2), non_unique.row_count);
     const verified = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+}
+
+test "table delete u64 key can empty a table" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "single_member";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "single_member.sadb-schema",
+        \\#def MAX_ROWS = 4
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var ids = [_]u64{7};
+    var points = [_]u64{70};
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(points[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    const deleted = try deleteU64Key(std.testing.allocator, ".", table_name, 0, 7);
+    try std.testing.expectEqual(@as(u64, 0), deleted.row_count);
+    try std.testing.expectEqual(@as(usize, 0), deleted.segment_count);
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 0), verified.row_count);
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 0), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .eq, 7));
 }
 
 test "table manifest selects active epoch over compatibility meta" {
