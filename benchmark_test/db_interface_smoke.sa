@@ -10,7 +10,9 @@
 #def SCHEMA_PATH_LEN = 19
 #def SCHEMA_LEN = 149
 #def ROWS = 4
+#def TOTAL_ROWS = 5
 #def COL_BYTES = 32
+#def ROW_BYTES = 32
 #def COLUMN_COUNT = 4
 #def COLUMNS_BYTES = 64
 
@@ -22,6 +24,7 @@ L_ENTRY:
     plan_col = alloc COL_BYTES
     status_col = alloc COL_BYTES
     points_col = alloc COL_BYTES
+    new_row = alloc ROW_BYTES
 
     store id_col+0, 1 as u64
     store id_col+8, 2 as u64
@@ -39,6 +42,10 @@ L_ENTRY:
     store points_col+8, 20 as u64
     store points_col+16, 30 as u64
     store points_col+24, 40 as u64
+    store new_row+0, 5 as u64
+    store new_row+8, 4 as u64
+    store new_row+16, 1 as u64
+    store new_row+24, 50 as u64
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
@@ -49,12 +56,14 @@ L_ENTRY:
     EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
     EXPAND DB_INFO_ROW_COUNT rows, info
     EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+    EXPAND DB_INSERT_ROW insert_row_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_insert, info
     EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INFO_EPOCH snapshot_epoch, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
     EXPAND DB_SUM_U64_HANDLE handle_sum_status, handle_points_sum_before, read_handle, 3
     EXPAND DB_COUNT_U64_CMP_HANDLE handle_count_status, handle_plan_ge_count, read_handle, 1, SA_DB_CMP_GE, 2
-    EXPAND DB_FIND_U64_HANDLE find_status, found_member, found_row, read_handle, 0, 3
+    EXPAND DB_FIND_U64_HANDLE find_status, found_member, found_row, read_handle, 0, 5
     EXPAND DB_GET_U64_HANDLE get_status, found_points, read_handle, 3, found_row
     EXPAND DB_MIN_U64_HANDLE handle_min_status, handle_points_min, read_handle, 3
     EXPAND DB_MAX_U64_HANDLE handle_max_status, handle_points_max, read_handle, 3
@@ -77,31 +86,33 @@ L_ENTRY:
     ok_ingest = eq ingest_status, SA_DB_OK
     ok_rows = eq rows, ROWS
     ok_create_index_status = eq create_index_status, SA_DB_OK
+    ok_insert_row_status = eq insert_row_status, SA_DB_OK
+    ok_rows_after_insert = eq rows_after_insert, TOTAL_ROWS
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
-    ok_snapshot_epoch = eq snapshot_epoch, 2
+    ok_snapshot_epoch = eq snapshot_epoch, 3
     ok_open_status = eq open_status, SA_DB_OK
     ok_handle_sum_status = eq handle_sum_status, SA_DB_OK
-    ok_handle_sum = eq handle_points_sum_before, 100
+    ok_handle_sum = eq handle_points_sum_before, 150
     ok_handle_count_status = eq handle_count_status, SA_DB_OK
-    ok_handle_count = eq handle_plan_ge_count, 2
+    ok_handle_count = eq handle_plan_ge_count, 3
     ok_find_status = eq find_status, SA_DB_OK
     ok_find_found = eq found_member, 1
-    ok_find_row = eq found_row, 2
+    ok_find_row = eq found_row, 4
     ok_get_status = eq get_status, SA_DB_OK
-    ok_get_points = eq found_points, 30
+    ok_get_points = eq found_points, 50
     ok_handle_min_status = eq handle_min_status, SA_DB_OK
     ok_handle_min = eq handle_points_min, 10
     ok_handle_max_status = eq handle_max_status, SA_DB_OK
-    ok_handle_max = eq handle_points_max, 40
+    ok_handle_max = eq handle_points_max, 50
     ok_update_status = eq update_status, SA_DB_OK
     ok_updated_rows = eq updated_rows, ROWS
     ok_recover_status = eq recover_status, SA_DB_OK
     ok_stale_sum_status = eq stale_handle_sum_status, SA_DB_OK
-    ok_stale_sum = eq stale_handle_points_sum, 100
+    ok_stale_sum = eq stale_handle_points_sum, 150
     ok_close_status = eq close_status, SA_DB_OK
     ok_open_after_status = eq open_after_status, SA_DB_OK
     ok_sum_after_status = eq sum_after_status, SA_DB_OK
-    ok_sum_after = eq points_sum_after, 120
+    ok_sum_after = eq points_sum_after, 170
     ok_count_status = eq count_status, SA_DB_OK
     ok_count = eq plan_one_count, 2
     ok_close_after_status = eq close_after_status, SA_DB_OK
@@ -109,52 +120,56 @@ L_ENTRY:
     ok_restore_status = eq restore_status, SA_DB_OK
     ok_open_restore_status = eq open_restore_status, SA_DB_OK
     ok_restore_sum_status = eq restore_sum_status, SA_DB_OK
-    ok_restore_sum = eq points_sum_restore, 100
+    ok_restore_sum = eq points_sum_restore, 150
     ok_close_restore_status = eq close_restore_status, SA_DB_OK
     ok01 = and ok_remove, ok_init
     ok02 = and ok01, ok_ingest
     ok03 = and ok02, ok_rows
     ok04 = and ok03, ok_create_index_status
-    ok05 = and ok04, ok_snapshot_status
-    ok06 = and ok05, ok_snapshot_epoch
-    ok07 = and ok06, ok_open_status
-    ok08 = and ok07, ok_handle_sum_status
-    ok09 = and ok08, ok_handle_sum
-    ok10 = and ok09, ok_handle_count_status
-    ok11 = and ok10, ok_handle_count
-    ok12 = and ok11, ok_find_status
-    ok13 = and ok12, ok_find_found
-    ok14 = and ok13, ok_find_row
-    ok15 = and ok14, ok_get_status
-    ok16 = and ok15, ok_get_points
-    ok17 = and ok16, ok_handle_min_status
-    ok18 = and ok17, ok_handle_min
-    ok19 = and ok18, ok_handle_max_status
-    ok20 = and ok19, ok_handle_max
-    ok21 = and ok20, ok_update_status
-    ok22 = and ok21, ok_updated_rows
-    ok23 = and ok22, ok_recover_status
-    ok24 = and ok23, ok_stale_sum_status
-    ok25 = and ok24, ok_stale_sum
-    ok26 = and ok25, ok_close_status
-    ok27 = and ok26, ok_open_after_status
-    ok28 = and ok27, ok_sum_after_status
-    ok29 = and ok28, ok_sum_after
-    ok30 = and ok29, ok_count_status
-    ok31 = and ok30, ok_count
-    ok32 = and ok31, ok_close_after_status
-    ok33 = and ok32, ok_verify
-    ok34 = and ok33, ok_restore_status
-    ok35 = and ok34, ok_open_restore_status
-    ok36 = and ok35, ok_restore_sum_status
-    ok37 = and ok36, ok_restore_sum
-    ok = and ok37, ok_close_restore_status
+    ok05 = and ok04, ok_insert_row_status
+    ok06 = and ok05, ok_rows_after_insert
+    ok07 = and ok06, ok_snapshot_status
+    ok08 = and ok07, ok_snapshot_epoch
+    ok09 = and ok08, ok_open_status
+    ok10 = and ok09, ok_handle_sum_status
+    ok11 = and ok10, ok_handle_sum
+    ok12 = and ok11, ok_handle_count_status
+    ok13 = and ok12, ok_handle_count
+    ok14 = and ok13, ok_find_status
+    ok15 = and ok14, ok_find_found
+    ok16 = and ok15, ok_find_row
+    ok17 = and ok16, ok_get_status
+    ok18 = and ok17, ok_get_points
+    ok19 = and ok18, ok_handle_min_status
+    ok20 = and ok19, ok_handle_min
+    ok21 = and ok20, ok_handle_max_status
+    ok22 = and ok21, ok_handle_max
+    ok23 = and ok22, ok_update_status
+    ok24 = and ok23, ok_updated_rows
+    ok25 = and ok24, ok_recover_status
+    ok26 = and ok25, ok_stale_sum_status
+    ok27 = and ok26, ok_stale_sum
+    ok28 = and ok27, ok_close_status
+    ok29 = and ok28, ok_open_after_status
+    ok30 = and ok29, ok_sum_after_status
+    ok31 = and ok30, ok_sum_after
+    ok32 = and ok31, ok_count_status
+    ok33 = and ok32, ok_count
+    ok34 = and ok33, ok_close_after_status
+    ok35 = and ok34, ok_verify
+    ok36 = and ok35, ok_restore_status
+    ok37 = and ok36, ok_open_restore_status
+    ok38 = and ok37, ok_restore_sum_status
+    ok39 = and ok38, ok_restore_sum
+    ok = and ok39, ok_close_restore_status
 
     !remove_status
     !init_status
     !ingest_status
     !rows
     !create_index_status
+    !insert_row_status
+    !rows_after_insert
     !snapshot_status
     !snapshot_epoch
     !open_status
@@ -197,6 +212,8 @@ L_ENTRY:
     !ok_ingest
     !ok_rows
     !ok_create_index_status
+    !ok_insert_row_status
+    !ok_rows_after_insert
     !ok_snapshot_status
     !ok_snapshot_epoch
     !ok_open_status
@@ -268,10 +285,13 @@ L_ENTRY:
     !ok35
     !ok36
     !ok37
+    !ok38
+    !ok39
     !id_col
     !plan_col
     !status_col
     !points_col
+    !new_row
     br ok -> L_OK, L_FAIL
 
 L_OK:

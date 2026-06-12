@@ -201,6 +201,27 @@ pub export fn sa_db_ingest_columns(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_insert_row(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.insertRawRow(gpa.allocator(), root, table_name, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_create_u64_index(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -506,8 +527,14 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(@as(u64, 3), info.row_count);
     try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_index(root.ptr, root.len, "members".ptr, "members".len, 0, 1, &info));
     try std.testing.expectEqual(@as(u64, 2), info.epoch);
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 4, .little);
+    std.mem.writeInt(u64, row[8..16], 40, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, "members".ptr, "members".len, &row, row.len, &info));
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
+    try std.testing.expectEqual(@as(u64, 3), info.epoch);
     try std.testing.expectEqual(SA_DB_OK, sa_db_snapshot(root.ptr, root.len, "members".ptr, "members".len, &info));
-    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+    try std.testing.expectEqual(@as(u64, 3), info.epoch);
 
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &handle));
@@ -515,10 +542,10 @@ test "db SA ABI creates ingests updates and scans raw columns" {
 
     var handle_sum: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
-    try std.testing.expectEqual(@as(u64, 60), handle_sum);
+    try std.testing.expectEqual(@as(u64, 100), handle_sum);
     var handle_count: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_count_u64_cmp_handle(handle, 0, @intFromEnum(table.U64CompareOp.ge), 2, &handle_count));
-    try std.testing.expectEqual(@as(u64, 2), handle_count);
+    try std.testing.expectEqual(@as(u64, 3), handle_count);
     var found: u64 = 0;
     var row_index: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(handle, 0, 3, &found, &row_index));
@@ -534,32 +561,32 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(@as(u64, 10), handle_min);
     var handle_max: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_max_u64_handle(handle, 1, &handle_max));
-    try std.testing.expectEqual(@as(u64, 30), handle_max);
+    try std.testing.expectEqual(@as(u64, 40), handle_max);
 
     var updated: u64 = 0;
-    try std.testing.expectEqual(SA_DB_OK, sa_db_update_u64_add(root.ptr, root.len, "members".ptr, "members".len, 1, 0, 3, 5, &updated));
-    try std.testing.expectEqual(@as(u64, 3), updated);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_update_u64_add(root.ptr, root.len, "members".ptr, "members".len, 1, 0, 4, 5, &updated));
+    try std.testing.expectEqual(@as(u64, 4), updated);
     try std.testing.expectEqual(SA_DB_OK, sa_db_recover(root.ptr, root.len, "members".ptr, "members".len, &info));
-    try std.testing.expectEqual(@as(u64, 3), info.epoch);
+    try std.testing.expectEqual(@as(u64, 4), info.epoch);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
-    try std.testing.expectEqual(@as(u64, 60), handle_sum);
+    try std.testing.expectEqual(@as(u64, 100), handle_sum);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
     try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_sum_u64_handle(handle, 1, &handle_sum));
 
     handle = null;
     try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
-    try std.testing.expectEqual(@as(u64, 75), handle_sum);
+    try std.testing.expectEqual(@as(u64, 120), handle_sum);
     try std.testing.expectEqual(SA_DB_OK, sa_db_count_u64_eq_handle(handle, 0, 2, &handle_count));
     try std.testing.expectEqual(@as(u64, 1), handle_count);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 
-    try std.testing.expectEqual(SA_DB_OK, sa_db_restore(root.ptr, root.len, "members".ptr, "members".len, 2, &info));
-    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_restore(root.ptr, root.len, "members".ptr, "members".len, 3, &info));
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
     handle = null;
     try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
-    try std.testing.expectEqual(@as(u64, 60), handle_sum);
+    try std.testing.expectEqual(@as(u64, 100), handle_sum);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 }

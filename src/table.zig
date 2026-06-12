@@ -1642,6 +1642,33 @@ pub fn ingestRawColumns(
     return tableInfo(meta);
 }
 
+pub fn insertRawRow(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    row_bytes: []const u8,
+) TableError!TableInfo {
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.row_bytes > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    if (row_bytes.len != @as(usize, @intCast(meta.row_bytes))) return TableError.InvalidFormat;
+
+    const columns = try allocator.alloc(RawColumnBytes, meta.columns.len);
+    defer allocator.free(columns);
+
+    var offset: usize = 0;
+    for (meta.columns, 0..) |column, idx| {
+        const stride: usize = @intCast(column.stride);
+        const next_offset = std.math.add(usize, offset, stride) catch return TableError.CursorOverflow;
+        if (next_offset > row_bytes.len) return TableError.InvalidFormat;
+        columns[idx] = .{ .bytes = row_bytes[offset..next_offset] };
+        offset = next_offset;
+    }
+    if (offset != row_bytes.len) return TableError.InvalidFormat;
+
+    return try ingestRawColumns(allocator, root_dir, table_name, 1, columns);
+}
+
 pub fn createU64Index(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -2529,6 +2556,21 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ge, 2));
     }
 
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, 4);
+    writeU64LE(&row, 8, 40);
+    const inserted = try insertRawRow(std.testing.allocator, ".", table_name, &row);
+    try std.testing.expectEqual(@as(u64, 4), inserted.row_count);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        const found4 = try snapshotFindU64(snapshot, 0, 4);
+        try std.testing.expect(found4.found);
+        try std.testing.expectEqual(@as(u64, 3), found4.row_index);
+        try std.testing.expectEqual(@as(u64, 40), try snapshotGetU64(snapshot, 1, found4.row_index));
+        try std.testing.expectEqual(@as(u64, 3), try snapshotCountU64Cmp(snapshot, 0, .ge, 2));
+    }
+
     _ = try updateU64ColumnAdd(std.testing.allocator, ".", table_name, 0, 0, 1, 10);
     {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
@@ -2538,7 +2580,7 @@ test "table persistent u64 index tracks ingest update and corruption" {
         const new_id = try snapshotFindU64(snapshot, 0, 11);
         try std.testing.expect(new_id.found);
         try std.testing.expectEqual(@as(u64, 0), new_id.row_index);
-        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
+        try std.testing.expectEqual(@as(u64, 3), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
         try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .le, 1));
     }
 

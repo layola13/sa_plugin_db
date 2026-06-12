@@ -41,6 +41,7 @@ Core native calls:
 - `sa_db_init_schema`
 - `sa_db_remove_table`
 - `sa_db_ingest_columns`
+- `sa_db_insert_row`
 - `sa_db_create_u64_index`
 - `sa_db_snapshot`
 - `sa_db_restore`
@@ -72,8 +73,9 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
-`DB_GET_U64_HANDLE`, `DB_CREATE_U64_INDEX`, `DB_MIN_U64_HANDLE`,
-`DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and `DB_RECOVER`.
+`DB_GET_U64_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
+`DB_CREATE_U64_INDEX`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_SNAPSHOT`, `DB_RESTORE`, and `DB_RECOVER`.
 
 ## Query Model
 
@@ -107,6 +109,12 @@ schema hash, segment hash, index hash, recorded size, and the expected
 the manifest to the highest valid epoch, which covers corrupted or missing
 manifest files after an interrupted commit.
 
+For ERP-style writes, `sa_db_insert_row` / `DB_INSERT_ROW` now accepts one
+fixed-width row laid out exactly as the active schema's column strides. The
+implementation splits the row into column slices and commits through the same
+column ingest path, so the write advances the table epoch and rebuilds any
+persisted `u64` indexes.
+
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-process transaction isolation. The
 v0.2 ERP foundation work is to add those missing database semantics without
@@ -122,8 +130,9 @@ benchmarks. The required baseline is:
   single-threaded, concurrent, and mixed read/write workloads.
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
   and dictionary-encoded strings.
-- Row-oriented public operations on top of the column store: insert, upsert,
-  get/delete by primary key, range query handles, and projected batch reads.
+- Row-oriented public operations on top of the column store: fixed-width insert
+  exists now; next are upsert, get/delete by primary key, range query handles,
+  and projected batch reads.
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64` point-lookup index, including date/customer/product filters and
   inventory/order workflows.
