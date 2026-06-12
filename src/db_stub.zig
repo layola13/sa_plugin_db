@@ -20,6 +20,7 @@ pub const ExecError = error{
     Locked,
     StaleMetadata,
     UnsupportedOperation,
+    ConstraintViolation,
 };
 
 pub const ExecResult = struct {
@@ -245,6 +246,7 @@ fn mapTableError(err: table_mod.TableError) ExecError {
         error.CursorOverflow => ExecError.InvalidFormat,
         error.SnapshotMissing => ExecError.FileNotFound,
         error.VerifyFailed => ExecError.SnapshotCorrupted,
+        error.ConstraintViolation => ExecError.ConstraintViolation,
     };
 }
 

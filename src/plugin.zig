@@ -53,6 +53,7 @@ fn isDbCliError(err: anyerror) bool {
         error.DbCapabilityEscalation,
         error.UnsupportedOperation,
         error.StaleMetadata,
+        error.ConstraintViolation,
         error.OutOfMemory,
         => true,
         else => false,
@@ -100,6 +101,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
         error.DuplicateRegister => "keep the original source path, grants, and entrypoint for this registered hash",
         error.DbCapabilityEscalation => "add explicit db_read/db_write/db_atomic_cursor grants for the query instructions",
         error.StaleMetadata => "retry the DB operation after refreshing table metadata",
+        error.ConstraintViolation => "use unique values for columns with unique DB indexes",
         error.UnsupportedOperation => "this DB operation is not implemented yet",
         error.OutOfMemory => "free memory and retry",
         else => "check DB command arguments",
@@ -130,6 +132,7 @@ fn writeDbCliError(writer: std.io.AnyWriter, argv: []const []const u8, err: anye
         error.DuplicateRegister => "DB query hash is already registered with different metadata",
         error.DbCapabilityEscalation => "DB query capability escalation",
         error.StaleMetadata => "DB table metadata changed during exec",
+        error.ConstraintViolation => "DB constraint violation",
         error.UnsupportedOperation => "DB operation is not implemented",
         error.OutOfMemory => "out of memory while processing DB command",
         else => @errorName(err),
@@ -184,6 +187,7 @@ fn mapTableError(err: table.TableError) anyerror {
         error.CursorOverflow => error.CursorOverflow,
         error.SnapshotMissing => error.SnapshotMissing,
         error.VerifyFailed => error.VerifyFailed,
+        error.ConstraintViolation => error.ConstraintViolation,
     };
 }
 
@@ -206,6 +210,7 @@ fn mapQmodError(err: qmod.ExecError) anyerror {
         error.Locked => error.Locked,
         error.StaleMetadata => error.StaleMetadata,
         error.UnsupportedOperation => error.UnsupportedOperation,
+        error.ConstraintViolation => error.ConstraintViolation,
     };
 }
 

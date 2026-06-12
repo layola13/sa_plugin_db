@@ -10,6 +10,7 @@ const SA_DB_ERR_CURSOR_OVERFLOW: u32 = 5;
 const SA_DB_ERR_VERIFY_FAILED: u32 = 6;
 const SA_DB_ERR_OUT_OF_MEMORY: u32 = 7;
 const SA_DB_ERR_IO: u32 = 8;
+const SA_DB_ERR_CONSTRAINT: u32 = 9;
 
 var mutation_mutex = std.Thread.Mutex{};
 var read_handle_mutex = std.Thread.Mutex{};
@@ -60,6 +61,7 @@ fn tableStatus(err: table.TableError) u32 {
         error.Locked => SA_DB_ERR_LOCKED,
         error.CursorOverflow => SA_DB_ERR_CURSOR_OVERFLOW,
         error.VerifyFailed => SA_DB_ERR_VERIFY_FAILED,
+        error.ConstraintViolation => SA_DB_ERR_CONSTRAINT,
     };
 }
 
@@ -533,6 +535,8 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, "members".ptr, "members".len, &row, row.len, &info));
     try std.testing.expectEqual(@as(u64, 4), info.row_count);
     try std.testing.expectEqual(@as(u64, 3), info.epoch);
+    try std.testing.expectEqual(SA_DB_ERR_CONSTRAINT, sa_db_insert_row(root.ptr, root.len, "members".ptr, "members".len, &row, row.len, &info));
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
     try std.testing.expectEqual(SA_DB_OK, sa_db_snapshot(root.ptr, root.len, "members".ptr, "members".len, &info));
     try std.testing.expectEqual(@as(u64, 3), info.epoch);
 

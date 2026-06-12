@@ -58,6 +58,8 @@ L_ENTRY:
     EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
     EXPAND DB_INSERT_ROW insert_row_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_insert, info
+    EXPAND DB_INSERT_ROW duplicate_insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_duplicate, info
     EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INFO_EPOCH snapshot_epoch, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
@@ -88,6 +90,8 @@ L_ENTRY:
     ok_create_index_status = eq create_index_status, SA_DB_OK
     ok_insert_row_status = eq insert_row_status, SA_DB_OK
     ok_rows_after_insert = eq rows_after_insert, TOTAL_ROWS
+    ok_duplicate_insert_status = eq duplicate_insert_status, SA_DB_ERR_CONSTRAINT
+    ok_rows_after_duplicate = eq rows_after_duplicate, TOTAL_ROWS
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
     ok_snapshot_epoch = eq snapshot_epoch, 3
     ok_open_status = eq open_status, SA_DB_OK
@@ -128,7 +132,9 @@ L_ENTRY:
     ok04 = and ok03, ok_create_index_status
     ok05 = and ok04, ok_insert_row_status
     ok06 = and ok05, ok_rows_after_insert
-    ok07 = and ok06, ok_snapshot_status
+    ok06a = and ok06, ok_duplicate_insert_status
+    ok06b = and ok06a, ok_rows_after_duplicate
+    ok07 = and ok06b, ok_snapshot_status
     ok08 = and ok07, ok_snapshot_epoch
     ok09 = and ok08, ok_open_status
     ok10 = and ok09, ok_handle_sum_status
@@ -170,6 +176,8 @@ L_ENTRY:
     !create_index_status
     !insert_row_status
     !rows_after_insert
+    !duplicate_insert_status
+    !rows_after_duplicate
     !snapshot_status
     !snapshot_epoch
     !open_status
@@ -214,6 +222,8 @@ L_ENTRY:
     !ok_create_index_status
     !ok_insert_row_status
     !ok_rows_after_insert
+    !ok_duplicate_insert_status
+    !ok_rows_after_duplicate
     !ok_snapshot_status
     !ok_snapshot_epoch
     !ok_open_status
@@ -254,6 +264,8 @@ L_ENTRY:
     !ok04
     !ok05
     !ok06
+    !ok06a
+    !ok06b
     !ok07
     !ok08
     !ok09

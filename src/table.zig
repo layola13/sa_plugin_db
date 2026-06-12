@@ -13,6 +13,7 @@ pub const TableError = error{
     CursorOverflow,
     SnapshotMissing,
     VerifyFailed,
+    ConstraintViolation,
 };
 
 pub const TableInfo = struct {
@@ -1855,7 +1856,7 @@ fn buildU64IndexBytes(
     std.sort.block(IndexEntry, entries, {}, indexEntryLessThan);
     if (unique and entries.len > 1) {
         for (entries[1..], 1..) |entry, idx| {
-            if (entry.key == entries[idx - 1].key) return TableError.InvalidFormat;
+            if (entry.key == entries[idx - 1].key) return TableError.ConstraintViolation;
         }
     }
 
@@ -2304,6 +2305,7 @@ pub fn ingestTable(
     if (total_rows > meta.max_rows) return TableError.CursorOverflow;
 
     try appendSegmentToMeta(allocator, root_dir, table_name, &meta, buffers, row_count);
+    try rebuildIndexes(allocator, root_dir, &meta);
     try writeMeta(allocator, root_dir, table_name, meta);
 
     for (buffers) |*buf| buf.deinit();
@@ -2571,6 +2573,31 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 3), try snapshotCountU64Cmp(snapshot, 0, .ge, 2));
     }
 
+    var duplicate_row: [16]u8 = undefined;
+    writeU64LE(&duplicate_row, 0, 4);
+    writeU64LE(&duplicate_row, 8, 400);
+    try std.testing.expectError(TableError.ConstraintViolation, insertRawRow(std.testing.allocator, ".", table_name, &duplicate_row));
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 4), snapshot.row_count);
+        try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 4));
+    }
+
+    var duplicate_ids = [_]u64{4};
+    var duplicate_points = [_]u64{400};
+    const duplicate_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(duplicate_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(duplicate_points[0..]) },
+    };
+    try std.testing.expectError(TableError.ConstraintViolation, ingestRawColumns(std.testing.allocator, ".", table_name, duplicate_ids.len, &duplicate_columns));
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 4), snapshot.row_count);
+        try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 4));
+    }
+
     _ = try updateU64ColumnAdd(std.testing.allocator, ".", table_name, 0, 0, 1, 10);
     {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
@@ -2584,6 +2611,14 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .le, 1));
     }
 
+    try std.testing.expectError(TableError.ConstraintViolation, updateU64ColumnAdd(std.testing.allocator, ".", table_name, 0, 1, 1, 1));
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 2), try snapshotGetU64(snapshot, 0, 1));
+        try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 3));
+    }
+
     {
         var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
         defer meta.deinit(std.testing.allocator);
@@ -2592,6 +2627,37 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try writeFile(std.testing.allocator, index_path, "corrupt");
     }
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table unique u64 index rejects duplicate existing data" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "duplicate_members";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "duplicate_members.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var ids = [_]u64{ 1, 1 };
+    var points = [_]u64{ 10, 20 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(points[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+
+    try std.testing.expectError(TableError.ConstraintViolation, createU64Index(std.testing.allocator, ".", table_name, 0, true));
+    const non_unique = try createU64Index(std.testing.allocator, ".", table_name, 0, false);
+    try std.testing.expectEqual(@as(u64, 2), non_unique.row_count);
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.row_count);
 }
 
 test "table manifest selects active epoch over compatibility meta" {

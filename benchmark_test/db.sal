@@ -10,6 +10,7 @@
 #def SA_DB_ERR_VERIFY_FAILED = 6
 #def SA_DB_ERR_OUT_OF_MEMORY = 7
 #def SA_DB_ERR_IO = 8
+#def SA_DB_ERR_CONSTRAINT = 9
 
 #def SA_DB_CMP_EQ = 0
 #def SA_DB_CMP_NE = 1

@@ -64,6 +64,9 @@ Read-handle query calls:
 - `sa_db_min_u64_handle`
 - `sa_db_max_u64_handle`
 
+Public status constants include `SA_DB_ERR_CONSTRAINT` for writes that violate
+unique indexes.
+
 Removed calls:
 
 - `sa_db_sum_u64`
@@ -109,6 +112,13 @@ schema hash, segment hash, index hash, recorded size, and the expected
 the manifest to the highest valid epoch, which covers corrupted or missing
 manifest files after an interrupted commit.
 
+`sa_db_create_u64_index(..., unique=1)` now acts as a real uniqueness
+constraint. Creating the unique index rejects existing duplicate values, and
+later column ingest, fixed-width row insert, update, compact, and Qmod commit
+paths rebuild the persisted index before committing metadata. If duplicate keys
+would appear, the write is rejected with `SA_DB_ERR_CONSTRAINT` and the active
+manifest remains on the previous table epoch.
+
 For ERP-style writes, `sa_db_insert_row` / `DB_INSERT_ROW` now accepts one
 fixed-width row laid out exactly as the active schema's column strides. The
 implementation splits the row into column slices and commits through the same
@@ -134,7 +144,7 @@ benchmarks. The required baseline is:
   exists now; next are upsert, get/delete by primary key, range query handles,
   and projected batch reads.
 - Generalized primary-key and secondary indexes beyond the current persisted
-  `u64` point-lookup index, including date/customer/product filters and
+  `u64` point-lookup/unique index, including date/customer/product filters and
   inventory/order workflows.
 - Transaction commit semantics, followed by optional WAL and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
