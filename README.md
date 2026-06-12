@@ -81,8 +81,9 @@ Read queries now use snapshots:
 
 1. `sa_db_open_read_table` opens a read handle and copies immutable column bytes
    into a read snapshot.
-2. `*_handle` query functions scan the in-memory snapshot; `find_u64` uses a
-   persisted sorted `u64 -> row` index when one exists for the column.
+2. `*_handle` query functions scan the in-memory snapshot; `find_u64` and
+   `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
+   the column.
 3. `sa_db_close_read_table` releases the snapshot.
 
 This makes repeated serial and concurrent reads fast because they no longer

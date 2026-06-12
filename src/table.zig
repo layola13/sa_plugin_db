@@ -1963,9 +1963,8 @@ fn snapshotIndexForU64Column(snapshot: *const ReadSnapshot, column_index: usize)
 }
 
 fn findU64InIndex(index: ReadIndexSnapshot, expected: u64) U64FindResult {
-    const n = index.entries.len / INDEX_RECORD_BYTES;
     var lo: usize = 0;
-    var hi: usize = n;
+    var hi: usize = index.entries.len / INDEX_RECORD_BYTES;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         const key = readIndexKey(index.entries, mid);
@@ -1975,10 +1974,54 @@ fn findU64InIndex(index: ReadIndexSnapshot, expected: u64) U64FindResult {
             hi = mid;
         }
     }
+    const n = index.entries.len / INDEX_RECORD_BYTES;
     if (lo < n and readIndexKey(index.entries, lo) == expected) {
         return .{ .found = true, .row_index = readIndexRow(index.entries, lo) };
     }
     return .{ .found = false, .row_index = 0 };
+}
+
+fn lowerBoundU64Index(index: ReadIndexSnapshot, expected: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = index.entries.len / INDEX_RECORD_BYTES;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (readIndexKey(index.entries, mid) < expected) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn upperBoundU64Index(index: ReadIndexSnapshot, expected: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = index.entries.len / INDEX_RECORD_BYTES;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (readIndexKey(index.entries, mid) <= expected) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64) u64 {
+    const n = index.entries.len / INDEX_RECORD_BYTES;
+    const lower = lowerBoundU64Index(index, expected);
+    const upper = upperBoundU64Index(index, expected);
+    const equal_count = upper - lower;
+    return switch (op) {
+        .eq => @intCast(equal_count),
+        .ne => @intCast(n - equal_count),
+        .lt => @intCast(lower),
+        .le => @intCast(upper),
+        .gt => @intCast(n - upper),
+        .ge => @intCast(n - lower),
+    };
 }
 
 pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
@@ -1999,6 +2042,9 @@ pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableE
 
 pub fn snapshotCountU64Cmp(snapshot: *const ReadSnapshot, column_index: usize, op: U64CompareOp, expected: u64) TableError!u64 {
     try ensureSnapshotU64Column(snapshot, column_index);
+    if (snapshotIndexForU64Column(snapshot, column_index)) |index| {
+        return countU64CmpInIndex(index, op, expected);
+    }
     var count: u64 = 0;
     for (snapshot.segments) |segment| {
         const bytes = segment.columns[column_index].bytes;
@@ -2477,6 +2523,10 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expect(found3.found);
         try std.testing.expectEqual(@as(u64, 2), found3.row_index);
         try std.testing.expectEqual(@as(u64, 30), try snapshotGetU64(snapshot, 1, found3.row_index));
+        try std.testing.expectEqual(@as(u64, 1), try snapshotCountU64Cmp(snapshot, 0, .eq, 3));
+        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ne, 2));
+        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .lt, 3));
+        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ge, 2));
     }
 
     _ = try updateU64ColumnAdd(std.testing.allocator, ".", table_name, 0, 0, 1, 10);
@@ -2488,6 +2538,8 @@ test "table persistent u64 index tracks ingest update and corruption" {
         const new_id = try snapshotFindU64(snapshot, 0, 11);
         try std.testing.expect(new_id.found);
         try std.testing.expectEqual(@as(u64, 0), new_id.row_index);
+        try std.testing.expectEqual(@as(u64, 2), try snapshotCountU64Cmp(snapshot, 0, .ge, 3));
+        try std.testing.expectEqual(@as(u64, 0), try snapshotCountU64Cmp(snapshot, 0, .le, 1));
     }
 
     {
