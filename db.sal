@@ -172,6 +172,14 @@
     %out_value = load __db_handle_get_slot_%out_value+0 as u64
 [END_MACRO]
 
+[MACRO] DB_PROJECT_ROWS_HANDLE %out_status, %out_written_rows, %out_required_bytes, %out_bytes, %out_bytes_len, %handle, %row_indices, %row_indices_len, %column_indices, %column_indices_len
+    __db_project_written_slot_%out_written_rows = stack_alloc 8
+    __db_project_required_slot_%out_required_bytes = stack_alloc 8
+    %out_status = call @sa_db_project_rows_handle(%handle, &%row_indices, %row_indices_len, &%column_indices, %column_indices_len, &%out_bytes, %out_bytes_len, &__db_project_written_slot_%out_written_rows, &__db_project_required_slot_%out_required_bytes)
+    %out_written_rows = load __db_project_written_slot_%out_written_rows+0 as u64
+    %out_required_bytes = load __db_project_required_slot_%out_required_bytes+0 as u64
+[END_MACRO]
+
 [MACRO] DB_GET_ROW_HANDLE %out_status, %handle, %row_index, %out_row, %out_row_len
     %out_status = call @sa_db_get_row_handle(%handle, %row_index, &%out_row, %out_row_len)
 [END_MACRO]

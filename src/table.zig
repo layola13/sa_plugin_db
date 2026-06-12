@@ -149,6 +149,11 @@ pub const U64RangeResult = struct {
     total: u64,
 };
 
+pub const ProjectRowsResult = struct {
+    written_rows: u64,
+    required_bytes: u64,
+};
+
 pub const ReadSnapshot = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -2163,6 +2168,71 @@ pub fn snapshotGetRow(snapshot: *const ReadSnapshot, row_index: u64, out_row: []
     try snapshotCopyRow(snapshot, row_index, out_row);
 }
 
+fn snapshotProjectedRowBytes(snapshot: *const ReadSnapshot, column_indices: []const u64) TableError!usize {
+    if (column_indices.len == 0) return TableError.InvalidFormat;
+    var total: u64 = 0;
+    for (column_indices) |column_index_u64| {
+        if (column_index_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
+        const column_index: usize = @intCast(column_index_u64);
+        if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+        total = std.math.add(u64, total, snapshot.columns[column_index].stride) catch return TableError.CursorOverflow;
+    }
+    if (total > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(total);
+}
+
+pub fn snapshotProjectRowsRequiredBytes(
+    snapshot: *const ReadSnapshot,
+    row_count: u64,
+    column_indices: []const u64,
+) TableError!u64 {
+    const projected_row_bytes = try snapshotProjectedRowBytes(snapshot, column_indices);
+    return std.math.mul(u64, row_count, @as(u64, @intCast(projected_row_bytes))) catch TableError.CursorOverflow;
+}
+
+pub fn snapshotProjectRows(
+    snapshot: *const ReadSnapshot,
+    row_indices: []const u64,
+    column_indices: []const u64,
+    out_bytes: []u8,
+) TableError!ProjectRowsResult {
+    const projected_row_bytes = try snapshotProjectedRowBytes(snapshot, column_indices);
+    const required_bytes = std.math.mul(u64, @as(u64, @intCast(row_indices.len)), @as(u64, @intCast(projected_row_bytes))) catch return TableError.CursorOverflow;
+    if (required_bytes > @as(u64, @intCast(out_bytes.len))) return TableError.CursorOverflow;
+
+    var out_offset: usize = 0;
+    for (row_indices) |row_index| {
+        if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
+        var row_base: u64 = 0;
+        var copied = false;
+        for (snapshot.segments) |segment| {
+            const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+            if (row_index < segment_end) {
+                const local_row = row_index - row_base;
+                for (column_indices) |column_index_u64| {
+                    const column_index: usize = @intCast(column_index_u64);
+                    const column = snapshot.columns[column_index];
+                    const bytes = segment.columns[column_index].bytes;
+                    const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+                    if (bytes.len != expected_len) return TableError.VerifyFailed;
+                    const stride: usize = @intCast(column.stride);
+                    const source_offset_u64 = std.math.mul(u64, local_row, @as(u64, column.stride)) catch return TableError.CursorOverflow;
+                    if (source_offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+                    const source_offset: usize = @intCast(source_offset_u64);
+                    @memcpy(out_bytes[out_offset .. out_offset + stride], bytes[source_offset .. source_offset + stride]);
+                    out_offset += stride;
+                }
+                copied = true;
+                break;
+            }
+            row_base = segment_end;
+        }
+        if (!copied) return TableError.InvalidFormat;
+    }
+
+    return .{ .written_rows = @intCast(row_indices.len), .required_bytes = required_bytes };
+}
+
 fn findUniqueU64KeyRow(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -3044,6 +3114,18 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try snapshotGetRow(snapshot, range_rows[1], &range_row);
         try std.testing.expectEqual(@as(u64, 4), readU64LE(&range_row, 0));
         try std.testing.expectEqual(@as(u64, 44), readU64LE(&range_row, 8));
+        const project_columns = [_]u64{ 0, 1 };
+        try std.testing.expectEqual(@as(u64, 32), try snapshotProjectRowsRequiredBytes(snapshot, 2, &project_columns));
+        var projected_rows: [32]u8 = undefined;
+        const projected = try snapshotProjectRows(snapshot, range_rows[0..2], &project_columns, &projected_rows);
+        try std.testing.expectEqual(@as(u64, 2), projected.written_rows);
+        try std.testing.expectEqual(@as(u64, 32), projected.required_bytes);
+        try std.testing.expectEqual(@as(u64, 3), readU64LE(&projected_rows, 0));
+        try std.testing.expectEqual(@as(u64, 30), readU64LE(&projected_rows, 8));
+        try std.testing.expectEqual(@as(u64, 4), readU64LE(&projected_rows, 16));
+        try std.testing.expectEqual(@as(u64, 44), readU64LE(&projected_rows, 24));
+        var too_small_project: [24]u8 = undefined;
+        try std.testing.expectError(TableError.CursorOverflow, snapshotProjectRows(snapshot, range_rows[0..2], &project_columns, &too_small_project));
         const empty_range = try snapshotRangeU64Rows(snapshot, 0, 9, 2, 0, 2, &range_rows);
         try std.testing.expectEqual(@as(u64, 0), empty_range.total);
         try std.testing.expectEqual(@as(u64, 0), empty_range.written);
