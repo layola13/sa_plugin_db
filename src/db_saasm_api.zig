@@ -41,6 +41,14 @@ fn inputBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
     return p[0..n];
 }
 
+fn outputBytes(ptr: ?[*]u8, len: u64) ?[]u8 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return null;
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
 fn requiredBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
     const bytes = inputBytes(ptr, len) orelse return null;
     if (bytes.len == 0) return null;
@@ -502,6 +510,21 @@ pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_i
     return SA_DB_OK;
 }
 
+pub export fn sa_db_get_row_u64_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u64,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowU64Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_min_u64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*u64) u32 {
     const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -579,6 +602,11 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     var row_points: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(handle, 1, row_index, &row_points));
     try std.testing.expectEqual(@as(u64, 30), row_points);
+    var fetched_row: [16]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u64_key_handle(handle, 0, 4, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 40), std.mem.readInt(u64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_u64_key_handle(handle, 0, 99, &fetched_row, fetched_row.len));
     try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(handle, 0, 99, &found, &row_index));
     try std.testing.expectEqual(@as(u64, 0), found);
     var handle_min: u64 = 0;

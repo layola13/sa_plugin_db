@@ -1990,6 +1990,13 @@ fn snapshotIndexForU64Column(snapshot: *const ReadSnapshot, column_index: usize)
     return null;
 }
 
+fn snapshotUniqueIndexForU64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
 fn findU64InIndex(index: ReadIndexSnapshot, expected: u64) U64FindResult {
     var lo: usize = 0;
     var hi: usize = index.entries.len / INDEX_RECORD_BYTES;
@@ -2050,6 +2057,53 @@ fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64)
         .gt => @intCast(n - upper),
         .ge => @intCast(n - lower),
     };
+}
+
+fn snapshotRowBytes(snapshot: *const ReadSnapshot) TableError!usize {
+    var total: u64 = 0;
+    for (snapshot.columns) |column| {
+        total = std.math.add(u64, total, column.stride) catch return TableError.CursorOverflow;
+    }
+    if (total > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(total);
+}
+
+fn snapshotCopyRow(snapshot: *const ReadSnapshot, row_index: u64, out_row: []u8) TableError!void {
+    if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
+    const row_bytes = try snapshotRowBytes(snapshot);
+    if (out_row.len != row_bytes) return TableError.InvalidFormat;
+
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const local_row = row_index - row_base;
+            var out_offset: usize = 0;
+            for (snapshot.columns, 0..) |column, column_idx| {
+                const bytes = segment.columns[column_idx].bytes;
+                const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+                if (bytes.len != expected_len) return TableError.VerifyFailed;
+                const stride: usize = @intCast(column.stride);
+                const source_offset_u64 = std.math.mul(u64, local_row, @as(u64, column.stride)) catch return TableError.CursorOverflow;
+                if (source_offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+                const source_offset: usize = @intCast(source_offset_u64);
+                @memcpy(out_row[out_offset .. out_offset + stride], bytes[source_offset .. source_offset + stride]);
+                out_offset += stride;
+            }
+            if (out_offset != out_row.len) return TableError.InvalidFormat;
+            return;
+        }
+        row_base = segment_end;
+    }
+    return TableError.InvalidFormat;
+}
+
+pub fn snapshotGetRowU64Key(snapshot: *const ReadSnapshot, column_index: usize, expected: u64, out_row: []u8) TableError!void {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForU64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findU64InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
 }
 
 fn findUniqueU64KeyRow(
@@ -2706,6 +2760,11 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 3), found4.row_index);
         try std.testing.expectEqual(@as(u64, 40), try snapshotGetU64(snapshot, 1, found4.row_index));
         try std.testing.expectEqual(@as(u64, 3), try snapshotCountU64Cmp(snapshot, 0, .ge, 2));
+        var fetched_row: [16]u8 = undefined;
+        try snapshotGetRowU64Key(snapshot, 0, 4, &fetched_row);
+        try std.testing.expectEqual(@as(u64, 4), readU64LE(&fetched_row, 0));
+        try std.testing.expectEqual(@as(u64, 40), readU64LE(&fetched_row, 8));
+        try std.testing.expectError(TableError.NotFound, snapshotGetRowU64Key(snapshot, 0, 99, &fetched_row));
     }
 
     var duplicate_row: [16]u8 = undefined;

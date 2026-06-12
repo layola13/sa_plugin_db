@@ -25,6 +25,7 @@ L_ENTRY:
     status_col = alloc COL_BYTES
     points_col = alloc COL_BYTES
     new_row = alloc ROW_BYTES
+    fetched_row = alloc ROW_BYTES
 
     store id_col+0, 1 as u64
     store id_col+8, 2 as u64
@@ -67,6 +68,12 @@ L_ENTRY:
     EXPAND DB_COUNT_U64_CMP_HANDLE handle_count_status, handle_plan_ge_count, read_handle, 1, SA_DB_CMP_GE, 2
     EXPAND DB_FIND_U64_HANDLE find_status, found_member, found_row, read_handle, 0, 5
     EXPAND DB_GET_U64_HANDLE get_status, found_points, read_handle, 3, found_row
+    EXPAND DB_GET_ROW_U64_KEY_HANDLE get_row_key_status, read_handle, 0, 5, fetched_row, ROW_BYTES
+    fetched_id = load fetched_row+0 as u64
+    fetched_plan = load fetched_row+8 as u64
+    fetched_status = load fetched_row+16 as u64
+    fetched_points = load fetched_row+24 as u64
+    EXPAND DB_GET_ROW_U64_KEY_HANDLE get_row_missing_status, read_handle, 0, 99, fetched_row, ROW_BYTES
     EXPAND DB_MIN_U64_HANDLE handle_min_status, handle_points_min, read_handle, 3
     EXPAND DB_MAX_U64_HANDLE handle_max_status, handle_points_max, read_handle, 3
     EXPAND DB_UPDATE_U64_ADD update_status, updated_rows, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 0, ROWS, 5
@@ -108,6 +115,12 @@ L_ENTRY:
     ok_find_row = eq found_row, 4
     ok_get_status = eq get_status, SA_DB_OK
     ok_get_points = eq found_points, 50
+    ok_get_row_key_status = eq get_row_key_status, SA_DB_OK
+    ok_fetched_id = eq fetched_id, 5
+    ok_fetched_plan = eq fetched_plan, 4
+    ok_fetched_status = eq fetched_status, 1
+    ok_fetched_points = eq fetched_points, 50
+    ok_get_row_missing_status = eq get_row_missing_status, SA_DB_ERR_NOT_FOUND
     ok_handle_min_status = eq handle_min_status, SA_DB_OK
     ok_handle_min = eq handle_points_min, 10
     ok_handle_max_status = eq handle_max_status, SA_DB_OK
@@ -154,7 +167,13 @@ L_ENTRY:
     ok16 = and ok15, ok_find_row
     ok17 = and ok16, ok_get_status
     ok18 = and ok17, ok_get_points
-    ok19 = and ok18, ok_handle_min_status
+    ok18a = and ok18, ok_get_row_key_status
+    ok18b = and ok18a, ok_fetched_id
+    ok18c = and ok18b, ok_fetched_plan
+    ok18d = and ok18c, ok_fetched_status
+    ok18e = and ok18d, ok_fetched_points
+    ok18f = and ok18e, ok_get_row_missing_status
+    ok19 = and ok18f, ok_handle_min_status
     ok20 = and ok19, ok_handle_min
     ok21 = and ok20, ok_handle_max_status
     ok22 = and ok21, ok_handle_max
@@ -203,6 +222,12 @@ L_ENTRY:
     !found_row
     !get_status
     !found_points
+    !get_row_key_status
+    !fetched_id
+    !fetched_plan
+    !fetched_status
+    !fetched_points
+    !get_row_missing_status
     !handle_min_status
     !handle_points_min
     !handle_max_status
@@ -252,6 +277,12 @@ L_ENTRY:
     !ok_find_row
     !ok_get_status
     !ok_get_points
+    !ok_get_row_key_status
+    !ok_fetched_id
+    !ok_fetched_plan
+    !ok_fetched_status
+    !ok_fetched_points
+    !ok_get_row_missing_status
     !ok_handle_min_status
     !ok_handle_min
     !ok_handle_max_status
@@ -298,6 +329,12 @@ L_ENTRY:
     !ok16
     !ok17
     !ok18
+    !ok18a
+    !ok18b
+    !ok18c
+    !ok18d
+    !ok18e
+    !ok18f
     !ok19
     !ok20
     !ok21
@@ -328,6 +365,7 @@ L_ENTRY:
     !status_col
     !points_col
     !new_row
+    !fetched_row
     br ok -> L_OK, L_FAIL
 
 L_OK:
