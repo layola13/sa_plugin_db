@@ -105,6 +105,16 @@ pub const TableMeta = struct {
     }
 };
 
+pub const TableWriteLock = struct {
+    file: std.fs.File,
+
+    pub fn release(self: *TableWriteLock) void {
+        self.file.unlock();
+        self.file.close();
+        self.* = undefined;
+    }
+};
+
 pub const TableManifest = struct {
     magic: []const u8,
     version: u32,
@@ -278,6 +288,30 @@ fn tableVersionedMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, ta
     const path = try activePath(allocator, root_dir, basename);
     allocator.free(basename);
     return path;
+}
+
+fn tableWriteLockName(allocator: std.mem.Allocator, table_name: []const u8) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.write.lock", .{table_name});
+}
+
+fn tableWriteLockPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    const basename = try tableWriteLockName(allocator, table_name);
+    errdefer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    allocator.free(basename);
+    return path;
+}
+
+pub fn acquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!TableWriteLock {
+    const path = try tableWriteLockPath(allocator, root_dir, table_name);
+    defer allocator.free(path);
+    try ensureParentDir(path);
+    const file = std.fs.cwd().createFile(path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+    }) catch |err| return mapFileError(err);
+    return .{ .file = file };
 }
 
 fn schemaMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
@@ -1139,10 +1173,13 @@ fn deleteRootTableArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
 
     const prefix = try allocPrintPath(allocator, "{s}.", .{table_name});
     defer allocator.free(prefix);
+    const lock_name = try tableWriteLockName(allocator, table_name);
+    defer allocator.free(lock_name);
     var it = dir.iterate();
     while (it.next() catch |err| return mapFileError(err)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        if (std.mem.eql(u8, entry.name, lock_name)) continue;
         const path = try activePath(allocator, root_dir, entry.name);
         defer allocator.free(path);
         try deleteIfExists(path);
@@ -1537,15 +1574,27 @@ fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []c
     try writeFile(allocator, compat_path, json);
 }
 
-pub fn commitTableMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+pub fn commitTableMetaUnlocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
     try writeMeta(allocator, root_dir, table_name, meta);
 }
 
-pub fn commitTableMetaWithRebuiltIndexes(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+pub fn commitTableMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+    try commitTableMetaUnlocked(allocator, root_dir, table_name, meta);
+}
+
+pub fn commitTableMetaWithRebuiltIndexesUnlocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
     var owned = try duplicateTableMeta(allocator, meta);
     defer owned.deinit(allocator);
     try rebuildIndexes(allocator, root_dir, &owned);
     try writeMeta(allocator, root_dir, table_name, owned);
+}
+
+pub fn commitTableMetaWithRebuiltIndexes(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+    try commitTableMetaWithRebuiltIndexesUnlocked(allocator, root_dir, table_name, meta);
 }
 
 pub fn rewriteColumnFileForEpoch(
@@ -1586,6 +1635,9 @@ pub fn initTableFromSchemaBytes(
     var schema_obj = schema.compile(allocator, schema_source, schema_path_hint) catch |err| return mapSchemaError(err);
     defer schema_obj.deinit();
 
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, schema_obj.table_name);
+    defer write_lock.release();
+
     const schema_path = try schemaMetaPath(allocator, root_dir, schema_obj.table_name);
     defer allocator.free(schema_path);
     try writeFile(allocator, schema_path, schema_source);
@@ -1601,6 +1653,9 @@ pub fn initTableFromSchemaBytes(
 }
 
 pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     if (loadActiveMeta(allocator, root_dir, table_name)) |meta| {
         var owned = meta;
         defer owned.deinit(allocator);
@@ -1652,7 +1707,7 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
     return .{ .row_count = 0, .segment_count = 0, .epoch = 0, .locked = false };
 }
 
-pub fn ingestRawColumns(
+fn ingestRawColumnsUnlocked(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
     table_name: []const u8,
@@ -1700,18 +1755,33 @@ pub fn ingestRawColumns(
     return tableInfo(meta);
 }
 
+pub fn ingestRawColumns(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    row_count: u64,
+    columns: []const RawColumnBytes,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+    return try ingestRawColumnsUnlocked(allocator, root_dir, table_name, row_count, columns);
+}
+
 pub fn insertRawRow(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
     table_name: []const u8,
     row_bytes: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const columns = try splitRawRowColumns(allocator, meta, row_bytes);
     defer allocator.free(columns);
 
-    return try ingestRawColumns(allocator, root_dir, table_name, 1, columns);
+    return try ingestRawColumnsUnlocked(allocator, root_dir, table_name, 1, columns);
 }
 
 fn fixedRowBytes(meta: TableMeta) TableError!usize {
@@ -1777,6 +1847,9 @@ pub fn createU64Index(
     column_index: usize,
     unique: bool,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
@@ -1842,6 +1915,9 @@ pub fn createI64Index(
     column_index: usize,
     unique: bool,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
@@ -2691,6 +2767,9 @@ pub fn deleteU64Key(
     column_index: usize,
     expected: u64,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
@@ -2707,6 +2786,9 @@ pub fn upsertRawRowU64Key(
     expected: u64,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
@@ -3034,6 +3116,9 @@ pub fn updateU64ColumnAdd(
     update_count: u64,
     delta: u64,
 ) TableError!u64 {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
@@ -3091,6 +3176,9 @@ pub fn ingestTable(
     table_name: []const u8,
     data_path: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var schema_obj = try loadSchema(allocator, root_dir, table_name);
     defer schema_obj.deinit();
 
@@ -3174,6 +3262,9 @@ pub fn snapshotTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     try appendSnapshotArtifacts(allocator, root_dir, table_name, meta);
@@ -3186,6 +3277,9 @@ pub fn restoreTable(
     table_name: []const u8,
     epoch: u64,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     return restoreSnapshotArtifacts(allocator, root_dir, table_name, epoch) catch |err| switch (err) {
         TableError.NotFound => TableError.SnapshotMissing,
         else => err,
@@ -3197,6 +3291,9 @@ pub fn recoverTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var best: ?TableMeta = null;
     defer if (best) |*meta| meta.deinit(allocator);
 
@@ -3228,6 +3325,9 @@ pub fn lockTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     owned.locked = true;
@@ -3242,6 +3342,9 @@ pub fn unlockTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, owned);
@@ -3260,6 +3363,9 @@ pub fn compactTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
     var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
@@ -3837,6 +3943,45 @@ test "table remove clears stale versioned files before reuse" {
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 900), try snapshotSumU64(snapshot, 1));
+}
+
+test "table remove preserves write lock file" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "locked_remove_orders";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_TOTAL_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "locked_remove_orders.sadb-schema", schema_source);
+
+    var ids = [_]u64{1};
+    var totals = [_]u64{100};
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+
+    var write_lock = try acquireTableWriteLock(std.testing.allocator, ".", table_name);
+    write_lock.release();
+
+    const lock_path = try tableWriteLockPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(lock_path);
+    try std.fs.cwd().access(lock_path, .{});
+
+    _ = try removeTable(std.testing.allocator, ".", table_name);
+    try std.fs.cwd().access(lock_path, .{});
+
+    var next_lock = try acquireTableWriteLock(std.testing.allocator, ".", table_name);
+    next_lock.release();
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {

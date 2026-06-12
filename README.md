@@ -148,10 +148,14 @@ reparse metadata or reread column files for every query. A handle remains a
 snapshot: writes made after opening the handle are not visible until a new read
 handle is opened.
 
-Writes are protected by an in-process mutex, so same-process concurrent ingest
-is correct. Storage writes now use file-level atomic replacement: data is first
-written to a temporary file in the destination directory, synced, renamed over
-the active file, and the parent directory is synced on Linux when available.
+Writes are protected by an in-process mutex at the SA ABI layer and by a
+per-table advisory write lock file (`<table>.write.lock`) in the table layer.
+This serializes CLI, qmod, and extern writers across processes for one table;
+the lock file is intentionally preserved by table removal so future writers keep
+coordinating on the same inode path. Storage writes use file-level atomic
+replacement: data is first written to a temporary file in the destination
+directory, synced, renamed over the active file, and the parent directory is
+synced on Linux when available.
 Table commits are selected through an active manifest that points at a versioned
 metadata file (`<table>.meta.<epoch>`). Mutating existing column data writes a new
 versioned column file and then advances the manifest, so a crash before manifest
@@ -193,9 +197,9 @@ delete rewrites the remaining rows into a new column segment, rebuilds indexes,
 advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
-primary/secondary index planning, or multi-process transaction isolation. The
-v0.2 ERP foundation work is to add those missing database semantics without
-losing the fast read-handle scan path.
+primary/secondary index planning, or multi-table transaction isolation. The v0.2
+ERP foundation work is to add those missing database semantics without losing
+the fast read-handle scan path.
 
 ## ERP Foundation Roadmap
 
@@ -215,7 +219,8 @@ benchmarks. The required baseline is:
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64` point-lookup/unique index, including date/customer/product filters and
   inventory/order workflows.
-- Transaction commit semantics, followed by optional WAL and async batch flush.
+- Multi-operation and multi-table transaction semantics, followed by optional
+  WAL and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
   aggregation as performance work after the reliability/data-model baseline.
 

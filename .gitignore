@@ -24,6 +24,7 @@ benchmark_test/*.out
 benchmark_test/*.bc
 benchmark_test/*.dat
 benchmark_test/*.meta
+benchmark_test/*.write.lock
 benchmark_test/*.db
 benchmark_test/*.db-*
 benchmark_test/members*.sai

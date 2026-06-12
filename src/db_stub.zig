@@ -250,6 +250,10 @@ fn mapTableError(err: table_mod.TableError) ExecError {
     };
 }
 
+fn acquireTableWriteLock(allocator: std.mem.Allocator, table_name: []const u8) ExecError!table_mod.TableWriteLock {
+    return table_mod.acquireTableWriteLock(allocator, ".", table_name) catch |err| return mapTableError(err);
+}
+
 fn readActiveTableMetaSource(allocator: std.mem.Allocator, table_name: []const u8) ExecError![]u8 {
     return table_mod.readActiveMetaSource(allocator, ".", table_name) catch |err| return mapTableError(err);
 }
@@ -1420,7 +1424,7 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
         }
     }
     write_table.parsed.value.epoch = next_epoch;
-    table_mod.commitTableMetaWithRebuiltIndexes(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
+    table_mod.commitTableMetaWithRebuiltIndexesUnlocked(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
 }
 
 fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
@@ -1497,6 +1501,9 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
     const table_name = try singleWriteGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, " load ") != null or std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
 
+    var write_lock = try acquireTableWriteLock(allocator, table_name);
+    defer write_lock.release();
+
     var write_table = try loadWriteTable(allocator, table_name);
     defer write_table.deinit(allocator);
     var values = ValueMap.init(allocator);
@@ -1567,6 +1574,9 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
 fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
     const grants = try singleReadWriteGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
+
+    var write_lock = try acquireTableWriteLock(allocator, grants.write_table);
+    defer write_lock.release();
 
     var write_table = try loadWriteTable(allocator, grants.write_table);
     defer write_table.deinit(allocator);
@@ -1662,6 +1672,9 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
 fn evalAtomicDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
     const table_name = try singleAtomicGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, " load ") != null or std.mem.indexOf(u8, source, "store ") != null) return null;
+
+    var write_lock = try acquireTableWriteLock(allocator, table_name);
+    defer write_lock.release();
 
     var write_table = try loadWriteTable(allocator, table_name);
     defer write_table.deinit(allocator);
