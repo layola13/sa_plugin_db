@@ -109,6 +109,11 @@ pub const U64CompareOp = enum(u32) {
     ge = 5,
 };
 
+pub const U64FindResult = struct {
+    found: bool,
+    row_index: u64,
+};
+
 pub const ReadSnapshot = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -1619,6 +1624,44 @@ pub fn snapshotCountU64Cmp(snapshot: *const ReadSnapshot, column_index: usize, o
         }
     }
     return count;
+}
+
+pub fn snapshotFindU64(snapshot: *const ReadSnapshot, column_index: usize, expected: u64) TableError!U64FindResult {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            if (readU64LE(bytes, byte_offset) == expected) {
+                return .{ .found = true, .row_index = row_base + i };
+            }
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    return .{ .found = false, .row_index = 0 };
+}
+
+pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const bytes = segment.columns[column_index].bytes;
+            const expected_len = try expectedColumnBytes(segment.rows, 8);
+            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            const local_row = row_index - row_base;
+            const byte_offset: usize = @intCast(local_row * 8);
+            return readU64LE(bytes, byte_offset);
+        }
+        row_base = segment_end;
+    }
+    return TableError.InvalidFormat;
 }
 
 pub fn snapshotMinU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {

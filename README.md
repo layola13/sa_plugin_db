@@ -57,6 +57,8 @@ Read-handle query calls:
 - `sa_db_sum_u64_handle`
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
+- `sa_db_find_u64_handle`
+- `sa_db_get_u64_handle`
 - `sa_db_min_u64_handle`
 - `sa_db_max_u64_handle`
 
@@ -68,8 +70,9 @@ Removed calls:
 - `DB_COUNT_U64_EQ`
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
-`DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_MIN_U64_HANDLE`,
-`DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and `DB_RECOVER`.
+`DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
+`DB_GET_U64_HANDLE`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`,
+`DB_RESTORE`, and `DB_RECOVER`.
 
 ## Query Model
 

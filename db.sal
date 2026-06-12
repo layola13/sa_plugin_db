@@ -131,6 +131,20 @@
     %out_count = load __db_handle_cmp_slot_%out_count+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FIND_U64_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %expected
+    __db_handle_find_found_slot_%out_found = stack_alloc 8
+    __db_handle_find_row_slot_%out_row_index = stack_alloc 8
+    %out_status = call @sa_db_find_u64_handle(%handle, %column_index, %expected, &__db_handle_find_found_slot_%out_found, &__db_handle_find_row_slot_%out_row_index)
+    %out_found = load __db_handle_find_found_slot_%out_found+0 as u64
+    %out_row_index = load __db_handle_find_row_slot_%out_row_index+0 as u64
+[END_MACRO]
+
+[MACRO] DB_GET_U64_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
+    __db_handle_get_slot_%out_value = stack_alloc 8
+    %out_status = call @sa_db_get_u64_handle(%handle, %column_index, %row_index, &__db_handle_get_slot_%out_value)
+    %out_value = load __db_handle_get_slot_%out_value+0 as u64
+[END_MACRO]
+
 [MACRO] DB_MIN_U64_HANDLE %out_status, %out_min, %handle, %column_index
     __db_handle_min_slot_%out_min = stack_alloc 8
     %out_status = call @sa_db_min_u64_handle(%handle, %column_index, &__db_handle_min_slot_%out_min)

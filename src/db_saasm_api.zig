@@ -413,6 +413,30 @@ pub export fn sa_db_count_u64_cmp_handle(handle: ?*anyopaque, column_index: u64,
     return SA_DB_OK;
 }
 
+pub export fn sa_db_find_u64_handle(handle: ?*anyopaque, column_index: u64, expected: u64, out_found: ?*u64, out_row_index: ?*u64) u32 {
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_slot = out_row_index orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    row_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFindU64(snapshot, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    row_slot.* = result.row_index;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u64) u32 {
+    const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const value = table.snapshotGetU64(snapshot, @intCast(column_index), row_index) catch |err| return tableStatus(err);
+    value_slot.* = value;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_min_u64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*u64) u32 {
     const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -472,6 +496,16 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     var handle_count: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_count_u64_cmp_handle(handle, 0, @intFromEnum(table.U64CompareOp.ge), 2, &handle_count));
     try std.testing.expectEqual(@as(u64, 2), handle_count);
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(handle, 0, 3, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 2), row_index);
+    var row_points: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(handle, 1, row_index, &row_points));
+    try std.testing.expectEqual(@as(u64, 30), row_points);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(handle, 0, 99, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 0), found);
     var handle_min: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_min_u64_handle(handle, 1, &handle_min));
     try std.testing.expectEqual(@as(u64, 10), handle_min);
