@@ -23,6 +23,7 @@
 @extern sa_db_find_u64_handle(handle: ptr, column_index: u64, expected: u64, &out_found: ptr, &out_row_index: ptr) -> u32
 @extern sa_db_range_u64_handle(handle: ptr, column_index: u64, min_value: u64, max_value: u64, offset: u64, limit: u64, &out_rows: ptr, out_rows_len: u64, &out_written: ptr, &out_total: ptr) -> u32
 @extern sa_db_get_u64_handle(handle: ptr, column_index: u64, row_index: u64, &out_value: ptr) -> u32
+@extern sa_db_get_row_handle(handle: ptr, row_index: u64, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_get_row_u64_key_handle(handle: ptr, column_index: u64, expected: u64, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_min_u64_handle(handle: ptr, column_index: u64, &out_min: ptr) -> u32
 @extern sa_db_max_u64_handle(handle: ptr, column_index: u64, &out_max: ptr) -> u32

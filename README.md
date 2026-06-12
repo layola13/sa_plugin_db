@@ -64,6 +64,7 @@ Read-handle query calls:
 - `sa_db_find_u64_handle`
 - `sa_db_range_u64_handle`
 - `sa_db_get_u64_handle`
+- `sa_db_get_row_handle`
 - `sa_db_get_row_u64_key_handle`
 - `sa_db_min_u64_handle`
 - `sa_db_max_u64_handle`
@@ -80,10 +81,11 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SUM_U64_HANDLE`, `DB_COUNT_U64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
-`DB_RANGE_U64_HANDLE`, `DB_GET_U64_HANDLE`, `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`,
-`DB_INSERT_ROW`, `DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_DELETE_U64_KEY`,
-`DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
-`DB_RECOVER`.
+`DB_RANGE_U64_HANDLE`, `DB_GET_U64_HANDLE`, `DB_GET_ROW_HANDLE`,
+`DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
+`DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_DELETE_U64_KEY`,
+`DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`,
+and `DB_RECOVER`.
 
 ## Query Model
 
@@ -93,8 +95,9 @@ Read queries now use snapshots:
    into a read snapshot.
 2. `*_handle` query functions scan the in-memory snapshot; `find_u64` and
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
-   the column. `get_row_u64_key_handle` requires a unique `u64` index and copies
-   the full fixed-width row into the caller's row buffer.
+   the column. `get_row_handle` copies a full fixed-width row by snapshot row
+   index, while `get_row_u64_key_handle` requires a unique `u64` index and copies
+   the matching row into the caller's row buffer.
 3. `sa_db_close_read_table` releases the snapshot.
 
 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE` returns row indices for an
@@ -103,6 +106,8 @@ list pages and key/date/order-number windows: callers pass `offset`, `limit`, an
 a `u64` row-index buffer; the API returns `total` matches and `written` row
 indices in index order. The target column must have a persisted `u64` index, so
 range pagination uses binary-search bounds instead of a full scan.
+Use `sa_db_get_row_handle` / `DB_GET_ROW_HANDLE` to materialize any returned row
+index into a fixed-width row buffer.
 
 This makes repeated serial and concurrent reads fast because they no longer
 reparse metadata or reread column files for every query. A handle remains a
@@ -169,8 +174,8 @@ benchmarks. The required baseline is:
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
   and dictionary-encoded strings.
 - Row-oriented public operations on top of the column store: fixed-width insert
-  read by unique `u64` key, and delete by unique `u64` key exist now; next are
-  upsert, range query handles, and projected batch reads.
+  read by row index or unique `u64` key, upsert, range query handles, and delete
+  by unique `u64` key exist now; next is projected batch reads.
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64` point-lookup/unique index, including date/customer/product filters and
   inventory/order workflows.

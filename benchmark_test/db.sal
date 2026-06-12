@@ -172,6 +172,10 @@
     %out_value = load __db_handle_get_slot_%out_value+0 as u64
 [END_MACRO]
 
+[MACRO] DB_GET_ROW_HANDLE %out_status, %handle, %row_index, %out_row, %out_row_len
+    %out_status = call @sa_db_get_row_handle(%handle, %row_index, &%out_row, %out_row_len)
+[END_MACRO]
+
 [MACRO] DB_GET_ROW_U64_KEY_HANDLE %out_status, %handle, %column_index, %expected, %out_row, %out_row_len
     %out_status = call @sa_db_get_row_u64_key_handle(%handle, %column_index, %expected, &%out_row, %out_row_len)
 [END_MACRO]

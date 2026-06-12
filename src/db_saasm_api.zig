@@ -572,6 +572,19 @@ pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_i
     return SA_DB_OK;
 }
 
+pub export fn sa_db_get_row_handle(
+    handle: ?*anyopaque,
+    row_index: u64,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRow(snapshot, row_index, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_get_row_u64_key_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -681,6 +694,11 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(@as(u64, 2), range_written);
     try std.testing.expectEqual(@as(u64, 2), range_rows[0]);
     try std.testing.expectEqual(@as(u64, 3), range_rows[1]);
+    var range_row: [16]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_handle(handle, range_rows[1], &range_row, range_row.len));
+    try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, range_row[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 44), std.mem.readInt(u64, range_row[8..16], .little));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_handle(handle, 99, &range_row, range_row.len));
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_range_u64_handle(handle, 1, 10, 50, 0, 2, &range_rows, range_rows.len, &range_written, &range_total));
     var found: u64 = 0;
     var row_index: u64 = 0;

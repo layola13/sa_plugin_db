@@ -2159,6 +2159,10 @@ pub fn snapshotGetRowU64Key(snapshot: *const ReadSnapshot, column_index: usize, 
     try snapshotCopyRow(snapshot, found.row_index, out_row);
 }
 
+pub fn snapshotGetRow(snapshot: *const ReadSnapshot, row_index: u64, out_row: []u8) TableError!void {
+    try snapshotCopyRow(snapshot, row_index, out_row);
+}
+
 fn findUniqueU64KeyRow(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -3036,6 +3040,10 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 2), range.written);
         try std.testing.expectEqual(@as(u64, 2), range_rows[0]);
         try std.testing.expectEqual(@as(u64, 3), range_rows[1]);
+        var range_row: [16]u8 = undefined;
+        try snapshotGetRow(snapshot, range_rows[1], &range_row);
+        try std.testing.expectEqual(@as(u64, 4), readU64LE(&range_row, 0));
+        try std.testing.expectEqual(@as(u64, 44), readU64LE(&range_row, 8));
         const empty_range = try snapshotRangeU64Rows(snapshot, 0, 9, 2, 0, 2, &range_rows);
         try std.testing.expectEqual(@as(u64, 0), empty_range.total);
         try std.testing.expectEqual(@as(u64, 0), empty_range.written);

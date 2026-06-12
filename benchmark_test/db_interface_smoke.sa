@@ -85,6 +85,9 @@ L_ENTRY:
     EXPAND DB_RANGE_U64_HANDLE range_status, range_written, range_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 2, 5, 1, 2
     range_row0 = load range_rows+0 as u64
     range_row1 = load range_rows+8 as u64
+    EXPAND DB_GET_ROW_HANDLE get_range_row_status, read_handle, range_row1, fetched_row, ROW_BYTES
+    range_fetched_id = load fetched_row+0 as u64
+    range_fetched_points = load fetched_row+24 as u64
     EXPAND DB_FIND_U64_HANDLE find_status, found_member, found_row, read_handle, 0, 5
     EXPAND DB_GET_U64_HANDLE get_status, found_points, read_handle, 3, found_row
     EXPAND DB_GET_ROW_U64_KEY_HANDLE get_row_key_status, read_handle, 0, 5, fetched_row, ROW_BYTES
@@ -140,6 +143,9 @@ L_ENTRY:
     ok_range_total = eq range_total, 4
     ok_range_row0 = eq range_row0, 2
     ok_range_row1 = eq range_row1, 3
+    ok_get_range_row_status = eq get_range_row_status, SA_DB_OK
+    ok_range_fetched_id = eq range_fetched_id, 4
+    ok_range_fetched_points = eq range_fetched_points, 40
     ok_find_status = eq find_status, SA_DB_OK
     ok_find_found = eq found_member, 1
     ok_find_row = eq found_row, 4
@@ -203,7 +209,10 @@ L_ENTRY:
     ok13c = and ok13b, ok_range_total
     ok13d = and ok13c, ok_range_row0
     ok13e = and ok13d, ok_range_row1
-    ok14 = and ok13e, ok_find_status
+    ok13f = and ok13e, ok_get_range_row_status
+    ok13g = and ok13f, ok_range_fetched_id
+    ok13h = and ok13g, ok_range_fetched_points
+    ok14 = and ok13h, ok_find_status
     ok15 = and ok14, ok_find_found
     ok16 = and ok15, ok_find_row
     ok17 = and ok16, ok_get_status
@@ -269,6 +278,9 @@ L_ENTRY:
     !range_total
     !range_row0
     !range_row1
+    !get_range_row_status
+    !range_fetched_id
+    !range_fetched_points
     !find_status
     !found_member
     !found_row
@@ -335,6 +347,9 @@ L_ENTRY:
     !ok_range_total
     !ok_range_row0
     !ok_range_row1
+    !ok_get_range_row_status
+    !ok_range_fetched_id
+    !ok_range_fetched_points
     !ok_find_status
     !ok_find_found
     !ok_find_row
@@ -398,6 +413,9 @@ L_ENTRY:
     !ok13c
     !ok13d
     !ok13e
+    !ok13f
+    !ok13g
+    !ok13h
     !ok14
     !ok15
     !ok16

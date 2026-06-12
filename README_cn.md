@@ -129,11 +129,11 @@ Schema 文件采用类似 C 语言宏定义的指令集（`#def`）：
 
 当前版本已经具备文件级原子替换：写入 schema、meta、列段文件、索引文件、snapshot/restore 目标文件时，会先写入同目录临时文件，执行文件同步，再通过原子 rename 替换活跃文件；在 Linux 上会尽力同步父目录。表提交由 active manifest 选择，manifest 指向版本化元数据文件（`<table>.meta.<epoch>`）；修改已有列数据时会写入新的版本化列文件，再推进 manifest，因此 manifest 替换前崩溃仍可读取旧 epoch。Qmod 读写路径也使用同一套 active-manifest 协议。当前已支持持久化 `u64 -> row` 索引，用于点查和 `count_u64_cmp` 比较计数，并会在 ingest/update/compact/qmod 写入后重建。`sa_db_create_u64_index(..., unique=1)` 现在会作为真正的唯一约束：创建唯一索引时会拒绝已有重复值，后续列式 ingest、固定宽度行式 insert、update、compact 和 Qmod commit 如果产生重复 key，会返回 `SA_DB_ERR_CONSTRAINT`，active manifest 保持在上一个有效 epoch。`verify` 会校验 schema 哈希、列段 SHA-256、索引 SHA-256、元数据记录字节数，以及 `segment.rows * column.stride` 推导出的期望字节数。`recover` 会扫描版本化元数据文件，选择最高的有效 epoch 重建 manifest，用于处理中断提交后 manifest 损坏或丢失的情况。
 
-读句柄查询现在新增 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE`，用于对已有持久化 `u64` 索引的列执行闭区间 `[min, max]` 范围分页。调用方传入 `offset`、`limit` 和 `u64` row-index 输出 buffer，接口返回总匹配数 `total` 与实际写入数量 `written`，输出顺序为索引顺序。该接口要求目标列已经建立 `u64` 索引，因此可通过二分边界完成分页，适合 ERP 中按订单号、日期编码、客户编号等索引字段取列表窗口。
+读句柄查询现在新增 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE`，用于对已有持久化 `u64` 索引的列执行闭区间 `[min, max]` 范围分页。调用方传入 `offset`、`limit` 和 `u64` row-index 输出 buffer，接口返回总匹配数 `total` 与实际写入数量 `written`，输出顺序为索引顺序。该接口要求目标列已经建立 `u64` 索引，因此可通过二分边界完成分页，适合 ERP 中按订单号、日期编码、客户编号等索引字段取列表窗口。`sa_db_get_row_handle` / `DB_GET_ROW_HANDLE` 可把这些 row-index 继续物化为调用方 buffer 中的一条固定宽度整行。
 
 面向 ERP 的行式写入已经提供第一版接口：`sa_db_insert_row` / `DB_INSERT_ROW` 接收一条按照当前 schema 列 stride 顺序排列的固定宽度行数据。内部会把行数据切分成各列切片，并复用列式 ingest 提交流程，因此会推进表 epoch，并重建已有的持久化 `u64` 索引。`sa_db_upsert_row_u64_key` / `DB_UPSERT_ROW_U64_KEY` 支持按唯一 `u64` key 原子 upsert 固定宽度整行：目标列必须已经建立唯一 `u64` 索引；key 存在时重写整表为新的列段、重建索引并推进 epoch，`out_inserted=0`；key 不存在时追加新行并返回 `out_inserted=1`。调用传入的 `expected` 必须等于行数据里 key 列编码出的 `u64` 值，否则返回 `SA_DB_ERR_INVALID_FORMAT`，不会提交新 epoch。`sa_db_get_row_u64_key_handle` / `DB_GET_ROW_U64_KEY_HANDLE` 支持在读句柄快照上按唯一 `u64` key 读取整行，并把固定宽度行数据复制到调用方 buffer。`sa_db_delete_u64_key` / `DB_DELETE_U64_KEY` 支持按唯一 `u64` key 删除一行，目标列必须已经建立唯一 `u64` 索引，因此是主键语义而不是删除普通非唯一匹配；删除会把剩余行重写到新的列段，重建索引并推进 epoch，key 不存在时返回 `SA_DB_ERR_NOT_FOUND`。
 
-这仍不是完整的 SQLite 级 ACID/WAL。面向中小型 ERP 的下一阶段需要继续补齐事务提交语义、通用主键/二级索引、范围查询 handle、nullable/decimal/date/string-dict 类型，以及 SA 编写的 ERP 场景 benchmark。当前 `u64` 唯一索引、固定宽度行 insert/upsert、按唯一 key get/delete 已经可作为主键语义的第一步。
+这仍不是完整的 SQLite 级 ACID/WAL。面向中小型 ERP 的下一阶段需要继续补齐事务提交语义、通用主键/二级索引、批量投影读取、nullable/decimal/date/string-dict 类型，以及 SA 编写的 ERP 场景 benchmark。当前 `u64` 唯一索引、范围分页、固定宽度行 insert/upsert、按 row-index 或唯一 key get、按唯一 key delete 已经可作为主键语义和列表页读取的第一步。
 
 ---
 
