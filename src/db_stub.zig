@@ -1,5 +1,6 @@
 const std = @import("std");
 const schema = @import("schema.zig");
+const table_mod = @import("table.zig");
 
 pub const ExecError = error{
     OutOfMemory,
@@ -128,39 +129,7 @@ const FunctionSig = struct {
     }
 };
 
-const QmodFileMeta = struct {
-    path: []const u8,
-    sha256: []const u8,
-    bytes: u64,
-};
-
-const QmodSegmentMeta = struct {
-    id: u64,
-    rows: u64,
-    files: []QmodFileMeta,
-};
-
-const QmodColumnMeta = struct {
-    name: []const u8,
-    stride: u32,
-    ty: []const u8,
-};
-
-const QmodTableMeta = struct {
-    magic: []const u8,
-    version: u32,
-    table_name: []const u8,
-    schema_path: []const u8,
-    schema_hash: []const u8,
-    locked: bool,
-    epoch: u64,
-    row_count: u64,
-    max_rows: u64,
-    row_bytes: u64,
-    next_segment_id: u64,
-    columns: []QmodColumnMeta,
-    segments: []QmodSegmentMeta,
-};
+const QmodTableMeta = table_mod.TableMeta;
 
 const TableColumn = struct {
     name: []const u8,
@@ -264,6 +233,23 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usiz
         error.OutOfMemory => ExecError.OutOfMemory,
         else => ExecError.InvalidFormat,
     };
+}
+
+fn mapTableError(err: table_mod.TableError) ExecError {
+    return switch (err) {
+        error.OutOfMemory => ExecError.OutOfMemory,
+        error.InvalidFormat => ExecError.SnapshotCorrupted,
+        error.InvalidPath => ExecError.InvalidPath,
+        error.NotFound => ExecError.FileNotFound,
+        error.Locked => ExecError.Locked,
+        error.CursorOverflow => ExecError.InvalidFormat,
+        error.SnapshotMissing => ExecError.FileNotFound,
+        error.VerifyFailed => ExecError.SnapshotCorrupted,
+    };
+}
+
+fn readActiveTableMetaSource(allocator: std.mem.Allocator, table_name: []const u8) ExecError![]u8 {
+    return table_mod.readActiveMetaSource(allocator, ".", table_name) catch |err| return mapTableError(err);
 }
 
 fn ensureRegistryDir() ExecError!void {
@@ -660,9 +646,7 @@ fn verifyAtomicGrantCursors(allocator: std.mem.Allocator, source: []const u8, gr
 }
 
 fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!ReadTable {
-    const meta_path = try tableMetaPath(allocator, table_name);
-    defer allocator.free(meta_path);
-    const meta_bytes = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
+    const meta_bytes = try readActiveTableMetaSource(allocator, table_name);
     defer allocator.free(meta_bytes);
     var parsed = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.SnapshotCorrupted;
     defer parsed.deinit();
@@ -721,7 +705,7 @@ fn validateCurrentSchemaHash(allocator: std.mem.Allocator, table_name: []const u
 fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!WriteTable {
     const meta_path = try tableMetaPath(allocator, table_name);
     errdefer allocator.free(meta_path);
-    const meta_bytes = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
+    const meta_bytes = try readActiveTableMetaSource(allocator, table_name);
     defer allocator.free(meta_bytes);
     var parsed = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.SnapshotCorrupted;
     errdefer parsed.deinit();
@@ -1353,7 +1337,7 @@ fn evalAtomicRmwAdd(line: []const u8, values: *ValueMap, cursors: *std.StringHas
 }
 
 fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!bool {
-    const meta_bytes = try readFileAlloc(allocator, write_table.meta_path, 16 * 1024 * 1024);
+    const meta_bytes = try readActiveTableMetaSource(allocator, write_table.parsed.value.table_name);
     defer allocator.free(meta_bytes);
     var current = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.InvalidFormat;
     defer current.deinit();
@@ -1387,7 +1371,12 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
 
 fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!void {
     var any_dirty = false;
-    var owned_hashes = std.ArrayList([]u8).init(allocator);
+    var owned_paths = std.ArrayList([]const u8).init(allocator);
+    defer {
+        for (owned_paths.items) |path| allocator.free(path);
+        owned_paths.deinit();
+    }
+    var owned_hashes = std.ArrayList([]const u8).init(allocator);
     defer {
         for (owned_hashes.items) |hash| allocator.free(hash);
         owned_hashes.deinit();
@@ -1400,24 +1389,27 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     if (!any_dirty) return;
     if (!(try tableMetaStillCurrent(allocator, write_table))) return ExecError.StaleMetadata;
 
+    const next_epoch = write_table.parsed.value.epoch + 1;
     for (write_table.columns, 0..) |*column, col_idx| {
         for (column.segments, 0..) |*segment, seg_idx| {
             if (!segment.dirty) continue;
-            try writeFile(segment.path, segment.bytes);
-            const encoded = hashHex(segment.bytes);
-            const owned_hash = allocator.dupe(u8, encoded[0..]) catch return ExecError.OutOfMemory;
-            owned_hashes.append(owned_hash) catch {
-                allocator.free(owned_hash);
-                return ExecError.OutOfMemory;
-            };
-            write_table.parsed.value.segments[seg_idx].files[col_idx].sha256 = owned_hash;
-            write_table.parsed.value.segments[seg_idx].files[col_idx].bytes = segment.bytes.len;
+            var file_meta = table_mod.rewriteColumnFileForEpoch(allocator, ".", segment.path, next_epoch, segment.bytes) catch |err| return mapTableError(err);
+            errdefer {
+                allocator.free(file_meta.path);
+                allocator.free(file_meta.sha256);
+            }
+            owned_paths.append(file_meta.path) catch return ExecError.OutOfMemory;
+            errdefer _ = owned_paths.pop();
+            owned_hashes.append(file_meta.sha256) catch return ExecError.OutOfMemory;
+            errdefer _ = owned_hashes.pop();
+            const target = &write_table.parsed.value.segments[seg_idx].files[col_idx];
+            target.* = file_meta;
+            segment.path = target.path;
+            file_meta = undefined;
         }
     }
-    write_table.parsed.value.epoch += 1;
-    const json = std.json.stringifyAlloc(allocator, write_table.parsed.value, .{}) catch return ExecError.OutOfMemory;
-    defer allocator.free(json);
-    try writeFile(write_table.meta_path, json);
+    write_table.parsed.value.epoch = next_epoch;
+    table_mod.commitTableMeta(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
 }
 
 fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
@@ -2794,7 +2786,7 @@ test "qmod exec rejects corrupted table snapshot metadata" {
     const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
     defer std.testing.allocator.free(hash_hex);
 
-    try writeFile("simple.meta", "{not-json}\n");
+    try writeFile("simple.manifest", "{not-json}\n");
 
     try std.testing.expectError(ExecError.SnapshotCorrupted, execQuery(std.testing.allocator, hash_hex, null));
 }
@@ -2846,11 +2838,7 @@ test "qmod write rejects corrupted table snapshot metadata" {
     const write_hash = try hashHexAlloc(std.testing.allocator, write_result.hash);
     defer std.testing.allocator.free(write_hash);
 
-    const meta_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, "simple.meta", 1 << 20);
-    defer std.testing.allocator.free(meta_bytes);
-    const replaced = try std.mem.replaceOwned(u8, std.testing.allocator, meta_bytes, "\"table_name\":\"simple\"", "\"table_name\":\"other\" ");
-    defer std.testing.allocator.free(replaced);
-    try writeFile("simple.meta", replaced);
+    try writeFile("simple.manifest", "{not-json}\n");
 
     try std.testing.expectError(ExecError.SnapshotCorrupted, execQuery(std.testing.allocator, write_hash, "params.bin"));
 }

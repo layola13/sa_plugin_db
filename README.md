@@ -83,8 +83,39 @@ snapshot: writes made after opening the handle are not visible until a new read
 handle is opened.
 
 Writes are protected by an in-process mutex, so same-process concurrent ingest
-is correct. This is not a replacement for SQLite-style ACID, WAL, or
-multi-process transaction isolation.
+is correct. Storage writes now use file-level atomic replacement: data is first
+written to a temporary file in the destination directory, synced, renamed over
+the active file, and the parent directory is synced on Linux when available.
+Table commits are selected through an active manifest that points at a versioned
+metadata file (`<table>.meta.<epoch>`). Mutating existing column data writes a new
+versioned column file and then advances the manifest, so a crash before manifest
+replacement leaves the previous epoch readable. Qmod read/write paths use the
+same active-manifest protocol as the public table APIs. Segment metadata records
+SHA-256 and byte counts, and verification checks schema hash, segment hash,
+recorded size, and the expected `rows * column_stride` size.
+
+This is still not a replacement for SQLite-style ACID, WAL, primary/secondary
+indexes, or multi-process transaction isolation. The v0.2 ERP foundation work is
+to add those missing database semantics without losing the fast read-handle scan
+path.
+
+## ERP Foundation Roadmap
+
+The next development target is small/mid ERP suitability, not only OLAP SUM
+benchmarks. The required baseline is:
+
+- SA ERP benchmarks covering customers, products, inventory movement, sales
+  orders, invoices/payments, and journal entries, with SQLite comparisons for
+  single-threaded, concurrent, and mixed read/write workloads.
+- Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
+  and dictionary-encoded strings.
+- Row-oriented public operations on top of the column store: insert, upsert,
+  get/delete by primary key, range query handles, and projected batch reads.
+- Primary-key and secondary indexes for point lookup, date/customer/product
+  filters, and inventory/order workflows.
+- Transaction commit semantics, followed by optional WAL and async batch flush.
+- mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
+  aggregation as performance work after the reliability/data-model baseline.
 
 ## Benchmark
 

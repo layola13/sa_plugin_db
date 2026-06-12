@@ -1,5 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const schema = @import("schema.zig");
+
+var temp_write_counter = std.atomic.Value(u64).init(0);
 
 pub const TableError = error{
     OutOfMemory,
@@ -76,6 +79,16 @@ pub const TableMeta = struct {
         allocator.free(self.segments);
         self.* = undefined;
     }
+};
+
+pub const TableManifest = struct {
+    magic: []const u8,
+    version: u32,
+    table_name: []const u8,
+    epoch: u64,
+    meta_path: []const u8,
+    meta_sha256: []const u8,
+    meta_bytes: u64,
 };
 
 pub const ReadColumnSnapshot = struct {
@@ -186,6 +199,26 @@ fn tableMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name:
     return path;
 }
 
+fn tableManifestPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    const basename = try allocPrintPath(allocator, "{s}.manifest", .{table_name});
+    errdefer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    allocator.free(basename);
+    return path;
+}
+
+fn tableVersionedMetaName(allocator: std.mem.Allocator, table_name: []const u8, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.meta.{d}", .{ table_name, epoch });
+}
+
+fn tableVersionedMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
+    const basename = try tableVersionedMetaName(allocator, table_name, epoch);
+    errdefer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    allocator.free(basename);
+    return path;
+}
+
 fn schemaMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
     const basename = try allocPrintPath(allocator, "{s}.sadb-schema", .{table_name});
     errdefer allocator.free(basename);
@@ -235,18 +268,66 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usiz
     return file.readToEndAlloc(allocator, max_bytes) catch |err| return mapFileError(err);
 }
 
-fn writeFile(path: []const u8, bytes: []const u8) TableError!void {
-    try ensureParentDir(path);
-    try deleteIfExists(path);
-    var file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| return mapFileError(err);
-    defer file.close();
-    file.writeAll(bytes) catch |err| return mapFileError(err);
+fn tempWritePath(allocator: std.mem.Allocator, path: []const u8) TableError![]u8 {
+    const parent = std.fs.path.dirname(path);
+    const basename = std.fs.path.basename(path);
+    const counter = temp_write_counter.fetchAdd(1, .monotonic);
+    const random = std.crypto.random.int(u64);
+    const temp_name = try allocPrintPath(allocator, ".{s}.tmp.{x}.{x}", .{ basename, random, counter });
+    errdefer allocator.free(temp_name);
+    if (parent) |dir| {
+        if (dir.len != 0) {
+            const joined = try joinPath(allocator, &.{ dir, temp_name });
+            allocator.free(temp_name);
+            return joined;
+        }
+    }
+    return temp_name;
 }
 
-fn copyFile(src_path: []const u8, dst_path: []const u8) TableError!void {
+fn syncParentDirBestEffort(path: []const u8) void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const dir_path = if (parent.len == 0) "." else parent;
+    var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
+    defer dir.close();
+    if (builtin.os.tag == .linux) {
+        _ = std.os.linux.fsync(dir.fd);
+    }
+}
+
+fn syncFile(path: []const u8) TableError!void {
+    var file = std.fs.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
+    defer file.close();
+    file.sync() catch |err| return mapFileError(err);
+}
+
+fn writeFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
+    try ensureParentDir(path);
+    const temp_path = try tempWritePath(allocator, path);
+    defer allocator.free(temp_path);
+    errdefer deleteIfExists(temp_path) catch {};
+
+    {
+        var file = std.fs.cwd().createFile(temp_path, .{ .truncate = true, .exclusive = true }) catch |err| return mapFileError(err);
+        defer file.close();
+        file.writeAll(bytes) catch |err| return mapFileError(err);
+        file.sync() catch |err| return mapFileError(err);
+    }
+
+    std.fs.cwd().rename(temp_path, path) catch |err| return mapFileError(err);
+    syncParentDirBestEffort(path);
+}
+
+fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) TableError!void {
     try ensureParentDir(dst_path);
-    try deleteIfExists(dst_path);
-    std.fs.Dir.copyFile(std.fs.cwd(), src_path, std.fs.cwd(), dst_path, .{}) catch |err| return mapFileError(err);
+    const temp_path = try tempWritePath(allocator, dst_path);
+    defer allocator.free(temp_path);
+    errdefer deleteIfExists(temp_path) catch {};
+
+    std.fs.Dir.copyFile(std.fs.cwd(), src_path, std.fs.cwd(), temp_path, .{}) catch |err| return mapFileError(err);
+    try syncFile(temp_path);
+    std.fs.cwd().rename(temp_path, dst_path) catch |err| return mapFileError(err);
+    syncParentDirBestEffort(dst_path);
 }
 
 fn hashHex(bytes: []const u8) [64]u8 {
@@ -264,6 +345,63 @@ fn parseTableMeta(allocator: std.mem.Allocator, source: []const u8) TableError!s
         return TableError.InvalidFormat;
     }
     return parsed;
+}
+
+fn parseTableManifest(allocator: std.mem.Allocator, source: []const u8) TableError!std.json.Parsed(TableManifest) {
+    const parsed = std.json.parseFromSlice(TableManifest, allocator, source, .{}) catch |err| return mapJsonError(err);
+    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-table-manifest")) {
+        parsed.deinit();
+        return TableError.InvalidFormat;
+    }
+    if (parsed.value.version != 1) {
+        parsed.deinit();
+        return TableError.InvalidFormat;
+    }
+    return parsed;
+}
+
+pub fn readActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
+    defer allocator.free(manifest_path);
+
+    const manifest_source = readFileAlloc(allocator, manifest_path, 1024 * 1024) catch |err| switch (err) {
+        TableError.NotFound => {
+            const compat_meta_path = try tableMetaPath(allocator, root_dir, table_name);
+            defer allocator.free(compat_meta_path);
+            return try readFileAlloc(allocator, compat_meta_path, 16 * 1024 * 1024);
+        },
+        else => return err,
+    };
+    defer allocator.free(manifest_source);
+
+    var manifest = try parseTableManifest(allocator, manifest_source);
+    defer manifest.deinit();
+    if (!std.mem.eql(u8, manifest.value.table_name, table_name)) return TableError.InvalidFormat;
+
+    const meta_path = try activePath(allocator, root_dir, manifest.value.meta_path);
+    defer allocator.free(meta_path);
+    const meta_source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
+    errdefer allocator.free(meta_source);
+    if (meta_source.len != manifest.value.meta_bytes) return TableError.VerifyFailed;
+    const meta_hash = hashBytes(meta_source);
+    const meta_hex = std.fmt.bytesToHex(meta_hash, .lower);
+    if (!std.mem.eql(u8, meta_hex[0..], manifest.value.meta_sha256)) return TableError.VerifyFailed;
+
+    var parsed_meta = try parseTableMeta(allocator, meta_source);
+    defer parsed_meta.deinit();
+    if (!std.mem.eql(u8, parsed_meta.value.table_name, table_name)) return TableError.InvalidFormat;
+    if (parsed_meta.value.epoch != manifest.value.epoch) return TableError.VerifyFailed;
+
+    return meta_source;
+}
+
+pub fn loadActiveMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!TableMeta {
+    const source = try readActiveMetaSource(allocator, root_dir, table_name);
+    defer allocator.free(source);
+    var parsed = try parseTableMeta(allocator, source);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
+    return try duplicateTableMeta(allocator, parsed.value);
 }
 
 fn parseJsonValue(allocator: std.mem.Allocator, source: []const u8) TableError!std.json.Parsed(std.json.Value) {
@@ -448,7 +586,7 @@ fn writeSegmentFiles(
         defer allocator.free(basename);
         const path = try activePath(allocator, root_dir, basename);
         defer allocator.free(path);
-        try writeFile(path, buffer.items);
+        try writeFile(allocator, path, buffer.items);
         files[idx] = try makeFileMeta(allocator, basename, buffer.items);
     }
 
@@ -562,7 +700,7 @@ fn mergeSegmentFiles(
         defer allocator.free(basename);
         const dst_path = try activePath(allocator, root_dir, basename);
         defer allocator.free(dst_path);
-        try writeFile(dst_path, merged.items);
+        try writeFile(allocator, dst_path, merged.items);
         files[col_idx] = try makeFileMeta(allocator, basename, merged.items);
         merged.deinit();
     }
@@ -587,24 +725,14 @@ fn loadCurrentMeta(
     schema_path: []const u8,
     schema_hex: []const u8,
 ) TableError!TableMeta {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-
-    const file = std.fs.cwd().openFile(meta_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return try buildInitialMeta(allocator, table_name, schema_path, schema_hex, schema_obj),
-        else => return mapFileError(err),
+    var meta = loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
+        TableError.NotFound => return try buildInitialMeta(allocator, table_name, schema_path, schema_hex, schema_obj),
+        else => return err,
     };
-    defer file.close();
-
-    const bytes = file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| return mapFileError(err);
-    defer allocator.free(bytes);
-
-    var parsed = try parseTableMeta(allocator, bytes);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    if (!std.mem.eql(u8, parsed.value.schema_hash, schema_hex)) return TableError.InvalidFormat;
-    try verifySchemaAgainstMeta(schema_obj, parsed.value);
-    return try duplicateTableMeta(allocator, parsed.value);
+    errdefer meta.deinit(allocator);
+    if (!std.mem.eql(u8, meta.schema_hash, schema_hex)) return TableError.InvalidFormat;
+    try verifySchemaAgainstMeta(schema_obj, meta);
+    return meta;
 }
 
 fn verifySchemaAgainstMeta(schema_obj: schema.Schema, meta: TableMeta) TableError!void {
@@ -626,19 +754,20 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
     try deleteTreeIfExists(snapshot_dir_path);
     std.fs.cwd().makePath(snapshot_dir_path) catch |err| return mapFileError(err);
 
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const snapshot_meta_name = std.fs.path.basename(meta_path);
+    const snapshot_meta_name = try allocPrintPath(allocator, "{s}.meta", .{table_name});
+    defer allocator.free(snapshot_meta_name);
     const snapshot_meta_path = try joinPath(allocator, &.{ snapshot_dir_path, snapshot_meta_name });
     defer allocator.free(snapshot_meta_path);
-    try copyFile(meta_path, snapshot_meta_path);
+    const active_meta_source = try readActiveMetaSource(allocator, root_dir, table_name);
+    defer allocator.free(active_meta_source);
+    try writeFile(allocator, snapshot_meta_path, active_meta_source);
 
     const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
     defer allocator.free(schema_path);
     const snapshot_schema_name = std.fs.path.basename(schema_path);
     const snapshot_schema_path = try joinPath(allocator, &.{ snapshot_dir_path, snapshot_schema_name });
     defer allocator.free(snapshot_schema_path);
-    try copyFile(schema_path, snapshot_schema_path);
+    try copyFile(allocator, schema_path, snapshot_schema_path);
 
     for (meta.segments) |segment| {
         for (segment.files) |file| {
@@ -646,7 +775,7 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
             defer allocator.free(src_path);
             const dst_path = try joinPath(allocator, &.{ snapshot_dir_path, file.path });
             defer allocator.free(dst_path);
-            try copyFile(src_path, dst_path);
+            try copyFile(allocator, src_path, dst_path);
         }
     }
 }
@@ -665,8 +794,6 @@ fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
 
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
     const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
     defer allocator.free(schema_path);
 
@@ -674,7 +801,7 @@ fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
     defer allocator.free(snapshot_schema_name);
     const snapshot_schema_path = try joinPath(allocator, &.{ snapshot_dir_path, snapshot_schema_name });
     defer allocator.free(snapshot_schema_path);
-    try copyFile(snapshot_schema_path, schema_path);
+    try copyFile(allocator, snapshot_schema_path, schema_path);
 
     for (parsed.value.segments) |segment| {
         for (segment.files) |file| {
@@ -682,11 +809,13 @@ fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
             defer allocator.free(src_path);
             const dst_path = try activePath(allocator, root_dir, file.path);
             defer allocator.free(dst_path);
-            try copyFile(src_path, dst_path);
+            try copyFile(allocator, src_path, dst_path);
         }
     }
 
-    try copyFile(snapshot_meta_path, meta_path);
+    var owned = try duplicateTableMeta(allocator, parsed.value);
+    defer owned.deinit(allocator);
+    try writeMeta(allocator, root_dir, table_name, owned);
     return tableInfo(parsed.value);
 }
 
@@ -702,8 +831,10 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
     var total_rows: u64 = 0;
     for (meta.segments) |segment| {
         if (segment.files.len != meta.columns.len) return TableError.VerifyFailed;
-        total_rows += segment.rows;
-        for (segment.files) |file| {
+        total_rows = std.math.add(u64, total_rows, segment.rows) catch return TableError.VerifyFailed;
+        for (segment.files, 0..) |file, column_idx| {
+            const expected_bytes = try expectedColumnBytes(segment.rows, meta.columns[column_idx].stride);
+            if (file.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
             const path = try activePath(allocator, root_dir, file.path);
             defer allocator.free(path);
             const bytes = try readFileAlloc(allocator, path, 1 << 30);
@@ -711,7 +842,7 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
             const hash = hashBytes(bytes);
             const hex = std.fmt.bytesToHex(hash, .lower);
             if (!std.mem.eql(u8, hex[0..], file.sha256)) return TableError.VerifyFailed;
-            if (bytes.len != file.bytes) return TableError.VerifyFailed;
+            if (bytes.len != expected_bytes) return TableError.VerifyFailed;
         }
     }
     if (total_rows != meta.row_count) return TableError.VerifyFailed;
@@ -732,6 +863,28 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     const meta_path = try tableMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(meta_path);
     if (std.fs.cwd().openFile(meta_path, .{})) |file| {
+        var f = file;
+        defer f.close();
+        f.chmod(0o444) catch {};
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFileError(err),
+    }
+
+    const manifest_path = try tableManifestPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(manifest_path);
+    if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
+        var f = file;
+        defer f.close();
+        f.chmod(0o444) catch {};
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFileError(err),
+    }
+
+    const versioned_meta_path = try tableVersionedMetaPath(allocator, root_dir, meta.table_name, meta.epoch);
+    defer allocator.free(versioned_meta_path);
+    if (std.fs.cwd().openFile(versioned_meta_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o444) catch {};
@@ -771,6 +924,28 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     const meta_path = try tableMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(meta_path);
     if (std.fs.cwd().openFile(meta_path, .{})) |file| {
+        var f = file;
+        defer f.close();
+        f.chmod(0o644) catch {};
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFileError(err),
+    }
+
+    const manifest_path = try tableManifestPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(manifest_path);
+    if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
+        var f = file;
+        defer f.close();
+        f.chmod(0o644) catch {};
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return mapFileError(err),
+    }
+
+    const versioned_meta_path = try tableVersionedMetaPath(allocator, root_dir, meta.table_name, meta.epoch);
+    defer allocator.free(versioned_meta_path);
+    if (std.fs.cwd().openFile(versioned_meta_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o644) catch {};
@@ -1078,11 +1253,54 @@ fn appendRowFromJson(columns: []const ColumnMeta, row: std.json.Value, buffers: 
 }
 
 fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
-    const path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(path);
     const json = std.json.stringifyAlloc(allocator, meta, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(json);
-    try writeFile(path, json);
+
+    const versioned_name = try tableVersionedMetaName(allocator, table_name, meta.epoch);
+    defer allocator.free(versioned_name);
+    const versioned_path = try activePath(allocator, root_dir, versioned_name);
+    defer allocator.free(versioned_path);
+    try writeFile(allocator, versioned_path, json);
+
+    const meta_hash = try hashHexAlloc(allocator, json);
+    defer allocator.free(meta_hash);
+    const manifest: TableManifest = .{
+        .magic = "sa-db-table-manifest",
+        .version = 1,
+        .table_name = table_name,
+        .epoch = meta.epoch,
+        .meta_path = versioned_name,
+        .meta_sha256 = meta_hash,
+        .meta_bytes = json.len,
+    };
+    const manifest_json = std.json.stringifyAlloc(allocator, manifest, .{}) catch |err| return mapJsonError(err);
+    defer allocator.free(manifest_json);
+    const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
+    defer allocator.free(manifest_path);
+    try writeFile(allocator, manifest_path, manifest_json);
+
+    const compat_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(compat_path);
+    try writeFile(allocator, compat_path, json);
+}
+
+pub fn commitTableMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    try writeMeta(allocator, root_dir, table_name, meta);
+}
+
+pub fn rewriteColumnFileForEpoch(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    previous_path: []const u8,
+    epoch: u64,
+    bytes: []const u8,
+) TableError!FileMeta {
+    const next_path = try allocPrintPath(allocator, "{s}.e{d}", .{ previous_path, epoch });
+    defer allocator.free(next_path);
+    const active_next_path = try activePath(allocator, root_dir, next_path);
+    defer allocator.free(active_next_path);
+    try writeFile(allocator, active_next_path, bytes);
+    return try makeFileMeta(allocator, next_path, bytes);
 }
 
 fn writeGeneratedIface(allocator: std.mem.Allocator, root_dir: []const u8, schema_obj: schema.Schema) TableError!void {
@@ -1094,7 +1312,7 @@ fn writeGeneratedIface(allocator: std.mem.Allocator, root_dir: []const u8, schem
     defer allocator.free(basename);
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeFile(path, iface.items);
+    try writeFile(allocator, path, iface.items);
 }
 
 pub fn initTableFromSchemaBytes(
@@ -1110,7 +1328,7 @@ pub fn initTableFromSchemaBytes(
 
     const schema_path = try schemaMetaPath(allocator, root_dir, schema_obj.table_name);
     defer allocator.free(schema_path);
-    try writeFile(schema_path, schema_source);
+    try writeFile(allocator, schema_path, schema_source);
     try writeGeneratedIface(allocator, root_dir, schema_obj);
 
     const schema_hash = try hashHexAlloc(allocator, schema_source);
@@ -1123,30 +1341,28 @@ pub fn initTableFromSchemaBytes(
 }
 
 pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!TableInfo {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-
-    if (readFileAlloc(allocator, meta_path, 16 * 1024 * 1024)) |source| {
-        defer allocator.free(source);
-        if (parseTableMeta(allocator, source)) |parsed_meta| {
-            var parsed = parsed_meta;
-            defer parsed.deinit();
-            if (std.mem.eql(u8, parsed.value.table_name, table_name)) {
-                for (parsed.value.segments) |segment| {
-                    for (segment.files) |file| {
-                        const path = try activePath(allocator, root_dir, file.path);
-                        defer allocator.free(path);
-                        try deleteIfExists(path);
-                    }
-                }
+    if (loadActiveMeta(allocator, root_dir, table_name)) |meta| {
+        var owned = meta;
+        defer owned.deinit(allocator);
+        for (owned.segments) |segment| {
+            for (segment.files) |file| {
+                const path = try activePath(allocator, root_dir, file.path);
+                defer allocator.free(path);
+                try deleteIfExists(path);
             }
-        } else |_| {}
+        }
     } else |err| switch (err) {
         TableError.NotFound => {},
         else => return err,
     }
 
+    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(meta_path);
     try deleteIfExists(meta_path);
+
+    const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
+    defer allocator.free(manifest_path);
+    try deleteIfExists(manifest_path);
 
     const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
     defer allocator.free(schema_path);
@@ -1266,9 +1482,7 @@ pub fn openReadSnapshot(
     errdefer snapshot.destroy();
 
     const arena_allocator = snapshot.arena.allocator();
-    const meta_path = try tableMetaPath(backing_allocator, root_dir, table_name);
-    defer backing_allocator.free(meta_path);
-    const source = try readFileAlloc(backing_allocator, meta_path, 16 * 1024 * 1024);
+    const source = try readActiveMetaSource(backing_allocator, root_dir, table_name);
     defer backing_allocator.free(source);
     var parsed = try parseTableMeta(backing_allocator, source);
     defer parsed.deinit();
@@ -1401,20 +1615,13 @@ pub fn updateU64ColumnAdd(
     update_count: u64,
     delta: u64,
 ) TableError!u64 {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
-    defer allocator.free(source);
-    var parsed = try parseTableMeta(allocator, source);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    if (parsed.value.locked) return TableError.Locked;
-    try ensureU64Column(parsed.value, column_index);
-    const end_row = std.math.add(u64, start_row, update_count) catch return TableError.CursorOverflow;
-    if (end_row > parsed.value.row_count) return TableError.InvalidFormat;
-
-    var owned = try duplicateTableMeta(allocator, parsed.value);
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    try ensureU64Column(owned, column_index);
+    const end_row = std.math.add(u64, start_row, update_count) catch return TableError.CursorOverflow;
+    if (end_row > owned.row_count) return TableError.InvalidFormat;
+    const next_epoch = owned.epoch + 1;
 
     var segment_start: u64 = 0;
     var updated: u64 = 0;
@@ -1446,14 +1653,14 @@ pub fn updateU64ColumnAdd(
             writeU64LE(mutable, byte_offset, next);
         }
 
-        try writeFile(path, mutable);
+        const updated_file = try rewriteColumnFileForEpoch(allocator, root_dir, file_meta.path, next_epoch, mutable);
+        allocator.free(file_meta.path);
         allocator.free(file_meta.sha256);
-        file_meta.sha256 = try hashHexAlloc(allocator, mutable);
-        file_meta.bytes = mutable.len;
+        file_meta.* = updated_file;
         updated += local_count;
     }
 
-    owned.epoch += 1;
+    owned.epoch = next_epoch;
     try writeMeta(allocator, root_dir, table_name, owned);
     return updated;
 }
@@ -1546,15 +1753,10 @@ pub fn snapshotTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
-    defer allocator.free(source);
-    var parsed = try parseTableMeta(allocator, source);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    try appendSnapshotArtifacts(allocator, root_dir, table_name, parsed.value);
-    return tableInfo(parsed.value);
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    try appendSnapshotArtifacts(allocator, root_dir, table_name, meta);
+    return tableInfo(meta);
 }
 
 pub fn restoreTable(
@@ -1574,15 +1776,10 @@ pub fn verifyTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
-    defer allocator.free(source);
-    var parsed = try parseTableMeta(allocator, source);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    try validateSegmentHashes(allocator, root_dir, parsed.value);
-    return tableInfo(parsed.value);
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    try validateSegmentHashes(allocator, root_dir, meta);
+    return tableInfo(meta);
 }
 
 pub fn lockTable(
@@ -1590,14 +1787,7 @@ pub fn lockTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
-    defer allocator.free(source);
-    var parsed = try parseTableMeta(allocator, source);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    var owned = try duplicateTableMeta(allocator, parsed.value);
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     owned.locked = true;
     owned.epoch += 1;
@@ -1611,16 +1801,9 @@ pub fn unlockTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
-    defer allocator.free(source);
-    var parsed = try parseTableMeta(allocator, source);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    try validateSegmentHashes(allocator, root_dir, parsed.value);
-    var owned = try duplicateTableMeta(allocator, parsed.value);
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
+    try validateSegmentHashes(allocator, root_dir, owned);
     if (owned.locked) {
         owned.locked = false;
         owned.epoch += 1;
@@ -1635,18 +1818,10 @@ pub fn compactTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
-    const meta_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(meta_path);
-    const source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
-    defer allocator.free(source);
-    var parsed = try parseTableMeta(allocator, source);
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.InvalidFormat;
-    if (parsed.value.locked) return TableError.Locked;
-    if (parsed.value.segments.len == 0) return tableInfo(parsed.value);
-
-    var owned = try duplicateTableMeta(allocator, parsed.value);
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    if (owned.segments.len == 0) return tableInfo(owned);
 
     const files = try mergeSegmentFiles(allocator, root_dir, table_name, &owned, owned.next_segment_id);
     errdefer freeFileMetas(allocator, files);
@@ -1672,6 +1847,121 @@ fn writeFileToTemp(dir: std.fs.Dir, path: []const u8, bytes: []const u8) !void {
     var file = try dir.createFile(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(bytes);
+}
+
+test "table atomic write replaces target and cleans temporary files" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    try writeFile(std.testing.allocator, "data.bin", "old");
+    try writeFile(std.testing.allocator, "data.bin", "new");
+
+    const contents = try readFileAlloc(std.testing.allocator, "data.bin", 1024);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("new", contents);
+
+    try tmp_dir.dir.makeDir("target_dir");
+    try std.testing.expectError(TableError.InvalidFormat, writeFile(std.testing.allocator, "target_dir", "x"));
+
+    var iter = tmp_dir.dir.iterate();
+    while (try iter.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".data.bin.tmp."));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".target_dir.tmp."));
+    }
+}
+
+test "table verify rejects segment byte-count metadata mismatch" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "inventory_txn";
+    try writeFileToTemp(tmp_dir.dir, "inventory_txn.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_QTY_STRIDE = 8 // u64
+    );
+    try writeFileToTemp(tmp_dir.dir, "rows.csv",
+        \\ID,QTY
+        \\1,5
+        \\2,8
+    );
+
+    _ = try ingestTable(std.testing.allocator, ".", table_name, "rows.csv");
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    const source = try readFileAlloc(std.testing.allocator, meta_path, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(source);
+    var parsed = try parseTableMeta(std.testing.allocator, source);
+    defer parsed.deinit();
+
+    var owned = try duplicateTableMeta(std.testing.allocator, parsed.value);
+    defer owned.deinit(std.testing.allocator);
+    owned.segments[0].files[0].bytes += 8;
+    try writeMeta(std.testing.allocator, ".", table_name, owned);
+
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table manifest selects active epoch over compatibility meta" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "orders";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "orders.sadb-schema", schema_source);
+
+    var ids1 = [_]u64{1};
+    var totals1 = [_]u64{500};
+    const first_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids1[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals1[0..]) },
+    };
+    const first = try ingestRawColumns(std.testing.allocator, ".", table_name, 1, &first_columns);
+    try std.testing.expectEqual(@as(u64, 1), first.row_count);
+
+    const manifest_path = try tableManifestPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(manifest_path);
+    const old_manifest = try readFileAlloc(std.testing.allocator, manifest_path, 1024 * 1024);
+    defer std.testing.allocator.free(old_manifest);
+
+    var ids2 = [_]u64{2};
+    var totals2 = [_]u64{700};
+    const second_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids2[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals2[0..]) },
+    };
+    const second = try ingestRawColumns(std.testing.allocator, ".", table_name, 1, &second_columns);
+    try std.testing.expectEqual(@as(u64, 2), second.row_count);
+
+    try writeFile(std.testing.allocator, manifest_path, old_manifest);
+
+    const active = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 1), active.row_count);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 500), try snapshotSumU64(snapshot, 1));
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {
