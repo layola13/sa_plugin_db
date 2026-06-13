@@ -18,6 +18,14 @@ pub const PrimType = enum(u8) {
     v128,
 };
 
+pub const LOGICAL_NONE: u32 = 0;
+pub const LOGICAL_DECIMAL_I64: u32 = 1;
+pub const LOGICAL_DATE_DAYS: u32 = 2;
+pub const LOGICAL_TIMESTAMP_MS: u32 = 3;
+pub const LOGICAL_TIMESTAMP_US: u32 = 4;
+pub const LOGICAL_BOOL: u32 = 5;
+pub const LOGICAL_NULL_BITMAP: u32 = 6;
+
 pub const ParseError = error{
     OutOfMemory,
     InvalidFormat,
@@ -32,6 +40,9 @@ pub const Column = struct {
     name: []const u8,
     stride: u32,
     ty: ?PrimType = null,
+    logical_type: u32 = LOGICAL_NONE,
+    logical_scale: u32 = 0,
+    nullable: bool = false,
 };
 
 pub const Def = struct {
@@ -232,6 +243,73 @@ fn primTypeBytes(ty: PrimType) u32 {
         .v128 => 16,
     };
 }
+
+fn logicalTypeFitsPrimitive(logical_type: u32, ty: PrimType) bool {
+    return switch (logical_type) {
+        LOGICAL_NONE => true,
+        LOGICAL_DECIMAL_I64, LOGICAL_DATE_DAYS, LOGICAL_TIMESTAMP_MS, LOGICAL_TIMESTAMP_US => ty == .i64,
+        LOGICAL_BOOL => ty == .i1 or ty == .u8 or ty == .u64,
+        LOGICAL_NULL_BITMAP => ty == .u8,
+        else => false,
+    };
+}
+
+fn parseScaleSuffix(token: []const u8, prefix: []const u8) ParseError!?u32 {
+    if (!std.mem.startsWith(u8, token, prefix)) return null;
+    if (token.len < prefix.len + 3) return ParseError.InvalidFormat;
+    if (token[prefix.len] != '(' or token[token.len - 1] != ')') return ParseError.InvalidFormat;
+    const body = token[prefix.len + 1 .. token.len - 1];
+    if (body.len == 0) return ParseError.InvalidFormat;
+    const scale = std.fmt.parseInt(u32, body, 10) catch return ParseError.InvalidFormat;
+    if (scale > 18) return ParseError.InvalidFormat;
+    return scale;
+}
+
+fn parseLogicalAnnotations(comment_tail: []const u8, ty: PrimType) ParseError!struct { logical_type: u32, logical_scale: u32, nullable: bool } {
+    const annotation_text = blk: {
+        const colon = std.mem.indexOfScalar(u8, comment_tail, ':') orelse comment_tail.len;
+        break :blk std.mem.trim(u8, comment_tail[0..colon], " \t\r,");
+    };
+    var logical_type: u32 = LOGICAL_NONE;
+    var logical_scale: u32 = 0;
+    var nullable = false;
+    var tokens = std.mem.tokenizeAny(u8, annotation_text, " \t\r,");
+    while (tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, " \t\r,");
+        if (token.len == 0) continue;
+        if (std.mem.eql(u8, token, "nullable")) {
+            nullable = true;
+            continue;
+        }
+        var next_type: u32 = LOGICAL_NONE;
+        var next_scale: u32 = 0;
+        if (try parseScaleSuffix(token, "decimal")) |scale| {
+            next_type = LOGICAL_DECIMAL_I64;
+            next_scale = scale;
+        } else if (try parseScaleSuffix(token, "money")) |scale| {
+            next_type = LOGICAL_DECIMAL_I64;
+            next_scale = scale;
+        } else if (std.mem.eql(u8, token, "date") or std.mem.eql(u8, token, "date_days")) {
+            next_type = LOGICAL_DATE_DAYS;
+        } else if (std.mem.eql(u8, token, "timestamp_ms")) {
+            next_type = LOGICAL_TIMESTAMP_MS;
+        } else if (std.mem.eql(u8, token, "timestamp_us")) {
+            next_type = LOGICAL_TIMESTAMP_US;
+        } else if (std.mem.eql(u8, token, "bool")) {
+            next_type = LOGICAL_BOOL;
+        } else if (std.mem.eql(u8, token, "null_bitmap")) {
+            next_type = LOGICAL_NULL_BITMAP;
+        } else {
+            return ParseError.UnsupportedType;
+        }
+        if (logical_type != LOGICAL_NONE) return ParseError.InvalidFormat;
+        if (!logicalTypeFitsPrimitive(next_type, ty)) return ParseError.InvalidFormat;
+        logical_type = next_type;
+        logical_scale = next_scale;
+    }
+    return .{ .logical_type = logical_type, .logical_scale = logical_scale, .nullable = nullable };
+}
+
 pub fn compile(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -290,6 +368,9 @@ pub fn compile(
         const col_name = try allocator.dupe(u8, base_name);
         errdefer allocator.free(col_name);
         var col_ty: ?PrimType = null;
+        var logical_type: u32 = LOGICAL_NONE;
+        var logical_scale: u32 = 0;
+        var nullable = false;
         if (std.mem.indexOf(u8, raw_line, "//")) |comment_idx| {
             const comment = trim(raw_line[comment_idx + 2 ..]);
             if (comment.len != 0) {
@@ -302,11 +383,15 @@ pub fn compile(
                     };
                     if (col_ty) |ty| {
                         if (primTypeBytes(ty) != stride) return ParseError.InvalidFormat;
+                        const annotations = try parseLogicalAnnotations(comment[first..], ty);
+                        logical_type = annotations.logical_type;
+                        logical_scale = annotations.logical_scale;
+                        nullable = annotations.nullable;
                     }
                 }
             }
         }
-        try columns.append(.{ .name = col_name, .stride = stride, .ty = col_ty });
+        try columns.append(.{ .name = col_name, .stride = stride, .ty = col_ty, .logical_type = logical_type, .logical_scale = logical_scale, .nullable = nullable });
     }
 
     const max_rows_value = max_rows orelse return ParseError.MissingMaxRows;
@@ -379,4 +464,32 @@ test "schema compiler computes row bytes and preserves table alias" {
     try writeIface(out.writer(), schema);
     try std.testing.expect(std.mem.containsAtLeast(u8, out.items, 1, "#def TABLE_ROW_BYTES = 13"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out.items, 1, "#def flash_sale_ROW_BYTES = 13"));
+}
+
+test "schema compiler parses logical column annotations" {
+    const source =
+        \\#def MAX_ROWS = 16
+        \\#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable : invoice amount
+        \\#def COL_DUE_DATE_STRIDE = 8 // i64 date
+        \\#def COL_POSTED_AT_STRIDE = 8 // i64 timestamp_ms
+        \\#def COL_ACTIVE_STRIDE = 1 // u8 bool
+    ;
+    var compiled = try compile(std.testing.allocator, source, "erp.sadb-schema");
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), compiled.columns.len);
+    try std.testing.expectEqual(@as(u32, LOGICAL_DECIMAL_I64), compiled.columns[0].logical_type);
+    try std.testing.expectEqual(@as(u32, 2), compiled.columns[0].logical_scale);
+    try std.testing.expect(compiled.columns[0].nullable);
+    try std.testing.expectEqual(@as(u32, LOGICAL_DATE_DAYS), compiled.columns[1].logical_type);
+    try std.testing.expectEqual(@as(u32, LOGICAL_TIMESTAMP_MS), compiled.columns[2].logical_type);
+    try std.testing.expectEqual(@as(u32, LOGICAL_BOOL), compiled.columns[3].logical_type);
+}
+
+test "schema compiler rejects incompatible logical annotations" {
+    const source =
+        \\#def MAX_ROWS = 16
+        \\#def COL_AMOUNT_STRIDE = 8 // u64 decimal(2)
+    ;
+    try std.testing.expectError(ParseError.InvalidFormat, compile(std.testing.allocator, source, "bad.sadb-schema"));
 }

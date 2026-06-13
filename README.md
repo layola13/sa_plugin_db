@@ -89,6 +89,7 @@ Read-handle query calls:
 - `sa_db_close_read_table`
 - `sa_db_snapshot_info_handle`
 - `sa_db_column_info_handle`
+- `sa_db_column_logical_info_handle`
 - `sa_db_sum_u64_handle`
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
@@ -151,9 +152,11 @@ Read queries now use snapshots:
 
 1. `sa_db_open_read_table` opens a read handle and copies immutable column bytes
    into a read snapshot.
-2. `sa_db_snapshot_info_handle` and `sa_db_column_info_handle` expose snapshot
-   row count, column count, row width, epoch, column stride, primitive type code,
-   and metadata string lengths without requiring callers to parse JSON meta.
+2. `sa_db_snapshot_info_handle`, `sa_db_column_info_handle`, and
+   `sa_db_column_logical_info_handle` expose snapshot row count, column count,
+   row width, epoch, column stride, primitive type code, metadata string lengths,
+   logical type, logical scale, and nullable marker without requiring callers to
+   parse JSON meta.
 3. `*_handle` query functions scan the in-memory snapshot; `find_u64` and
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
    the column. Signed `i64` columns now have the same point/range/count/min/max
@@ -177,6 +180,15 @@ microseconds, boolean as normalized `0/1`, and nullable fields as a sidecar null
 bitmap. These helpers deliberately do not introduce a new physical format yet,
 so existing `i64`/`u64` indexes, range reads, projections, and fixed-width row
 buffers remain the query surface.
+Schema comments can now carry logical metadata after the primitive type and
+before an optional `:` description, for example `// i64 decimal(2) nullable`,
+`// i64 date`, `// i64 timestamp_ms`, `// i64 timestamp_us`, or `// u8 bool`.
+These annotations are stored in table metadata and surfaced through
+`sa_db_column_logical_info_handle` / `DB_COLUMN_LOGICAL_INFO_HANDLE` using the
+`SA_DB_LOGICAL_*` constants, so SA ERP code can inspect column semantics at
+runtime while keeping the on-disk bytes primitive and fixed-width. Existing
+schemas without annotations keep `SA_DB_LOGICAL_NONE`, scale `0`, and nullable
+`0`.
 
 Low-cardinality strings are supported through table-level dictionaries rather
 than variable-width string columns. `sa_db_dict_intern` / `DB_DICT_INTERN` maps a

@@ -37,6 +37,9 @@ pub const ColumnMeta = struct {
     name: []const u8,
     stride: u32,
     ty: []const u8,
+    logical_type: u32 = schema.LOGICAL_NONE,
+    logical_scale: u32 = 0,
+    nullable: bool = false,
 };
 
 pub const FileMeta = struct {
@@ -257,6 +260,12 @@ pub const ColumnInfo = struct {
     type_code: u64,
     name_len: u64,
     type_name_len: u64,
+};
+
+pub const ColumnLogicalInfo = struct {
+    logical_type: u64,
+    logical_scale: u64,
+    nullable: u64,
 };
 
 pub const ReadSnapshot = struct {
@@ -670,6 +679,9 @@ fn duplicateColumns(allocator: std.mem.Allocator, columns: []const schema.Column
             .name = try allocator.dupe(u8, column.name),
             .stride = column.stride,
             .ty = try allocator.dupe(u8, schema.primTypeName(ty)),
+            .logical_type = column.logical_type,
+            .logical_scale = column.logical_scale,
+            .nullable = column.nullable,
         };
     }
     return out;
@@ -689,6 +701,9 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
             .name = try allocator.dupe(u8, column.name),
             .stride = column.stride,
             .ty = try allocator.dupe(u8, column.ty),
+            .logical_type = column.logical_type,
+            .logical_scale = column.logical_scale,
+            .nullable = column.nullable,
         };
     }
 
@@ -3055,6 +3070,9 @@ fn duplicateColumnMetasToArena(allocator: std.mem.Allocator, columns: []const Co
             .name = try allocator.dupe(u8, column.name),
             .stride = column.stride,
             .ty = try allocator.dupe(u8, column.ty),
+            .logical_type = column.logical_type,
+            .logical_scale = column.logical_scale,
+            .nullable = column.nullable,
         };
     }
     return out;
@@ -3743,6 +3761,16 @@ pub fn snapshotColumnInfo(snapshot: *const ReadSnapshot, column_index: usize) Ta
         .type_code = @intFromEnum(ty),
         .name_len = column.name.len,
         .type_name_len = column.ty.len,
+    };
+}
+
+pub fn snapshotColumnLogicalInfo(snapshot: *const ReadSnapshot, column_index: usize) TableError!ColumnLogicalInfo {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    return .{
+        .logical_type = column.logical_type,
+        .logical_scale = column.logical_scale,
+        .nullable = if (column.nullable) 1 else 0,
     };
 }
 

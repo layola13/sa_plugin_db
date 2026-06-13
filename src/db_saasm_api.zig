@@ -48,6 +48,12 @@ pub const SaDbColumnInfo = extern struct {
     type_name_len: u64,
 };
 
+pub const SaDbColumnLogicalInfo = extern struct {
+    logical_type: u64,
+    logical_scale: u64,
+    nullable: u64,
+};
+
 pub const SaDbColumnInput = extern struct {
     data: ?[*]const u8,
     len: u64,
@@ -138,6 +144,16 @@ fn fillColumnInfo(out_info: ?*SaDbColumnInfo, info: table.ColumnInfo) u32 {
         .type_code = info.type_code,
         .name_len = info.name_len,
         .type_name_len = info.type_name_len,
+    };
+    return SA_DB_OK;
+}
+
+fn fillColumnLogicalInfo(out_info: ?*SaDbColumnLogicalInfo, info: table.ColumnLogicalInfo) u32 {
+    const slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = .{
+        .logical_type = info.logical_type,
+        .logical_scale = info.logical_scale,
+        .nullable = info.nullable,
     };
     return SA_DB_OK;
 }
@@ -1095,6 +1111,14 @@ pub export fn sa_db_column_info_handle(handle: ?*anyopaque, column_index: u64, o
     defer releaseReadSnapshot(snapshot);
     const info = table.snapshotColumnInfo(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
     return fillColumnInfo(out_info, info);
+}
+
+pub export fn sa_db_column_logical_info_handle(handle: ?*anyopaque, column_index: u64, out_info: ?*SaDbColumnLogicalInfo) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const info = table.snapshotColumnLogicalInfo(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    return fillColumnLogicalInfo(out_info, info);
 }
 
 pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_sum: ?*u64) u32 {

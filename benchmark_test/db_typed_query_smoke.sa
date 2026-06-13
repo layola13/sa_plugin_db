@@ -3,12 +3,12 @@
 @const ROOT = utf8:"."
 @const TABLE = utf8:"typed_orders"
 @const SCHEMA_PATH = utf8:"typed_orders.sadb-schema"
-@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_AMOUNT_STRIDE = 8 // i64\n#def COL_DUE_DATE_STRIDE = 8 // i64\n"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable\n#def COL_DUE_DATE_STRIDE = 8 // i64 date nullable\n"
 
 #def ROOT_LEN = 1
 #def TABLE_LEN = 12
 #def SCHEMA_PATH_LEN = 24
-#def SCHEMA_LEN = 118
+#def SCHEMA_LEN = 152
 #def ROWS = 4
 #def COLUMN_COUNT = 3
 #def COL_BYTES = 32
@@ -20,6 +20,7 @@
 @main() -> i32:
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
+    logical_info = stack_alloc SaDbColumnLogicalInfo_SIZE
     columns = stack_alloc COLUMNS_BYTES
     id_col = alloc COL_BYTES
     amount_col = alloc COL_BYTES
@@ -66,6 +67,15 @@ L_ENTRY:
     EXPAND DB_CREATE_I64_INDEX due_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
 
+    EXPAND DB_COLUMN_LOGICAL_INFO_HANDLE amount_logical_status, read_handle, 1, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_TYPE amount_logical_type, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_SCALE amount_logical_scale, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_NULLABLE amount_nullable, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_HANDLE due_logical_status, read_handle, 2, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_TYPE due_logical_type, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_SCALE due_logical_scale, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_NULLABLE due_nullable, logical_info
+
     EXPAND DB_RANGE_DECIMAL_I64_HANDLE amount_range_status, amount_range_written, amount_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 0, 0, 0, 0, 50, 0, 0, 4
     amount_range_row0 = load range_rows+0 as u64
     amount_range_row1 = load range_rows+8 as u64
@@ -100,6 +110,14 @@ L_ENTRY:
     ok_amount_index = eq amount_index_status, SA_DB_OK
     ok_due_index = eq due_index_status, SA_DB_OK
     ok_open = eq open_status, SA_DB_OK
+    ok_amount_logical_status = eq amount_logical_status, SA_DB_OK
+    ok_amount_logical_type = eq amount_logical_type, SA_DB_LOGICAL_DECIMAL_I64
+    ok_amount_logical_scale = eq amount_logical_scale, 2
+    ok_amount_nullable = eq amount_nullable, 1
+    ok_due_logical_status = eq due_logical_status, SA_DB_OK
+    ok_due_logical_type = eq due_logical_type, SA_DB_LOGICAL_DATE_DAYS
+    ok_due_logical_scale = eq due_logical_scale, 0
+    ok_due_nullable = eq due_nullable, 1
     ok_amount_range_status = eq amount_range_status, SA_DB_OK
     ok_amount_range_written = eq amount_range_written, 2
     ok_amount_range_total = eq amount_range_total, 2
@@ -141,7 +159,15 @@ L_ENTRY:
     ok19 = and ok18, ok_amount_index
     ok20 = and ok19, ok_due_index
     ok21 = and ok20, ok_open
-    ok22 = and ok21, ok_amount_range_status
+    ok_logical01 = and ok_amount_logical_status, ok_amount_logical_type
+    ok_logical02 = and ok_logical01, ok_amount_logical_scale
+    ok_logical03 = and ok_logical02, ok_amount_nullable
+    ok_logical04 = and ok_logical03, ok_due_logical_status
+    ok_logical05 = and ok_logical04, ok_due_logical_type
+    ok_logical06 = and ok_logical05, ok_due_logical_scale
+    ok_logical_all = and ok_logical06, ok_due_nullable
+    ok21a = and ok21, ok_logical_all
+    ok22 = and ok21a, ok_amount_range_status
     ok23 = and ok22, ok_amount_range_written
     ok24 = and ok23, ok_amount_range_total
     ok25 = and ok24, ok_amount_range_row0
@@ -188,6 +214,14 @@ L_ENTRY:
     !due_index_status
     !open_status
     !read_handle
+    !amount_logical_status
+    !amount_logical_type
+    !amount_logical_scale
+    !amount_nullable
+    !due_logical_status
+    !due_logical_type
+    !due_logical_scale
+    !due_nullable
     !amount_range_status
     !amount_range_written
     !amount_range_total
@@ -231,6 +265,14 @@ L_ENTRY:
     !ok_amount_index
     !ok_due_index
     !ok_open
+    !ok_amount_logical_status
+    !ok_amount_logical_type
+    !ok_amount_logical_scale
+    !ok_amount_nullable
+    !ok_due_logical_status
+    !ok_due_logical_type
+    !ok_due_logical_scale
+    !ok_due_nullable
     !ok_amount_range_status
     !ok_amount_range_written
     !ok_amount_range_total
@@ -289,6 +331,14 @@ L_ENTRY:
     !ok37
     !ok38
     !ok39
+    !ok_logical01
+    !ok_logical02
+    !ok_logical03
+    !ok_logical04
+    !ok_logical05
+    !ok_logical06
+    !ok_logical_all
+    !ok21a
     !id_col
     !amount_col
     !due_date_col
