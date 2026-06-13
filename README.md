@@ -207,6 +207,13 @@ index hash, index shape/order, dictionary hash, recorded size, dictionary entry 
 expected `rows * column_stride` size. `recover` scans versioned metadata files
 and rebuilds the manifest to the highest valid epoch, which covers corrupted or
 missing manifest files after an interrupted commit.
+Single-table transactions add explicit recovery markers: commit writes
+`<table>.tx.<epoch>.pending` before replacement artifacts and writes a verified
+`<table>.tx.<epoch>.commit` marker after the versioned transaction metadata is
+durable. Recovery ignores pending-only transaction metadata, validates commit
+markers against the referenced meta hash/byte count, completes committed
+transactions when the active manifest is stale or corrupt, and removes stale
+pending markers.
 
 `sa_db_create_u64_index(..., unique=1)` now acts as a real uniqueness
 constraint. Creating the unique index rejects existing duplicate values, and
@@ -232,7 +239,9 @@ returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_UPSERT_ROW_U64_KEY`, and
 `DB_TX_DELETE_U64_KEY` mutate an in-memory transaction image; no new table epoch
 or manifest is published until `sa_db_tx_commit` / `DB_TX_COMMIT`. Commit writes
 one replacement segment, rebuilds all persisted indexes, then advances the active
-manifest once. If commit fails, for example because a batch introduces duplicate
+manifest once. A pending/commit marker pair lets `recover` distinguish incomplete
+transaction metadata from committed metadata whose manifest update was
+interrupted. If commit fails, for example because a batch introduces duplicate
 keys for a unique index, the previous active manifest remains visible and the
 transaction handle is closed. `sa_db_tx_rollback` / `DB_TX_ROLLBACK` drops the
 in-memory image without publishing any rows. This is currently a single-table,
@@ -262,9 +271,9 @@ for stable labels that can be represented as integer IDs in fixed-width rows.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
-ERP foundation work is to extend the current single-table transaction baseline
-into stronger crash-recovery and multi-table semantics without losing the fast
-read-handle scan path.
+ERP foundation work is to extend the current single-table transaction/recovery
+baseline into block checksums, optional WAL, and multi-table semantics without
+losing the fast read-handle scan path.
 
 ## ERP Foundation Roadmap
 
@@ -286,8 +295,8 @@ benchmarks. The required baseline is:
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
-- Crash-recovery hardening for the single-table transaction path, then multi-table
-  transaction semantics, optional WAL, and async batch flush.
+- Remaining crash-recovery hardening such as block checksums and fault-injection
+  tests, then multi-table transaction semantics, optional WAL, and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
   aggregation as performance work after the reliability/data-model baseline.
 

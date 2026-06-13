@@ -180,6 +180,38 @@ pub const TableManifest = struct {
     meta_bytes: u64,
 };
 
+const TxPendingMarker = struct {
+    magic: []const u8,
+    version: u32,
+    table_name: []const u8,
+    previous_epoch: u64,
+    target_epoch: u64,
+};
+
+const TxCommitMarker = struct {
+    magic: []const u8,
+    version: u32,
+    table_name: []const u8,
+    epoch: u64,
+    meta_path: []const u8,
+    meta_sha256: []const u8,
+    meta_bytes: u64,
+};
+
+const WrittenMeta = struct {
+    json: []u8,
+    versioned_name: []u8,
+    meta_hash: []u8,
+    meta_bytes: usize,
+
+    fn deinit(self: *WrittenMeta, allocator: std.mem.Allocator) void {
+        allocator.free(self.json);
+        allocator.free(self.versioned_name);
+        allocator.free(self.meta_hash);
+        self.* = undefined;
+    }
+};
+
 pub const ReadColumnSnapshot = struct {
     bytes: []const u8,
 };
@@ -340,6 +372,30 @@ fn tableVersionedMetaName(allocator: std.mem.Allocator, table_name: []const u8, 
 
 fn tableVersionedMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
     const basename = try tableVersionedMetaName(allocator, table_name, epoch);
+    errdefer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    allocator.free(basename);
+    return path;
+}
+
+fn txPendingMarkerName(allocator: std.mem.Allocator, table_name: []const u8, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.tx.{d}.pending", .{ table_name, epoch });
+}
+
+fn txCommitMarkerName(allocator: std.mem.Allocator, table_name: []const u8, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.tx.{d}.commit", .{ table_name, epoch });
+}
+
+fn txPendingMarkerPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
+    const basename = try txPendingMarkerName(allocator, table_name, epoch);
+    errdefer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    allocator.free(basename);
+    return path;
+}
+
+fn txCommitMarkerPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
+    const basename = try txCommitMarkerName(allocator, table_name, epoch);
     errdefer allocator.free(basename);
     const path = try activePath(allocator, root_dir, basename);
     allocator.free(basename);
@@ -521,6 +577,24 @@ fn parseTableManifest(allocator: std.mem.Allocator, source: []const u8) TableErr
         return TableError.InvalidFormat;
     }
     return parsed;
+}
+
+fn parseTxCommitMarker(allocator: std.mem.Allocator, source: []const u8) TableError!std.json.Parsed(TxCommitMarker) {
+    const parsed = std.json.parseFromSlice(TxCommitMarker, allocator, source, .{}) catch |err| return mapJsonError(err);
+    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-tx-commit")) {
+        parsed.deinit();
+        return TableError.InvalidFormat;
+    }
+    if (parsed.value.version != 1) {
+        parsed.deinit();
+        return TableError.InvalidFormat;
+    }
+    return parsed;
+}
+
+fn fileExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
 }
 
 pub fn readActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
@@ -1379,6 +1453,17 @@ fn maybeSelectRecoveryMeta(
     defer allocator.free(source);
     var parsed = parseTableMeta(allocator, source) catch return;
     defer parsed.deinit();
+    const pending_path = txPendingMarkerPath(allocator, root_dir, table_name, parsed.value.epoch) catch return;
+    defer allocator.free(pending_path);
+    const commit_path = txCommitMarkerPath(allocator, root_dir, table_name, parsed.value.epoch) catch return;
+    defer allocator.free(commit_path);
+    const has_pending = fileExists(pending_path);
+    const has_commit = fileExists(commit_path);
+    if (has_commit) {
+        validateTxCommitMarkerForMeta(allocator, root_dir, table_name, parsed.value, source) catch return;
+    } else if (has_pending) {
+        return;
+    }
     validateRecoverCandidate(allocator, root_dir, table_name, parsed.value) catch return;
     if (best.*) |current| {
         if (parsed.value.epoch <= current.epoch) return;
@@ -1411,6 +1496,28 @@ fn scanVersionedRecoveryMetas(
         const path = try activePath(allocator, root_dir, entry.name);
         defer allocator.free(path);
         try maybeSelectRecoveryMeta(allocator, root_dir, table_name, path, best);
+    }
+}
+
+fn cleanupPendingTxMarkers(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    const dir_path = rootPrefix(root_dir);
+    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
+    defer dir.close();
+
+    const prefix = try allocPrintPath(allocator, "{s}.tx.", .{table_name});
+    defer allocator.free(prefix);
+    const suffix = ".pending";
+    var it = dir.iterate();
+    while (it.next() catch |err| return mapFileError(err)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const epoch_text = entry.name[prefix.len .. entry.name.len - suffix.len];
+        if (epoch_text.len == 0) continue;
+        _ = std.fmt.parseInt(u64, epoch_text, 10) catch continue;
+        const path = try activePath(allocator, root_dir, entry.name);
+        defer allocator.free(path);
+        try deleteIfExists(path);
     }
 }
 
@@ -1803,26 +1910,35 @@ fn appendRowFromJson(columns: []const ColumnMeta, row: std.json.Value, buffers: 
     }
 }
 
-fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!WrittenMeta {
     const json = std.json.stringifyAlloc(allocator, meta, .{}) catch |err| return mapJsonError(err);
-    defer allocator.free(json);
+    errdefer allocator.free(json);
 
     const versioned_name = try tableVersionedMetaName(allocator, table_name, meta.epoch);
-    defer allocator.free(versioned_name);
+    errdefer allocator.free(versioned_name);
     const versioned_path = try activePath(allocator, root_dir, versioned_name);
     defer allocator.free(versioned_path);
     try writeFile(allocator, versioned_path, json);
 
     const meta_hash = try hashHexAlloc(allocator, json);
-    defer allocator.free(meta_hash);
+    errdefer allocator.free(meta_hash);
+    return .{
+        .json = json,
+        .versioned_name = versioned_name,
+        .meta_hash = meta_hash,
+        .meta_bytes = json.len,
+    };
+}
+
+fn publishWrittenMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta, written: WrittenMeta) TableError!void {
     const manifest: TableManifest = .{
         .magic = "sa-db-table-manifest",
         .version = 1,
         .table_name = table_name,
         .epoch = meta.epoch,
-        .meta_path = versioned_name,
-        .meta_sha256 = meta_hash,
-        .meta_bytes = json.len,
+        .meta_path = written.versioned_name,
+        .meta_sha256 = written.meta_hash,
+        .meta_bytes = written.meta_bytes,
     };
     const manifest_json = std.json.stringifyAlloc(allocator, manifest, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(manifest_json);
@@ -1832,7 +1948,70 @@ fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []c
 
     const compat_path = try tableMetaPath(allocator, root_dir, table_name);
     defer allocator.free(compat_path);
-    try writeFile(allocator, compat_path, json);
+    try writeFile(allocator, compat_path, written.json);
+}
+
+fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    var written = try writeVersionedMeta(allocator, root_dir, table_name, meta);
+    defer written.deinit(allocator);
+    try publishWrittenMeta(allocator, root_dir, table_name, meta, written);
+}
+
+fn writeTxPendingMarker(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, previous_epoch: u64, target_epoch: u64) TableError!void {
+    const marker: TxPendingMarker = .{
+        .magic = "sa-db-tx-pending",
+        .version = 1,
+        .table_name = table_name,
+        .previous_epoch = previous_epoch,
+        .target_epoch = target_epoch,
+    };
+    const json = std.json.stringifyAlloc(allocator, marker, .{}) catch |err| return mapJsonError(err);
+    defer allocator.free(json);
+    const path = try txPendingMarkerPath(allocator, root_dir, table_name, target_epoch);
+    defer allocator.free(path);
+    try writeFile(allocator, path, json);
+}
+
+fn writeTxCommitMarker(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta, written: WrittenMeta) TableError!void {
+    const marker: TxCommitMarker = .{
+        .magic = "sa-db-tx-commit",
+        .version = 1,
+        .table_name = table_name,
+        .epoch = meta.epoch,
+        .meta_path = written.versioned_name,
+        .meta_sha256 = written.meta_hash,
+        .meta_bytes = written.meta_bytes,
+    };
+    const json = std.json.stringifyAlloc(allocator, marker, .{}) catch |err| return mapJsonError(err);
+    defer allocator.free(json);
+    const path = try txCommitMarkerPath(allocator, root_dir, table_name, meta.epoch);
+    defer allocator.free(path);
+    try writeFile(allocator, path, json);
+}
+
+fn deleteTxPendingMarkerIfExists(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError!void {
+    const path = try txPendingMarkerPath(allocator, root_dir, table_name, epoch);
+    defer allocator.free(path);
+    try deleteIfExists(path);
+}
+
+fn validateTxCommitMarkerForMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta, meta_source: []const u8) TableError!void {
+    const path = try txCommitMarkerPath(allocator, root_dir, table_name, meta.epoch);
+    defer allocator.free(path);
+    const source = try readFileAlloc(allocator, path, 1024 * 1024);
+    defer allocator.free(source);
+    var parsed = try parseTxCommitMarker(allocator, source);
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return TableError.VerifyFailed;
+    if (!std.mem.eql(u8, parsed.value.table_name, meta.table_name)) return TableError.VerifyFailed;
+    if (parsed.value.epoch != meta.epoch) return TableError.VerifyFailed;
+    const versioned_name = try tableVersionedMetaName(allocator, table_name, meta.epoch);
+    defer allocator.free(versioned_name);
+    if (!std.mem.eql(u8, parsed.value.meta_path, versioned_name)) return TableError.VerifyFailed;
+    if (parsed.value.meta_bytes != meta_source.len) return TableError.VerifyFailed;
+    const meta_hash = hashBytes(meta_source);
+    const meta_hex = std.fmt.bytesToHex(meta_hash, .lower);
+    if (!std.mem.eql(u8, parsed.value.meta_sha256, meta_hex[0..])) return TableError.VerifyFailed;
 }
 
 pub fn commitTableMetaUnlocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
@@ -2343,9 +2522,20 @@ pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, 
 
 pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!TableInfo {
     if (!tx.dirty) return tableInfo(tx.meta);
+    const previous_epoch = tx.meta.epoch;
+    const target_epoch = std.math.add(u64, previous_epoch, 1) catch return TableError.CursorOverflow;
+    try writeTxPendingMarker(allocator, tx.root_dir, tx.table_name, previous_epoch, target_epoch);
+    var pending_marker_live = true;
+    errdefer if (pending_marker_live) deleteTxPendingMarkerIfExists(allocator, tx.root_dir, tx.table_name, target_epoch) catch {};
+
     try rewriteSegmentsFromTransaction(allocator, tx);
     try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
-    try writeMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
+    var written = try writeVersionedMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
+    defer written.deinit(allocator);
+    try writeTxCommitMarker(allocator, tx.root_dir, tx.table_name, tx.meta, written);
+    try publishWrittenMeta(allocator, tx.root_dir, tx.table_name, tx.meta, written);
+    deleteTxPendingMarkerIfExists(allocator, tx.root_dir, tx.table_name, tx.meta.epoch) catch {};
+    pending_marker_live = false;
     tx.dirty = false;
     return tableInfo(tx.meta);
 }
@@ -4330,6 +4520,7 @@ pub fn recoverTable(
 
     const recovered = best orelse return TableError.VerifyFailed;
     try writeMeta(allocator, root_dir, table_name, recovered);
+    try cleanupPendingTxMarkers(allocator, root_dir, table_name);
     return tableInfo(recovered);
 }
 
@@ -5145,6 +5336,95 @@ test "table recover rebuilds manifest from highest valid versioned meta" {
     const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 300), try snapshotSumU64(snapshot, 1));
+}
+
+test "table recover completes committed transaction marker when manifest is stale" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "recover_committed_tx";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "recover_committed_tx.sadb-schema", schema_source);
+    const indexed = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+    try std.testing.expectEqual(@as(u64, 1), indexed.epoch);
+
+    const manifest_path = try tableManifestPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(manifest_path);
+    const old_manifest = try readFileAlloc(std.testing.allocator, manifest_path, 1024 * 1024);
+    defer std.testing.allocator.free(old_manifest);
+
+    const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, 1);
+    writeU64LE(&row, 8, 10);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 2), committed.epoch);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    try writeFile(std.testing.allocator, manifest_path, old_manifest);
+    const active_old = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 0), active_old.row_count);
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 1), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 2), recovered.epoch);
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 10), try snapshotSumU64(snapshot, 1));
+}
+
+test "table recover ignores incomplete transaction meta and cleans pending marker" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "recover_incomplete_tx";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "recover_incomplete_tx.sadb-schema", schema_source);
+    const indexed = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+    try std.testing.expectEqual(@as(u64, 1), indexed.epoch);
+
+    var tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, 1);
+    writeU64LE(&row, 8, 10);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    const target_epoch = tx.meta.epoch + 1;
+    try writeTxPendingMarker(std.testing.allocator, ".", table_name, tx.meta.epoch, target_epoch);
+    try rewriteSegmentsFromTransaction(std.testing.allocator, tx);
+    try rebuildIndexes(std.testing.allocator, ".", &tx.meta);
+    var written = try writeVersionedMeta(std.testing.allocator, ".", table_name, tx.meta);
+    written.deinit(std.testing.allocator);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    const active_before_recover = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 0), active_before_recover.row_count);
+    try std.testing.expectEqual(@as(u64, 1), active_before_recover.epoch);
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 0), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.epoch);
+    const pending_path = try txPendingMarkerPath(std.testing.allocator, ".", table_name, target_epoch);
+    defer std.testing.allocator.free(pending_path);
+    try std.testing.expect(!fileExists(pending_path));
 }
 
 test "table remove clears stale versioned files before reuse" {
