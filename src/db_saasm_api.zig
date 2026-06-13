@@ -76,6 +76,14 @@ fn inputU64s(ptr: ?[*]const u64, len: u64) ?[]const u64 {
     return p[0..n];
 }
 
+fn inputU64sAllowEmpty(ptr: ?[*]const u64, len: u64) ?[]const u64 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return &.{};
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
 fn outputBytes(ptr: ?[*]u8, len: u64) ?[]u8 {
     if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
     const n: usize = @intCast(len);
@@ -2825,6 +2833,93 @@ pub export fn sa_db_filter_bool_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_filter_rows_u64_range_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    min_value: u64,
+    max_value: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterRowsU64Range(snapshot, @intCast(column_index), in_rows, min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_rows_i64_range_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    min_value: i64,
+    max_value: i64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterRowsI64Range(snapshot, @intCast(column_index), in_rows, min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_rows_bool_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    expected: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const expected_bool = boolFromAbi(expected) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterRowsBool(snapshot, @intCast(column_index), in_rows, expected_bool, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u64) u32 {
     const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -3617,6 +3712,81 @@ test "db SA ABI queries u64 timestamp pair ranges" {
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "timestamp_orders".ptr, "timestamp_orders".len, &info));
+}
+
+test "db SA ABI filters candidate rows for ERP predicates" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_CUSTOMER_ID_STRIDE = 8 // u64
+        \\#def COL_ORDER_DAY_STRIDE = 8 // i64 date
+        \\#def COL_STATUS_ID_STRIDE = 8 // u64
+        \\#def COL_POSTED_STRIDE = 1 // u8 bool
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "candidate_filters.sadb-schema".ptr, "candidate_filters.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var customer_ids = [_]u64{ 7, 7, 7, 8, 7, 7 };
+    var order_days = [_]i64{ -5, 0, 10, -3, 20, 25 };
+    var status_ids = [_]u64{ 1, 2, 2, 2, 1, 2 };
+    var posted = [_]u8{ 1, 1, 0, 1, 1, 1 };
+    var totals = [_]i64{ 1000, 2000, 3000, 4000, 5000, 7000 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&customer_ids), .len = @sizeOf(@TypeOf(customer_ids)) },
+        .{ .data = @ptrCast(&order_days), .len = @sizeOf(@TypeOf(order_days)) },
+        .{ .data = @ptrCast(&status_ids), .len = @sizeOf(@TypeOf(status_ids)) },
+        .{ .data = @ptrCast(&posted), .len = @sizeOf(@TypeOf(posted)) },
+        .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, customer_ids.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_i64_pair_index(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, 0, 1, 1, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, &handle));
+
+    var rows = [_]u64{ 99, 99, 99, 99, 99, 99 };
+    var written: u64 = 0;
+    var total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_i64_pair_handle(handle, 0, 1, 7, -5, 25, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_u64_range_handle(handle, 2, &rows, written, 2, 2, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), rows[2]);
+
+    var filtered = [_]u64{ 99, 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_i64_range_handle(handle, 4, &rows, written, 1500, 5500, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_bool_handle(handle, 3, &rows, 3, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[1]);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_filter_rows_bool_handle(handle, 3, &rows, 3, 2, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, &info));
 }
 
 test "db SA ABI commits and rolls back write transactions" {

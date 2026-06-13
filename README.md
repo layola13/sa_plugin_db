@@ -148,6 +148,9 @@ Read-handle query calls:
 - `sa_db_filter_u64_pair_key1_handle`
 - `sa_db_filter_u64_i64_pair_key1_handle`
 - `sa_db_filter_bool_handle`
+- `sa_db_filter_rows_u64_range_handle`
+- `sa_db_filter_rows_i64_range_handle`
+- `sa_db_filter_rows_bool_handle`
 - `sa_db_filter_blob_eq_handle`
 - `sa_db_filter_blob_contains_handle`
 - `sa_db_filter_blob_token_handle`
@@ -196,7 +199,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_U64_DATE_PAIR_HANDLE`, `DB_RANGE_U64_TIMESTAMP_MS_PAIR_HANDLE`,
 `DB_RANGE_U64_TIMESTAMP_US_PAIR_HANDLE`,
 `DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
-`DB_FILTER_BOOL_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
+`DB_FILTER_BOOL_HANDLE`, `DB_FILTER_ROWS_U64_RANGE_HANDLE`,
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_FILTER_ROWS_BOOL_HANDLE`,
+`DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
 `DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`, `DB_GET_F32_HANDLE`,
@@ -420,6 +425,17 @@ same `u64_i64_pair` index.
 Use this for customer/date, status/due-date, product/posting-date, and other
 ERP list filters where the second key is a signed date, timestamp, or amount
 encoding.
+Candidate row filters are the first explicit composition layer above these
+indexes. `sa_db_filter_rows_u64_range_handle` /
+`DB_FILTER_ROWS_U64_RANGE_HANDLE`, `sa_db_filter_rows_i64_range_handle` /
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, and `sa_db_filter_rows_bool_handle` /
+`DB_FILTER_ROWS_BOOL_HANDLE` take an existing row-id list, preserve that list's
+order, apply an additional snapshot column predicate, and return the same
+`offset`/`limit`/`total` pagination contract. SA callers can therefore run an
+indexed customer/date or blob/text query first, then narrow the candidate rows by
+status, amount/date range, or posted/active bool without materializing full rows
+in SA code. This is a planner building block rather than a SQL optimizer: callers
+still choose the first selective index explicitly.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
@@ -594,8 +610,10 @@ benchmarks. The required baseline is:
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
   prefix, and contains filters plus fixed-first-key `u64_pair` and
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
-  customer/date, status/due-date, and product/posting-date shapes. The first ERP
-  workflow benchmark now covers customers, products, orders, order lines,
+  customer/date, status/due-date, and product/posting-date shapes. Candidate row
+  filters now compose an existing row-id list with additional `u64`, `i64`, or
+  bool predicates for multi-condition list pages. The first ERP workflow
+  benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
   same composite ERP filters; next is broader index planning.
 - Generalized primary-key and secondary indexes beyond the current persisted
@@ -647,6 +665,9 @@ sa build-exe db_timestamp_query_smoke.sa -o db_timestamp_query_smoke.out --no-in
 
 sa build-exe db_u64_timestamp_pair_smoke.sa -o db_u64_timestamp_pair_smoke.out --no-incremental
 ./db_u64_timestamp_pair_smoke.out
+
+sa build-exe db_candidate_filter_smoke.sa -o db_candidate_filter_smoke.out --no-incremental
+./db_candidate_filter_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out

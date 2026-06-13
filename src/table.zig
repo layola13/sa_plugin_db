@@ -6599,6 +6599,102 @@ fn copyRangeRowsWithNullBitmap(
     return .{ .written = written, .total = total };
 }
 
+const SnapshotRowValue = struct {
+    bytes: []const u8,
+    local_row: u64,
+};
+
+fn snapshotColumnBytesForRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64, stride: u32) TableError!SnapshotRowValue {
+    if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const bytes = segment.columns[column_index].bytes;
+            const expected_len = try expectedColumnBytes(segment.rows, stride);
+            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            return .{ .bytes = bytes, .local_row = row_index - row_base };
+        }
+        row_base = segment_end;
+    }
+    return TableError.InvalidFormat;
+}
+
+fn snapshotU64AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 8);
+    const byte_offset: usize = @intCast(located.local_row * 8);
+    return readU64LE(located.bytes, byte_offset);
+}
+
+fn snapshotI64AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!i64 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 8);
+    const byte_offset: usize = @intCast(located.local_row * 8);
+    return readI64LE(located.bytes, byte_offset);
+}
+
+fn snapshotBoolAtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!bool {
+    const column = snapshot.columns[column_index];
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, column.stride);
+    return try readBoolColumnValue(column, located.bytes, located.local_row);
+}
+
+fn copyCandidateRowsByPredicate(
+    in_rows: []const u64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+    context: anytype,
+    comptime matches: fn (@TypeOf(context), u64) TableError!bool,
+) TableError!U64RangeResult {
+    var total: u64 = 0;
+    var written: u64 = 0;
+    const out_capacity: u64 = @intCast(out_rows.len);
+    for (in_rows) |row| {
+        if (try matches(context, row)) {
+            if (total >= offset and limit != 0 and written < limit and written < out_capacity) {
+                out_rows[@intCast(written)] = row;
+                written += 1;
+            }
+            total = std.math.add(u64, total, 1) catch return TableError.CursorOverflow;
+        }
+    }
+    return .{ .written = written, .total = total };
+}
+
+const FilterRowsU64RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u64,
+    max_value: u64,
+};
+
+fn matchesRowsU64Range(context: FilterRowsU64RangeContext, row: u64) TableError!bool {
+    const value = try snapshotU64AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsI64RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i64,
+    max_value: i64,
+};
+
+fn matchesRowsI64Range(context: FilterRowsI64RangeContext, row: u64) TableError!bool {
+    const value = try snapshotI64AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsBoolContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    expected: bool,
+};
+
+fn matchesRowsBool(context: FilterRowsBoolContext, row: u64) TableError!bool {
+    return (try snapshotBoolAtRow(context.snapshot, context.column_index, row)) == context.expected;
+}
+
 fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64) u64 {
     const n = index.entries.len / INDEX_RECORD_BYTES;
     const lower = lowerBoundU64Index(index, expected);
@@ -8080,6 +8176,63 @@ pub fn snapshotFilterU64I64PairKey1Rows(
     out_rows: []u64,
 ) TableError!U64RangeResult {
     return snapshotRangeU64I64PairRows(snapshot, column_index, column_index2, key1, std.math.minInt(i64), std.math.maxInt(i64), offset, limit, out_rows);
+}
+
+pub fn snapshotFilterRowsU64Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: u64,
+    max_value: u64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsU64RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsU64Range);
+}
+
+pub fn snapshotFilterRowsI64Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: i64,
+    max_value: i64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsI64RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsI64Range);
+}
+
+pub fn snapshotFilterRowsBool(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    expected: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotBoolColumn(snapshot, column_index);
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsBoolContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .expected = expected,
+    }, matchesRowsBool);
 }
 
 pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
@@ -9937,6 +10090,84 @@ test "table persistent u64 i64 pair index supports ERP date lookups" {
     try std.testing.expectError(TableError.ConstraintViolation, insertRawRow(std.testing.allocator, ".", table_name, &duplicate_row));
     const after_duplicate = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(@as(u64, 5), after_duplicate.row_count);
+}
+
+test "table filters candidate rows for ERP composite predicates" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "erp_candidate_filters";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "erp_candidate_filters.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_CUSTOMER_ID_STRIDE = 8 // u64
+        \\#def COL_ORDER_DAY_STRIDE = 8 // i64 date
+        \\#def COL_STATUS_ID_STRIDE = 8 // u64
+        \\#def COL_POSTED_STRIDE = 1 // u8 bool
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+    );
+
+    var customer_ids = [_]u64{ 7, 7, 7, 8, 7, 7 };
+    var order_days = [_]i64{ -5, 0, 10, -3, 20, 25 };
+    var status_ids = [_]u64{ 1, 2, 2, 2, 1, 2 };
+    var posted = [_]u8{ 1, 1, 0, 1, 1, 1 };
+    var totals = [_]i64{ 1000, 2000, 3000, 4000, 5000, 7000 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(customer_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(order_days[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(status_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(posted[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, customer_ids.len, &columns);
+    _ = try createU64I64PairIndex(std.testing.allocator, ".", table_name, 0, 1, true);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+
+    var candidate_rows = [_]u64{ 99, 99, 99, 99, 99, 99 };
+    const candidate_result = try snapshotRangeU64I64PairRows(snapshot, 0, 1, 7, -5, 25, 0, candidate_rows.len, &candidate_rows);
+    try std.testing.expectEqual(@as(u64, 5), candidate_result.total);
+    try std.testing.expectEqual(@as(u64, 5), candidate_result.written);
+
+    const candidate_len: usize = @intCast(candidate_result.written);
+    const original_candidate_rows = candidate_rows;
+    const status_result = try snapshotFilterRowsU64Range(snapshot, 2, candidate_rows[0..candidate_len], 2, 2, 0, candidate_rows.len, &candidate_rows);
+    try std.testing.expectEqual(@as(u64, 3), status_result.total);
+    try std.testing.expectEqual(@as(u64, 3), status_result.written);
+    try std.testing.expectEqual(@as(u64, 1), candidate_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), candidate_rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), candidate_rows[2]);
+
+    var filtered_rows = [_]u64{ 99, 99, 99, 99 };
+    const status_page = try snapshotFilterRowsU64Range(snapshot, 2, original_candidate_rows[0..candidate_len], 2, 2, 1, 1, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), status_page.total);
+    try std.testing.expectEqual(@as(u64, 1), status_page.written);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[0]);
+
+    const status_len: usize = @intCast(status_result.written);
+    const amount_result = try snapshotFilterRowsI64Range(snapshot, 4, candidate_rows[0..status_len], 1500, 5500, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 2), amount_result.total);
+    try std.testing.expectEqual(@as(u64, 2), amount_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+
+    const posted_result = try snapshotFilterRowsBool(snapshot, 3, candidate_rows[0..status_len], true, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 2), posted_result.total);
+    try std.testing.expectEqual(@as(u64, 2), posted_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[1]);
+
+    const empty = try snapshotFilterRowsU64Range(snapshot, 2, &.{}, 2, 2, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 0), empty.total);
+    try std.testing.expectEqual(@as(u64, 0), empty.written);
+
+    const invalid_rows = [_]u64{999};
+    try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsU64Range(snapshot, 2, &invalid_rows, 2, 2, 0, filtered_rows.len, &filtered_rows));
 }
 
 test "table write transaction commits atomically and preserves previous epoch on constraint failure" {

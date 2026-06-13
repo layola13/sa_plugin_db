@@ -1,0 +1,253 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"candidate_filters"
+@const SCHEMA_PATH = utf8:"candidate_filters.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_CUSTOMER_ID_STRIDE = 8 // u64\n#def COL_ORDER_DAY_STRIDE = 8 // i64 date\n#def COL_STATUS_ID_STRIDE = 8 // u64\n#def COL_POSTED_STRIDE = 1 // u8 bool\n#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 17
+#def SCHEMA_PATH_LEN = 29
+#def SCHEMA_LEN = 224
+#def ROWS = 6
+#def U64_COL_BYTES = 48
+#def I64_COL_BYTES = 48
+#def BOOL_COL_BYTES = 6
+#def COLUMN_COUNT = 5
+#def COLUMNS_BYTES = 80
+#def ROWS_CAP = 6
+#def ROWS_BYTES = 48
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    customer_ids = alloc U64_COL_BYTES
+    order_days = alloc I64_COL_BYTES
+    status_ids = alloc U64_COL_BYTES
+    posted = alloc BOOL_COL_BYTES
+    totals = alloc I64_COL_BYTES
+    candidate_rows = alloc ROWS_BYTES
+    status_rows = alloc ROWS_BYTES
+    final_rows = alloc ROWS_BYTES
+
+    store customer_ids+0, 7 as u64
+    store customer_ids+8, 7 as u64
+    store customer_ids+16, 7 as u64
+    store customer_ids+24, 8 as u64
+    store customer_ids+32, 7 as u64
+    store customer_ids+40, 7 as u64
+    store order_days+0, -5 as i64
+    store order_days+8, 0 as i64
+    store order_days+16, 10 as i64
+    store order_days+24, -3 as i64
+    store order_days+32, 20 as i64
+    store order_days+40, 25 as i64
+    store status_ids+0, 1 as u64
+    store status_ids+8, 2 as u64
+    store status_ids+16, 2 as u64
+    store status_ids+24, 2 as u64
+    store status_ids+32, 1 as u64
+    store status_ids+40, 2 as u64
+    store posted+0, 1 as u8
+    store posted+1, 1 as u8
+    store posted+2, 0 as u8
+    store posted+3, 1 as u8
+    store posted+4, 1 as u8
+    store posted+5, 1 as u8
+    store totals+0, 1000 as i64
+    store totals+8, 2000 as i64
+    store totals+16, 3000 as i64
+    store totals+24, 4000 as i64
+    store totals+32, 5000 as i64
+    store totals+40, 7000 as i64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, customer_ids, U64_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, order_days, I64_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, status_ids, U64_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, posted, BOOL_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, totals, I64_COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U64_I64_PAIR_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, 1, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_RANGE_U64_I64_PAIR_HANDLE candidate_status, candidate_written, candidate_total, candidate_rows, ROWS_CAP, read_handle, 0, 1, 7, -5, 25, 0, ROWS_CAP
+    EXPAND DB_FILTER_ROWS_U64_RANGE_HANDLE status_filter_status, status_written, status_total, status_rows, ROWS_CAP, read_handle, 2, candidate_rows, candidate_written, 2, 2, 0, ROWS_CAP
+    status_row0 = load status_rows+0 as u64
+    status_row1 = load status_rows+8 as u64
+    status_row2 = load status_rows+16 as u64
+    EXPAND DB_FILTER_ROWS_I64_RANGE_HANDLE amount_filter_status, amount_written, amount_total, final_rows, ROWS_CAP, read_handle, 4, status_rows, status_written, 1500, 5500, 0, ROWS_CAP
+    amount_row0 = load final_rows+0 as u64
+    amount_row1 = load final_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_BOOL_HANDLE posted_filter_status, posted_written, posted_total, final_rows, ROWS_CAP, read_handle, 3, status_rows, status_written, 1, 0, ROWS_CAP
+    posted_row0 = load final_rows+0 as u64
+    posted_row1 = load final_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_BOOL_HANDLE invalid_bool_status, invalid_bool_written, invalid_bool_total, final_rows, ROWS_CAP, read_handle, 3, status_rows, status_written, 2, 0, ROWS_CAP
+
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_index = eq index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_candidate_status = eq candidate_status, SA_DB_OK
+    ok_candidate_written = eq candidate_written, 5
+    ok_candidate_total = eq candidate_total, 5
+    ok_status_filter_status = eq status_filter_status, SA_DB_OK
+    ok_status_written = eq status_written, 3
+    ok_status_total = eq status_total, 3
+    ok_status_row0 = eq status_row0, 1
+    ok_status_row1 = eq status_row1, 2
+    ok_status_row2 = eq status_row2, 5
+    ok_amount_filter_status = eq amount_filter_status, SA_DB_OK
+    ok_amount_written = eq amount_written, 2
+    ok_amount_total = eq amount_total, 2
+    ok_amount_row0 = eq amount_row0, 1
+    ok_amount_row1 = eq amount_row1, 2
+    ok_posted_filter_status = eq posted_filter_status, SA_DB_OK
+    ok_posted_written = eq posted_written, 2
+    ok_posted_total = eq posted_total, 2
+    ok_posted_row0 = eq posted_row0, 1
+    ok_posted_row1 = eq posted_row1, 5
+    ok_invalid_bool_status = eq invalid_bool_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_invalid_bool_written = eq invalid_bool_written, 0
+    ok_invalid_bool_total = eq invalid_bool_total, 0
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_index
+    ok04 = and ok03, ok_open
+    ok05 = and ok04, ok_candidate_status
+    ok06 = and ok05, ok_candidate_written
+    ok07 = and ok06, ok_candidate_total
+    ok08 = and ok07, ok_status_filter_status
+    ok09 = and ok08, ok_status_written
+    ok10 = and ok09, ok_status_total
+    ok11 = and ok10, ok_status_row0
+    ok12 = and ok11, ok_status_row1
+    ok13 = and ok12, ok_status_row2
+    ok14 = and ok13, ok_amount_filter_status
+    ok15 = and ok14, ok_amount_written
+    ok16 = and ok15, ok_amount_total
+    ok17 = and ok16, ok_amount_row0
+    ok18 = and ok17, ok_amount_row1
+    ok19 = and ok18, ok_posted_filter_status
+    ok20 = and ok19, ok_posted_written
+    ok21 = and ok20, ok_posted_total
+    ok22 = and ok21, ok_posted_row0
+    ok23 = and ok22, ok_posted_row1
+    ok24 = and ok23, ok_invalid_bool_status
+    ok25 = and ok24, ok_invalid_bool_written
+    ok26 = and ok25, ok_invalid_bool_total
+    ok27 = and ok26, ok_close
+    ok = and ok27, ok_verify
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !index_status
+    !open_status
+    !read_handle
+    !candidate_status
+    !candidate_written
+    !candidate_total
+    !status_filter_status
+    !status_written
+    !status_total
+    !status_row0
+    !status_row1
+    !status_row2
+    !amount_filter_status
+    !amount_written
+    !amount_total
+    !amount_row0
+    !amount_row1
+    !posted_filter_status
+    !posted_written
+    !posted_total
+    !posted_row0
+    !posted_row1
+    !invalid_bool_status
+    !invalid_bool_written
+    !invalid_bool_total
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_index
+    !ok_open
+    !ok_candidate_status
+    !ok_candidate_written
+    !ok_candidate_total
+    !ok_status_filter_status
+    !ok_status_written
+    !ok_status_total
+    !ok_status_row0
+    !ok_status_row1
+    !ok_status_row2
+    !ok_amount_filter_status
+    !ok_amount_written
+    !ok_amount_total
+    !ok_amount_row0
+    !ok_amount_row1
+    !ok_posted_filter_status
+    !ok_posted_written
+    !ok_posted_total
+    !ok_posted_row0
+    !ok_posted_row1
+    !ok_invalid_bool_status
+    !ok_invalid_bool_written
+    !ok_invalid_bool_total
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !customer_ids
+    !order_days
+    !status_ids
+    !posted
+    !totals
+    !candidate_rows
+    !status_rows
+    !final_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9032)
