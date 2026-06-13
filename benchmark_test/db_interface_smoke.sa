@@ -99,6 +99,7 @@ L_ENTRY:
     EXPAND DB_INFO_ROW_COUNT rows, info
     EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
     EXPAND DB_CREATE_I64_INDEX create_i64_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 4, 0, info
+    EXPAND DB_CREATE_U64_PAIR_INDEX create_pair_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 2, 1, info
     EXPAND DB_INSERT_ROW insert_row_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
     EXPAND DB_INFO_ROW_COUNT rows_after_insert, info
     EXPAND DB_INSERT_ROW duplicate_insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, new_row, ROW_BYTES, info
@@ -143,6 +144,11 @@ L_ENTRY:
     project_points0 = load projected_rows+8 as u64
     project_id1 = load projected_rows+16 as u64
     project_points1 = load projected_rows+24 as u64
+    EXPAND DB_FIND_U64_PAIR_HANDLE pair_find_status, pair_found, pair_found_row, read_handle, 1, 2, 1, paused_status_id
+    EXPAND DB_GET_U64_HANDLE pair_get_status, pair_member_id, read_handle, 0, pair_found_row
+    EXPAND DB_RANGE_U64_PAIR_HANDLE pair_range_status, pair_range_written, pair_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 1, active_status_id, paused_status_id, 0, 2
+    pair_range_row0 = load range_rows+0 as u64
+    pair_range_row1 = load range_rows+8 as u64
     EXPAND DB_RANGE_I64_HANDLE balance_range_status, balance_range_written, balance_range_total, balance_range_rows, RANGE_ROWS_CAP, read_handle, 4, -80, 10, 0, 3
     balance_range_row0 = load balance_range_rows+0 as u64
     balance_range_row1 = load balance_range_rows+8 as u64
@@ -209,6 +215,7 @@ L_ENTRY:
     ok_rows = eq rows, ROWS
     ok_create_index_status = eq create_index_status, SA_DB_OK
     ok_create_i64_index_status = eq create_i64_index_status, SA_DB_OK
+    ok_create_pair_index_status = eq create_pair_index_status, SA_DB_OK
     ok_insert_row_status = eq insert_row_status, SA_DB_OK
     ok_rows_after_insert = eq rows_after_insert, TOTAL_ROWS
     ok_duplicate_insert_status = eq duplicate_insert_status, SA_DB_ERR_CONSTRAINT
@@ -220,13 +227,13 @@ L_ENTRY:
     ok_upsert_new_inserted = eq upsert_new_inserted, 1
     ok_rows_after_upsert_new = eq rows_after_upsert_new, UPSERT_ROWS
     ok_snapshot_status = eq snapshot_status, SA_DB_OK
-    ok_snapshot_epoch = eq snapshot_epoch, 8
+    ok_snapshot_epoch = eq snapshot_epoch, 9
     ok_open_status = eq open_status, SA_DB_OK
     ok_shape_status = eq shape_status, SA_DB_OK
     ok_shape_rows = eq shape_rows, UPSERT_ROWS
     ok_shape_columns = eq shape_columns, COLUMN_COUNT
     ok_shape_row_bytes = eq shape_row_bytes, ROW_BYTES
-    ok_shape_epoch = eq shape_epoch, 8
+    ok_shape_epoch = eq shape_epoch, 9
     ok_column_info_status = eq column_info_status, SA_DB_OK
     ok_column_stride = eq column_stride, 8
     ok_column_type = eq column_type, SA_DB_TYPE_U64
@@ -251,6 +258,16 @@ L_ENTRY:
     ok_project_points0 = eq project_points0, 30
     ok_project_id1 = eq project_id1, 4
     ok_project_points1 = eq project_points1, 40
+    ok_pair_find_status = eq pair_find_status, SA_DB_OK
+    ok_pair_found = eq pair_found, 1
+    ok_pair_found_row = eq pair_found_row, 2
+    ok_pair_get_status = eq pair_get_status, SA_DB_OK
+    ok_pair_member_id = eq pair_member_id, 3
+    ok_pair_range_status = eq pair_range_status, SA_DB_OK
+    ok_pair_range_written = eq pair_range_written, 2
+    ok_pair_range_total = eq pair_range_total, 2
+    ok_pair_range_row0 = eq pair_range_row0, 0
+    ok_pair_range_row1 = eq pair_range_row1, 2
     ok_balance_range_status = eq balance_range_status, SA_DB_OK
     ok_balance_range_written = eq balance_range_written, 3
     ok_balance_range_total = eq balance_range_total, 3
@@ -333,7 +350,8 @@ L_ENTRY:
     ok03 = and ok02, ok_rows
     ok04 = and ok03, ok_create_index_status
     ok04a = and ok04, ok_create_i64_index_status
-    ok05 = and ok04a, ok_insert_row_status
+    ok04b = and ok04a, ok_create_pair_index_status
+    ok05 = and ok04b, ok_insert_row_status
     ok06 = and ok05, ok_rows_after_insert
     ok06a = and ok06, ok_duplicate_insert_status
     ok06b = and ok06a, ok_rows_after_duplicate
@@ -375,7 +393,17 @@ L_ENTRY:
     ok13m = and ok13l, ok_project_points0
     ok13n = and ok13m, ok_project_id1
     ok13o = and ok13n, ok_project_points1
-    ok13p = and ok13o, ok_balance_range_status
+    ok_pair01 = and ok_pair_find_status, ok_pair_found
+    ok_pair02 = and ok_pair01, ok_pair_found_row
+    ok_pair03 = and ok_pair02, ok_pair_get_status
+    ok_pair04 = and ok_pair03, ok_pair_member_id
+    ok_pair05 = and ok_pair04, ok_pair_range_status
+    ok_pair06 = and ok_pair05, ok_pair_range_written
+    ok_pair07 = and ok_pair06, ok_pair_range_total
+    ok_pair08 = and ok_pair07, ok_pair_range_row0
+    ok_pair09 = and ok_pair08, ok_pair_range_row1
+    ok13o_pair = and ok13o, ok_pair09
+    ok13p = and ok13o_pair, ok_balance_range_status
     ok13q = and ok13p, ok_balance_range_written
     ok13r = and ok13q, ok_balance_range_total
     ok13s = and ok13r, ok_balance_range_row0
@@ -459,6 +487,7 @@ L_ENTRY:
     !rows
     !create_index_status
     !create_i64_index_status
+    !create_pair_index_status
     !insert_row_status
     !rows_after_insert
     !duplicate_insert_status
@@ -502,6 +531,16 @@ L_ENTRY:
     !project_points0
     !project_id1
     !project_points1
+    !pair_find_status
+    !pair_found
+    !pair_found_row
+    !pair_get_status
+    !pair_member_id
+    !pair_range_status
+    !pair_range_written
+    !pair_range_total
+    !pair_range_row0
+    !pair_range_row1
     !balance_range_status
     !balance_range_written
     !balance_range_total
@@ -587,6 +626,7 @@ L_ENTRY:
     !ok_rows
     !ok_create_index_status
     !ok_create_i64_index_status
+    !ok_create_pair_index_status
     !ok_insert_row_status
     !ok_rows_after_insert
     !ok_duplicate_insert_status
@@ -629,6 +669,16 @@ L_ENTRY:
     !ok_project_points0
     !ok_project_id1
     !ok_project_points1
+    !ok_pair_find_status
+    !ok_pair_found
+    !ok_pair_found_row
+    !ok_pair_get_status
+    !ok_pair_member_id
+    !ok_pair_range_status
+    !ok_pair_range_written
+    !ok_pair_range_total
+    !ok_pair_range_row0
+    !ok_pair_range_row1
     !ok_balance_range_status
     !ok_balance_range_written
     !ok_balance_range_total
@@ -711,6 +761,7 @@ L_ENTRY:
     !ok03
     !ok04
     !ok04a
+    !ok04b
     !ok05
     !ok06
     !ok06a
@@ -753,6 +804,16 @@ L_ENTRY:
     !ok13m
     !ok13n
     !ok13o
+    !ok_pair01
+    !ok_pair02
+    !ok_pair03
+    !ok_pair04
+    !ok_pair05
+    !ok_pair06
+    !ok_pair07
+    !ok_pair08
+    !ok_pair09
+    !ok13o_pair
     !ok13p
     !ok13q
     !ok13r

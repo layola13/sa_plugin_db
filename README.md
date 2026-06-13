@@ -45,6 +45,7 @@ Core native calls:
 - `sa_db_upsert_row_u64_key`
 - `sa_db_create_u64_index`
 - `sa_db_create_i64_index`
+- `sa_db_create_u64_pair_index`
 - `sa_db_dict_intern`
 - `sa_db_dict_lookup`
 - `sa_db_dict_value_len`
@@ -71,8 +72,10 @@ Read-handle query calls:
 - `sa_db_count_i64_cmp_handle`
 - `sa_db_find_u64_handle`
 - `sa_db_find_i64_handle`
+- `sa_db_find_u64_pair_handle`
 - `sa_db_range_u64_handle`
 - `sa_db_range_i64_handle`
+- `sa_db_range_u64_pair_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
 - `sa_db_project_rows_handle`
@@ -96,10 +99,12 @@ Removed calls:
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
-`DB_FIND_I64_HANDLE`, `DB_RANGE_U64_HANDLE`, `DB_RANGE_I64_HANDLE`,
-`DB_GET_U64_HANDLE`, `DB_GET_I64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
+`DB_FIND_I64_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
+`DB_RANGE_I64_HANDLE`, `DB_RANGE_U64_PAIR_HANDLE`, `DB_GET_U64_HANDLE`,
+`DB_GET_I64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
+`DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
@@ -118,8 +123,11 @@ Read queries now use snapshots:
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
    the column. Signed `i64` columns now have the same point/range/count/min/max
    read-handle surface through a persisted signed-order index, which is suitable
-   for ERP amount cents, balances, and timestamp encodings. `project_rows_handle`
-   copies only selected columns for a batch of
+   for ERP amount cents, balances, and timestamp encodings. A persisted
+   `u64_pair -> row` index supports ERP composite keys such as
+   `(order_id, line_no)`, `(product_id, warehouse_id)`, or
+   `(customer_id, date_code)` with point lookup and fixed-first-key range
+   pagination over the second key. `project_rows_handle` copies only selected columns for a batch of
    row indices. `get_row_handle` copies a full fixed-width row by snapshot row
    index, while `get_row_u64_key_handle` requires a unique `u64` index and copies
    the matching row into the caller's row buffer.
@@ -153,6 +161,13 @@ index into a fixed-width row buffer.
 `sa_db_range_i64_handle` / `DB_RANGE_I64_HANDLE` behaves the same for indexed
 `i64` columns, but uses signed ordering so negative values sort before zero and
 positive values.
+`sa_db_create_u64_pair_index` / `DB_CREATE_U64_PAIR_INDEX` builds a persisted
+composite index over two `u64` columns. `unique=1` enforces uniqueness of the
+whole `(key1, key2)` tuple. `sa_db_find_u64_pair_handle` /
+`DB_FIND_U64_PAIR_HANDLE` finds one exact tuple. `sa_db_range_u64_pair_handle` /
+`DB_RANGE_U64_PAIR_HANDLE` returns row indices for one fixed first key and an
+inclusive second-key range, with the same `offset`/`limit` pagination contract as
+single-column range reads.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
@@ -177,10 +192,10 @@ metadata file (`<table>.meta.<epoch>`). Mutating existing column data writes a n
 versioned column file and then advances the manifest, so a crash before manifest
 replacement leaves the previous epoch readable. Qmod read/write paths use the
 same active-manifest protocol as the public table APIs. Segment metadata records
-SHA-256 and byte counts. U64/I64 index files and string dictionary files are also
-versioned, hashed, snapshotted, restored, and verified. Indexes are rebuilt on
+SHA-256 and byte counts. U64, I64, U64-pair index files and string dictionary
+files are also versioned, hashed, snapshotted, restored, and verified. Indexes are rebuilt on
 ingest/update/compact/qmod writes. Verification checks schema hash, segment hash,
-index hash, dictionary hash, recorded size, dictionary entry count, and the
+index hash, index shape/order, dictionary hash, recorded size, dictionary entry count, and the
 expected `rows * column_stride` size. `recover` scans versioned metadata files
 and rebuilds the manifest to the highest valid epoch, which covers corrupted or
 missing manifest files after an interrupted commit.
@@ -191,6 +206,12 @@ later column ingest, fixed-width row insert, update, compact, and Qmod commit
 paths rebuild the persisted index before committing metadata. If duplicate keys
 would appear, the write is rejected with `SA_DB_ERR_CONSTRAINT` and the active
 manifest remains on the previous table epoch.
+
+`sa_db_create_u64_pair_index(..., unique=1)` applies the same constraint model
+to a two-column tuple. This is the first ERP secondary-index shape: order lines
+can enforce `(order_id, line_no)`, inventory balances can enforce
+`(product_id, warehouse_id)`, and list pages can scan all rows for a fixed first
+key over a second-key range without falling back to a full table scan.
 
 For ERP-style writes, `sa_db_insert_row` / `DB_INSERT_ROW` now accepts one
 fixed-width row laid out exactly as the active schema's column strides. The
@@ -242,8 +263,8 @@ benchmarks. The required baseline is:
   by unique `u64` key exist now. Projected batch reads now cover the first ERP
   list-page shape; next is typed column families beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
-  `u64` point-lookup/unique index, including date/customer/product filters and
-  inventory/order workflows.
+  `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
+  filters and broader inventory/order workflows.
 - Multi-operation and multi-table transaction semantics, followed by optional
   WAL and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
