@@ -1,0 +1,209 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"u64_i64_orders"
+@const SCHEMA_PATH = utf8:"u64_i64_orders.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_CUSTOMER_ID_STRIDE = 8 // u64\n#def COL_ORDER_DAY_STRIDE = 8 // i64\n#def COL_TOTAL_CENTS_STRIDE = 8 // i64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 14
+#def SCHEMA_PATH_LEN = 26
+#def SCHEMA_LEN = 133
+#def ROWS = 5
+#def COL_BYTES = 40
+#def ROW_BYTES = 24
+#def COLUMN_COUNT = 3
+#def COLUMNS_BYTES = 48
+#def RANGE_ROWS_CAP = 4
+#def RANGE_ROWS_BYTES = 32
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    customer_ids = alloc COL_BYTES
+    order_days = alloc COL_BYTES
+    totals = alloc COL_BYTES
+    range_rows = alloc RANGE_ROWS_BYTES
+    fetched_row = alloc ROW_BYTES
+
+    store customer_ids+0, 7 as u64
+    store customer_ids+8, 7 as u64
+    store customer_ids+16, 7 as u64
+    store customer_ids+24, 8 as u64
+    store customer_ids+32, 7 as u64
+    store order_days+0, -5 as i64
+    store order_days+8, 0 as i64
+    store order_days+16, 10 as i64
+    store order_days+24, -3 as i64
+    store order_days+32, 20 as i64
+    store totals+0, 1000 as i64
+    store totals+8, 2000 as i64
+    store totals+16, 3000 as i64
+    store totals+24, 4000 as i64
+    store totals+32, 5000 as i64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, customer_ids, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, order_days, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, totals, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U64_I64_PAIR_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, 1, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_FIND_U64_I64_PAIR_HANDLE find_status, found, found_row, read_handle, 0, 1, 7, -5
+    EXPAND DB_RANGE_U64_I64_PAIR_HANDLE range_status, range_written, range_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 1, 7, -5, 10, 0, RANGE_ROWS_CAP
+    range_row0 = load range_rows+0 as u64
+    range_row1 = load range_rows+8 as u64
+    range_row2 = load range_rows+16 as u64
+    EXPAND DB_FILTER_U64_I64_PAIR_KEY1_HANDLE page_status, page_written, page_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 1, 7, 1, 2
+    page_row0 = load range_rows+0 as u64
+    page_row1 = load range_rows+8 as u64
+    EXPAND DB_GET_ROW_HANDLE get_row_status, read_handle, page_row0, fetched_row, ROW_BYTES
+    fetched_customer = load fetched_row+0 as u64
+    fetched_day = load fetched_row+8 as i64
+    fetched_total = load fetched_row+16 as i64
+
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_index = eq index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_find_status = eq find_status, SA_DB_OK
+    ok_found = eq found, 1
+    ok_found_row = eq found_row, 0
+    ok_range_status = eq range_status, SA_DB_OK
+    ok_range_written = eq range_written, 3
+    ok_range_total = eq range_total, 3
+    ok_range_row0 = eq range_row0, 0
+    ok_range_row1 = eq range_row1, 1
+    ok_range_row2 = eq range_row2, 2
+    ok_page_status = eq page_status, SA_DB_OK
+    ok_page_written = eq page_written, 2
+    ok_page_total = eq page_total, 4
+    ok_page_row0 = eq page_row0, 1
+    ok_page_row1 = eq page_row1, 2
+    ok_get_row = eq get_row_status, SA_DB_OK
+    ok_fetched_customer = eq fetched_customer, 7
+    ok_fetched_day = eq fetched_day, 0
+    ok_fetched_total = eq fetched_total, 2000
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_index
+    ok04 = and ok03, ok_open
+    ok05 = and ok04, ok_find_status
+    ok06 = and ok05, ok_found
+    ok07 = and ok06, ok_found_row
+    ok08 = and ok07, ok_range_status
+    ok09 = and ok08, ok_range_written
+    ok10 = and ok09, ok_range_total
+    ok11 = and ok10, ok_range_row0
+    ok12 = and ok11, ok_range_row1
+    ok13 = and ok12, ok_range_row2
+    ok14 = and ok13, ok_page_status
+    ok15 = and ok14, ok_page_written
+    ok16 = and ok15, ok_page_total
+    ok17 = and ok16, ok_page_row0
+    ok18 = and ok17, ok_page_row1
+    ok19 = and ok18, ok_get_row
+    ok20 = and ok19, ok_fetched_customer
+    ok21 = and ok20, ok_fetched_day
+    ok22 = and ok21, ok_fetched_total
+    ok23 = and ok22, ok_close
+    ok = and ok23, ok_verify
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !index_status
+    !open_status
+    !read_handle
+    !find_status
+    !found
+    !found_row
+    !range_status
+    !range_written
+    !range_total
+    !range_row0
+    !range_row1
+    !range_row2
+    !page_status
+    !page_written
+    !page_total
+    !page_row0
+    !page_row1
+    !get_row_status
+    !fetched_customer
+    !fetched_day
+    !fetched_total
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_index
+    !ok_open
+    !ok_find_status
+    !ok_found
+    !ok_found_row
+    !ok_range_status
+    !ok_range_written
+    !ok_range_total
+    !ok_range_row0
+    !ok_range_row1
+    !ok_range_row2
+    !ok_page_status
+    !ok_page_written
+    !ok_page_total
+    !ok_page_row0
+    !ok_page_row1
+    !ok_get_row
+    !ok_fetched_customer
+    !ok_fetched_day
+    !ok_fetched_total
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !customer_ids
+    !order_days
+    !totals
+    !range_rows
+    !fetched_row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9030)

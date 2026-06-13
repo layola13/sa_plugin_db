@@ -61,6 +61,7 @@ Core native calls:
 - `sa_db_create_f32_index`
 - `sa_db_create_f64_index`
 - `sa_db_create_u64_pair_index`
+- `sa_db_create_u64_i64_pair_index`
 - `sa_db_create_blob_eq_index`
 - `sa_db_create_blob_token_index`
 - `sa_db_create_blob_prefix_index`
@@ -124,6 +125,7 @@ Read-handle query calls:
 - `sa_db_find_i32_handle`
 - `sa_db_find_bool_handle`
 - `sa_db_find_u64_pair_handle`
+- `sa_db_find_u64_i64_pair_handle`
 - `sa_db_range_u64_handle`
 - `sa_db_range_i64_handle`
 - `sa_db_range_u32_handle`
@@ -139,7 +141,9 @@ Read-handle query calls:
 - `sa_db_range_timestamp_us_handle`
 - `sa_db_range_timestamp_us_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
+- `sa_db_range_u64_i64_pair_handle`
 - `sa_db_filter_u64_pair_key1_handle`
+- `sa_db_filter_u64_i64_pair_key1_handle`
 - `sa_db_filter_bool_handle`
 - `sa_db_filter_blob_eq_handle`
 - `sa_db_filter_blob_contains_handle`
@@ -181,11 +185,12 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FIND_I64_HANDLE`, `DB_FIND_U32_HANDLE`, `DB_FIND_I32_HANDLE`, `DB_FIND_U8_HANDLE`,
 `DB_FIND_I8_HANDLE`, `DB_FIND_U16_HANDLE`, `DB_FIND_I16_HANDLE`, `DB_FIND_F32_HANDLE`,
 `DB_FIND_F64_HANDLE`,
-`DB_FIND_BOOL_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
+`DB_FIND_BOOL_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_FIND_U64_I64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
 `DB_RANGE_I64_HANDLE`, `DB_RANGE_U32_HANDLE`, `DB_RANGE_I32_HANDLE`,
 `DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
 `DB_RANGE_I16_HANDLE`, `DB_RANGE_F32_HANDLE`, `DB_RANGE_F64_HANDLE`,
-`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_U64_PAIR_KEY1_HANDLE`,
+`DB_RANGE_U64_PAIR_HANDLE`, `DB_RANGE_U64_I64_PAIR_HANDLE`,
+`DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
@@ -199,7 +204,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
 `DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_F32_INDEX`,
-`DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
+`DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`, `DB_CREATE_U64_I64_PAIR_INDEX`,
 `DB_CREATE_BLOB_EQ_INDEX`, `DB_CREATE_BLOB_TOKEN_INDEX`,
 `DB_CREATE_BLOB_PREFIX_INDEX`, `DB_CREATE_BLOB_CONTAINS_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
@@ -242,7 +247,12 @@ Read queries now use snapshots:
    `u64_pair -> row` index supports ERP composite keys such as
    `(order_id, line_no)`, `(product_id, warehouse_id)`, or
    `(customer_id, date_code)` with point lookup, fixed-first-key list pagination,
-   and fixed-first-key range pagination over the second key. A persisted `blob_eq -> row` index accelerates
+   and fixed-first-key range pagination over the second key. A persisted
+   `u64_i64_pair -> row` index keeps the same lookup and pagination contract for
+   `(u64, i64)` tuples, with signed ordering on the second key. It is intended
+   for ERP filters such as `(customer_id, order_day)`, `(status_id, due_day)`,
+   or `(product_id, posted_day)` where date/time/amount encodings are signed
+   `i64`. A persisted `blob_eq -> row` index accelerates
    exact filters over `blob_handle` columns for high-frequency text/blob equality
    predicates, while persisted `blob_token -> row` and `blob_prefix -> row`
    indexes accelerate ASCII token and token-prefix searches over ERP text/blob
@@ -384,6 +394,17 @@ single-column range reads. `sa_db_filter_u64_pair_key1_handle` /
 `DB_FILTER_U64_PAIR_KEY1_HANDLE` lists every row matching a fixed first key with
 the same pagination contract, which covers ERP child-row screens such as all
 lines for one order or all stock movements for one product.
+`sa_db_create_u64_i64_pair_index` / `DB_CREATE_U64_I64_PAIR_INDEX` provides the
+same persisted composite index shape for a `u64` first column and signed `i64`
+second column. `sa_db_find_u64_i64_pair_handle` /
+`DB_FIND_U64_I64_PAIR_HANDLE` finds one exact tuple,
+`sa_db_range_u64_i64_pair_handle` / `DB_RANGE_U64_I64_PAIR_HANDLE` pages one
+fixed first key over an inclusive signed second-key range, and
+`sa_db_filter_u64_i64_pair_key1_handle` /
+`DB_FILTER_U64_I64_PAIR_KEY1_HANDLE` lists every row for the fixed first key.
+Use this for customer/date, status/due-date, product/posting-date, and other
+ERP list filters where the second key is a signed date, timestamp, or amount
+encoding.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
@@ -411,7 +432,7 @@ same active-manifest protocol as the public table APIs. Segment metadata records
 whole-file SHA-256, byte counts, and 64KB block-level SHA-256 lists for newly
 written column segment files. Older metadata without block hashes remains
 readable, but new segment writes include block hashes and verification checks
-them. Single-column integer/float index files, U64-pair index files, blob exact
+them. Single-column integer/float index files, U64-pair and U64/I64-pair index files, blob exact
 index files, string dictionary files, and blob store files are also versioned,
 hashed, block-hashed, snapshotted, restored, and verified. Indexes are
 rebuilt on ingest/update/compact/qmod writes. Verification checks schema hash,
@@ -441,6 +462,9 @@ to a two-column tuple. This is the first ERP secondary-index shape: order lines
 can enforce `(order_id, line_no)`, inventory balances can enforce
 `(product_id, warehouse_id)`, and list pages can scan all rows for a fixed first
 key over a second-key range without falling back to a full table scan.
+`sa_db_create_u64_i64_pair_index(..., unique=1)` applies the same model when the
+second key is signed, such as `(customer_id, order_day)` or
+`(status_id, due_day)`, and preserves signed ordering for range pagination.
 
 `sa_db_create_blob_eq_index(..., unique=1)` applies the uniqueness model to the
 real bytes referenced by one `blob_handle` column in one named store. It rejects
@@ -552,14 +576,16 @@ benchmarks. The required baseline is:
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
-  prefix, and contains filters plus fixed-first-key `u64_pair` filters cover
-  common high-frequency text and child-row equality/search shapes. The first ERP
+  prefix, and contains filters plus fixed-first-key `u64_pair` and
+  `u64_i64_pair` filters cover common high-frequency text, child-row equality,
+  customer/date, status/due-date, and product/posting-date shapes. The first ERP
   workflow benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices; next is the matching SQLite ERP comparison
   and broader index planning.
 - Generalized primary-key and secondary indexes beyond the current persisted
-  small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
-  filters and broader inventory/order workflows.
+  small-integer, float, `u64`, `i64`, `u64_pair`, and `u64_i64_pair` index
+  shapes, including broader planner support for common ERP filters and
+  inventory/order workflows.
 - Remaining crash-recovery hardening such as a broader fault-injection matrix,
   then multi-table transaction semantics, optional WAL, and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD

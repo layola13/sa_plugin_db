@@ -985,6 +985,29 @@ pub export fn sa_db_create_u64_pair_index(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_create_u64_i64_pair_index(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    column_index2: u64,
+    unique: u32,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createU64I64PairIndex(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), unique != 0) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_create_blob_eq_index(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -2070,6 +2093,21 @@ pub export fn sa_db_find_u64_pair_handle(handle: ?*anyopaque, column_index: u64,
     return SA_DB_OK;
 }
 
+pub export fn sa_db_find_u64_i64_pair_handle(handle: ?*anyopaque, column_index: u64, column_index2: u64, key1: u64, key2: i64, out_found: ?*u64, out_row_index: ?*u64) u32 {
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_slot = out_row_index orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    row_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFindU64I64Pair(snapshot, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    row_slot.* = result.row_index;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_range_u64_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -2601,6 +2639,35 @@ pub export fn sa_db_range_u64_pair_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_range_u64_i64_pair_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    min_key2: i64,
+    max_key2: i64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotRangeU64I64PairRows(snapshot, @intCast(column_index), @intCast(column_index2), key1, min_key2, max_key2, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_filter_u64_pair_key1_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -2623,6 +2690,33 @@ pub export fn sa_db_filter_u64_pair_key1_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotFilterU64PairKey1Rows(snapshot, @intCast(column_index), @intCast(column_index2), key1, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_u64_i64_pair_key1_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterU64I64PairKey1Rows(snapshot, @intCast(column_index), @intCast(column_index2), key1, offset, limit, rows) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
@@ -3307,6 +3401,67 @@ test "db SA ABI creates and queries u64 pair indexes" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "order_lines".ptr, "order_lines".len, &info));
+}
+
+test "db SA ABI creates and queries u64 i64 pair indexes" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_CUSTOMER_ID_STRIDE = 8 // u64
+        \\#def COL_ORDER_DAY_STRIDE = 8 // i64
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "customer_orders.sadb-schema".ptr, "customer_orders.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var customer_ids = [_]u64{ 7, 7, 7, 8, 7 };
+    var order_days = [_]i64{ -5, 0, 10, -3, 20 };
+    var totals = [_]i64{ 1000, 2000, 3000, 4000, 5000 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&customer_ids), .len = @sizeOf(@TypeOf(customer_ids)) },
+        .{ .data = @ptrCast(&order_days), .len = @sizeOf(@TypeOf(order_days)) },
+        .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "customer_orders".ptr, "customer_orders".len, customer_ids.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_i64_pair_index(root.ptr, root.len, "customer_orders".ptr, "customer_orders".len, 0, 1, 1, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "customer_orders".ptr, "customer_orders".len, &handle));
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_i64_pair_handle(handle, 0, 1, 7, -5, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 0), row_index);
+    var total_cents: i64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 2, row_index, &total_cents));
+    try std.testing.expectEqual(@as(i64, 1000), total_cents);
+
+    var rows = [_]u64{ 99, 99, 99, 99 };
+    var written: u64 = 0;
+    var total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_i64_pair_handle(handle, 0, 1, 7, -5, 10, 0, 4, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), rows[2]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_u64_i64_pair_key1_handle(handle, 0, 1, 7, 1, 2, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 4), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), rows[1]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "customer_orders".ptr, "customer_orders".len, &info));
 }
 
 test "db SA ABI commits and rolls back write transactions" {

@@ -291,6 +291,10 @@
     %out_status = call @sa_db_create_u64_pair_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %column_index2, %unique, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_CREATE_U64_I64_PAIR_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %column_index2, %unique, %out_info
+    %out_status = call @sa_db_create_u64_i64_pair_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %column_index2, %unique, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_CREATE_BLOB_EQ_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %store_name, %store_name_len, %unique, %out_info
     %out_status = call @sa_db_create_blob_eq_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, &%store_name, %store_name_len, %unique, &%out_info)
 [END_MACRO]
@@ -679,6 +683,14 @@
     %out_row_index = load __db_handle_find_pair_row_slot_%out_row_index+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FIND_U64_I64_PAIR_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %column_index2, %key1, %key2
+    __db_handle_find_u64_i64_pair_found_slot_%out_found = stack_alloc 8
+    __db_handle_find_u64_i64_pair_row_slot_%out_row_index = stack_alloc 8
+    %out_status = call @sa_db_find_u64_i64_pair_handle(%handle, %column_index, %column_index2, %key1, %key2, &__db_handle_find_u64_i64_pair_found_slot_%out_found, &__db_handle_find_u64_i64_pair_row_slot_%out_row_index)
+    %out_found = load __db_handle_find_u64_i64_pair_found_slot_%out_found+0 as u64
+    %out_row_index = load __db_handle_find_u64_i64_pair_row_slot_%out_row_index+0 as u64
+[END_MACRO]
+
 [MACRO] DB_RANGE_U64_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_value, %max_value, %offset, %limit
     __db_handle_range_written_slot_%out_written = stack_alloc 8
     __db_handle_range_total_slot_%out_total = stack_alloc 8
@@ -847,12 +859,28 @@
     %out_total = load __db_handle_range_pair_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_RANGE_U64_I64_PAIR_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %column_index2, %key1, %min_key2, %max_key2, %offset, %limit
+    __db_handle_range_u64_i64_pair_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_u64_i64_pair_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_u64_i64_pair_handle(%handle, %column_index, %column_index2, %key1, %min_key2, %max_key2, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_u64_i64_pair_written_slot_%out_written, &__db_handle_range_u64_i64_pair_total_slot_%out_total)
+    %out_written = load __db_handle_range_u64_i64_pair_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_u64_i64_pair_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_U64_PAIR_KEY1_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %column_index2, %key1, %offset, %limit
     __db_handle_filter_pair_key1_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_pair_key1_total_slot_%out_total = stack_alloc 8
     %out_status = call @sa_db_filter_u64_pair_key1_handle(%handle, %column_index, %column_index2, %key1, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_pair_key1_written_slot_%out_written, &__db_handle_filter_pair_key1_total_slot_%out_total)
     %out_written = load __db_handle_filter_pair_key1_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_filter_pair_key1_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_U64_I64_PAIR_KEY1_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %column_index2, %key1, %offset, %limit
+    __db_handle_filter_u64_i64_pair_key1_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_u64_i64_pair_key1_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_u64_i64_pair_key1_handle(%handle, %column_index, %column_index2, %key1, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_u64_i64_pair_key1_written_slot_%out_written, &__db_handle_filter_u64_i64_pair_key1_total_slot_%out_total)
+    %out_written = load __db_handle_filter_u64_i64_pair_key1_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_u64_i64_pair_key1_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_FILTER_BOOL_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %expected, %offset, %limit
