@@ -1,0 +1,523 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"small_items"
+@const SCHEMA_PATH = utf8:"small_items.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_STATUS8_STRIDE = 1 // u8\n#def COL_DELTA8_STRIDE = 1 // i8\n#def COL_WAREHOUSE_STRIDE = 2 // u16\n#def COL_DELTA16_STRIDE = 2 // i16\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 11
+#def SCHEMA_PATH_LEN = 23
+#def SCHEMA_LEN = 187
+#def ROWS = 5
+#def COLUMN_COUNT = 5
+#def ID_COL_BYTES = 40
+#def U8_COL_BYTES = 5
+#def I8_COL_BYTES = 5
+#def U16_COL_BYTES = 10
+#def I16_COL_BYTES = 10
+#def COLUMNS_BYTES = 80
+#def RANGE_ROWS_CAP = 4
+#def RANGE_ROWS_BYTES = 32
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc ID_COL_BYTES
+    u8_col = alloc U8_COL_BYTES
+    i8_col = alloc I8_COL_BYTES
+    u16_col = alloc U16_COL_BYTES
+    i16_col = alloc I16_COL_BYTES
+    range_rows = alloc RANGE_ROWS_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+    store id_col+32, 5 as u64
+    store u8_col+0, 1 as u8
+    store u8_col+1, 7 as u8
+    store u8_col+2, 3 as u8
+    store u8_col+3, 7 as u8
+    store u8_col+4, 9 as u8
+    store i8_col+0, -2 as i8
+    store i8_col+1, 0 as i8
+    store i8_col+2, 5 as i8
+    store i8_col+3, -1 as i8
+    store i8_col+4, -2 as i8
+    store u16_col+0, 300 as u16
+    store u16_col+2, 10 as u16
+    store u16_col+4, 300 as u16
+    store u16_col+6, 42 as u16
+    store u16_col+8, 655 as u16
+    store i16_col+0, -100 as i16
+    store i16_col+2, 50 as i16
+    store i16_col+4, 0 as i16
+    store i16_col+6, -25 as i16
+    store i16_col+8, 50 as i16
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, ID_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, u8_col, U8_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, i8_col, I8_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, u16_col, U16_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, i16_col, I16_COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U8_INDEX u8_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
+    EXPAND DB_CREATE_I8_INDEX i8_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
+    EXPAND DB_CREATE_U16_INDEX u16_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 0, info
+    EXPAND DB_CREATE_I16_INDEX i16_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 4, 0, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_COUNT_U8_CMP_HANDLE u8_count_status, u8_ge_count, read_handle, 1, SA_DB_CMP_GE, 7
+    EXPAND DB_FIND_U8_HANDLE u8_find_status, u8_found, u8_row, read_handle, 1, 3
+    EXPAND DB_RANGE_U8_HANDLE u8_range_status, u8_range_written, u8_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 1, 7, 1, 3
+    u8_range_row0 = load range_rows+0 as u64
+    u8_range_row1 = load range_rows+8 as u64
+    u8_range_row2 = load range_rows+16 as u64
+    EXPAND DB_GET_U8_HANDLE u8_get_status, u8_value, read_handle, 1, u8_row
+    EXPAND DB_MIN_U8_HANDLE u8_min_status, u8_min, read_handle, 1
+    EXPAND DB_MAX_U8_HANDLE u8_max_status, u8_max, read_handle, 1
+
+    EXPAND DB_COUNT_I8_CMP_HANDLE i8_count_status, i8_lt_count, read_handle, 2, SA_DB_CMP_LT, 0
+    EXPAND DB_FIND_I8_HANDLE i8_find_status, i8_found, i8_row, read_handle, 2, -1
+    EXPAND DB_RANGE_I8_HANDLE i8_range_status, i8_range_written, i8_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, -2, 0, 0, 4
+    i8_range_row0 = load range_rows+0 as u64
+    i8_range_row1 = load range_rows+8 as u64
+    i8_range_row2 = load range_rows+16 as u64
+    i8_range_row3 = load range_rows+24 as u64
+    EXPAND DB_GET_I8_HANDLE i8_get_status, i8_value, read_handle, 2, i8_row
+    EXPAND DB_MIN_I8_HANDLE i8_min_status, i8_min, read_handle, 2
+    EXPAND DB_MAX_I8_HANDLE i8_max_status, i8_max, read_handle, 2
+
+    EXPAND DB_COUNT_U16_CMP_HANDLE u16_count_status, u16_eq_count, read_handle, 3, SA_DB_CMP_EQ, 300
+    EXPAND DB_FIND_U16_HANDLE u16_find_status, u16_found, u16_row, read_handle, 3, 42
+    EXPAND DB_RANGE_U16_HANDLE u16_range_status, u16_range_written, u16_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 3, 10, 300, 1, 3
+    u16_range_row0 = load range_rows+0 as u64
+    u16_range_row1 = load range_rows+8 as u64
+    u16_range_row2 = load range_rows+16 as u64
+    EXPAND DB_GET_U16_HANDLE u16_get_status, u16_value, read_handle, 3, u16_row
+    EXPAND DB_MIN_U16_HANDLE u16_min_status, u16_min, read_handle, 3
+    EXPAND DB_MAX_U16_HANDLE u16_max_status, u16_max, read_handle, 3
+
+    EXPAND DB_COUNT_I16_CMP_HANDLE i16_count_status, i16_le_count, read_handle, 4, SA_DB_CMP_LE, 0
+    EXPAND DB_FIND_I16_HANDLE i16_find_status, i16_found, i16_row, read_handle, 4, -25
+    EXPAND DB_RANGE_I16_HANDLE i16_range_status, i16_range_written, i16_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 4, -100, 0, 0, 3
+    i16_range_row0 = load range_rows+0 as u64
+    i16_range_row1 = load range_rows+8 as u64
+    i16_range_row2 = load range_rows+16 as u64
+    EXPAND DB_GET_I16_HANDLE i16_get_status, i16_value, read_handle, 4, i16_row
+    EXPAND DB_MIN_I16_HANDLE i16_min_status, i16_min, read_handle, 4
+    EXPAND DB_MAX_I16_HANDLE i16_max_status, i16_max, read_handle, 4
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_u8_index = eq u8_index_status, SA_DB_OK
+    ok_i8_index = eq i8_index_status, SA_DB_OK
+    ok_u16_index = eq u16_index_status, SA_DB_OK
+    ok_i16_index = eq i16_index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_u8_count_status = eq u8_count_status, SA_DB_OK
+    ok_u8_ge_count = eq u8_ge_count, 3
+    ok_u8_find_status = eq u8_find_status, SA_DB_OK
+    ok_u8_found = eq u8_found, 1
+    ok_u8_row = eq u8_row, 2
+    ok_u8_range_status = eq u8_range_status, SA_DB_OK
+    ok_u8_range_written = eq u8_range_written, 3
+    ok_u8_range_total = eq u8_range_total, 4
+    ok_u8_range_row0 = eq u8_range_row0, 2
+    ok_u8_range_row1 = eq u8_range_row1, 1
+    ok_u8_range_row2 = eq u8_range_row2, 3
+    ok_u8_get_status = eq u8_get_status, SA_DB_OK
+    ok_u8_value = eq u8_value, 3
+    ok_u8_min_status = eq u8_min_status, SA_DB_OK
+    ok_u8_min = eq u8_min, 1
+    ok_u8_max_status = eq u8_max_status, SA_DB_OK
+    ok_u8_max = eq u8_max, 9
+
+    ok_i8_count_status = eq i8_count_status, SA_DB_OK
+    ok_i8_lt_count = eq i8_lt_count, 3
+    ok_i8_find_status = eq i8_find_status, SA_DB_OK
+    ok_i8_found = eq i8_found, 1
+    ok_i8_row = eq i8_row, 3
+    ok_i8_range_status = eq i8_range_status, SA_DB_OK
+    ok_i8_range_written = eq i8_range_written, 4
+    ok_i8_range_total = eq i8_range_total, 4
+    ok_i8_range_row0 = eq i8_range_row0, 0
+    ok_i8_range_row1 = eq i8_range_row1, 4
+    ok_i8_range_row2 = eq i8_range_row2, 3
+    ok_i8_range_row3 = eq i8_range_row3, 1
+    ok_i8_get_status = eq i8_get_status, SA_DB_OK
+    ok_i8_value = eq i8_value, -1
+    ok_i8_min_status = eq i8_min_status, SA_DB_OK
+    ok_i8_min = eq i8_min, -2
+    ok_i8_max_status = eq i8_max_status, SA_DB_OK
+    ok_i8_max = eq i8_max, 5
+
+    ok_u16_count_status = eq u16_count_status, SA_DB_OK
+    ok_u16_eq_count = eq u16_eq_count, 2
+    ok_u16_find_status = eq u16_find_status, SA_DB_OK
+    ok_u16_found = eq u16_found, 1
+    ok_u16_row = eq u16_row, 3
+    ok_u16_range_status = eq u16_range_status, SA_DB_OK
+    ok_u16_range_written = eq u16_range_written, 3
+    ok_u16_range_total = eq u16_range_total, 4
+    ok_u16_range_row0 = eq u16_range_row0, 3
+    ok_u16_range_row1 = eq u16_range_row1, 0
+    ok_u16_range_row2 = eq u16_range_row2, 2
+    ok_u16_get_status = eq u16_get_status, SA_DB_OK
+    ok_u16_value = eq u16_value, 42
+    ok_u16_min_status = eq u16_min_status, SA_DB_OK
+    ok_u16_min = eq u16_min, 10
+    ok_u16_max_status = eq u16_max_status, SA_DB_OK
+    ok_u16_max = eq u16_max, 655
+
+    ok_i16_count_status = eq i16_count_status, SA_DB_OK
+    ok_i16_le_count = eq i16_le_count, 3
+    ok_i16_find_status = eq i16_find_status, SA_DB_OK
+    ok_i16_found = eq i16_found, 1
+    ok_i16_row = eq i16_row, 3
+    ok_i16_range_status = eq i16_range_status, SA_DB_OK
+    ok_i16_range_written = eq i16_range_written, 3
+    ok_i16_range_total = eq i16_range_total, 3
+    ok_i16_range_row0 = eq i16_range_row0, 0
+    ok_i16_range_row1 = eq i16_range_row1, 3
+    ok_i16_range_row2 = eq i16_range_row2, 2
+    ok_i16_get_status = eq i16_get_status, SA_DB_OK
+    ok_i16_value = eq i16_value, -25
+    ok_i16_min_status = eq i16_min_status, SA_DB_OK
+    ok_i16_min = eq i16_min, -100
+    ok_i16_max_status = eq i16_max_status, SA_DB_OK
+    ok_i16_max = eq i16_max, 50
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_u8_index
+    ok04 = and ok03, ok_i8_index
+    ok05 = and ok04, ok_u16_index
+    ok06 = and ok05, ok_i16_index
+    ok07 = and ok06, ok_open
+    ok08 = and ok07, ok_u8_count_status
+    ok09 = and ok08, ok_u8_ge_count
+    ok10 = and ok09, ok_u8_find_status
+    ok11 = and ok10, ok_u8_found
+    ok12 = and ok11, ok_u8_row
+    ok13 = and ok12, ok_u8_range_status
+    ok14 = and ok13, ok_u8_range_written
+    ok15 = and ok14, ok_u8_range_total
+    ok16 = and ok15, ok_u8_range_row0
+    ok17 = and ok16, ok_u8_range_row1
+    ok18 = and ok17, ok_u8_range_row2
+    ok19 = and ok18, ok_u8_get_status
+    ok20 = and ok19, ok_u8_value
+    ok21 = and ok20, ok_u8_min_status
+    ok22 = and ok21, ok_u8_min
+    ok23 = and ok22, ok_u8_max_status
+    ok24 = and ok23, ok_u8_max
+    ok25 = and ok24, ok_i8_count_status
+    ok26 = and ok25, ok_i8_lt_count
+    ok27 = and ok26, ok_i8_find_status
+    ok28 = and ok27, ok_i8_found
+    ok29 = and ok28, ok_i8_row
+    ok30 = and ok29, ok_i8_range_status
+    ok31 = and ok30, ok_i8_range_written
+    ok32 = and ok31, ok_i8_range_total
+    ok33 = and ok32, ok_i8_range_row0
+    ok34 = and ok33, ok_i8_range_row1
+    ok35 = and ok34, ok_i8_range_row2
+    ok36 = and ok35, ok_i8_range_row3
+    ok37 = and ok36, ok_i8_get_status
+    ok38 = and ok37, ok_i8_value
+    ok39 = and ok38, ok_i8_min_status
+    ok40 = and ok39, ok_i8_min
+    ok41 = and ok40, ok_i8_max_status
+    ok42 = and ok41, ok_i8_max
+    ok43 = and ok42, ok_u16_count_status
+    ok44 = and ok43, ok_u16_eq_count
+    ok45 = and ok44, ok_u16_find_status
+    ok46 = and ok45, ok_u16_found
+    ok47 = and ok46, ok_u16_row
+    ok48 = and ok47, ok_u16_range_status
+    ok49 = and ok48, ok_u16_range_written
+    ok50 = and ok49, ok_u16_range_total
+    ok51 = and ok50, ok_u16_range_row0
+    ok52 = and ok51, ok_u16_range_row1
+    ok53 = and ok52, ok_u16_range_row2
+    ok54 = and ok53, ok_u16_get_status
+    ok55 = and ok54, ok_u16_value
+    ok56 = and ok55, ok_u16_min_status
+    ok57 = and ok56, ok_u16_min
+    ok58 = and ok57, ok_u16_max_status
+    ok59 = and ok58, ok_u16_max
+    ok60 = and ok59, ok_i16_count_status
+    ok61 = and ok60, ok_i16_le_count
+    ok62 = and ok61, ok_i16_find_status
+    ok63 = and ok62, ok_i16_found
+    ok64 = and ok63, ok_i16_row
+    ok65 = and ok64, ok_i16_range_status
+    ok66 = and ok65, ok_i16_range_written
+    ok67 = and ok66, ok_i16_range_total
+    ok68 = and ok67, ok_i16_range_row0
+    ok69 = and ok68, ok_i16_range_row1
+    ok70 = and ok69, ok_i16_range_row2
+    ok71 = and ok70, ok_i16_get_status
+    ok72 = and ok71, ok_i16_value
+    ok73 = and ok72, ok_i16_min_status
+    ok74 = and ok73, ok_i16_min
+    ok75 = and ok74, ok_i16_max_status
+    ok76 = and ok75, ok_i16_max
+    ok = and ok76, ok_close
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !u8_index_status
+    !i8_index_status
+    !u16_index_status
+    !i16_index_status
+    !open_status
+    !read_handle
+    !u8_count_status
+    !u8_ge_count
+    !u8_find_status
+    !u8_found
+    !u8_row
+    !u8_range_status
+    !u8_range_written
+    !u8_range_total
+    !u8_range_row0
+    !u8_range_row1
+    !u8_range_row2
+    !u8_get_status
+    !u8_value
+    !u8_min_status
+    !u8_min
+    !u8_max_status
+    !u8_max
+    !i8_count_status
+    !i8_lt_count
+    !i8_find_status
+    !i8_found
+    !i8_row
+    !i8_range_status
+    !i8_range_written
+    !i8_range_total
+    !i8_range_row0
+    !i8_range_row1
+    !i8_range_row2
+    !i8_range_row3
+    !i8_get_status
+    !i8_value
+    !i8_min_status
+    !i8_min
+    !i8_max_status
+    !i8_max
+    !u16_count_status
+    !u16_eq_count
+    !u16_find_status
+    !u16_found
+    !u16_row
+    !u16_range_status
+    !u16_range_written
+    !u16_range_total
+    !u16_range_row0
+    !u16_range_row1
+    !u16_range_row2
+    !u16_get_status
+    !u16_value
+    !u16_min_status
+    !u16_min
+    !u16_max_status
+    !u16_max
+    !i16_count_status
+    !i16_le_count
+    !i16_find_status
+    !i16_found
+    !i16_row
+    !i16_range_status
+    !i16_range_written
+    !i16_range_total
+    !i16_range_row0
+    !i16_range_row1
+    !i16_range_row2
+    !i16_get_status
+    !i16_value
+    !i16_min_status
+    !i16_min
+    !i16_max_status
+    !i16_max
+    !close_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_u8_index
+    !ok_i8_index
+    !ok_u16_index
+    !ok_i16_index
+    !ok_open
+    !ok_u8_count_status
+    !ok_u8_ge_count
+    !ok_u8_find_status
+    !ok_u8_found
+    !ok_u8_row
+    !ok_u8_range_status
+    !ok_u8_range_written
+    !ok_u8_range_total
+    !ok_u8_range_row0
+    !ok_u8_range_row1
+    !ok_u8_range_row2
+    !ok_u8_get_status
+    !ok_u8_value
+    !ok_u8_min_status
+    !ok_u8_min
+    !ok_u8_max_status
+    !ok_u8_max
+    !ok_i8_count_status
+    !ok_i8_lt_count
+    !ok_i8_find_status
+    !ok_i8_found
+    !ok_i8_row
+    !ok_i8_range_status
+    !ok_i8_range_written
+    !ok_i8_range_total
+    !ok_i8_range_row0
+    !ok_i8_range_row1
+    !ok_i8_range_row2
+    !ok_i8_range_row3
+    !ok_i8_get_status
+    !ok_i8_value
+    !ok_i8_min_status
+    !ok_i8_min
+    !ok_i8_max_status
+    !ok_i8_max
+    !ok_u16_count_status
+    !ok_u16_eq_count
+    !ok_u16_find_status
+    !ok_u16_found
+    !ok_u16_row
+    !ok_u16_range_status
+    !ok_u16_range_written
+    !ok_u16_range_total
+    !ok_u16_range_row0
+    !ok_u16_range_row1
+    !ok_u16_range_row2
+    !ok_u16_get_status
+    !ok_u16_value
+    !ok_u16_min_status
+    !ok_u16_min
+    !ok_u16_max_status
+    !ok_u16_max
+    !ok_i16_count_status
+    !ok_i16_le_count
+    !ok_i16_find_status
+    !ok_i16_found
+    !ok_i16_row
+    !ok_i16_range_status
+    !ok_i16_range_written
+    !ok_i16_range_total
+    !ok_i16_range_row0
+    !ok_i16_range_row1
+    !ok_i16_range_row2
+    !ok_i16_get_status
+    !ok_i16_value
+    !ok_i16_min_status
+    !ok_i16_min
+    !ok_i16_max_status
+    !ok_i16_max
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !ok45
+    !ok46
+    !ok47
+    !ok48
+    !ok49
+    !ok50
+    !ok51
+    !ok52
+    !ok53
+    !ok54
+    !ok55
+    !ok56
+    !ok57
+    !ok58
+    !ok59
+    !ok60
+    !ok61
+    !ok62
+    !ok63
+    !ok64
+    !ok65
+    !ok66
+    !ok67
+    !ok68
+    !ok69
+    !ok70
+    !ok71
+    !ok72
+    !ok73
+    !ok74
+    !ok75
+    !ok76
+    !id_col
+    !u8_col
+    !i8_col
+    !u16_col
+    !i16_col
+    !range_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9008)

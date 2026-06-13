@@ -53,6 +53,10 @@ Core native calls:
 - `sa_db_create_i64_index`
 - `sa_db_create_u32_index`
 - `sa_db_create_i32_index`
+- `sa_db_create_u8_index`
+- `sa_db_create_i8_index`
+- `sa_db_create_u16_index`
+- `sa_db_create_i16_index`
 - `sa_db_create_u64_pair_index`
 - `sa_db_dict_intern`
 - `sa_db_dict_lookup`
@@ -154,22 +158,29 @@ Removed calls:
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
-`DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`, `DB_FIND_U64_HANDLE`,
-`DB_FIND_I64_HANDLE`, `DB_FIND_U32_HANDLE`, `DB_FIND_I32_HANDLE`,
+`DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_U8_CMP_HANDLE`, `DB_COUNT_I8_CMP_HANDLE`,
+`DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`, `DB_FIND_U64_HANDLE`,
+`DB_FIND_I64_HANDLE`, `DB_FIND_U32_HANDLE`, `DB_FIND_I32_HANDLE`, `DB_FIND_U8_HANDLE`,
+`DB_FIND_I8_HANDLE`, `DB_FIND_U16_HANDLE`, `DB_FIND_I16_HANDLE`,
 `DB_FIND_BOOL_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
 `DB_RANGE_I64_HANDLE`, `DB_RANGE_U32_HANDLE`, `DB_RANGE_I32_HANDLE`,
-`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
-`DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`,
+`DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
+`DB_RANGE_I16_HANDLE`, `DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
+`DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
+`DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
-`DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
+`DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
+`DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
 `DB_DICT_VALUE_COPY_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
-`DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
+`DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_MIN_U8_HANDLE`, `DB_MAX_U8_HANDLE`,
+`DB_MIN_I8_HANDLE`, `DB_MAX_I8_HANDLE`, `DB_MIN_U16_HANDLE`, `DB_MAX_U16_HANDLE`,
+`DB_MIN_I16_HANDLE`, `DB_MAX_I16_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
 `DB_RECOVER`.
 
 ## Query Model
@@ -187,8 +198,8 @@ Read queries now use snapshots:
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
    the column. Signed `i64` columns now have the same point/range/count/min/max
    read-handle surface through a persisted signed-order index, which is suitable
-   for ERP amount cents, balances, and timestamp encodings. Compact `u32` and
-   `i32` columns now also support persisted indexes plus count/find/range/get
+   for ERP amount cents, balances, and timestamp encodings. Compact `u8`, `i8`,
+   `u16`, `i16`, `u32`, and `i32` columns now also support persisted indexes plus count/find/range/get
    and min/max helpers, which fits status codes, warehouse IDs, line numbers,
    small foreign keys, and signed adjustment fields without forcing 8-byte
    storage. A persisted
@@ -251,9 +262,11 @@ index into a fixed-width row buffer.
 `sa_db_range_i64_handle` / `DB_RANGE_I64_HANDLE` behaves the same for indexed
 `i64` columns, but uses signed ordering so negative values sort before zero and
 positive values.
-`sa_db_range_u32_handle` / `DB_RANGE_U32_HANDLE` and
-`sa_db_range_i32_handle` / `DB_RANGE_I32_HANDLE` provide the same indexed
-pagination for compact 4-byte columns, with `i32` using signed ordering. These
+`sa_db_range_u8_handle` / `DB_RANGE_U8_HANDLE`, `sa_db_range_i8_handle` /
+`DB_RANGE_I8_HANDLE`, `sa_db_range_u16_handle` / `DB_RANGE_U16_HANDLE`,
+`sa_db_range_i16_handle` / `DB_RANGE_I16_HANDLE`, `sa_db_range_u32_handle` /
+`DB_RANGE_U32_HANDLE`, and `sa_db_range_i32_handle` / `DB_RANGE_I32_HANDLE`
+provide the same indexed pagination for compact 1-, 2-, and 4-byte columns, with signed types using signed ordering. These
 are intended for ERP status codes, warehouse IDs, line numbers, compact foreign
 keys, and signed adjustment fields.
 `sa_db_range_u64_null_bitmap_handle` / `DB_RANGE_U64_NULL_BITMAP_HANDLE` and
@@ -409,16 +422,16 @@ benchmarks. The required baseline is:
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
   and dictionary-encoded strings. Primitive schema type codes, low-cardinality
   string dictionaries, and logical encode/decode helpers for decimal/date/time,
-  bool, and null bitmaps exist now. Indexed `u64`/`i64` range reads can now apply
+  bool, and null bitmaps exist now. Indexed `u8/i8/u16/i16/u32/i32/u64/i64` range reads can now apply
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
-  wrappers exist for ERP list filters. Richer typed column families are next.
+  wrappers exist for ERP list filters. Richer typed column families such as floats and wider string/blob handling are next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape; next is typed column
   families beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
-  `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
+  small-integer, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
 - Remaining crash-recovery hardening such as a broader fault-injection matrix,
   then multi-table transaction semantics, optional WAL, and async batch flush.
