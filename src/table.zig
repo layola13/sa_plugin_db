@@ -6821,30 +6821,23 @@ const SortRowsContext = struct {
     descending: bool,
 };
 
-const SortRowsU64Entry = struct {
-    row: u64,
-    key: u64,
-    input_index: usize,
-};
-
-const SortRowsI64Entry = struct {
-    row: u64,
-    key: i64,
-    input_index: usize,
-};
-
-fn sortRowsU64LessThan(context: SortRowsContext, lhs: SortRowsU64Entry, rhs: SortRowsU64Entry) bool {
-    if (lhs.key != rhs.key) {
-        return if (context.descending) lhs.key > rhs.key else lhs.key < rhs.key;
-    }
-    return lhs.input_index < rhs.input_index;
+fn SortRowsEntry(comptime Key: type) type {
+    return struct {
+        row: u64,
+        key: Key,
+        input_index: usize,
+    };
 }
 
-fn sortRowsI64LessThan(context: SortRowsContext, lhs: SortRowsI64Entry, rhs: SortRowsI64Entry) bool {
-    if (lhs.key != rhs.key) {
-        return if (context.descending) lhs.key > rhs.key else lhs.key < rhs.key;
-    }
-    return lhs.input_index < rhs.input_index;
+fn sortRowsLessThan(comptime Key: type) fn (SortRowsContext, SortRowsEntry(Key), SortRowsEntry(Key)) bool {
+    return struct {
+        fn lessThan(context: SortRowsContext, lhs: SortRowsEntry(Key), rhs: SortRowsEntry(Key)) bool {
+            if (lhs.key != rhs.key) {
+                return if (context.descending) lhs.key > rhs.key else lhs.key < rhs.key;
+            }
+            return lhs.input_index < rhs.input_index;
+        }
+    }.lessThan;
 }
 
 fn copySortedRowsPage(entries: anytype, offset: u64, limit: u64, out_rows: []u64) U64RangeResult {
@@ -6866,6 +6859,36 @@ fn copySortedRowsPage(entries: anytype, offset: u64, limit: u64, out_rows: []u64
         out_rows[i] = entries[page_start + i].row;
     }
     return .{ .written = @intCast(write_count), .total = total };
+}
+
+fn snapshotSortRowsBy(
+    comptime Key: type,
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+    comptime readKey: fn (*const ReadSnapshot, usize, u64) TableError!Key,
+) TableError!U64RangeResult {
+    if (in_rows.len == 0) return .{ .written = 0, .total = 0 };
+
+    const Entry = SortRowsEntry(Key);
+    const entries = try allocator.alloc(Entry, in_rows.len);
+    defer allocator.free(entries);
+
+    for (in_rows, 0..) |row, idx| {
+        entries[idx] = .{
+            .row = row,
+            .key = try readKey(snapshot, column_index, row),
+            .input_index = idx,
+        };
+    }
+
+    std.sort.block(Entry, entries, SortRowsContext{ .descending = descending }, sortRowsLessThan(Key));
+    return copySortedRowsPage(entries, offset, limit, out_rows);
 }
 
 fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64) u64 {
@@ -8575,21 +8598,7 @@ pub fn snapshotSortRowsU64(
     out_rows: []u64,
 ) TableError!U64RangeResult {
     try ensureSnapshotU64Column(snapshot, column_index);
-    if (in_rows.len == 0) return .{ .written = 0, .total = 0 };
-
-    const entries = try allocator.alloc(SortRowsU64Entry, in_rows.len);
-    defer allocator.free(entries);
-
-    for (in_rows, 0..) |row, idx| {
-        entries[idx] = .{
-            .row = row,
-            .key = try snapshotU64AtRow(snapshot, column_index, row),
-            .input_index = idx,
-        };
-    }
-
-    std.sort.block(SortRowsU64Entry, entries, SortRowsContext{ .descending = descending }, sortRowsU64LessThan);
-    return copySortedRowsPage(entries, offset, limit, out_rows);
+    return try snapshotSortRowsBy(u64, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotU64AtRow);
 }
 
 pub fn snapshotSortRowsI64(
@@ -8603,21 +8612,91 @@ pub fn snapshotSortRowsI64(
     out_rows: []u64,
 ) TableError!U64RangeResult {
     try ensureSnapshotI64Column(snapshot, column_index);
-    if (in_rows.len == 0) return .{ .written = 0, .total = 0 };
+    return try snapshotSortRowsBy(i64, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotI64AtRow);
+}
 
-    const entries = try allocator.alloc(SortRowsI64Entry, in_rows.len);
-    defer allocator.free(entries);
+pub fn snapshotSortRowsU32(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU32Column(snapshot, column_index);
+    return try snapshotSortRowsBy(u32, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotU32AtRow);
+}
 
-    for (in_rows, 0..) |row, idx| {
-        entries[idx] = .{
-            .row = row,
-            .key = try snapshotI64AtRow(snapshot, column_index, row),
-            .input_index = idx,
-        };
-    }
+pub fn snapshotSortRowsI32(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI32Column(snapshot, column_index);
+    return try snapshotSortRowsBy(i32, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotI32AtRow);
+}
 
-    std.sort.block(SortRowsI64Entry, entries, SortRowsContext{ .descending = descending }, sortRowsI64LessThan);
-    return copySortedRowsPage(entries, offset, limit, out_rows);
+pub fn snapshotSortRowsU8(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU8Column(snapshot, column_index);
+    return try snapshotSortRowsBy(u8, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotU8AtRow);
+}
+
+pub fn snapshotSortRowsI8(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI8Column(snapshot, column_index);
+    return try snapshotSortRowsBy(i8, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotI8AtRow);
+}
+
+pub fn snapshotSortRowsU16(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU16Column(snapshot, column_index);
+    return try snapshotSortRowsBy(u16, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotU16AtRow);
+}
+
+pub fn snapshotSortRowsI16(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI16Column(snapshot, column_index);
+    return try snapshotSortRowsBy(i16, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotI16AtRow);
 }
 
 pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
@@ -10587,6 +10666,57 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 1), amount_page.written);
     try std.testing.expectEqual(@as(u64, 2), sorted_rows[0]);
 
+    const channel_sort = try snapshotSortRowsU32(std.testing.allocator, snapshot, 5, original_candidate_rows[0..candidate_len], true, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), channel_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), channel_sort.written);
+    try std.testing.expectEqual(@as(u64, 5), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[4]);
+
+    const adjustment_sort = try snapshotSortRowsI32(std.testing.allocator, snapshot, 6, original_candidate_rows[0..candidate_len], false, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), adjustment_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), adjustment_sort.written);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 5), sorted_rows[4]);
+
+    const priority_sort = try snapshotSortRowsU8(std.testing.allocator, snapshot, 7, original_candidate_rows[0..candidate_len], true, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), priority_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), priority_sort.written);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 5), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[4]);
+
+    const signed_flag_sort = try snapshotSortRowsI8(std.testing.allocator, snapshot, 8, original_candidate_rows[0..candidate_len], false, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), signed_flag_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), signed_flag_sort.written);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 5), sorted_rows[4]);
+
+    const warehouse_sort = try snapshotSortRowsU16(std.testing.allocator, snapshot, 9, original_candidate_rows[0..candidate_len], true, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), warehouse_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), warehouse_sort.written);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[4]);
+
+    const qty_delta_page = try snapshotSortRowsI16(std.testing.allocator, snapshot, 10, original_candidate_rows[0..candidate_len], false, 1, 2, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), qty_delta_page.total);
+    try std.testing.expectEqual(@as(u64, 2), qty_delta_page.written);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[1]);
+
     const channel_result = try snapshotFilterRowsU32Range(snapshot, 5, original_candidate_rows[0..candidate_len], 20, 40, 0, filtered_rows.len, &filtered_rows);
     try std.testing.expectEqual(@as(u64, 3), channel_result.total);
     try std.testing.expectEqual(@as(u64, 3), channel_result.written);
@@ -10655,6 +10785,7 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsU16Range(snapshot, 9, &invalid_rows, 200, 200, 0, filtered_rows.len, &filtered_rows));
     try std.testing.expectError(TableError.InvalidFormat, snapshotStatsRowsU64(snapshot, 2, &invalid_rows));
     try std.testing.expectError(TableError.InvalidFormat, snapshotSortRowsI64(std.testing.allocator, snapshot, 4, &invalid_rows, true, 0, filtered_rows.len, &filtered_rows));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotSortRowsU16(std.testing.allocator, snapshot, 9, &invalid_rows, true, 0, filtered_rows.len, &filtered_rows));
 }
 
 test "table write transaction commits atomically and preserves previous epoch on constraint failure" {

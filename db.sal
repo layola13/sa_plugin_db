@@ -1059,6 +1059,54 @@
     %out_total = load __db_handle_sort_rows_i64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_SORT_ROWS_U32_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_u32_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_u32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_u32_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_u32_written_slot_%out_written, &__db_handle_sort_rows_u32_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_u32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_u32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_I32_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_i32_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_i32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_i32_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_i32_written_slot_%out_written, &__db_handle_sort_rows_i32_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_i32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_i32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_U8_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_u8_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_u8_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_u8_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_u8_written_slot_%out_written, &__db_handle_sort_rows_u8_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_u8_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_u8_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_I8_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_i8_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_i8_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_i8_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_i8_written_slot_%out_written, &__db_handle_sort_rows_i8_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_i8_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_i8_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_U16_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_u16_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_u16_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_u16_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_u16_written_slot_%out_written, &__db_handle_sort_rows_u16_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_u16_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_u16_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_I16_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_i16_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_i16_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_i16_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_i16_written_slot_%out_written, &__db_handle_sort_rows_i16_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_i16_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_i16_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_BLOB_EQ_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
     __db_handle_filter_blob_eq_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_blob_eq_total_slot_%out_total = stack_alloc 8

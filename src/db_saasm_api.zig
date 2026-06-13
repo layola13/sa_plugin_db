@@ -3263,7 +3263,7 @@ pub export fn sa_db_filter_rows_bool_handle(
     return SA_DB_OK;
 }
 
-pub export fn sa_db_sort_rows_u64_handle(
+fn sortRowsHandle(
     handle: ?*anyopaque,
     column_index: u64,
     in_rows_ptr: ?[*]const u64,
@@ -3275,6 +3275,7 @@ pub export fn sa_db_sort_rows_u64_handle(
     out_rows_len: u64,
     out_written: ?*u64,
     out_total: ?*u64,
+    comptime sortFn: anytype,
 ) u32 {
     const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
@@ -3288,10 +3289,26 @@ pub export fn sa_db_sort_rows_u64_handle(
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    const result = table.snapshotSortRowsU64(gpa.allocator(), snapshot, @intCast(column_index), in_rows, sort_descending, offset, limit, rows) catch |err| return tableStatus(err);
+    const result = sortFn(gpa.allocator(), snapshot, @intCast(column_index), in_rows, sort_descending, offset, limit, rows) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
+}
+
+pub export fn sa_db_sort_rows_u64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsU64);
 }
 
 pub export fn sa_db_sort_rows_i64_handle(
@@ -3307,22 +3324,103 @@ pub export fn sa_db_sort_rows_i64_handle(
     out_written: ?*u64,
     out_total: ?*u64,
 ) u32 {
-    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    written_slot.* = 0;
-    total_slot.* = 0;
-    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    defer releaseReadSnapshot(snapshot);
-    const result = table.snapshotSortRowsI64(gpa.allocator(), snapshot, @intCast(column_index), in_rows, sort_descending, offset, limit, rows) catch |err| return tableStatus(err);
-    written_slot.* = result.written;
-    total_slot.* = result.total;
-    return SA_DB_OK;
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsI64);
+}
+
+pub export fn sa_db_sort_rows_u32_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsU32);
+}
+
+pub export fn sa_db_sort_rows_i32_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsI32);
+}
+
+pub export fn sa_db_sort_rows_u8_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsU8);
+}
+
+pub export fn sa_db_sort_rows_i8_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsI8);
+}
+
+pub export fn sa_db_sort_rows_u16_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsU16);
+}
+
+pub export fn sa_db_sort_rows_i16_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return sortRowsHandle(handle, column_index, in_rows_ptr, in_rows_len, descending, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotSortRowsI16);
 }
 
 pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u64) u32 {
@@ -4252,6 +4350,57 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 0), written);
     try std.testing.expectEqual(@as(u64, 0), total);
 
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_u32_handle(handle, 7, &original_candidate_rows, candidate_written, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+    try std.testing.expectEqual(@as(u64, 5), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 1), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 0), filtered[3]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[4]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_i32_handle(handle, 8, &original_candidate_rows, candidate_written, 0, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+    try std.testing.expectEqual(@as(u64, 0), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 1), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[3]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[4]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_u8_handle(handle, 9, &original_candidate_rows, candidate_written, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+    try std.testing.expectEqual(@as(u64, 2), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 1), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[3]);
+    try std.testing.expectEqual(@as(u64, 0), filtered[4]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_i8_handle(handle, 10, &original_candidate_rows, candidate_written, 0, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+    try std.testing.expectEqual(@as(u64, 0), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 1), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[3]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[4]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_u16_handle(handle, 11, &original_candidate_rows, candidate_written, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 0), filtered[3]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[4]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_i16_handle(handle, 12, &original_candidate_rows, candidate_written, 0, 1, 2, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 0), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 1), filtered[1]);
+
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_u32_range_handle(handle, 7, &original_candidate_rows, candidate_written, 20, 40, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 3), total);
     try std.testing.expectEqual(@as(u64, 3), written);
@@ -4308,6 +4457,12 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     written = 123;
     total = 456;
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_sort_rows_i64_handle(handle, 4, &invalid_stats_rows, invalid_stats_rows.len, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_sort_rows_u16_handle(handle, 11, &invalid_stats_rows, invalid_stats_rows.len, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 0), written);
     try std.testing.expectEqual(@as(u64, 0), total);
 

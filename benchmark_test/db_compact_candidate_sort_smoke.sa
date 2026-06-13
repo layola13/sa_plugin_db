@@ -1,0 +1,371 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"compact_candidate_sort"
+@const SCHEMA_PATH = utf8:"compact_candidate_sort.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 6\n#def COL_ID_STRIDE = 8 // u64\n#def COL_U32_STRIDE = 4 // u32\n#def COL_I32_STRIDE = 4 // i32\n#def COL_U8_STRIDE = 1 // u8\n#def COL_I8_STRIDE = 1 // i8\n#def COL_U16_STRIDE = 2 // u16\n#def COL_I16_STRIDE = 2 // i16\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 22
+#def SCHEMA_PATH_LEN = 34
+#def SCHEMA_LEN = 230
+#def ROWS = 5
+#def COLUMN_COUNT = 7
+#def COLUMNS_BYTES = 112
+#def ID_COL_BYTES = 40
+#def U32_COL_BYTES = 20
+#def I32_COL_BYTES = 20
+#def U8_COL_BYTES = 5
+#def I8_COL_BYTES = 5
+#def U16_COL_BYTES = 10
+#def I16_COL_BYTES = 10
+#def ROWS_CAP = 5
+#def ROWS_BYTES = 40
+#def CANDIDATE_ROWS = 4
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc ID_COL_BYTES
+    u32_col = alloc U32_COL_BYTES
+    i32_col = alloc I32_COL_BYTES
+    u8_col = alloc U8_COL_BYTES
+    i8_col = alloc I8_COL_BYTES
+    u16_col = alloc U16_COL_BYTES
+    i16_col = alloc I16_COL_BYTES
+    candidate_rows = alloc ROWS_BYTES
+    out_rows = alloc ROWS_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+    store id_col+32, 5 as u64
+    store u32_col+0, 10 as u32
+    store u32_col+4, 20 as u32
+    store u32_col+8, 20 as u32
+    store u32_col+12, 30 as u32
+    store u32_col+16, 40 as u32
+    store i32_col+0, -3 as i32
+    store i32_col+4, 5 as i32
+    store i32_col+8, 7 as i32
+    store i32_col+12, 9 as i32
+    store i32_col+16, 11 as i32
+    store u8_col+0, 1 as u8
+    store u8_col+1, 2 as u8
+    store u8_col+2, 3 as u8
+    store u8_col+3, 1 as u8
+    store u8_col+4, 2 as u8
+    store i8_col+0, -1 as i8
+    store i8_col+1, 0 as i8
+    store i8_col+2, 1 as i8
+    store i8_col+3, 0 as i8
+    store i8_col+4, -1 as i8
+    store u16_col+0, 100 as u16
+    store u16_col+2, 200 as u16
+    store u16_col+4, 200 as u16
+    store u16_col+6, 300 as u16
+    store u16_col+8, 100 as u16
+    store i16_col+0, -5 as i16
+    store i16_col+2, 10 as i16
+    store i16_col+4, 20 as i16
+    store i16_col+6, 30 as i16
+    store i16_col+8, -15 as i16
+    store candidate_rows+0, 0 as u64
+    store candidate_rows+8, 1 as u64
+    store candidate_rows+16, 2 as u64
+    store candidate_rows+24, 4 as u64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, ID_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, u32_col, U32_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, i32_col, I32_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, u8_col, U8_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, i8_col, I8_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 5, u16_col, U16_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 6, i16_col, I16_COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_SORT_ROWS_U32_HANDLE u32_sort_status, u32_written, u32_total, out_rows, ROWS_CAP, read_handle, 1, candidate_rows, CANDIDATE_ROWS, 1, 0, ROWS_CAP
+    u32_row0 = load out_rows+0 as u64
+    u32_row1 = load out_rows+8 as u64
+    u32_row2 = load out_rows+16 as u64
+    u32_row3 = load out_rows+24 as u64
+    EXPAND DB_SORT_ROWS_I32_HANDLE i32_sort_status, i32_written, i32_total, out_rows, ROWS_CAP, read_handle, 2, candidate_rows, CANDIDATE_ROWS, 0, 0, ROWS_CAP
+    i32_row0 = load out_rows+0 as u64
+    i32_row1 = load out_rows+8 as u64
+    i32_row2 = load out_rows+16 as u64
+    i32_row3 = load out_rows+24 as u64
+    EXPAND DB_SORT_ROWS_U8_HANDLE u8_sort_status, u8_written, u8_total, out_rows, ROWS_CAP, read_handle, 3, candidate_rows, CANDIDATE_ROWS, 1, 0, ROWS_CAP
+    u8_row0 = load out_rows+0 as u64
+    u8_row1 = load out_rows+8 as u64
+    u8_row2 = load out_rows+16 as u64
+    u8_row3 = load out_rows+24 as u64
+    EXPAND DB_SORT_ROWS_I8_HANDLE i8_sort_status, i8_written, i8_total, out_rows, ROWS_CAP, read_handle, 4, candidate_rows, CANDIDATE_ROWS, 0, 0, ROWS_CAP
+    i8_row0 = load out_rows+0 as u64
+    i8_row1 = load out_rows+8 as u64
+    i8_row2 = load out_rows+16 as u64
+    i8_row3 = load out_rows+24 as u64
+    EXPAND DB_SORT_ROWS_U16_HANDLE u16_sort_status, u16_written, u16_total, out_rows, ROWS_CAP, read_handle, 5, candidate_rows, CANDIDATE_ROWS, 1, 0, ROWS_CAP
+    u16_row0 = load out_rows+0 as u64
+    u16_row1 = load out_rows+8 as u64
+    u16_row2 = load out_rows+16 as u64
+    u16_row3 = load out_rows+24 as u64
+    EXPAND DB_SORT_ROWS_I16_HANDLE i16_sort_status, i16_written, i16_total, out_rows, ROWS_CAP, read_handle, 6, candidate_rows, CANDIDATE_ROWS, 0, 1, 2
+    i16_row0 = load out_rows+0 as u64
+    i16_row1 = load out_rows+8 as u64
+
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_u32_status = eq u32_sort_status, SA_DB_OK
+    ok_u32_written = eq u32_written, 4
+    ok_u32_total = eq u32_total, 4
+    ok_u32_row0 = eq u32_row0, 4
+    ok_u32_row1 = eq u32_row1, 1
+    ok_u32_row2 = eq u32_row2, 2
+    ok_u32_row3 = eq u32_row3, 0
+    ok_i32_status = eq i32_sort_status, SA_DB_OK
+    ok_i32_written = eq i32_written, 4
+    ok_i32_total = eq i32_total, 4
+    ok_i32_row0 = eq i32_row0, 0
+    ok_i32_row1 = eq i32_row1, 1
+    ok_i32_row2 = eq i32_row2, 2
+    ok_i32_row3 = eq i32_row3, 4
+    ok_u8_status = eq u8_sort_status, SA_DB_OK
+    ok_u8_written = eq u8_written, 4
+    ok_u8_total = eq u8_total, 4
+    ok_u8_row0 = eq u8_row0, 2
+    ok_u8_row1 = eq u8_row1, 1
+    ok_u8_row2 = eq u8_row2, 4
+    ok_u8_row3 = eq u8_row3, 0
+    ok_i8_status = eq i8_sort_status, SA_DB_OK
+    ok_i8_written = eq i8_written, 4
+    ok_i8_total = eq i8_total, 4
+    ok_i8_row0 = eq i8_row0, 0
+    ok_i8_row1 = eq i8_row1, 4
+    ok_i8_row2 = eq i8_row2, 1
+    ok_i8_row3 = eq i8_row3, 2
+    ok_u16_status = eq u16_sort_status, SA_DB_OK
+    ok_u16_written = eq u16_written, 4
+    ok_u16_total = eq u16_total, 4
+    ok_u16_row0 = eq u16_row0, 1
+    ok_u16_row1 = eq u16_row1, 2
+    ok_u16_row2 = eq u16_row2, 0
+    ok_u16_row3 = eq u16_row3, 4
+    ok_i16_status = eq i16_sort_status, SA_DB_OK
+    ok_i16_written = eq i16_written, 2
+    ok_i16_total = eq i16_total, 4
+    ok_i16_row0 = eq i16_row0, 0
+    ok_i16_row1 = eq i16_row1, 1
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_open
+    ok04 = and ok03, ok_u32_status
+    ok05 = and ok04, ok_u32_written
+    ok06 = and ok05, ok_u32_total
+    ok07 = and ok06, ok_u32_row0
+    ok08 = and ok07, ok_u32_row1
+    ok09 = and ok08, ok_u32_row2
+    ok10 = and ok09, ok_u32_row3
+    ok11 = and ok10, ok_i32_status
+    ok12 = and ok11, ok_i32_written
+    ok13 = and ok12, ok_i32_total
+    ok14 = and ok13, ok_i32_row0
+    ok15 = and ok14, ok_i32_row1
+    ok16 = and ok15, ok_i32_row2
+    ok17 = and ok16, ok_i32_row3
+    ok18 = and ok17, ok_u8_status
+    ok19 = and ok18, ok_u8_written
+    ok20 = and ok19, ok_u8_total
+    ok21 = and ok20, ok_u8_row0
+    ok22 = and ok21, ok_u8_row1
+    ok23 = and ok22, ok_u8_row2
+    ok24 = and ok23, ok_u8_row3
+    ok25 = and ok24, ok_i8_status
+    ok26 = and ok25, ok_i8_written
+    ok27 = and ok26, ok_i8_total
+    ok28 = and ok27, ok_i8_row0
+    ok29 = and ok28, ok_i8_row1
+    ok30 = and ok29, ok_i8_row2
+    ok31 = and ok30, ok_i8_row3
+    ok32 = and ok31, ok_u16_status
+    ok33 = and ok32, ok_u16_written
+    ok34 = and ok33, ok_u16_total
+    ok35 = and ok34, ok_u16_row0
+    ok36 = and ok35, ok_u16_row1
+    ok37 = and ok36, ok_u16_row2
+    ok38 = and ok37, ok_u16_row3
+    ok39 = and ok38, ok_i16_status
+    ok40 = and ok39, ok_i16_written
+    ok41 = and ok40, ok_i16_total
+    ok42 = and ok41, ok_i16_row0
+    ok43 = and ok42, ok_i16_row1
+    ok44 = and ok43, ok_close
+    ok = and ok44, ok_verify
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !open_status
+    !read_handle
+    !u32_sort_status
+    !u32_written
+    !u32_total
+    !u32_row0
+    !u32_row1
+    !u32_row2
+    !u32_row3
+    !i32_sort_status
+    !i32_written
+    !i32_total
+    !i32_row0
+    !i32_row1
+    !i32_row2
+    !i32_row3
+    !u8_sort_status
+    !u8_written
+    !u8_total
+    !u8_row0
+    !u8_row1
+    !u8_row2
+    !u8_row3
+    !i8_sort_status
+    !i8_written
+    !i8_total
+    !i8_row0
+    !i8_row1
+    !i8_row2
+    !i8_row3
+    !u16_sort_status
+    !u16_written
+    !u16_total
+    !u16_row0
+    !u16_row1
+    !u16_row2
+    !u16_row3
+    !i16_sort_status
+    !i16_written
+    !i16_total
+    !i16_row0
+    !i16_row1
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_open
+    !ok_u32_status
+    !ok_u32_written
+    !ok_u32_total
+    !ok_u32_row0
+    !ok_u32_row1
+    !ok_u32_row2
+    !ok_u32_row3
+    !ok_i32_status
+    !ok_i32_written
+    !ok_i32_total
+    !ok_i32_row0
+    !ok_i32_row1
+    !ok_i32_row2
+    !ok_i32_row3
+    !ok_u8_status
+    !ok_u8_written
+    !ok_u8_total
+    !ok_u8_row0
+    !ok_u8_row1
+    !ok_u8_row2
+    !ok_u8_row3
+    !ok_i8_status
+    !ok_i8_written
+    !ok_i8_total
+    !ok_i8_row0
+    !ok_i8_row1
+    !ok_i8_row2
+    !ok_i8_row3
+    !ok_u16_status
+    !ok_u16_written
+    !ok_u16_total
+    !ok_u16_row0
+    !ok_u16_row1
+    !ok_u16_row2
+    !ok_u16_row3
+    !ok_i16_status
+    !ok_i16_written
+    !ok_i16_total
+    !ok_i16_row0
+    !ok_i16_row1
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !id_col
+    !u32_col
+    !i32_col
+    !u8_col
+    !i8_col
+    !u16_col
+    !i16_col
+    !candidate_rows
+    !out_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9046)

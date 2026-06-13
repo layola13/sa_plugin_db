@@ -165,6 +165,12 @@ Read-handle query calls:
 - `sa_db_filter_rows_bool_handle`
 - `sa_db_sort_rows_u64_handle`
 - `sa_db_sort_rows_i64_handle`
+- `sa_db_sort_rows_u32_handle`
+- `sa_db_sort_rows_i32_handle`
+- `sa_db_sort_rows_u8_handle`
+- `sa_db_sort_rows_i8_handle`
+- `sa_db_sort_rows_u16_handle`
+- `sa_db_sort_rows_i16_handle`
 - `sa_db_filter_blob_eq_handle`
 - `sa_db_filter_blob_contains_handle`
 - `sa_db_filter_blob_token_handle`
@@ -222,6 +228,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FILTER_ROWS_DATE_RANGE_HANDLE`, `DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE`,
 `DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE`, `DB_FILTER_ROWS_BOOL_HANDLE`,
 `DB_SORT_ROWS_U64_HANDLE`, `DB_SORT_ROWS_I64_HANDLE`,
+`DB_SORT_ROWS_U32_HANDLE`, `DB_SORT_ROWS_I32_HANDLE`,
+`DB_SORT_ROWS_U8_HANDLE`, `DB_SORT_ROWS_I8_HANDLE`,
+`DB_SORT_ROWS_U16_HANDLE`, `DB_SORT_ROWS_I16_HANDLE`,
 `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
@@ -476,13 +485,17 @@ selective index explicitly.
 candidate row list and return `count`, `sum`, `min`, and `max` in one snapshot
 pass. Use the signed variant for scaled decimal amounts, date/timestamp extrema,
 and signed ERP adjustment totals; an empty candidate list returns zeroed stats.
-`sa_db_sort_rows_u64_handle` / `DB_SORT_ROWS_U64_HANDLE` and
-`sa_db_sort_rows_i64_handle` / `DB_SORT_ROWS_I64_HANDLE` sort an existing
-candidate row list by a snapshot column, validate that every candidate row is in
-range, and return a stable `offset`/`limit` page. Equal sort keys keep the input
-candidate order, so ERP list pages stay deterministic after applying filters.
-Use the signed variant for scaled decimal amounts, dates, timestamps, and other
-signed business fields.
+`sa_db_sort_rows_u64_handle` / `DB_SORT_ROWS_U64_HANDLE`,
+`sa_db_sort_rows_i64_handle` / `DB_SORT_ROWS_I64_HANDLE`, and compact integer
+variants `sa_db_sort_rows_u32_handle`, `sa_db_sort_rows_i32_handle`,
+`sa_db_sort_rows_u8_handle`, `sa_db_sort_rows_i8_handle`,
+`sa_db_sort_rows_u16_handle`, and `sa_db_sort_rows_i16_handle` with matching
+`DB_SORT_ROWS_*_HANDLE` macros sort an existing candidate row list by a snapshot
+column, validate that every candidate row is in range, and return a stable
+`offset`/`limit` page. Equal sort keys keep the input candidate order, so ERP
+list pages stay deterministic after applying filters. Use the signed variants
+for scaled decimal amounts, dates, timestamps, signed adjustment fields, and
+compact signed business codes.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
