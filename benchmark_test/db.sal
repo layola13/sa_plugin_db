@@ -833,6 +833,22 @@
     %out_total = load __db_handle_filter_bool_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_BLOB_EQ_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
+    __db_handle_filter_blob_eq_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_blob_eq_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_blob_eq_handle(%handle, %column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_blob_eq_written_slot_%out_written, &__db_handle_filter_blob_eq_total_slot_%out_total)
+    %out_written = load __db_handle_filter_blob_eq_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_blob_eq_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_BLOB_CONTAINS_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
+    __db_handle_filter_blob_contains_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_blob_contains_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_blob_contains_handle(%handle, %column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_blob_contains_written_slot_%out_written, &__db_handle_filter_blob_contains_total_slot_%out_total)
+    %out_written = load __db_handle_filter_blob_contains_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_blob_contains_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_GET_U64_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
     __db_handle_get_slot_%out_value = stack_alloc 8
     %out_status = call @sa_db_get_u64_handle(%handle, %column_index, %row_index, &__db_handle_get_slot_%out_value)

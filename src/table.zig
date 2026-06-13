@@ -287,6 +287,16 @@ pub const BoolFilterResult = struct {
     total: u64,
 };
 
+pub const BlobFilterResult = struct {
+    written: u64,
+    total: u64,
+};
+
+const BlobFilterMode = enum {
+    eq,
+    contains,
+};
+
 pub const ProjectRowsResult = struct {
     written_rows: u64,
     required_bytes: u64,
@@ -4629,6 +4639,12 @@ fn ensureSnapshotBoolColumn(snapshot: *const ReadSnapshot, column_index: usize) 
     }
 }
 
+fn ensureSnapshotBlobHandleColumn(snapshot: *const ReadSnapshot, column_index: usize) TableError!void {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    if (column.stride != 8 or !std.mem.eql(u8, column.ty, "blob_handle")) return TableError.InvalidFormat;
+}
+
 fn snapshotFindDictIndex(snapshot: *const ReadSnapshot, dict_name: []const u8) ?usize {
     for (snapshot.dicts, 0..) |dict, idx| {
         if (std.mem.eql(u8, dict.name, dict_name)) return idx;
@@ -4681,6 +4697,118 @@ pub fn snapshotBlobValueCopy(snapshot: *const ReadSnapshot, store_name: []const 
     if (out.len < value.len) return TableError.CursorOverflow;
     if (value.len != 0) @memcpy(out[0..value.len], value);
     return .{ .found = true, .written = value.len };
+}
+
+fn blobFilterValueMatches(value: []const u8, needle: []const u8, mode: BlobFilterMode) bool {
+    return switch (mode) {
+        .eq => std.mem.eql(u8, value, needle),
+        .contains => std.mem.indexOf(u8, value, needle) != null,
+    };
+}
+
+fn setBlobMatchBit(matches: []u8, id: u64) void {
+    const byte_index: usize = @intCast(id >> 3);
+    const bit: u3 = @intCast(id & 7);
+    matches[byte_index] |= @as(u8, 1) << bit;
+}
+
+fn getBlobMatchBit(matches: []const u8, id: u64) bool {
+    if (id >> 3 > @as(u64, @intCast(std.math.maxInt(usize)))) return false;
+    const byte_index: usize = @intCast(id >> 3);
+    if (byte_index >= matches.len) return false;
+    const bit: u3 = @intCast(id & 7);
+    return (matches[byte_index] & (@as(u8, 1) << bit)) != 0;
+}
+
+fn buildBlobMatchBitmap(allocator: std.mem.Allocator, bytes: []const u8, needle: []const u8, mode: BlobFilterMode) TableError![]u8 {
+    const count = try blobEntryCount(bytes);
+    const bit_count = std.math.add(u64, count, 1) catch return TableError.CursorOverflow;
+    const bitmap_len_u64 = (bit_count + 7) / 8;
+    if (bitmap_len_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const matches = try allocator.alloc(u8, @intCast(bitmap_len_u64));
+    errdefer allocator.free(matches);
+    @memset(matches, 0);
+
+    var offset: usize = 8;
+    var id: u64 = 1;
+    while (id <= count) : (id += 1) {
+        const len_u64 = readU64LE(bytes, offset);
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        const value = bytes[offset .. offset + len];
+        if (blobFilterValueMatches(value, needle, mode)) setBlobMatchBit(matches, id);
+        offset += len;
+    }
+    return matches;
+}
+
+fn snapshotFilterBlobRowsMode(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    store_name: []const u8,
+    needle: []const u8,
+    mode: BlobFilterMode,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    try ensureSnapshotBlobHandleColumn(snapshot, column_index);
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(needle);
+    const blob_idx = snapshotFindBlobStoreIndex(snapshot, store_name) orelse return .{ .written = 0, .total = 0 };
+    const matches = try buildBlobMatchBitmap(allocator, snapshot.blobs[blob_idx].bytes, needle, mode);
+    defer allocator.free(matches);
+
+    var total: u64 = 0;
+    var written: u64 = 0;
+    const out_capacity: u64 = @intCast(out_rows.len);
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            const id = readU64LE(bytes, byte_offset);
+            if (id != 0 and getBlobMatchBit(matches, id)) {
+                if (total >= offset and limit != 0 and written < limit and written < out_capacity) {
+                    out_rows[@intCast(written)] = row_base + i;
+                    written += 1;
+                }
+                total = std.math.add(u64, total, 1) catch return TableError.CursorOverflow;
+            }
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    return .{ .written = written, .total = total };
+}
+
+pub fn snapshotFilterBlobEqRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    store_name: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    return snapshotFilterBlobRowsMode(allocator, snapshot, column_index, store_name, needle, .eq, offset, limit, out_rows);
+}
+
+pub fn snapshotFilterBlobContainsRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    store_name: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    return snapshotFilterBlobRowsMode(allocator, snapshot, column_index, store_name, needle, .contains, offset, limit, out_rows);
 }
 
 fn readBoolColumnValue(column: ColumnMeta, bytes: []const u8, local_row: u64) TableError!bool {
@@ -7770,6 +7898,68 @@ test "table blob store persists variable bytes and read snapshots are isolated" 
     defer std.testing.allocator.free(blob_path);
     try writeFile(std.testing.allocator, blob_path, "corrupt");
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table blob handle filters exact and contains values" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "blob_filter_items";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_filter_items.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const empty = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "");
+    const first = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+    const second = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "second note with details");
+    const duplicate = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+
+    var row_bytes: [16]u8 = undefined;
+    const row_ids = [_]u64{ 100, 101, 102, 103, 104, 105 };
+    const note_ids = [_]u64{ first.id, second.id, duplicate.id, empty.id, 999, 0 };
+    for (row_ids, note_ids) |row_id, note_id| {
+        writeU64LE(&row_bytes, 0, row_id);
+        writeU64LE(&row_bytes, 8, note_id);
+        _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+    }
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+
+    var rows: [8]u64 = undefined;
+    const exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "first note", 0, 8, &rows);
+    try std.testing.expectEqual(@as(u64, 2), exact.total);
+    try std.testing.expectEqual(@as(u64, 2), exact.written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), rows[1]);
+
+    const exact_page = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "first note", 1, 1, &rows);
+    try std.testing.expectEqual(@as(u64, 2), exact_page.total);
+    try std.testing.expectEqual(@as(u64, 1), exact_page.written);
+    try std.testing.expectEqual(@as(u64, 2), rows[0]);
+
+    const contains = try snapshotFilterBlobContainsRows(std.testing.allocator, snapshot, 1, "notes", "details", 0, 8, &rows);
+    try std.testing.expectEqual(@as(u64, 1), contains.total);
+    try std.testing.expectEqual(@as(u64, 1), contains.written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+
+    const empty_exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "", 0, 8, &rows);
+    try std.testing.expectEqual(@as(u64, 1), empty_exact.total);
+    try std.testing.expectEqual(@as(u64, 1), empty_exact.written);
+    try std.testing.expectEqual(@as(u64, 3), rows[0]);
+
+    const missing_store = try snapshotFilterBlobContainsRows(std.testing.allocator, snapshot, 1, "other_notes", "note", 0, 8, &rows);
+    try std.testing.expectEqual(@as(u64, 0), missing_store.total);
+    try std.testing.expectEqual(@as(u64, 0), missing_store.written);
+
+    try std.testing.expectError(TableError.InvalidFormat, snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 0, "notes", "first note", 0, 8, &rows));
 }
 
 test "table persistent u64 pair index supports ERP composite lookups" {

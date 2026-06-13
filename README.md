@@ -135,6 +135,8 @@ Read-handle query calls:
 - `sa_db_range_timestamp_us_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
 - `sa_db_filter_bool_handle`
+- `sa_db_filter_blob_eq_handle`
+- `sa_db_filter_blob_contains_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
 - `sa_db_get_u32_handle`
@@ -175,7 +177,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_I64_HANDLE`, `DB_RANGE_U32_HANDLE`, `DB_RANGE_I32_HANDLE`,
 `DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
 `DB_RANGE_I16_HANDLE`, `DB_RANGE_F32_HANDLE`, `DB_RANGE_F64_HANDLE`,
-`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
+`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`,
+`DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
 `DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`, `DB_GET_F32_HANDLE`,
 `DB_GET_F64_HANDLE`,
@@ -191,7 +194,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
 `DB_DICT_VALUE_COPY_HANDLE`, `DB_BLOB_PUT`, `DB_BLOB_VALUE_LEN`,
 `DB_BLOB_VALUE_COPY`, `DB_BLOB_VALUE_LEN_HANDLE`,
-`DB_BLOB_VALUE_COPY_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_BLOB_VALUE_COPY_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`,
+`DB_FILTER_BLOB_CONTAINS_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_MIN_U8_HANDLE`, `DB_MAX_U8_HANDLE`,
 `DB_MIN_I8_HANDLE`, `DB_MAX_I8_HANDLE`, `DB_MIN_U16_HANDLE`, `DB_MAX_U16_HANDLE`,
 `DB_MIN_I16_HANDLE`, `DB_MAX_I16_HANDLE`, `DB_MIN_F32_HANDLE`, `DB_MAX_F32_HANDLE`,
@@ -280,7 +284,13 @@ for varchar/blob data rather than low-cardinality deduplication. Use
 `sa_db_open_read_table`, use `sa_db_blob_value_len_handle` /
 `DB_BLOB_VALUE_LEN_HANDLE` and `sa_db_blob_value_copy_handle` /
 `DB_BLOB_VALUE_COPY_HANDLE`; blob bytes are part of the immutable snapshot, so
-new blob writes are not visible to an already-open read handle.
+new blob writes are not visible to an already-open read handle. Read handles also
+provide first-pass text/blob filtering through `sa_db_filter_blob_eq_handle` /
+`DB_FILTER_BLOB_EQ_HANDLE` and `sa_db_filter_blob_contains_handle` /
+`DB_FILTER_BLOB_CONTAINS_HANDLE`. These scan the snapshot `blob_handle` column,
+return row indices with the same `offset`/`limit`/`total` contract as other list
+queries, and let ERP screens filter notes, addresses, descriptions, or external
+payload keys before projecting rows.
 
 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE` returns row indices for an
 inclusive `[min, max]` range over an indexed `u64` column. It is designed for ERP
@@ -437,7 +447,9 @@ while the named blob store owns the bytes. The blob artifact is part of the tabl
 lifecycle: snapshot, restore, verify, recover, lock, unlock, and remove all carry
 it with whole-file and block-level hashes. This keeps ordinary row/index queries
 fixed-width while allowing notes, descriptions, addresses, and external payload
-keys to live outside the column row buffer.
+keys to live outside the column row buffer. `DB_FILTER_BLOB_EQ_HANDLE` and
+`DB_FILTER_BLOB_CONTAINS_HANDLE` provide the first non-indexed list filter over
+those values on an immutable read handle.
 
 The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 `DB_DECIMAL_TO_PARTS`, `DB_DATE_FROM_YMD`, `DB_DATE_TO_YMD`,
@@ -471,12 +483,14 @@ benchmarks. The required baseline is:
   range reads exist for ERP list filters; `u64/i64` range wrappers can also apply
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
   wrappers are available. `blob_handle` stores now cover variable-width text and
-  bytes; secondary indexing/search over those values is next.
+  bytes, with read-handle exact/contains filters; secondary indexes over those
+  values are next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
-  batch reads now cover the first ERP list-page shape; next is richer text/blob
-  filtering and ERP benchmark coverage beyond raw fixed-width bytes.
+  batch reads now cover the first ERP list-page shape, and blob exact/contains
+  filters cover the first text search shape; next is indexed text/blob filtering
+  and ERP benchmark coverage beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.

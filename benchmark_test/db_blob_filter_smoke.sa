@@ -1,0 +1,239 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"blob_filter_items"
+@const SCHEMA_PATH = utf8:"blob_filter_items.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_NOTE_STRIDE = 8 // blob_handle\n"
+@const STORE = utf8:"notes"
+@const VALUE_A = utf8:"first note"
+@const VALUE_B = utf8:"second note with details"
+@const NEEDLE_DETAILS = utf8:"details"
+@const NEEDLE_ABSENT = utf8:"absent"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 17
+#def SCHEMA_PATH_LEN = 29
+#def SCHEMA_LEN = 88
+#def STORE_LEN = 5
+#def VALUE_A_LEN = 10
+#def VALUE_B_LEN = 24
+#def NEEDLE_DETAILS_LEN = 7
+#def NEEDLE_ABSENT_LEN = 6
+#def ROW_BYTES = 16
+#def FILTER_ROWS_CAP = 4
+#def FILTER_ROWS_BYTES = 32
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+    filter_rows = alloc FILTER_ROWS_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+
+    EXPAND DB_BLOB_PUT put_a_status, blob_a_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, info
+    EXPAND DB_BLOB_PUT put_b_status, blob_b_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, VALUE_B, VALUE_B_LEN, info
+    EXPAND DB_BLOB_PUT put_c_status, blob_c_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, info
+
+    store row+0, 100 as u64
+    store row+8, blob_a_id as u64
+    EXPAND DB_INSERT_ROW insert_a_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 101 as u64
+    store row+8, blob_b_id as u64
+    EXPAND DB_INSERT_ROW insert_b_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 102 as u64
+    store row+8, blob_c_id as u64
+    EXPAND DB_INSERT_ROW insert_c_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 103 as u64
+    store row+8, 0 as u64
+    EXPAND DB_INSERT_ROW insert_null_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_FILTER_BLOB_EQ_HANDLE eq_status, eq_written, eq_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, 0, FILTER_ROWS_CAP
+    eq_row0 = load filter_rows+0 as u64
+    eq_row1 = load filter_rows+8 as u64
+    EXPAND DB_FILTER_BLOB_EQ_HANDLE eq_page_status, eq_page_written, eq_page_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, 1, 1
+    eq_page_row0 = load filter_rows+0 as u64
+    EXPAND DB_FILTER_BLOB_CONTAINS_HANDLE contains_status, contains_written, contains_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, NEEDLE_DETAILS, NEEDLE_DETAILS_LEN, 0, FILTER_ROWS_CAP
+    contains_row0 = load filter_rows+0 as u64
+    EXPAND DB_FILTER_BLOB_CONTAINS_HANDLE absent_status, absent_written, absent_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, NEEDLE_ABSENT, NEEDLE_ABSENT_LEN, 0, FILTER_ROWS_CAP
+    EXPAND DB_FILTER_BLOB_EQ_HANDLE invalid_column_status, invalid_column_written, invalid_column_total, filter_rows, FILTER_ROWS_CAP, read_handle, 0, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, 0, FILTER_ROWS_CAP
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_put_a = eq put_a_status, SA_DB_OK
+    ok_blob_a = eq blob_a_id, 1
+    ok_put_b = eq put_b_status, SA_DB_OK
+    ok_blob_b = eq blob_b_id, 2
+    ok_put_c = eq put_c_status, SA_DB_OK
+    ok_blob_c = eq blob_c_id, 3
+    ok_insert_a = eq insert_a_status, SA_DB_OK
+    ok_insert_b = eq insert_b_status, SA_DB_OK
+    ok_insert_c = eq insert_c_status, SA_DB_OK
+    ok_insert_null = eq insert_null_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_eq_status = eq eq_status, SA_DB_OK
+    ok_eq_written = eq eq_written, 2
+    ok_eq_total = eq eq_total, 2
+    ok_eq_row0 = eq eq_row0, 0
+    ok_eq_row1 = eq eq_row1, 2
+    ok_eq_page_status = eq eq_page_status, SA_DB_OK
+    ok_eq_page_written = eq eq_page_written, 1
+    ok_eq_page_total = eq eq_page_total, 2
+    ok_eq_page_row0 = eq eq_page_row0, 2
+    ok_contains_status = eq contains_status, SA_DB_OK
+    ok_contains_written = eq contains_written, 1
+    ok_contains_total = eq contains_total, 1
+    ok_contains_row0 = eq contains_row0, 1
+    ok_absent_status = eq absent_status, SA_DB_OK
+    ok_absent_written = eq absent_written, 0
+    ok_absent_total = eq absent_total, 0
+    ok_invalid_column_status = eq invalid_column_status, SA_DB_ERR_INVALID_FORMAT
+    ok_invalid_column_written = eq invalid_column_written, 0
+    ok_invalid_column_total = eq invalid_column_total, 0
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_put_a
+    ok03 = and ok02, ok_blob_a
+    ok04 = and ok03, ok_put_b
+    ok05 = and ok04, ok_blob_b
+    ok06 = and ok05, ok_put_c
+    ok07 = and ok06, ok_blob_c
+    ok08 = and ok07, ok_insert_a
+    ok09 = and ok08, ok_insert_b
+    ok10 = and ok09, ok_insert_c
+    ok11 = and ok10, ok_insert_null
+    ok12 = and ok11, ok_open
+    ok13 = and ok12, ok_eq_status
+    ok14 = and ok13, ok_eq_written
+    ok15 = and ok14, ok_eq_total
+    ok16 = and ok15, ok_eq_row0
+    ok17 = and ok16, ok_eq_row1
+    ok18 = and ok17, ok_eq_page_status
+    ok19 = and ok18, ok_eq_page_written
+    ok20 = and ok19, ok_eq_page_total
+    ok21 = and ok20, ok_eq_page_row0
+    ok22 = and ok21, ok_contains_status
+    ok23 = and ok22, ok_contains_written
+    ok24 = and ok23, ok_contains_total
+    ok25 = and ok24, ok_contains_row0
+    ok26 = and ok25, ok_absent_status
+    ok27 = and ok26, ok_absent_written
+    ok28 = and ok27, ok_absent_total
+    ok29 = and ok28, ok_invalid_column_status
+    ok30 = and ok29, ok_invalid_column_written
+    ok31 = and ok30, ok_invalid_column_total
+    ok = and ok31, ok_close
+
+    !remove_status
+    !init_status
+    !put_a_status
+    !blob_a_id
+    !put_b_status
+    !blob_b_id
+    !put_c_status
+    !blob_c_id
+    !insert_a_status
+    !insert_b_status
+    !insert_c_status
+    !insert_null_status
+    !open_status
+    !read_handle
+    !eq_status
+    !eq_written
+    !eq_total
+    !eq_row0
+    !eq_row1
+    !eq_page_status
+    !eq_page_written
+    !eq_page_total
+    !eq_page_row0
+    !contains_status
+    !contains_written
+    !contains_total
+    !contains_row0
+    !absent_status
+    !absent_written
+    !absent_total
+    !invalid_column_status
+    !invalid_column_written
+    !invalid_column_total
+    !close_status
+    !ok_remove
+    !ok_init
+    !ok_put_a
+    !ok_blob_a
+    !ok_put_b
+    !ok_blob_b
+    !ok_put_c
+    !ok_blob_c
+    !ok_insert_a
+    !ok_insert_b
+    !ok_insert_c
+    !ok_insert_null
+    !ok_open
+    !ok_eq_status
+    !ok_eq_written
+    !ok_eq_total
+    !ok_eq_row0
+    !ok_eq_row1
+    !ok_eq_page_status
+    !ok_eq_page_written
+    !ok_eq_page_total
+    !ok_eq_page_row0
+    !ok_contains_status
+    !ok_contains_written
+    !ok_contains_total
+    !ok_contains_row0
+    !ok_absent_status
+    !ok_absent_written
+    !ok_absent_total
+    !ok_invalid_column_status
+    !ok_invalid_column_written
+    !ok_invalid_column_total
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !row
+    !filter_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9012)
