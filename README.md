@@ -673,18 +673,30 @@ Latest 5-run median results:
 | concurrent 4x25 SUM with read handles | 48.385 ms | 120.165 ms | db plugin |
 | concurrent insert, 4x12,500 rows | 55.618 ms | 90.713 ms | db plugin |
 
-Current ERP workflow benchmark coverage now has db and SQLite programs, but only
-single verification runs are recorded so far. Use 5-run medians before treating
-the ERP numbers as stable performance claims.
+ERP workflow 5-run median results:
+
+| Operation | db plugin | SQLite | Fastest |
+| --- | ---: | ---: | --- |
+| init 6 ERP tables | 179.537 ms | 1.329 ms | SQLite |
+| ingest ERP rows | 142.905 ms | 97.366 ms | SQLite |
+| build ERP indexes | 221.795 ms | 26.309 ms | SQLite |
+| order lines by order id | 0.023 ms | 0.049 ms | db plugin |
+| project order line columns | 0.005 ms | 0.033 ms | db plugin |
+| orders by customer id | 0.006 ms | 0.023 ms | db plugin |
+| due invoice range | 0.010 ms | 0.238 ms | db plugin |
+| inventory moves by product id | 0.010 ms | 0.033 ms | db plugin |
+| verify/integrity | 163.732 ms | 45.411 ms | SQLite |
 
 Summary:
 
 - Reused read-handle queries are faster than SQLite in this benchmark.
 - Concurrent read-handle SUM is about 2.5x faster than the SQLite comparison.
 - Concurrent insert is about 1.6x faster than the SQLite comparison.
+- ERP indexed list/projection queries favor the db plugin in the current
+  workflow, especially due-invoice range scans and projected order lines.
 - Single SUM queries can still favor SQLite when db handle open/snapshot cost is
   included.
-- SQLite remains stronger for SQL, indexes, ACID, WAL, crash recovery,
+- SQLite remains stronger for SQL, index creation, ACID, WAL, crash recovery,
   compact/vacuum, and integrity checks.
 
 Detailed results: `benchmark_test/RESULTS.md`.
