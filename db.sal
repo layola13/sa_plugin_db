@@ -295,6 +295,10 @@
     %out_status = call @sa_db_create_blob_eq_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, &%store_name, %store_name_len, %unique, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_CREATE_BLOB_TOKEN_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %store_name, %store_name_len, %out_info
+    %out_status = call @sa_db_create_blob_token_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, &%store_name, %store_name_len, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_DICT_INTERN %out_status, %out_id, %out_inserted, %root, %root_len, %table_name, %table_name_len, %dict_name, %dict_name_len, %value, %value_len, %out_info
     __db_dict_id_slot_%out_id = stack_alloc 8
     __db_dict_inserted_slot_%out_inserted = stack_alloc 8
@@ -857,6 +861,14 @@
     %out_status = call @sa_db_filter_blob_contains_handle(%handle, %column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_blob_contains_written_slot_%out_written, &__db_handle_filter_blob_contains_total_slot_%out_total)
     %out_written = load __db_handle_filter_blob_contains_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_filter_blob_contains_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_BLOB_TOKEN_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
+    __db_handle_filter_blob_token_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_blob_token_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_blob_token_handle(%handle, %column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_blob_token_written_slot_%out_written, &__db_handle_filter_blob_token_total_slot_%out_total)
+    %out_written = load __db_handle_filter_blob_token_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_blob_token_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_GET_U64_HANDLE %out_status, %out_value, %handle, %column_index, %row_index

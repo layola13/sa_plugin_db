@@ -1009,6 +1009,29 @@ pub export fn sa_db_create_blob_eq_index(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_create_blob_token_index(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createBlobTokenIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_dict_intern(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -1618,6 +1641,39 @@ pub export fn sa_db_filter_blob_contains_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotFilterBlobContainsRows(gpa.allocator(), snapshot, @intCast(column_index), store_name, value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_blob_token_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterBlobTokenRows(gpa.allocator(), snapshot, @intCast(column_index), store_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
@@ -3287,6 +3343,67 @@ test "db SA ABI commits and rolls back transaction blob handles" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
     try std.testing.expectEqual(@as(u64, 1), info.row_count);
     try std.testing.expectEqual(@as(u64, 3), info.epoch);
+}
+
+test "db SA ABI creates and queries blob token indexes" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "token_abi";
+    const store_name = "notes";
+    const value_a = "Blue Widget SKU-001";
+    const value_b = "red widget sku_002";
+    const value_c = "invoice paid customer";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "token_abi.sadb-schema".ptr, "token_abi.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var blob_a_id: u64 = 0;
+    var blob_b_id: u64 = 0;
+    var blob_c_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, value_a.ptr, value_a.len, &blob_a_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, value_b.ptr, value_b.len, &blob_b_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, value_c.ptr, value_c.len, &blob_c_id, &info));
+
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 100, .little);
+    std.mem.writeInt(u64, row[8..16], blob_a_id, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+    std.mem.writeInt(u64, row[0..8], 101, .little);
+    std.mem.writeInt(u64, row[8..16], blob_b_id, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+    std.mem.writeInt(u64, row[0..8], 102, .little);
+    std.mem.writeInt(u64, row[8..16], blob_c_id, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_blob_token_index(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, &info));
+    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &read_handle));
+    var rows = [_]u64{ 99, 99, 99 };
+    var written: u64 = 0;
+    var total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_blob_token_handle(read_handle, 1, store_name.ptr, store_name.len, "WIDGET".ptr, "WIDGET".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), rows[1]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_blob_token_handle(read_handle, 1, store_name.ptr, store_name.len, "paid".ptr, "paid".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 1), total);
+    try std.testing.expectEqual(@as(u64, 2), rows[0]);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_filter_blob_token_handle(read_handle, 1, store_name.ptr, store_name.len, "two words".ptr, "two words".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
 }
 
 test "db SA ABI creates ingests updates and scans raw columns" {
