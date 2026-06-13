@@ -5596,6 +5596,141 @@ test "table recover rebuilds manifest from highest valid versioned meta" {
     try std.testing.expectEqual(@as(u64, 300), try snapshotSumU64(snapshot, 1));
 }
 
+test "table recover skips corrupt highest segment artifact" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "recover_bad_segment";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_TOTAL_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "recover_bad_segment.sadb-schema", schema_source);
+
+    var ids1 = [_]u64{1};
+    var totals1 = [_]u64{100};
+    const first_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids1[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals1[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, 1, &first_columns);
+
+    var ids2 = [_]u64{2};
+    var totals2 = [_]u64{200};
+    const second_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids2[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals2[0..]) },
+    };
+    const second = try ingestRawColumns(std.testing.allocator, ".", table_name, 1, &second_columns);
+    try std.testing.expectEqual(@as(u64, 2), second.row_count);
+    try std.testing.expectEqual(@as(u64, 2), second.epoch);
+
+    var latest = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer latest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), latest.segments.len);
+    const corrupt_path = try activePath(std.testing.allocator, ".", latest.segments[1].files[0].path);
+    defer std.testing.allocator.free(corrupt_path);
+    try writeFile(std.testing.allocator, corrupt_path, "corrupt");
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 1), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.epoch);
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 1), verified.row_count);
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 100), try snapshotSumU64(snapshot, 1));
+}
+
+test "table recover skips corrupt highest index artifact" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "recover_bad_index";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_TOTAL_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "recover_bad_index.sadb-schema", schema_source);
+
+    var ids = [_]u64{ 1, 2 };
+    var totals = [_]u64{ 100, 200 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    const indexed = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+    try std.testing.expectEqual(@as(u64, 2), indexed.epoch);
+
+    var latest = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer latest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), latest.indexes.len);
+    const corrupt_path = try activePath(std.testing.allocator, ".", latest.indexes[0].path);
+    defer std.testing.allocator.free(corrupt_path);
+    try writeFile(std.testing.allocator, corrupt_path, "corrupt");
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.epoch);
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.indexes.len);
+    try std.testing.expectEqual(@as(u64, 300), try snapshotSumU64(snapshot, 1));
+}
+
+test "table recover skips corrupt highest dictionary artifact" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "recover_bad_dict";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "recover_bad_dict.sadb-schema", schema_source);
+    _ = try internStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    const paused = try internStringDict(std.testing.allocator, ".", table_name, "status", "paused");
+    try std.testing.expectEqual(@as(u64, 2), paused.info.epoch);
+
+    var latest = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer latest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), latest.dicts.len);
+    const corrupt_path = try activePath(std.testing.allocator, ".", latest.dicts[0].path);
+    defer std.testing.allocator.free(corrupt_path);
+    try writeFile(std.testing.allocator, corrupt_path, "corrupt");
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+
+    const recovered = try recoverTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 0), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.epoch);
+    const active = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    try std.testing.expect(active.found);
+    try std.testing.expectEqual(@as(u64, 1), active.id);
+    const missing_paused = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "paused");
+    try std.testing.expect(!missing_paused.found);
+}
+
 test "table recover completes committed transaction marker when manifest is stale" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();

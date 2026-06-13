@@ -142,7 +142,7 @@ Schema 文件采用类似 C 语言宏定义的指令集（`#def`）：
 
 `sa_db_dict_intern` / `DB_DICT_INTERN` 是 ERP 字符串数据模型的第一层：字典适合状态、分类、仓库、支付方式、单据类型等重复值集合，不是通用 varchar/blob 存储。字典本身是表 artifact，会随 snapshot、restore、verify、recover、lock、unlock 和 remove 一起维护一致性。
 
-这仍不是完整的 SQLite 级 ACID/WAL，也还没有多表事务。面向中小型 ERP 的下一阶段需要继续补齐故障注入测试、可选 WAL、更多主键/二级索引形态、nullable/decimal/date helper，以及 SA 编写的 ERP 场景 benchmark。当前 primitive 类型元数据、`u64` 唯一索引、`i64` signed 范围/点查/比较读取、`u64_pair` 组合键点查与分页、低基数字符串字典、范围分页、批量投影读取、固定宽度行 insert/upsert、带恢复 marker 的单表批量事务、列段/索引/字典 block checksum、按 row-index 或唯一 key get、按唯一 key delete、单表跨进程写锁已经可作为主键语义、类型感知行编码和列表页读取的第一步。
+这仍不是完整的 SQLite 级 ACID/WAL，也还没有多表事务。面向中小型 ERP 的下一阶段需要继续扩大故障注入矩阵、补齐可选 WAL、更多主键/二级索引形态、nullable/decimal/date helper，以及 SA 编写的 ERP 场景 benchmark。当前 primitive 类型元数据、`u64` 唯一索引、`i64` signed 范围/点查/比较读取、`u64_pair` 组合键点查与分页、低基数字符串字典、范围分页、批量投影读取、固定宽度行 insert/upsert、带恢复 marker 的单表批量事务、列段/索引/字典 block checksum、按 row-index 或唯一 key get、按唯一 key delete、单表跨进程写锁已经可作为主键语义、类型感知行编码和列表页读取的第一步。
 
 ---
 

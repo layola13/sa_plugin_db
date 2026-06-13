@@ -299,8 +299,8 @@ benchmarks. The required baseline is:
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
-- Remaining crash-recovery hardening such as fault-injection tests, then
-  multi-table transaction semantics, optional WAL, and async batch flush.
+- Remaining crash-recovery hardening such as a broader fault-injection matrix,
+  then multi-table transaction semantics, optional WAL, and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
   aggregation as performance work after the reliability/data-model baseline.
 
