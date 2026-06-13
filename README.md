@@ -64,6 +64,7 @@ Core native calls:
 - `sa_db_create_blob_eq_index`
 - `sa_db_create_blob_token_index`
 - `sa_db_create_blob_prefix_index`
+- `sa_db_create_blob_contains_index`
 - `sa_db_dict_intern`
 - `sa_db_dict_lookup`
 - `sa_db_dict_value_len`
@@ -199,7 +200,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_F32_INDEX`,
 `DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
 `DB_CREATE_BLOB_EQ_INDEX`, `DB_CREATE_BLOB_TOKEN_INDEX`,
-`DB_CREATE_BLOB_PREFIX_INDEX`,
+`DB_CREATE_BLOB_PREFIX_INDEX`, `DB_CREATE_BLOB_CONTAINS_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
 `DB_DICT_VALUE_COPY_HANDLE`, `DB_BLOB_PUT`, `DB_BLOB_VALUE_LEN`,
@@ -320,9 +321,13 @@ hash collisions cannot leak false matches. `sa_db_create_blob_prefix_index` /
 ASCII letters/digits/underscore token model. `sa_db_filter_blob_prefix_handle` /
 `DB_FILTER_BLOB_PREFIX_HANDLE` is case-insensitive, matches prefixes at token
 starts rather than arbitrary substrings, accepts prefixes up to 64 bytes, and
-confirms hash candidates against the snapshot blob bytes. Contains filtering
-remains a substring scan until it gets a dedicated index shape. Blob filters
-return row indices with the same
+confirms hash candidates against the snapshot blob bytes. `sa_db_create_blob_contains_index`
+/ `DB_CREATE_BLOB_CONTAINS_INDEX` builds a persisted byte-level trigram candidate
+index for substring contains filters. `sa_db_filter_blob_contains_handle` /
+`DB_FILTER_BLOB_CONTAINS_HANDLE` uses it automatically for needles of at least 3
+bytes, picks the most selective trigram candidate from the query, then confirms
+the full substring against snapshot blob bytes; empty and 1-2 byte needles keep
+the scan path to preserve exact contains semantics. Blob filters return row indices with the same
 `offset`/`limit`/`total` contract as other list
 queries, and let ERP screens filter notes, addresses, descriptions, or external
 payload keys before projecting rows.
@@ -500,8 +505,9 @@ case-insensitive ASCII token search over notes, addresses, item names, SKUs, and
 external document labels. `DB_CREATE_BLOB_PREFIX_INDEX` adds the adjacent
 case-insensitive token-prefix search shape for typeahead-like ERP filters such as
 SKU prefixes, customer labels, and external document prefixes.
-`DB_FILTER_BLOB_CONTAINS_HANDLE` remains a substring scan until a dedicated
-substring index is added.
+`DB_CREATE_BLOB_CONTAINS_INDEX` adds byte-level substring candidate indexing for
+descriptions, notes, and external references that do not fit token or prefix
+search; contains queries still confirm full bytes after index lookup.
 
 The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 `DB_DECIMAL_TO_PARTS`, `DB_DATE_FROM_YMD`, `DB_DATE_TO_YMD`,
@@ -536,15 +542,15 @@ benchmarks. The required baseline is:
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
   wrappers are available. `blob_handle` stores now cover variable-width text and
   bytes, with read-handle exact/contains/token/prefix filters; persisted exact,
-  token, and prefix indexes cover high-frequency equality and text predicates,
-  while substring contains search still needs its own index shape.
+  token, prefix, and trigram contains indexes cover high-frequency equality and
+  text predicates.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
-  batch reads now cover the first ERP list-page shape, and indexed blob exact and
-  token and prefix filters cover common high-frequency text equality/search
-  shapes; next is substring contains indexing and ERP benchmark coverage beyond
-  raw fixed-width bytes.
+  batch reads now cover the first ERP list-page shape, and indexed blob exact,
+  token, prefix, and contains filters cover common high-frequency text
+  equality/search shapes; next is ERP benchmark coverage beyond raw fixed-width
+  bytes and broader index planning.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
@@ -594,6 +600,9 @@ sa build-exe db_blob_token_smoke.sa -o db_blob_token_smoke.out --no-incremental
 
 sa build-exe db_blob_prefix_smoke.sa -o db_blob_prefix_smoke.out --no-incremental
 ./db_blob_prefix_smoke.out
+
+sa build-exe db_blob_contains_smoke.sa -o db_blob_contains_smoke.out --no-incremental
+./db_blob_contains_smoke.out
 
 sa build-exe db_member_bench.sa -o db_member_bench.out --no-incremental
 ./db_member_bench.out
