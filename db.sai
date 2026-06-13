@@ -37,6 +37,7 @@
 @extern sa_db_create_f32_index(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, unique: u32, &out_info: ptr) -> u32
 @extern sa_db_create_f64_index(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, unique: u32, &out_info: ptr) -> u32
 @extern sa_db_create_u64_pair_index(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, unique: u32, &out_info: ptr) -> u32
+@extern sa_db_create_blob_eq_index(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, &store_name: ptr, store_name_len: u64, unique: u32, &out_info: ptr) -> u32
 @extern sa_db_dict_intern(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &dict_name: ptr, dict_name_len: u64, &value: ptr, value_len: u64, &out_id: ptr, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_dict_lookup(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &dict_name: ptr, dict_name_len: u64, &value: ptr, value_len: u64, &out_found: ptr, &out_id: ptr) -> u32
 @extern sa_db_dict_value_len(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &dict_name: ptr, dict_name_len: u64, id: u64, &out_found: ptr, &out_len: ptr) -> u32

@@ -962,6 +962,30 @@ pub export fn sa_db_create_u64_pair_index(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_create_blob_eq_index(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    unique: u32,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createBlobEqIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name, unique != 0) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_dict_intern(
     root_ptr: ?[*]const u8,
     root_len: u64,

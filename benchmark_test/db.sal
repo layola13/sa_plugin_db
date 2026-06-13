@@ -285,6 +285,10 @@
     %out_status = call @sa_db_create_u64_pair_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %column_index2, %unique, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_CREATE_BLOB_EQ_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %store_name, %store_name_len, %unique, %out_info
+    %out_status = call @sa_db_create_blob_eq_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, &%store_name, %store_name_len, %unique, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_DICT_INTERN %out_status, %out_id, %out_inserted, %root, %root_len, %table_name, %table_name_len, %dict_name, %dict_name_len, %value, %value_len, %out_info
     __db_dict_id_slot_%out_id = stack_alloc 8
     __db_dict_inserted_slot_%out_inserted = stack_alloc 8

@@ -61,6 +61,7 @@ pub const IndexMeta = struct {
     kind: []const u8,
     column_index: u64,
     column_index2: ?u64 = null,
+    store_name: ?[]const u8 = null,
     unique: bool,
     path: []const u8,
     sha256: []const u8,
@@ -247,6 +248,7 @@ pub const ReadIndexSnapshot = struct {
     kind: []const u8,
     column_index: u64,
     column_index2: ?u64 = null,
+    store_name: ?[]const u8 = null,
     unique: bool,
     entries: []const u8,
 };
@@ -501,6 +503,10 @@ fn indexFileName(allocator: std.mem.Allocator, table_name: []const u8, kind: []c
 
 fn pairIndexFileName(allocator: std.mem.Allocator, table_name: []const u8, kind: []const u8, column_index: u64, column_index2: u64, epoch: u64) TableError![]u8 {
     return allocPrintPath(allocator, "{s}.idx.{s}.{d}.{d}.{d}.dat", .{ table_name, kind, column_index, column_index2, epoch });
+}
+
+fn blobEqIndexFileName(allocator: std.mem.Allocator, table_name: []const u8, column_index: u64, store_name: []const u8, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.idx.{s}.{d}.{s}.{d}.dat", .{ table_name, BLOB_EQ_INDEX_KIND, column_index, store_name, epoch });
 }
 
 fn dictFileName(allocator: std.mem.Allocator, table_name: []const u8, dict_name: []const u8, epoch: u64) TableError![]u8 {
@@ -1044,6 +1050,7 @@ fn emptyIndexMeta() IndexMeta {
         .kind = &.{},
         .column_index = 0,
         .column_index2 = null,
+        .store_name = null,
         .unique = false,
         .path = &.{},
         .sha256 = &.{},
@@ -1058,6 +1065,7 @@ fn initIndexMetas(indexes: []IndexMeta) void {
 fn freeIndexMeta(allocator: std.mem.Allocator, index: IndexMeta) void {
     allocator.free(index.name);
     allocator.free(index.kind);
+    if (index.store_name) |store_name| allocator.free(store_name);
     allocator.free(index.path);
     allocator.free(index.sha256);
     freeBlockSha256List(allocator, index.block_sha256);
@@ -1073,6 +1081,8 @@ fn duplicateIndexMeta(allocator: std.mem.Allocator, index: IndexMeta) TableError
     errdefer allocator.free(name);
     const kind = try allocator.dupe(u8, index.kind);
     errdefer allocator.free(kind);
+    const store_name = if (index.store_name) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (store_name) |value| allocator.free(value);
     const path = try allocator.dupe(u8, index.path);
     errdefer allocator.free(path);
     const sha256 = try allocator.dupe(u8, index.sha256);
@@ -1084,6 +1094,7 @@ fn duplicateIndexMeta(allocator: std.mem.Allocator, index: IndexMeta) TableError
         .kind = kind,
         .column_index = index.column_index,
         .column_index2 = index.column_index2,
+        .store_name = store_name,
         .unique = index.unique,
         .path = path,
         .sha256 = sha256,
@@ -1534,6 +1545,11 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
             const column_index2 = try indexColumnIndex2(index);
             try ensureU64PairColumns(meta, column_index, column_index2);
             expected_bytes = try expectedU64PairIndexBytes(meta.row_count);
+        } else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) {
+            if (index.column_index2 != null) return TableError.VerifyFailed;
+            _ = try indexBlobStoreName(index);
+            try ensureBlobHandleColumn(meta, column_index);
+            expected_bytes = try expectedIndexBytes(meta.row_count);
         } else {
             return TableError.VerifyFailed;
         }
@@ -1549,6 +1565,8 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
         try validateIndexBlockHashes(index, bytes);
         if (std.mem.eql(u8, index.kind, "u64_pair")) {
             try validateU64PairIndexBytesShape(bytes, meta.row_count, index.unique);
+        } else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) {
+            try validateIndexBytesShape(bytes, meta.row_count, false);
         } else {
             try validateIndexBytesShape(bytes, meta.row_count, index.unique);
         }
@@ -1572,6 +1590,8 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
             try buildU32IndexBytes(allocator, root_dir, meta, column_index, index.unique)
         else if (std.mem.eql(u8, index.kind, "i32"))
             try buildI32IndexBytes(allocator, root_dir, meta, column_index, index.unique)
+        else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND))
+            try buildBlobEqIndexBytes(allocator, root_dir, meta, column_index, try indexBlobStoreName(index), index.unique)
         else
             try buildU64PairIndexBytes(allocator, root_dir, meta, column_index, try indexColumnIndex2(index), index.unique);
         defer allocator.free(expected);
@@ -3253,6 +3273,7 @@ pub fn putBlobValue(
     try putBlobStoreMeta(allocator, &meta, new_meta);
     consumed = true;
     meta.epoch = next_epoch;
+    try rebuildBlobEqIndexesForStore(allocator, root_dir, &meta, store_name);
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .id = new_count };
 }
@@ -3679,6 +3700,68 @@ pub fn createU64PairIndex(
     return tableInfo(meta);
 }
 
+pub fn createBlobEqIndex(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    store_name: []const u8,
+    unique: bool,
+) TableError!TableInfo {
+    try validateBlobStoreName(store_name);
+
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+    try ensureBlobHandleColumn(meta, column_index);
+
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null and
+            index.store_name != null and
+            std.mem.eql(u8, index.store_name.?, store_name))
+        {
+            if (index.unique == unique) return tableInfo(meta);
+            return TableError.InvalidFormat;
+        }
+    }
+
+    const old_indexes = meta.indexes;
+    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
+    initIndexMetas(new_indexes);
+    var assigned_indexes = false;
+    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
+
+    for (old_indexes, 0..) |index, idx| {
+        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
+    }
+
+    const new_index = &new_indexes[old_indexes.len];
+    new_index.* = .{
+        .name = try allocPrintPath(allocator, "blob_eq_col{d}_{s}", .{ column_index, store_name }),
+        .kind = try allocator.dupe(u8, BLOB_EQ_INDEX_KIND),
+        .column_index = @intCast(column_index),
+        .column_index2 = null,
+        .store_name = try allocator.dupe(u8, store_name),
+        .unique = unique,
+        .path = try allocator.dupe(u8, ""),
+        .sha256 = try allocator.dupe(u8, ""),
+        .bytes = 0,
+    };
+
+    freeIndexMetas(allocator, old_indexes);
+    meta.indexes = new_indexes;
+    assigned_indexes = true;
+    meta.epoch += 1;
+    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
+    try writeMeta(allocator, root_dir, table_name, meta);
+    return tableInfo(meta);
+}
+
 fn ensureU64Column(meta: TableMeta, column_index: usize) TableError!void {
     if (column_index >= meta.columns.len) return TableError.InvalidFormat;
     const column = meta.columns[column_index];
@@ -3769,10 +3852,22 @@ fn ensureU64PairColumns(meta: TableMeta, column_index: usize, column_index2: usi
     try ensureU64Column(meta, column_index2);
 }
 
+fn ensureBlobHandleColumn(meta: TableMeta, column_index: usize) TableError!void {
+    if (column_index >= meta.columns.len) return TableError.InvalidFormat;
+    const column = meta.columns[column_index];
+    if (column.stride != 8 or !std.mem.eql(u8, column.ty, "blob_handle")) return TableError.InvalidFormat;
+}
+
 fn indexColumnIndex2(index: IndexMeta) TableError!usize {
     const column_index2 = index.column_index2 orelse return TableError.InvalidFormat;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
     return @intCast(column_index2);
+}
+
+fn indexBlobStoreName(index: IndexMeta) TableError![]const u8 {
+    const store_name = index.store_name orelse return TableError.InvalidFormat;
+    try validateBlobStoreName(store_name);
+    return store_name;
 }
 
 fn readU64LE(bytes: []const u8, offset: usize) u64 {
@@ -3895,6 +3990,7 @@ fn expectedColumnBytes(segment_rows: u64, stride: u32) TableError!usize {
 
 const INDEX_RECORD_BYTES: usize = 16;
 const U64_PAIR_INDEX_RECORD_BYTES: usize = 24;
+const BLOB_EQ_INDEX_KIND = "blob_eq";
 
 const SingleIndexKind = enum {
     u8,
@@ -3920,6 +4016,18 @@ const U64PairIndexEntry = struct {
     row: u64,
 };
 
+const BlobValueRef = struct {
+    hash: u64 = 0,
+    value: []const u8 = &.{},
+    valid: bool = false,
+};
+
+const BlobEqIndexEntry = struct {
+    key: u64,
+    row: u64,
+    blob_id: u64,
+};
+
 fn indexEntryLessThan(_: void, lhs: IndexEntry, rhs: IndexEntry) bool {
     return lhs.key < rhs.key or (lhs.key == rhs.key and lhs.row < rhs.row);
 }
@@ -3928,6 +4036,47 @@ fn u64PairIndexEntryLessThan(_: void, lhs: U64PairIndexEntry, rhs: U64PairIndexE
     if (lhs.key1 != rhs.key1) return lhs.key1 < rhs.key1;
     if (lhs.key2 != rhs.key2) return lhs.key2 < rhs.key2;
     return lhs.row < rhs.row;
+}
+
+fn blobEqIndexEntryLessThan(_: void, lhs: BlobEqIndexEntry, rhs: BlobEqIndexEntry) bool {
+    return lhs.key < rhs.key or (lhs.key == rhs.key and lhs.row < rhs.row);
+}
+
+fn blobValueHash(value: []const u8) u64 {
+    const digest = hashBytes(value);
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
+
+fn buildBlobValueRefs(allocator: std.mem.Allocator, bytes: []const u8) TableError![]BlobValueRef {
+    const count = try blobEntryCount(bytes);
+    const ref_count = std.math.add(u64, count, 1) catch return TableError.CursorOverflow;
+    if (ref_count > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const refs = try allocator.alloc(BlobValueRef, @intCast(ref_count));
+    errdefer allocator.free(refs);
+    for (refs) |*item| item.* = .{};
+
+    var offset: usize = 8;
+    var id: u64 = 1;
+    while (id <= count) : (id += 1) {
+        const len_u64 = readU64LE(bytes, offset);
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        const value = bytes[offset .. offset + len];
+        refs[@intCast(id)] = .{
+            .hash = blobValueHash(value),
+            .value = value,
+            .valid = true,
+        };
+        offset += len;
+    }
+    return refs;
+}
+
+fn blobRefForId(refs: []const BlobValueRef, id: u64) ?BlobValueRef {
+    if (id > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const idx: usize = @intCast(id);
+    if (idx >= refs.len or !refs[idx].valid) return null;
+    return refs[idx];
 }
 
 fn readIndexKey(bytes: []const u8, entry_index: usize) u64 {
@@ -4352,11 +4501,87 @@ fn buildU64PairIndexBytes(
     return out;
 }
 
+fn buildBlobEqIndexBytes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    store_name: []const u8,
+    unique: bool,
+) TableError![]u8 {
+    try ensureBlobHandleColumn(meta, column_index);
+    try validateBlobStoreName(store_name);
+    if (meta.row_count > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+
+    var blob_bytes: []u8 = &.{};
+    var blob_refs: []BlobValueRef = &.{};
+    var has_blob_bytes = false;
+    var has_blob_refs = false;
+    if (findBlobStoreMetaIndex(meta, store_name)) |blob_idx| {
+        blob_bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[blob_idx]);
+        has_blob_bytes = true;
+        errdefer if (!has_blob_refs) allocator.free(blob_bytes);
+        blob_refs = try buildBlobValueRefs(allocator, blob_bytes);
+        has_blob_refs = true;
+    }
+    defer if (has_blob_refs) allocator.free(blob_refs);
+    defer if (has_blob_bytes) allocator.free(blob_bytes);
+
+    const entries = try allocator.alloc(BlobEqIndexEntry, @intCast(meta.row_count));
+    defer allocator.free(entries);
+
+    var row_base: u64 = 0;
+    var entry_idx: usize = 0;
+    for (meta.segments) |segment| {
+        const file_meta = segment.files[column_index];
+        const path = try activePath(allocator, root_dir, file_meta.path);
+        defer allocator.free(path);
+        const bytes = try readFileAlloc(allocator, path, 1 << 30);
+        defer allocator.free(bytes);
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            const blob_id = readU64LE(bytes, byte_offset);
+            const key = if (blobRefForId(blob_refs, blob_id)) |value_ref| value_ref.hash else 0;
+            entries[entry_idx] = .{ .key = key, .row = row_base + i, .blob_id = blob_id };
+            entry_idx += 1;
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    if (entry_idx != entries.len or row_base != meta.row_count) return TableError.VerifyFailed;
+
+    std.sort.block(BlobEqIndexEntry, entries, {}, blobEqIndexEntryLessThan);
+    if (unique and entries.len > 1) {
+        var group_start: usize = 0;
+        while (group_start < entries.len) {
+            var group_end = group_start + 1;
+            while (group_end < entries.len and entries[group_end].key == entries[group_start].key) : (group_end += 1) {}
+            var i = group_start;
+            while (i < group_end) : (i += 1) {
+                const value = blobRefForId(blob_refs, entries[i].blob_id) orelse continue;
+                var j = group_start;
+                while (j < i) : (j += 1) {
+                    const previous_value = blobRefForId(blob_refs, entries[j].blob_id) orelse continue;
+                    if (std.mem.eql(u8, value.value, previous_value.value)) return TableError.ConstraintViolation;
+                }
+            }
+            group_start = group_end;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedIndexBytes(meta.row_count));
+    for (entries, 0..) |entry, idx| writeIndexEntry(out, idx, .{ .key = entry.key, .row = entry.row });
+    return out;
+}
+
 fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, index_idx: usize) TableError!void {
     const index = &meta.indexes[index_idx];
     if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
     const column_index: usize = @intCast(index.column_index);
     const column_index2: ?usize = if (std.mem.eql(u8, index.kind, "u64_pair")) try indexColumnIndex2(index.*) else null;
+    const store_name = if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) try indexBlobStoreName(index.*) else null;
     const bytes = if (std.mem.eql(u8, index.kind, "u64"))
         try buildU64IndexBytes(allocator, root_dir, meta.*, column_index, index.unique)
     else if (std.mem.eql(u8, index.kind, "i64"))
@@ -4379,10 +4604,14 @@ fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *Tab
         try buildI32IndexBytes(allocator, root_dir, meta.*, column_index, index.unique)
     else if (std.mem.eql(u8, index.kind, "u64_pair"))
         try buildU64PairIndexBytes(allocator, root_dir, meta.*, column_index, column_index2.?, index.unique)
+    else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND))
+        try buildBlobEqIndexBytes(allocator, root_dir, meta.*, column_index, store_name.?, index.unique)
     else
         return TableError.InvalidFormat;
     defer allocator.free(bytes);
-    const basename = if (column_index2) |c2|
+    const basename = if (store_name) |name|
+        try blobEqIndexFileName(allocator, meta.table_name, index.column_index, name, meta.epoch)
+    else if (column_index2) |c2|
         try pairIndexFileName(allocator, meta.table_name, index.kind, index.column_index, @intCast(c2), meta.epoch)
     else
         try indexFileName(allocator, meta.table_name, index.kind, index.column_index, meta.epoch);
@@ -4408,6 +4637,18 @@ fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *Tab
 
 pub fn rebuildIndexes(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta) TableError!void {
     for (0..meta.indexes.len) |idx| try rebuildIndexAt(allocator, root_dir, meta, idx);
+}
+
+fn rebuildBlobEqIndexesForStore(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, store_name: []const u8) TableError!void {
+    for (0..meta.indexes.len) |idx| {
+        const index = meta.indexes[idx];
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.store_name != null and
+            std.mem.eql(u8, index.store_name.?, store_name))
+        {
+            try rebuildIndexAt(allocator, root_dir, meta, idx);
+        }
+    }
 }
 
 pub fn openReadSnapshot(
@@ -4516,6 +4757,12 @@ pub fn openReadSnapshot(
             try ensureSnapshotU64Column(snapshot, column_index);
             try ensureSnapshotU64Column(snapshot, column_index2);
             expected_bytes = try expectedU64PairIndexBytes(parsed.value.row_count);
+        } else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) {
+            if (index.column_index2 != null) return TableError.InvalidFormat;
+            const store_name = index.store_name orelse return TableError.InvalidFormat;
+            try validateBlobStoreName(store_name);
+            try ensureSnapshotBlobHandleColumn(snapshot, column_index);
+            expected_bytes = try expectedIndexBytes(parsed.value.row_count);
         } else {
             return TableError.InvalidFormat;
         }
@@ -4530,6 +4777,8 @@ pub fn openReadSnapshot(
         try validateIndexBlockHashes(index, bytes);
         if (std.mem.eql(u8, index.kind, "u64_pair")) {
             try validateU64PairIndexBytesShape(bytes, parsed.value.row_count, index.unique);
+        } else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) {
+            try validateIndexBytesShape(bytes, parsed.value.row_count, false);
         } else {
             try validateIndexBytesShape(bytes, parsed.value.row_count, index.unique);
         }
@@ -4537,6 +4786,7 @@ pub fn openReadSnapshot(
             .kind = try arena_allocator.dupe(u8, index.kind),
             .column_index = index.column_index,
             .column_index2 = index.column_index2,
+            .store_name = if (index.store_name) |store_name| try arena_allocator.dupe(u8, store_name) else null,
             .unique = index.unique,
             .entries = bytes,
         };
@@ -4742,6 +4992,62 @@ fn buildBlobMatchBitmap(allocator: std.mem.Allocator, bytes: []const u8, needle:
     return matches;
 }
 
+fn snapshotBlobHandleAtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
+    if (row_index >= snapshot.row_count) return TableError.VerifyFailed;
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const local_row = row_index - row_base;
+            const bytes = segment.columns[column_index].bytes;
+            const expected_len = try expectedColumnBytes(segment.rows, 8);
+            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            const byte_offset_u64 = std.math.mul(u64, local_row, 8) catch return TableError.CursorOverflow;
+            if (byte_offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+            const byte_offset: usize = @intCast(byte_offset_u64);
+            return readU64LE(bytes, byte_offset);
+        }
+        row_base = segment_end;
+    }
+    return TableError.VerifyFailed;
+}
+
+fn snapshotFilterBlobEqRowsIndexed(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    index: ReadIndexSnapshot,
+    column_index: usize,
+    blob_bytes: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    const refs = try buildBlobValueRefs(allocator, blob_bytes);
+    defer allocator.free(refs);
+
+    const key = blobValueHash(needle);
+    const start = lowerBoundU64Index(index, key);
+    const end = upperBoundU64Index(index, key);
+    var total: u64 = 0;
+    var written: u64 = 0;
+    const out_capacity: u64 = @intCast(out_rows.len);
+    var i = start;
+    while (i < end) : (i += 1) {
+        const row = readIndexRow(index.entries, i);
+        if (row >= snapshot.row_count) return TableError.VerifyFailed;
+        const blob_id = try snapshotBlobHandleAtRow(snapshot, column_index, row);
+        const value_ref = blobRefForId(refs, blob_id) orelse continue;
+        if (!std.mem.eql(u8, value_ref.value, needle)) continue;
+        if (total >= offset and limit != 0 and written < limit and written < out_capacity) {
+            out_rows[@intCast(written)] = row;
+            written += 1;
+        }
+        total = std.math.add(u64, total, 1) catch return TableError.CursorOverflow;
+    }
+    return .{ .written = written, .total = total };
+}
+
 fn snapshotFilterBlobRowsMode(
     allocator: std.mem.Allocator,
     snapshot: *const ReadSnapshot,
@@ -4757,6 +5063,11 @@ fn snapshotFilterBlobRowsMode(
     try validateBlobStoreName(store_name);
     try validateBlobValue(needle);
     const blob_idx = snapshotFindBlobStoreIndex(snapshot, store_name) orelse return .{ .written = 0, .total = 0 };
+    if (mode == .eq) {
+        if (snapshotIndexForBlobEqColumnStore(snapshot, column_index, store_name)) |index| {
+            return snapshotFilterBlobEqRowsIndexed(allocator, snapshot, index, column_index, snapshot.blobs[blob_idx].bytes, needle, offset, limit, out_rows);
+        }
+    }
     const matches = try buildBlobMatchBitmap(allocator, snapshot.blobs[blob_idx].bytes, needle, mode);
     defer allocator.free(matches);
 
@@ -4994,6 +5305,20 @@ fn snapshotIndexForU64PairColumns(snapshot: *const ReadSnapshot, column_index: u
             index.column_index == @as(u64, @intCast(column_index)) and
             index.column_index2 != null and
             index.column_index2.? == @as(u64, @intCast(column_index2)))
+        {
+            return index;
+        }
+    }
+    return null;
+}
+
+fn snapshotIndexForBlobEqColumnStore(snapshot: *const ReadSnapshot, column_index: usize, store_name: []const u8) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null and
+            index.store_name != null and
+            std.mem.eql(u8, index.store_name.?, store_name))
         {
             return index;
         }
@@ -7930,6 +8255,11 @@ test "table blob handle filters exact and contains values" {
         _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
     }
 
+    try std.testing.expectError(TableError.ConstraintViolation, createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "notes", true));
+    const indexed = try createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "notes", false);
+    try std.testing.expectEqual(@as(u64, 6), indexed.row_count);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+
     const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
     defer snapshot.destroy();
 
@@ -7960,6 +8290,42 @@ test "table blob handle filters exact and contains values" {
     try std.testing.expectEqual(@as(u64, 0), missing_store.written);
 
     try std.testing.expectError(TableError.InvalidFormat, snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 0, "notes", "first note", 0, 8, &rows));
+}
+
+test "table blob exact index is rebuilt when blob values are appended" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "blob_index_late_values";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_index_late_values.sadb-schema",
+        \\#def MAX_ROWS = 4
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    var row_bytes: [16]u8 = undefined;
+    writeU64LE(&row_bytes, 0, 200);
+    writeU64LE(&row_bytes, 8, 1);
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+    _ = try createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "notes", false);
+
+    const late = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "late note");
+    try std.testing.expectEqual(@as(u64, 1), late.id);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+
+    var rows: [2]u64 = undefined;
+    const exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "late note", 0, 2, &rows);
+    try std.testing.expectEqual(@as(u64, 1), exact.total);
+    try std.testing.expectEqual(@as(u64, 1), exact.written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
 }
 
 test "table persistent u64 pair index supports ERP composite lookups" {

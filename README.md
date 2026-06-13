@@ -60,6 +60,7 @@ Core native calls:
 - `sa_db_create_f32_index`
 - `sa_db_create_f64_index`
 - `sa_db_create_u64_pair_index`
+- `sa_db_create_blob_eq_index`
 - `sa_db_dict_intern`
 - `sa_db_dict_lookup`
 - `sa_db_dict_value_len`
@@ -190,6 +191,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
 `DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_F32_INDEX`,
 `DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
+`DB_CREATE_BLOB_EQ_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
 `DB_DICT_VALUE_COPY_HANDLE`, `DB_BLOB_PUT`, `DB_BLOB_VALUE_LEN`,
@@ -228,7 +230,10 @@ Read queries now use snapshots:
    `u64_pair -> row` index supports ERP composite keys such as
    `(order_id, line_no)`, `(product_id, warehouse_id)`, or
    `(customer_id, date_code)` with point lookup and fixed-first-key range
-   pagination over the second key. Logical `bool` columns expose count, first
+   pagination over the second key. A persisted `blob_eq -> row` index accelerates
+   exact filters over `blob_handle` columns for high-frequency text/blob equality
+   predicates while keeping collision checks against the snapshot blob bytes.
+   Logical `bool` columns expose count, first
    match, row-list filtering, and get helpers over `u8`/`i1` or `u64` `0/1`
    encodings. `project_rows_handle` copies only selected columns for a batch of
    row indices. `get_row_handle` copies a full fixed-width row by snapshot row
@@ -287,7 +292,13 @@ for varchar/blob data rather than low-cardinality deduplication. Use
 new blob writes are not visible to an already-open read handle. Read handles also
 provide first-pass text/blob filtering through `sa_db_filter_blob_eq_handle` /
 `DB_FILTER_BLOB_EQ_HANDLE` and `sa_db_filter_blob_contains_handle` /
-`DB_FILTER_BLOB_CONTAINS_HANDLE`. These scan the snapshot `blob_handle` column,
+`DB_FILTER_BLOB_CONTAINS_HANDLE`. `sa_db_create_blob_eq_index` /
+`DB_CREATE_BLOB_EQ_INDEX` builds a persisted exact-match secondary index for one
+`blob_handle` column and one named store; `DB_FILTER_BLOB_EQ_HANDLE` uses it
+automatically when present, then confirms candidate rows against the immutable
+blob bytes so hash collisions cannot leak false matches. Without the index, exact
+filtering falls back to the previous snapshot scan. Contains filtering is still a
+scan and should later get a separate prefix/token/inverted index. Both filters
 return row indices with the same `offset`/`limit`/`total` contract as other list
 queries, and let ERP screens filter notes, addresses, descriptions, or external
 payload keys before projecting rows.
@@ -367,9 +378,9 @@ same active-manifest protocol as the public table APIs. Segment metadata records
 whole-file SHA-256, byte counts, and 64KB block-level SHA-256 lists for newly
 written column segment files. Older metadata without block hashes remains
 readable, but new segment writes include block hashes and verification checks
-them. Single-column integer/float index files, U64-pair index files, string
-dictionary files, and blob store files are also versioned, hashed, block-hashed,
-snapshotted, restored, and verified. Indexes are
+them. Single-column integer/float index files, U64-pair index files, blob exact
+index files, string dictionary files, and blob store files are also versioned,
+hashed, block-hashed, snapshotted, restored, and verified. Indexes are
 rebuilt on ingest/update/compact/qmod writes. Verification checks schema hash,
 segment hash, segment block hashes, index hash, index block hashes, index
 shape/order, dictionary hash, dictionary block hashes, dictionary entry count,
@@ -397,6 +408,12 @@ to a two-column tuple. This is the first ERP secondary-index shape: order lines
 can enforce `(order_id, line_no)`, inventory balances can enforce
 `(product_id, warehouse_id)`, and list pages can scan all rows for a fixed first
 key over a second-key range without falling back to a full table scan.
+
+`sa_db_create_blob_eq_index(..., unique=1)` applies the uniqueness model to the
+real bytes referenced by one `blob_handle` column in one named store. It rejects
+duplicate existing text/blob values, rebuilds on row writes and relevant
+`blob_put` calls, and keeps the active manifest on the previous epoch if the
+constraint would be violated.
 
 For ERP-style writes, `sa_db_insert_row` / `DB_INSERT_ROW` now accepts one
 fixed-width row laid out exactly as the active schema's column strides. The
@@ -447,9 +464,12 @@ while the named blob store owns the bytes. The blob artifact is part of the tabl
 lifecycle: snapshot, restore, verify, recover, lock, unlock, and remove all carry
 it with whole-file and block-level hashes. This keeps ordinary row/index queries
 fixed-width while allowing notes, descriptions, addresses, and external payload
-keys to live outside the column row buffer. `DB_FILTER_BLOB_EQ_HANDLE` and
-`DB_FILTER_BLOB_CONTAINS_HANDLE` provide the first non-indexed list filter over
-those values on an immutable read handle.
+keys to live outside the column row buffer. `DB_CREATE_BLOB_EQ_INDEX` adds a
+persisted exact index over those handles for high-frequency filters such as SKU,
+external document key, address code, or normalized short text; `unique=1`
+enforces uniqueness of the real bytes, not just the hash. `DB_FILTER_BLOB_EQ_HANDLE`
+uses that index when present, while `DB_FILTER_BLOB_CONTAINS_HANDLE` remains a
+scan until the text-search index shape is added.
 
 The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 `DB_DECIMAL_TO_PARTS`, `DB_DATE_FROM_YMD`, `DB_DATE_TO_YMD`,
@@ -483,14 +503,15 @@ benchmarks. The required baseline is:
   range reads exist for ERP list filters; `u64/i64` range wrappers can also apply
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
   wrappers are available. `blob_handle` stores now cover variable-width text and
-  bytes, with read-handle exact/contains filters; secondary indexes over those
-  values are next.
+  bytes, with read-handle exact/contains filters; persisted exact indexes over
+  those values now cover high-frequency equality predicates, while contains and
+  prefix/token search still need their own index shape.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
-  batch reads now cover the first ERP list-page shape, and blob exact/contains
-  filters cover the first text search shape; next is indexed text/blob filtering
-  and ERP benchmark coverage beyond raw fixed-width bytes.
+  batch reads now cover the first ERP list-page shape, and indexed blob exact
+  filters cover the first high-frequency text equality shape; next is contains
+  indexing and ERP benchmark coverage beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
