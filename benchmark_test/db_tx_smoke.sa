@@ -1,0 +1,296 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"tx_members"
+@const SCHEMA_PATH = utf8:"tx_members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 10
+#def SCHEMA_PATH_LEN = 22
+#def SCHEMA_LEN = 82
+#def ROW_BYTES = 16
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    snapshot_info = stack_alloc SaDbSnapshotInfo_SIZE
+    row = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+
+    EXPAND DB_TX_BEGIN tx1_begin_status, tx1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 1 as u64
+    store row+8, 10 as u64
+    EXPAND DB_TX_INSERT_ROW tx1_insert1_status, tx1, row, ROW_BYTES, info
+    store row+0, 2 as u64
+    store row+8, 20 as u64
+    EXPAND DB_TX_INSERT_ROW tx1_insert2_status, tx1, row, ROW_BYTES, info
+    EXPAND DB_TX_COMMIT tx1_commit_status, tx1, info
+    EXPAND DB_INFO_ROW_COUNT tx1_rows, info
+    EXPAND DB_INFO_EPOCH tx1_epoch, info
+
+    EXPAND DB_OPEN_READ_TABLE open1_status, read1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SNAPSHOT_INFO_HANDLE shape1_status, read1, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_COUNT shape1_rows, snapshot_info
+    EXPAND DB_SUM_U64_HANDLE sum1_status, sum1, read1, 1
+    EXPAND DB_CLOSE_READ_TABLE close1_status, read1
+
+    EXPAND DB_TX_BEGIN tx2_begin_status, tx2, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 2 as u64
+    store row+8, 200 as u64
+    EXPAND DB_TX_INSERT_ROW tx2_insert_status, tx2, row, ROW_BYTES, info
+    EXPAND DB_TX_COMMIT tx2_commit_status, tx2, info
+
+    EXPAND DB_OPEN_READ_TABLE open2_status, read2, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SUM_U64_HANDLE sum2_status, sum2, read2, 1
+    EXPAND DB_CLOSE_READ_TABLE close2_status, read2
+
+    EXPAND DB_TX_BEGIN tx3_begin_status, tx3, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 2 as u64
+    store row+8, 25 as u64
+    EXPAND DB_TX_UPSERT_ROW_U64_KEY tx3_upsert_existing_status, tx3_existing_inserted, tx3, 0, 2, row, ROW_BYTES, info
+    store row+0, 3 as u64
+    store row+8, 30 as u64
+    EXPAND DB_TX_UPSERT_ROW_U64_KEY tx3_upsert_new_status, tx3_new_inserted, tx3, 0, 3, row, ROW_BYTES, info
+    EXPAND DB_TX_DELETE_U64_KEY tx3_delete_status, tx3, 0, 1, info
+    EXPAND DB_TX_COMMIT tx3_commit_status, tx3, info
+    EXPAND DB_INFO_ROW_COUNT tx3_rows, info
+    EXPAND DB_INFO_EPOCH tx3_epoch, info
+
+    EXPAND DB_TX_BEGIN tx4_begin_status, tx4, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 4 as u64
+    store row+8, 40 as u64
+    EXPAND DB_TX_INSERT_ROW tx4_insert_status, tx4, row, ROW_BYTES, info
+    EXPAND DB_TX_ROLLBACK tx4_rollback_status, tx4
+
+    EXPAND DB_OPEN_READ_TABLE open4_status, read4, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SNAPSHOT_INFO_HANDLE shape4_status, read4, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_COUNT shape4_rows, snapshot_info
+    EXPAND DB_SUM_U64_HANDLE sum4_status, sum4, read4, 1
+    EXPAND DB_CLOSE_READ_TABLE close4_status, read4
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_create_index = eq create_index_status, SA_DB_OK
+    ok_tx1_begin = eq tx1_begin_status, SA_DB_OK
+    ok_tx1_insert1 = eq tx1_insert1_status, SA_DB_OK
+    ok_tx1_insert2 = eq tx1_insert2_status, SA_DB_OK
+    ok_tx1_commit = eq tx1_commit_status, SA_DB_OK
+    ok_tx1_rows = eq tx1_rows, 2
+    ok_tx1_epoch = eq tx1_epoch, 2
+    ok_open1 = eq open1_status, SA_DB_OK
+    ok_shape1 = eq shape1_status, SA_DB_OK
+    ok_shape1_rows = eq shape1_rows, 2
+    ok_sum1_status = eq sum1_status, SA_DB_OK
+    ok_sum1 = eq sum1, 30
+    ok_close1 = eq close1_status, SA_DB_OK
+    ok_tx2_begin = eq tx2_begin_status, SA_DB_OK
+    ok_tx2_insert = eq tx2_insert_status, SA_DB_OK
+    ok_tx2_commit = eq tx2_commit_status, SA_DB_ERR_CONSTRAINT
+    ok_open2 = eq open2_status, SA_DB_OK
+    ok_sum2_status = eq sum2_status, SA_DB_OK
+    ok_sum2 = eq sum2, 30
+    ok_close2 = eq close2_status, SA_DB_OK
+    ok_tx3_begin = eq tx3_begin_status, SA_DB_OK
+    ok_tx3_upsert_existing = eq tx3_upsert_existing_status, SA_DB_OK
+    ok_tx3_existing_inserted = eq tx3_existing_inserted, 0
+    ok_tx3_upsert_new = eq tx3_upsert_new_status, SA_DB_OK
+    ok_tx3_new_inserted = eq tx3_new_inserted, 1
+    ok_tx3_delete = eq tx3_delete_status, SA_DB_OK
+    ok_tx3_commit = eq tx3_commit_status, SA_DB_OK
+    ok_tx3_rows = eq tx3_rows, 2
+    ok_tx3_epoch = eq tx3_epoch, 3
+    ok_tx4_begin = eq tx4_begin_status, SA_DB_OK
+    ok_tx4_insert = eq tx4_insert_status, SA_DB_OK
+    ok_tx4_rollback = eq tx4_rollback_status, SA_DB_OK
+    ok_open4 = eq open4_status, SA_DB_OK
+    ok_shape4 = eq shape4_status, SA_DB_OK
+    ok_shape4_rows = eq shape4_rows, 2
+    ok_sum4_status = eq sum4_status, SA_DB_OK
+    ok_sum4 = eq sum4, 55
+    ok_close4 = eq close4_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_create_index
+    ok03 = and ok02, ok_tx1_begin
+    ok04 = and ok03, ok_tx1_insert1
+    ok05 = and ok04, ok_tx1_insert2
+    ok06 = and ok05, ok_tx1_commit
+    ok07 = and ok06, ok_tx1_rows
+    ok08 = and ok07, ok_tx1_epoch
+    ok09 = and ok08, ok_open1
+    ok10 = and ok09, ok_shape1
+    ok11 = and ok10, ok_shape1_rows
+    ok12 = and ok11, ok_sum1_status
+    ok13 = and ok12, ok_sum1
+    ok14 = and ok13, ok_close1
+    ok15 = and ok14, ok_tx2_begin
+    ok16 = and ok15, ok_tx2_insert
+    ok17 = and ok16, ok_tx2_commit
+    ok18 = and ok17, ok_open2
+    ok19 = and ok18, ok_sum2_status
+    ok20 = and ok19, ok_sum2
+    ok21 = and ok20, ok_close2
+    ok22 = and ok21, ok_tx3_begin
+    ok23 = and ok22, ok_tx3_upsert_existing
+    ok24 = and ok23, ok_tx3_existing_inserted
+    ok25 = and ok24, ok_tx3_upsert_new
+    ok26 = and ok25, ok_tx3_new_inserted
+    ok27 = and ok26, ok_tx3_delete
+    ok28 = and ok27, ok_tx3_commit
+    ok29 = and ok28, ok_tx3_rows
+    ok30 = and ok29, ok_tx3_epoch
+    ok31 = and ok30, ok_tx4_begin
+    ok32 = and ok31, ok_tx4_insert
+    ok33 = and ok32, ok_tx4_rollback
+    ok34 = and ok33, ok_open4
+    ok35 = and ok34, ok_shape4
+    ok36 = and ok35, ok_shape4_rows
+    ok37 = and ok36, ok_sum4_status
+    ok38 = and ok37, ok_sum4
+    ok39 = and ok38, ok_close4
+    ok = and ok39, ok_verify
+
+    !remove_status
+    !init_status
+    !create_index_status
+    !tx1_begin_status
+    !tx1
+    !tx1_insert1_status
+    !tx1_insert2_status
+    !tx1_commit_status
+    !tx1_rows
+    !tx1_epoch
+    !open1_status
+    !read1
+    !shape1_status
+    !shape1_rows
+    !sum1_status
+    !sum1
+    !close1_status
+    !tx2_begin_status
+    !tx2
+    !tx2_insert_status
+    !tx2_commit_status
+    !open2_status
+    !read2
+    !sum2_status
+    !sum2
+    !close2_status
+    !tx3_begin_status
+    !tx3
+    !tx3_upsert_existing_status
+    !tx3_existing_inserted
+    !tx3_upsert_new_status
+    !tx3_new_inserted
+    !tx3_delete_status
+    !tx3_commit_status
+    !tx3_rows
+    !tx3_epoch
+    !tx4_begin_status
+    !tx4
+    !tx4_insert_status
+    !tx4_rollback_status
+    !open4_status
+    !read4
+    !shape4_status
+    !shape4_rows
+    !sum4_status
+    !sum4
+    !close4_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_create_index
+    !ok_tx1_begin
+    !ok_tx1_insert1
+    !ok_tx1_insert2
+    !ok_tx1_commit
+    !ok_tx1_rows
+    !ok_tx1_epoch
+    !ok_open1
+    !ok_shape1
+    !ok_shape1_rows
+    !ok_sum1_status
+    !ok_sum1
+    !ok_close1
+    !ok_tx2_begin
+    !ok_tx2_insert
+    !ok_tx2_commit
+    !ok_open2
+    !ok_sum2_status
+    !ok_sum2
+    !ok_close2
+    !ok_tx3_begin
+    !ok_tx3_upsert_existing
+    !ok_tx3_existing_inserted
+    !ok_tx3_upsert_new
+    !ok_tx3_new_inserted
+    !ok_tx3_delete
+    !ok_tx3_commit
+    !ok_tx3_rows
+    !ok_tx3_epoch
+    !ok_tx4_begin
+    !ok_tx4_insert
+    !ok_tx4_rollback
+    !ok_open4
+    !ok_shape4
+    !ok_shape4_rows
+    !ok_sum4_status
+    !ok_sum4
+    !ok_close4
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9002)

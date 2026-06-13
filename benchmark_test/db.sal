@@ -108,6 +108,34 @@
     %out_inserted = load __db_upsert_inserted_slot_%out_inserted+0 as u64
 [END_MACRO]
 
+[MACRO] DB_TX_BEGIN %out_status, %out_handle, %root, %root_len, %table_name, %table_name_len
+    __db_tx_handle_slot_%out_handle = stack_alloc 8
+    %out_status = call @sa_db_tx_begin(&%root, %root_len, &%table_name, %table_name_len, &__db_tx_handle_slot_%out_handle)
+    %out_handle = load __db_tx_handle_slot_%out_handle+0 as ptr
+[END_MACRO]
+
+[MACRO] DB_TX_INSERT_ROW %out_status, %handle, %row, %row_len, %out_info
+    %out_status = call @sa_db_tx_insert_row(%handle, &%row, %row_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_TX_UPSERT_ROW_U64_KEY %out_status, %out_inserted, %handle, %column_index, %expected, %row, %row_len, %out_info
+    __db_tx_upsert_inserted_slot_%out_inserted = stack_alloc 8
+    %out_status = call @sa_db_tx_upsert_row_u64_key(%handle, %column_index, %expected, &%row, %row_len, &__db_tx_upsert_inserted_slot_%out_inserted, &%out_info)
+    %out_inserted = load __db_tx_upsert_inserted_slot_%out_inserted+0 as u64
+[END_MACRO]
+
+[MACRO] DB_TX_DELETE_U64_KEY %out_status, %handle, %column_index, %expected, %out_info
+    %out_status = call @sa_db_tx_delete_u64_key(%handle, %column_index, %expected, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_TX_COMMIT %out_status, %handle, %out_info
+    %out_status = call @sa_db_tx_commit(%handle, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_TX_ROLLBACK %out_status, %handle
+    %out_status = call @sa_db_tx_rollback(%handle)
+[END_MACRO]
+
 [MACRO] DB_CREATE_U64_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %unique, %out_info
     %out_status = call @sa_db_create_u64_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
 [END_MACRO]

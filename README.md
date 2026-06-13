@@ -43,6 +43,12 @@ Core native calls:
 - `sa_db_ingest_columns`
 - `sa_db_insert_row`
 - `sa_db_upsert_row_u64_key`
+- `sa_db_tx_begin`
+- `sa_db_tx_insert_row`
+- `sa_db_tx_upsert_row_u64_key`
+- `sa_db_tx_delete_u64_key`
+- `sa_db_tx_commit`
+- `sa_db_tx_rollback`
 - `sa_db_create_u64_index`
 - `sa_db_create_i64_index`
 - `sa_db_create_u64_pair_index`
@@ -103,7 +109,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_I64_HANDLE`, `DB_RANGE_U64_PAIR_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
-`DB_UPSERT_ROW_U64_KEY`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
+`DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
+`DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
+`DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
@@ -219,6 +227,17 @@ implementation splits the row into column slices and commits through the same
 column ingest path, so the write advances the table epoch and rebuilds any
 persisted `u64` indexes.
 
+`sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
+returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_UPSERT_ROW_U64_KEY`, and
+`DB_TX_DELETE_U64_KEY` mutate an in-memory transaction image; no new table epoch
+or manifest is published until `sa_db_tx_commit` / `DB_TX_COMMIT`. Commit writes
+one replacement segment, rebuilds all persisted indexes, then advances the active
+manifest once. If commit fails, for example because a batch introduces duplicate
+keys for a unique index, the previous active manifest remains visible and the
+transaction handle is closed. `sa_db_tx_rollback` / `DB_TX_ROLLBACK` drops the
+in-memory image without publishing any rows. This is currently a single-table,
+single-writer transaction model; read handles still see only committed snapshots.
+
 `sa_db_upsert_row_u64_key` / `DB_UPSERT_ROW_U64_KEY` upserts one fixed-width row
 by a unique `u64` key. The target column must already have a unique `u64` index.
 When the key exists, the existing row is atomically replaced by rewriting the
@@ -243,8 +262,9 @@ for stable labels that can be represented as integer IDs in fixed-width rows.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
-ERP foundation work is to add those missing database semantics without losing
-the fast read-handle scan path.
+ERP foundation work is to extend the current single-table transaction baseline
+into stronger crash-recovery and multi-table semantics without losing the fast
+read-handle scan path.
 
 ## ERP Foundation Roadmap
 
@@ -258,15 +278,16 @@ benchmarks. The required baseline is:
   and dictionary-encoded strings. Primitive schema type codes are exposed and the
   first low-cardinality string dictionary API exists; decimal/date/null helpers
   and richer typed column families still need dedicated encode/query helpers.
-- Row-oriented public operations on top of the column store: fixed-width insert
-  read by row index or unique `u64` key, upsert, range query handles, and delete
-  by unique `u64` key exist now. Projected batch reads now cover the first ERP
-  list-page shape; next is typed column families beyond raw fixed-width bytes.
+- Row-oriented public operations on top of the column store: fixed-width insert,
+  read by row index or unique `u64` key, upsert, range query handles, delete by
+  unique `u64` key, and single-table batch transactions exist now. Projected
+  batch reads now cover the first ERP list-page shape; next is typed column
+  families beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
-- Multi-operation and multi-table transaction semantics, followed by optional
-  WAL and async batch flush.
+- Crash-recovery hardening for the single-table transaction path, then multi-table
+  transaction semantics, optional WAL, and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
   aggregation as performance work after the reliability/data-model baseline.
 
@@ -290,6 +311,9 @@ Run db benchmarks:
 cd /home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test
 sa build-exe db_interface_smoke.sa -o db_interface_smoke.out --no-incremental
 ./db_interface_smoke.out
+
+sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
+./db_tx_smoke.out
 
 sa build-exe db_member_bench.sa -o db_member_bench.out --no-incremental
 ./db_member_bench.out

@@ -152,6 +152,24 @@ pub const TableWriteLock = struct {
     }
 };
 
+pub const WriteTransaction = struct {
+    root_dir: []const u8,
+    table_name: []const u8,
+    write_lock: TableWriteLock,
+    meta: TableMeta,
+    buffers: []std.ArrayList(u8),
+    dirty: bool = false,
+
+    pub fn deinit(self: *WriteTransaction, allocator: std.mem.Allocator) void {
+        self.write_lock.release();
+        self.meta.deinit(allocator);
+        freeColumnBuffers(allocator, self.buffers);
+        allocator.free(self.root_dir);
+        allocator.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
 pub const TableManifest = struct {
     magic: []const u8,
     version: u32,
@@ -2086,6 +2104,250 @@ fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, ro
         try buffers[idx].appendSlice(column.bytes);
     }
     return buffers;
+}
+
+fn freeColumnBuffers(allocator: std.mem.Allocator, buffers: []std.ArrayList(u8)) void {
+    for (buffers) |*buf| buf.deinit();
+    allocator.free(buffers);
+}
+
+fn buildAllColumnBuffers(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError![]std.ArrayList(u8) {
+    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    errdefer allocator.free(buffers);
+    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    errdefer {
+        for (buffers) |*buf| buf.deinit();
+    }
+
+    for (meta.columns, 0..) |column, col_idx| {
+        var copied_rows: u64 = 0;
+        for (meta.segments) |segment| {
+            const file_meta = segment.files[col_idx];
+            const path = try activePath(allocator, root_dir, file_meta.path);
+            defer allocator.free(path);
+            const bytes = try readFileAlloc(allocator, path, 1 << 30);
+            defer allocator.free(bytes);
+            const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+            if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+            const actual_hash = hashBytes(bytes);
+            const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
+            if (!std.mem.eql(u8, actual_hex[0..], file_meta.sha256)) return TableError.VerifyFailed;
+            try buffers[col_idx].appendSlice(bytes);
+            copied_rows = std.math.add(u64, copied_rows, segment.rows) catch return TableError.CursorOverflow;
+        }
+        if (copied_rows != meta.row_count) return TableError.VerifyFailed;
+        const expected_total = try expectedColumnBytes(meta.row_count, column.stride);
+        if (buffers[col_idx].items.len != expected_total) return TableError.VerifyFailed;
+    }
+
+    return buffers;
+}
+
+fn hasUniqueU64Index(meta: TableMeta, column_index: usize) bool {
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u64") and
+            index.unique and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn validateTransactionBuffers(tx: *const WriteTransaction) TableError!void {
+    if (tx.buffers.len != tx.meta.columns.len) return TableError.InvalidFormat;
+    for (tx.meta.columns, 0..) |column, col_idx| {
+        const expected_len = try expectedColumnBytes(tx.meta.row_count, column.stride);
+        if (tx.buffers[col_idx].items.len != expected_len) return TableError.VerifyFailed;
+    }
+}
+
+fn txFindU64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u64) TableError!U64FindResult {
+    try ensureU64Column(tx.meta, column_index);
+    if (!hasUniqueU64Index(tx.meta, column_index)) return TableError.InvalidFormat;
+    try validateTransactionBuffers(tx);
+
+    const bytes = tx.buffers[column_index].items;
+    var row: u64 = 0;
+    while (row < tx.meta.row_count) : (row += 1) {
+        const offset_u64 = std.math.mul(u64, row, 8) catch return TableError.CursorOverflow;
+        const offset: usize = @intCast(offset_u64);
+        if (readU64LE(bytes, offset) == expected) return .{ .found = true, .row_index = row };
+    }
+    return .{ .found = false, .row_index = 0 };
+}
+
+fn txAppendRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!void {
+    if (row_bytes.len != try fixedRowBytes(tx.meta)) return TableError.InvalidFormat;
+    const next_row_count = std.math.add(u64, tx.meta.row_count, 1) catch return TableError.CursorOverflow;
+    if (next_row_count > tx.meta.max_rows) return TableError.CursorOverflow;
+
+    var offset: usize = 0;
+    for (tx.meta.columns, 0..) |column, col_idx| {
+        const stride: usize = @intCast(column.stride);
+        const next_offset = std.math.add(usize, offset, stride) catch return TableError.CursorOverflow;
+        if (next_offset > row_bytes.len) return TableError.InvalidFormat;
+        try tx.buffers[col_idx].appendSlice(row_bytes[offset..next_offset]);
+        offset = next_offset;
+    }
+    if (offset != row_bytes.len) return TableError.InvalidFormat;
+    tx.meta.row_count = next_row_count;
+    tx.dirty = true;
+}
+
+fn txReplaceRawRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8) TableError!void {
+    if (row_index >= tx.meta.row_count) return TableError.InvalidFormat;
+    if (row_bytes.len != try fixedRowBytes(tx.meta)) return TableError.InvalidFormat;
+    try validateTransactionBuffers(tx);
+
+    var row_offset: usize = 0;
+    for (tx.meta.columns, 0..) |column, col_idx| {
+        const stride: usize = @intCast(column.stride);
+        const next_row_offset = std.math.add(usize, row_offset, stride) catch return TableError.CursorOverflow;
+        if (next_row_offset > row_bytes.len) return TableError.InvalidFormat;
+        const dest_offset_u64 = std.math.mul(u64, row_index, column.stride) catch return TableError.CursorOverflow;
+        if (dest_offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+        const dest_offset: usize = @intCast(dest_offset_u64);
+        @memcpy(tx.buffers[col_idx].items[dest_offset .. dest_offset + stride], row_bytes[row_offset..next_row_offset]);
+        row_offset = next_row_offset;
+    }
+    if (row_offset != row_bytes.len) return TableError.InvalidFormat;
+    tx.dirty = true;
+}
+
+fn removeBufferRange(buf: *std.ArrayList(u8), start: usize, len: usize) void {
+    const end = start + len;
+    const tail_len = buf.items.len - end;
+    std.mem.copyForwards(u8, buf.items[start .. start + tail_len], buf.items[end..]);
+    buf.shrinkRetainingCapacity(buf.items.len - len);
+}
+
+fn txDeleteRow(tx: *WriteTransaction, row_index: u64) TableError!void {
+    if (row_index >= tx.meta.row_count) return TableError.InvalidFormat;
+    try validateTransactionBuffers(tx);
+
+    for (tx.meta.columns, 0..) |column, col_idx| {
+        const stride: usize = @intCast(column.stride);
+        const offset_u64 = std.math.mul(u64, row_index, column.stride) catch return TableError.CursorOverflow;
+        if (offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+        removeBufferRange(&tx.buffers[col_idx], @intCast(offset_u64), stride);
+    }
+    tx.meta.row_count -= 1;
+    tx.dirty = true;
+}
+
+fn rewriteSegmentsFromTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!void {
+    try validateTransactionBuffers(tx);
+
+    const next_row_count = tx.meta.row_count;
+    const new_segments = try allocator.alloc(SegmentMeta, if (next_row_count > 0) 1 else 0);
+    var new_files: ?[]FileMeta = null;
+    var assigned_segments = false;
+    errdefer if (!assigned_segments) {
+        if (new_files) |files| freeFileMetas(allocator, files);
+        allocator.free(new_segments);
+    };
+
+    if (next_row_count > 0) {
+        const files = try writeSegmentFiles(allocator, tx.root_dir, tx.table_name, tx.meta.next_segment_id, tx.buffers);
+        new_files = files;
+        new_segments[0] = .{
+            .id = tx.meta.next_segment_id,
+            .rows = next_row_count,
+            .files = files,
+        };
+        new_files = null;
+        tx.meta.next_segment_id += 1;
+    }
+
+    const old_segments = tx.meta.segments;
+    tx.meta.segments = new_segments;
+    assigned_segments = true;
+    freeSegmentMetas(allocator, old_segments);
+    tx.meta.epoch += 1;
+}
+
+pub fn beginWriteTransaction(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError!*WriteTransaction {
+    const root_copy = try allocator.dupe(u8, root_dir);
+    errdefer allocator.free(root_copy);
+    const table_copy = try allocator.dupe(u8, table_name);
+    errdefer allocator.free(table_copy);
+
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    var write_lock_transferred = false;
+    errdefer if (!write_lock_transferred) write_lock.release();
+
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta_transferred = false;
+    errdefer if (!meta_transferred) meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+
+    const buffers = try buildAllColumnBuffers(allocator, root_dir, meta);
+    var buffers_transferred = false;
+    errdefer if (!buffers_transferred) freeColumnBuffers(allocator, buffers);
+
+    const tx = try allocator.create(WriteTransaction);
+    errdefer allocator.destroy(tx);
+    tx.* = .{
+        .root_dir = root_copy,
+        .table_name = table_copy,
+        .write_lock = write_lock,
+        .meta = meta,
+        .buffers = buffers,
+        .dirty = false,
+    };
+    write_lock_transferred = true;
+    meta_transferred = true;
+    buffers_transferred = true;
+    return tx;
+}
+
+pub fn destroyWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) void {
+    tx.deinit(allocator);
+    allocator.destroy(tx);
+}
+
+pub fn writeTransactionInfo(tx: *const WriteTransaction) TableInfo {
+    return tableInfo(tx.meta);
+}
+
+pub fn writeTransactionInsertRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!TableInfo {
+    try txAppendRawRow(tx, row_bytes);
+    return tableInfo(tx.meta);
+}
+
+pub fn writeTransactionUpsertRawRowU64Key(tx: *WriteTransaction, column_index: usize, expected: u64, row_bytes: []const u8) TableError!UpsertResult {
+    const key_value = try rowU64KeyValue(tx.meta, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+    const found = try txFindU64KeyRow(tx, column_index, expected);
+    if (found.found) {
+        try txReplaceRawRow(tx, found.row_index, row_bytes);
+        return .{ .info = tableInfo(tx.meta), .inserted = false };
+    }
+    try txAppendRawRow(tx, row_bytes);
+    return .{ .info = tableInfo(tx.meta), .inserted = true };
+}
+
+pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, expected: u64) TableError!TableInfo {
+    const found = try txFindU64KeyRow(tx, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    try txDeleteRow(tx, found.row_index);
+    return tableInfo(tx.meta);
+}
+
+pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!TableInfo {
+    if (!tx.dirty) return tableInfo(tx.meta);
+    try rewriteSegmentsFromTransaction(allocator, tx);
+    try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
+    try writeMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
+    tx.dirty = false;
+    return tableInfo(tx.meta);
 }
 
 fn buildDictBytesWithValue(allocator: std.mem.Allocator, old_bytes: []const u8, old_count: u64, value: []const u8) TableError![]u8 {
@@ -4372,6 +4634,80 @@ test "table persistent u64 pair index supports ERP composite lookups" {
     defer std.testing.allocator.free(index_path);
     try writeFile(std.testing.allocator, index_path, "corrupt");
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table write transaction commits atomically and preserves previous epoch on constraint failure" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "tx_members";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "tx_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    var tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, 1);
+    writeU64LE(&row, 8, 10);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    writeU64LE(&row, 0, 2);
+    writeU64LE(&row, 8, 20);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 2), committed.row_count);
+    try std.testing.expectEqual(@as(u64, 2), committed.epoch);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
+    }
+
+    tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    writeU64LE(&row, 0, 2);
+    writeU64LE(&row, 8, 200);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    try std.testing.expectError(TableError.ConstraintViolation, commitWriteTransaction(std.testing.allocator, tx));
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    const after_failed_commit = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), after_failed_commit.row_count);
+    try std.testing.expectEqual(@as(u64, 2), after_failed_commit.epoch);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
+    }
+
+    tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    writeU64LE(&row, 0, 2);
+    writeU64LE(&row, 8, 25);
+    const upsert_existing = try writeTransactionUpsertRawRowU64Key(tx, 0, 2, &row);
+    try std.testing.expect(!upsert_existing.inserted);
+    writeU64LE(&row, 0, 3);
+    writeU64LE(&row, 8, 30);
+    const upsert_new = try writeTransactionUpsertRawRowU64Key(tx, 0, 3, &row);
+    try std.testing.expect(upsert_new.inserted);
+    _ = try writeTransactionDeleteU64Key(tx, 0, 1);
+    const committed_mutations = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 2), committed_mutations.row_count);
+    try std.testing.expectEqual(@as(u64, 3), committed_mutations.epoch);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 55), try snapshotSumU64(snapshot, 1));
+    }
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {
