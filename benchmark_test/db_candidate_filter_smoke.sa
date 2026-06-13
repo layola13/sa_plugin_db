@@ -98,6 +98,8 @@ L_ENTRY:
     status_row0 = load status_rows+0 as u64
     status_row1 = load status_rows+8 as u64
     status_row2 = load status_rows+16 as u64
+    EXPAND DB_STATS_ROWS_U64_HANDLE status_stats_status, status_stats_count, status_stats_sum, status_stats_min, status_stats_max, read_handle, 2, status_rows, status_written
+    EXPAND DB_STATS_ROWS_I64_HANDLE amount_stats_status, amount_stats_count, amount_stats_sum, amount_stats_min, amount_stats_max, read_handle, 4, status_rows, status_written
     EXPAND DB_FILTER_ROWS_I64_RANGE_HANDLE amount_filter_status, amount_written, amount_total, final_rows, ROWS_CAP, read_handle, 4, status_rows, status_written, 1500, 5500, 0, ROWS_CAP
     amount_row0 = load final_rows+0 as u64
     amount_row1 = load final_rows+8 as u64
@@ -138,6 +140,16 @@ L_ENTRY:
     ok_status_row0 = eq status_row0, 1
     ok_status_row1 = eq status_row1, 2
     ok_status_row2 = eq status_row2, 5
+    ok_status_stats_status = eq status_stats_status, SA_DB_OK
+    ok_status_stats_count = eq status_stats_count, 3
+    ok_status_stats_sum = eq status_stats_sum, 6
+    ok_status_stats_min = eq status_stats_min, 2
+    ok_status_stats_max = eq status_stats_max, 2
+    ok_amount_stats_status = eq amount_stats_status, SA_DB_OK
+    ok_amount_stats_count = eq amount_stats_count, 3
+    ok_amount_stats_sum = eq amount_stats_sum, 12000
+    ok_amount_stats_min = eq amount_stats_min, 2000
+    ok_amount_stats_max = eq amount_stats_max, 7000
     ok_amount_filter_status = eq amount_filter_status, SA_DB_OK
     ok_amount_written = eq amount_written, 2
     ok_amount_total = eq amount_total, 2
@@ -188,36 +200,46 @@ L_ENTRY:
     ok17 = and ok16, ok_status_row0
     ok18 = and ok17, ok_status_row1
     ok19 = and ok18, ok_status_row2
-    ok20 = and ok19, ok_amount_filter_status
-    ok21 = and ok20, ok_amount_written
-    ok22 = and ok21, ok_amount_total
-    ok23 = and ok22, ok_amount_row0
-    ok24 = and ok23, ok_amount_row1
-    ok25 = and ok24, ok_decimal_filter_status
-    ok26 = and ok25, ok_decimal_written
-    ok27 = and ok26, ok_decimal_total
-    ok28 = and ok27, ok_decimal_row0
-    ok29 = and ok28, ok_decimal_row1
-    ok30 = and ok29, ok_timestamp_ms_filter_status
-    ok31 = and ok30, ok_timestamp_ms_written
-    ok32 = and ok31, ok_timestamp_ms_total
-    ok33 = and ok32, ok_timestamp_ms_row0
-    ok34 = and ok33, ok_timestamp_ms_row1
-    ok35 = and ok34, ok_timestamp_us_filter_status
-    ok36 = and ok35, ok_timestamp_us_written
-    ok37 = and ok36, ok_timestamp_us_total
-    ok38 = and ok37, ok_timestamp_us_row0
-    ok39 = and ok38, ok_timestamp_us_row1
-    ok40 = and ok39, ok_posted_filter_status
-    ok41 = and ok40, ok_posted_written
-    ok42 = and ok41, ok_posted_total
-    ok43 = and ok42, ok_posted_row0
-    ok44 = and ok43, ok_posted_row1
-    ok45 = and ok44, ok_invalid_bool_status
-    ok46 = and ok45, ok_invalid_bool_written
-    ok47 = and ok46, ok_invalid_bool_total
-    ok48 = and ok47, ok_close
-    ok = and ok48, ok_verify
+    ok20 = and ok19, ok_status_stats_status
+    ok21 = and ok20, ok_status_stats_count
+    ok22 = and ok21, ok_status_stats_sum
+    ok23 = and ok22, ok_status_stats_min
+    ok24 = and ok23, ok_status_stats_max
+    ok25 = and ok24, ok_amount_stats_status
+    ok26 = and ok25, ok_amount_stats_count
+    ok27 = and ok26, ok_amount_stats_sum
+    ok28 = and ok27, ok_amount_stats_min
+    ok29 = and ok28, ok_amount_stats_max
+    ok30 = and ok29, ok_amount_filter_status
+    ok31 = and ok30, ok_amount_written
+    ok32 = and ok31, ok_amount_total
+    ok33 = and ok32, ok_amount_row0
+    ok34 = and ok33, ok_amount_row1
+    ok35 = and ok34, ok_decimal_filter_status
+    ok36 = and ok35, ok_decimal_written
+    ok37 = and ok36, ok_decimal_total
+    ok38 = and ok37, ok_decimal_row0
+    ok39 = and ok38, ok_decimal_row1
+    ok40 = and ok39, ok_timestamp_ms_filter_status
+    ok41 = and ok40, ok_timestamp_ms_written
+    ok42 = and ok41, ok_timestamp_ms_total
+    ok43 = and ok42, ok_timestamp_ms_row0
+    ok44 = and ok43, ok_timestamp_ms_row1
+    ok45 = and ok44, ok_timestamp_us_filter_status
+    ok46 = and ok45, ok_timestamp_us_written
+    ok47 = and ok46, ok_timestamp_us_total
+    ok48 = and ok47, ok_timestamp_us_row0
+    ok49 = and ok48, ok_timestamp_us_row1
+    ok50 = and ok49, ok_posted_filter_status
+    ok51 = and ok50, ok_posted_written
+    ok52 = and ok51, ok_posted_total
+    ok53 = and ok52, ok_posted_row0
+    ok54 = and ok53, ok_posted_row1
+    ok55 = and ok54, ok_invalid_bool_status
+    ok56 = and ok55, ok_invalid_bool_written
+    ok57 = and ok56, ok_invalid_bool_total
+    ok58 = and ok57, ok_close
+    ok = and ok58, ok_verify
 
     !remove_status
     !init_status
@@ -240,6 +262,16 @@ L_ENTRY:
     !status_row0
     !status_row1
     !status_row2
+    !status_stats_status
+    !status_stats_count
+    !status_stats_sum
+    !status_stats_min
+    !status_stats_max
+    !amount_stats_status
+    !amount_stats_count
+    !amount_stats_sum
+    !amount_stats_min
+    !amount_stats_max
     !amount_filter_status
     !amount_written
     !amount_total
@@ -290,6 +322,16 @@ L_ENTRY:
     !ok_status_row0
     !ok_status_row1
     !ok_status_row2
+    !ok_status_stats_status
+    !ok_status_stats_count
+    !ok_status_stats_sum
+    !ok_status_stats_min
+    !ok_status_stats_max
+    !ok_amount_stats_status
+    !ok_amount_stats_count
+    !ok_amount_stats_sum
+    !ok_amount_stats_min
+    !ok_amount_stats_max
     !ok_amount_filter_status
     !ok_amount_written
     !ok_amount_total
@@ -368,6 +410,16 @@ L_ENTRY:
     !ok46
     !ok47
     !ok48
+    !ok49
+    !ok50
+    !ok51
+    !ok52
+    !ok53
+    !ok54
+    !ok55
+    !ok56
+    !ok57
+    !ok58
     !customer_ids
     !order_days
     !status_ids

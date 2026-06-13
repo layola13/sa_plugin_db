@@ -1799,6 +1799,66 @@ pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_s
     return SA_DB_OK;
 }
 
+pub export fn sa_db_stats_rows_u64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    out_count: ?*u64,
+    out_sum: ?*u64,
+    out_min: ?*u64,
+    out_max: ?*u64,
+) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_slot = out_max orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    count_slot.* = 0;
+    sum_slot.* = 0;
+    min_slot.* = 0;
+    max_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const stats = table.snapshotStatsRowsU64(snapshot, @intCast(column_index), in_rows) catch |err| return tableStatus(err);
+    count_slot.* = stats.count;
+    sum_slot.* = stats.sum;
+    min_slot.* = stats.min;
+    max_slot.* = stats.max;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_stats_rows_i64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    out_count: ?*u64,
+    out_sum: ?*i64,
+    out_min: ?*i64,
+    out_max: ?*i64,
+) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_slot = out_max orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    count_slot.* = 0;
+    sum_slot.* = 0;
+    min_slot.* = 0;
+    max_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const stats = table.snapshotStatsRowsI64(snapshot, @intCast(column_index), in_rows) catch |err| return tableStatus(err);
+    count_slot.* = stats.count;
+    sum_slot.* = stats.sum;
+    min_slot.* = stats.min;
+    max_slot.* = stats.max;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_count_u64_eq_handle(handle: ?*anyopaque, column_index: u64, expected: u64, out_count: ?*u64) u32 {
     const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -3889,6 +3949,36 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 1), rows[0]);
     try std.testing.expectEqual(@as(u64, 2), rows[1]);
     try std.testing.expectEqual(@as(u64, 5), rows[2]);
+
+    var stats_count: u64 = 0;
+    var stats_u64_sum: u64 = 0;
+    var stats_u64_min: u64 = 0;
+    var stats_u64_max: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_stats_rows_u64_handle(handle, 2, &rows, written, &stats_count, &stats_u64_sum, &stats_u64_min, &stats_u64_max));
+    try std.testing.expectEqual(@as(u64, 3), stats_count);
+    try std.testing.expectEqual(@as(u64, 6), stats_u64_sum);
+    try std.testing.expectEqual(@as(u64, 2), stats_u64_min);
+    try std.testing.expectEqual(@as(u64, 2), stats_u64_max);
+
+    var stats_i64_sum: i64 = 0;
+    var stats_i64_min: i64 = 0;
+    var stats_i64_max: i64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_stats_rows_i64_handle(handle, 4, &rows, written, &stats_count, &stats_i64_sum, &stats_i64_min, &stats_i64_max));
+    try std.testing.expectEqual(@as(u64, 3), stats_count);
+    try std.testing.expectEqual(@as(i64, 12000), stats_i64_sum);
+    try std.testing.expectEqual(@as(i64, 2000), stats_i64_min);
+    try std.testing.expectEqual(@as(i64, 7000), stats_i64_max);
+
+    stats_count = 123;
+    stats_i64_sum = 456;
+    stats_i64_min = 789;
+    stats_i64_max = 999;
+    const invalid_stats_rows = [_]u64{999};
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_stats_rows_i64_handle(handle, 4, &invalid_stats_rows, invalid_stats_rows.len, &stats_count, &stats_i64_sum, &stats_i64_min, &stats_i64_max));
+    try std.testing.expectEqual(@as(u64, 0), stats_count);
+    try std.testing.expectEqual(@as(i64, 0), stats_i64_sum);
+    try std.testing.expectEqual(@as(i64, 0), stats_i64_min);
+    try std.testing.expectEqual(@as(i64, 0), stats_i64_max);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_i64_range_handle(handle, 4, &rows, written, 1500, 5500, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);

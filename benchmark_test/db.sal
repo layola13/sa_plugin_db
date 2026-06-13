@@ -515,6 +515,30 @@
     %out_sum = load __db_handle_sum_slot_%out_sum+0 as u64
 [END_MACRO]
 
+[MACRO] DB_STATS_ROWS_U64_HANDLE %out_status, %out_count, %out_sum, %out_min, %out_max, %handle, %column_index, %in_rows, %in_rows_len
+    __db_handle_stats_rows_u64_count_slot_%out_count = stack_alloc 8
+    __db_handle_stats_rows_u64_sum_slot_%out_sum = stack_alloc 8
+    __db_handle_stats_rows_u64_min_slot_%out_min = stack_alloc 8
+    __db_handle_stats_rows_u64_max_slot_%out_max = stack_alloc 8
+    %out_status = call @sa_db_stats_rows_u64_handle(%handle, %column_index, &%in_rows, %in_rows_len, &__db_handle_stats_rows_u64_count_slot_%out_count, &__db_handle_stats_rows_u64_sum_slot_%out_sum, &__db_handle_stats_rows_u64_min_slot_%out_min, &__db_handle_stats_rows_u64_max_slot_%out_max)
+    %out_count = load __db_handle_stats_rows_u64_count_slot_%out_count+0 as u64
+    %out_sum = load __db_handle_stats_rows_u64_sum_slot_%out_sum+0 as u64
+    %out_min = load __db_handle_stats_rows_u64_min_slot_%out_min+0 as u64
+    %out_max = load __db_handle_stats_rows_u64_max_slot_%out_max+0 as u64
+[END_MACRO]
+
+[MACRO] DB_STATS_ROWS_I64_HANDLE %out_status, %out_count, %out_sum, %out_min, %out_max, %handle, %column_index, %in_rows, %in_rows_len
+    __db_handle_stats_rows_i64_count_slot_%out_count = stack_alloc 8
+    __db_handle_stats_rows_i64_sum_slot_%out_sum = stack_alloc 8
+    __db_handle_stats_rows_i64_min_slot_%out_min = stack_alloc 8
+    __db_handle_stats_rows_i64_max_slot_%out_max = stack_alloc 8
+    %out_status = call @sa_db_stats_rows_i64_handle(%handle, %column_index, &%in_rows, %in_rows_len, &__db_handle_stats_rows_i64_count_slot_%out_count, &__db_handle_stats_rows_i64_sum_slot_%out_sum, &__db_handle_stats_rows_i64_min_slot_%out_min, &__db_handle_stats_rows_i64_max_slot_%out_max)
+    %out_count = load __db_handle_stats_rows_i64_count_slot_%out_count+0 as u64
+    %out_sum = load __db_handle_stats_rows_i64_sum_slot_%out_sum+0 as i64
+    %out_min = load __db_handle_stats_rows_i64_min_slot_%out_min+0 as i64
+    %out_max = load __db_handle_stats_rows_i64_max_slot_%out_max+0 as i64
+[END_MACRO]
+
 [MACRO] DB_COUNT_U64_EQ_HANDLE %out_status, %out_count, %handle, %column_index, %expected
     __db_handle_count_slot_%out_count = stack_alloc 8
     %out_status = call @sa_db_count_u64_eq_handle(%handle, %column_index, %expected, &__db_handle_count_slot_%out_count)

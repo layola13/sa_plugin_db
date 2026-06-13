@@ -113,6 +113,8 @@ Read-handle query calls:
 - `sa_db_column_info_handle`
 - `sa_db_column_logical_info_handle`
 - `sa_db_sum_u64_handle`
+- `sa_db_stats_rows_u64_handle`
+- `sa_db_stats_rows_i64_handle`
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
 - `sa_db_count_i64_cmp_handle`
@@ -188,6 +190,7 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
+`DB_STATS_ROWS_U64_HANDLE`, `DB_STATS_ROWS_I64_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
 `DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_U8_CMP_HANDLE`, `DB_COUNT_I8_CMP_HANDLE`,
 `DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_F32_CMP_HANDLE`,
@@ -450,6 +453,11 @@ customer/date or blob/text query first, then narrow the candidate rows by status
 amount/date/timestamp range, or posted/active bool without materializing full
 rows in SA code. This is a planner building block rather than a SQL optimizer:
 callers still choose the first selective index explicitly.
+`sa_db_stats_rows_u64_handle` / `DB_STATS_ROWS_U64_HANDLE` and
+`sa_db_stats_rows_i64_handle` / `DB_STATS_ROWS_I64_HANDLE` aggregate an existing
+candidate row list and return `count`, `sum`, `min`, and `max` in one snapshot
+pass. Use the signed variant for scaled decimal amounts, date/timestamp extrema,
+and signed ERP adjustment totals; an empty candidate list returns zeroed stats.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested

@@ -165,6 +165,20 @@ pub const BlobValueCopyResult = struct {
     written: u64,
 };
 
+pub const U64RowsStats = struct {
+    count: u64,
+    sum: u64,
+    min: u64,
+    max: u64,
+};
+
+pub const I64RowsStats = struct {
+    count: u64,
+    sum: i64,
+    min: i64,
+    max: i64,
+};
+
 pub const TableWriteLock = struct {
     file: std.fs.File,
 
@@ -7170,6 +7184,42 @@ pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableE
     return sum;
 }
 
+pub fn snapshotStatsRowsU64(snapshot: *const ReadSnapshot, column_index: usize, row_indices: []const u64) TableError!U64RowsStats {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    var stats = U64RowsStats{ .count = 0, .sum = 0, .min = 0, .max = 0 };
+    for (row_indices) |row_index| {
+        const value = try snapshotU64AtRow(snapshot, column_index, row_index);
+        if (stats.count == 0) {
+            stats.min = value;
+            stats.max = value;
+        } else {
+            stats.min = @min(stats.min, value);
+            stats.max = @max(stats.max, value);
+        }
+        stats.sum = std.math.add(u64, stats.sum, value) catch return TableError.CursorOverflow;
+        stats.count = std.math.add(u64, stats.count, 1) catch return TableError.CursorOverflow;
+    }
+    return stats;
+}
+
+pub fn snapshotStatsRowsI64(snapshot: *const ReadSnapshot, column_index: usize, row_indices: []const u64) TableError!I64RowsStats {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    var stats = I64RowsStats{ .count = 0, .sum = 0, .min = 0, .max = 0 };
+    for (row_indices) |row_index| {
+        const value = try snapshotI64AtRow(snapshot, column_index, row_index);
+        if (stats.count == 0) {
+            stats.min = value;
+            stats.max = value;
+        } else {
+            stats.min = @min(stats.min, value);
+            stats.max = @max(stats.max, value);
+        }
+        stats.sum = std.math.add(i64, stats.sum, value) catch return TableError.CursorOverflow;
+        stats.count = std.math.add(u64, stats.count, 1) catch return TableError.CursorOverflow;
+    }
+    return stats;
+}
+
 pub fn snapshotCountU64Cmp(snapshot: *const ReadSnapshot, column_index: usize, op: U64CompareOp, expected: u64) TableError!u64 {
     try ensureSnapshotU64Column(snapshot, column_index);
     if (snapshotIndexForU64Column(snapshot, column_index)) |index| {
@@ -10150,6 +10200,18 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 2), filtered_rows[0]);
 
     const status_len: usize = @intCast(status_result.written);
+    const status_stats = try snapshotStatsRowsU64(snapshot, 2, candidate_rows[0..status_len]);
+    try std.testing.expectEqual(@as(u64, 3), status_stats.count);
+    try std.testing.expectEqual(@as(u64, 6), status_stats.sum);
+    try std.testing.expectEqual(@as(u64, 2), status_stats.min);
+    try std.testing.expectEqual(@as(u64, 2), status_stats.max);
+
+    const amount_stats = try snapshotStatsRowsI64(snapshot, 4, candidate_rows[0..status_len]);
+    try std.testing.expectEqual(@as(u64, 3), amount_stats.count);
+    try std.testing.expectEqual(@as(i64, 12000), amount_stats.sum);
+    try std.testing.expectEqual(@as(i64, 2000), amount_stats.min);
+    try std.testing.expectEqual(@as(i64, 7000), amount_stats.max);
+
     const amount_result = try snapshotFilterRowsI64Range(snapshot, 4, candidate_rows[0..status_len], 1500, 5500, 0, filtered_rows.len, &filtered_rows);
     try std.testing.expectEqual(@as(u64, 2), amount_result.total);
     try std.testing.expectEqual(@as(u64, 2), amount_result.written);
@@ -10165,9 +10227,15 @@ test "table filters candidate rows for ERP composite predicates" {
     const empty = try snapshotFilterRowsU64Range(snapshot, 2, &.{}, 2, 2, 0, filtered_rows.len, &filtered_rows);
     try std.testing.expectEqual(@as(u64, 0), empty.total);
     try std.testing.expectEqual(@as(u64, 0), empty.written);
+    const empty_stats = try snapshotStatsRowsI64(snapshot, 4, &.{});
+    try std.testing.expectEqual(@as(u64, 0), empty_stats.count);
+    try std.testing.expectEqual(@as(i64, 0), empty_stats.sum);
+    try std.testing.expectEqual(@as(i64, 0), empty_stats.min);
+    try std.testing.expectEqual(@as(i64, 0), empty_stats.max);
 
     const invalid_rows = [_]u64{999};
     try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsU64Range(snapshot, 2, &invalid_rows, 2, 2, 0, filtered_rows.len, &filtered_rows));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotStatsRowsU64(snapshot, 2, &invalid_rows));
 }
 
 test "table write transaction commits atomically and preserves previous epoch on constraint failure" {
