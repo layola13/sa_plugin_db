@@ -1171,6 +1171,77 @@ pub export fn sa_db_column_logical_info_handle(handle: ?*anyopaque, column_index
     return fillColumnLogicalInfo(out_info, info);
 }
 
+pub export fn sa_db_dict_lookup_handle(
+    handle: ?*anyopaque,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_found: ?*u64,
+    out_id: ?*u64,
+) u32 {
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    id_slot.* = 0;
+
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotDictLookup(snapshot, dict_name, value) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    id_slot.* = result.id;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_dict_value_len_handle(
+    handle: ?*anyopaque,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    id: u64,
+    out_found: ?*u64,
+    out_len: ?*u64,
+) u32 {
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const len_slot = out_len orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    len_slot.* = 0;
+
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotDictValueLen(snapshot, dict_name, id) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    len_slot.* = result.len;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_dict_value_copy_handle(
+    handle: ?*anyopaque,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    id: u64,
+    out_buf_ptr: ?[*]u8,
+    out_buf_len: u64,
+    out_found: ?*u64,
+    out_written: ?*u64,
+) u32 {
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_buf = outputBytes(out_buf_ptr, out_buf_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    written_slot.* = 0;
+
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotDictValueCopy(snapshot, dict_name, id, out_buf) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    written_slot.* = result.written;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_sum: ?*u64) u32 {
     const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -2055,6 +2126,25 @@ test "db SA ABI interns and reads string dictionaries" {
     try std.testing.expectEqual(@as(u64, 1), found);
     try std.testing.expectEqual(@as(u64, 6), written);
     try std.testing.expectEqualStrings("paused", value_buf[0..@intCast(written)]);
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "members".ptr, "members".len, &read_handle));
+    try std.testing.expect(read_handle != null);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup_handle(read_handle, "member_status".ptr, "member_status".len, "active".ptr, "active".len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 1), lookup_id);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup_handle(read_handle, "member_status".ptr, "member_status".len, "closed".ptr, "closed".len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(@as(u64, 0), lookup_id);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_value_len_handle(read_handle, "member_status".ptr, "member_status".len, paused_id, &found, &value_len));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 6), value_len);
+    @memset(value_buf[0..], 0);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_value_copy_handle(read_handle, "member_status".ptr, "member_status".len, paused_id, &value_buf, value_buf.len, &found, &written));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 6), written);
+    try std.testing.expectEqualStrings("paused", value_buf[0..@intCast(written)]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "members".ptr, "members".len, &info));
 }

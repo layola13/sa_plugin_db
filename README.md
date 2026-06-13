@@ -58,6 +58,9 @@ Core native calls:
 - `sa_db_dict_lookup`
 - `sa_db_dict_value_len`
 - `sa_db_dict_value_copy`
+- `sa_db_dict_lookup_handle`
+- `sa_db_dict_value_len_handle`
+- `sa_db_dict_value_copy_handle`
 - `sa_db_delete_u64_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
@@ -164,7 +167,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
-`DB_DICT_VALUE_COPY`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
+`DB_DICT_VALUE_COPY_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
 `DB_RECOVER`.
 
@@ -230,6 +234,11 @@ advancing the table epoch. `sa_db_dict_lookup` finds an existing ID,
 `sa_db_dict_value_copy` copies the stored bytes into the caller buffer. ERP rows
 store the returned ID in a normal `u64` column, so status/category/type fields can
 reuse the existing `u64` indexes, range reads, projections, and row APIs.
+For read-heavy ERP list rendering, prefer the read-handle variants
+`sa_db_dict_lookup_handle`, `sa_db_dict_value_len_handle`, and
+`sa_db_dict_value_copy_handle` after `sa_db_open_read_table`; the dictionary bytes
+are already part of the immutable snapshot, so repeated lookups do not re-open the
+table metadata or dictionary artifact.
 
 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE` returns row indices for an
 inclusive `[min, max]` range over an indexed `u64` column. It is designed for ERP
@@ -369,6 +378,8 @@ versioned table artifact, so snapshot, restore, verify, recover, lock, unlock,
 and table removal handle it with the same consistency rules as columns and
 indexes. It is not a general varchar/blob store; it is intentionally optimized
 for stable labels that can be represented as integer IDs in fixed-width rows.
+Read handles expose dictionary lookup and ID-to-bytes helpers directly, which is
+the recommended path for decoding list rows back to labels inside one snapshot.
 
 The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 `DB_DECIMAL_TO_PARTS`, `DB_DATE_FROM_YMD`, `DB_DATE_TO_YMD`,

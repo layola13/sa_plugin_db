@@ -385,6 +385,30 @@
     %out_status = call @sa_db_column_logical_info_handle(%handle, %column_index, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_DICT_LOOKUP_HANDLE %out_status, %out_found, %out_id, %handle, %dict_name, %dict_name_len, %value, %value_len
+    __db_dict_lookup_handle_found_slot_%out_found = stack_alloc 8
+    __db_dict_lookup_handle_id_slot_%out_id = stack_alloc 8
+    %out_status = call @sa_db_dict_lookup_handle(%handle, &%dict_name, %dict_name_len, &%value, %value_len, &__db_dict_lookup_handle_found_slot_%out_found, &__db_dict_lookup_handle_id_slot_%out_id)
+    %out_found = load __db_dict_lookup_handle_found_slot_%out_found+0 as u64
+    %out_id = load __db_dict_lookup_handle_id_slot_%out_id+0 as u64
+[END_MACRO]
+
+[MACRO] DB_DICT_VALUE_LEN_HANDLE %out_status, %out_found, %out_len, %handle, %dict_name, %dict_name_len, %id
+    __db_dict_value_handle_found_slot_%out_found = stack_alloc 8
+    __db_dict_value_handle_len_slot_%out_len = stack_alloc 8
+    %out_status = call @sa_db_dict_value_len_handle(%handle, &%dict_name, %dict_name_len, %id, &__db_dict_value_handle_found_slot_%out_found, &__db_dict_value_handle_len_slot_%out_len)
+    %out_found = load __db_dict_value_handle_found_slot_%out_found+0 as u64
+    %out_len = load __db_dict_value_handle_len_slot_%out_len+0 as u64
+[END_MACRO]
+
+[MACRO] DB_DICT_VALUE_COPY_HANDLE %out_status, %out_found, %out_written, %handle, %dict_name, %dict_name_len, %id, %out_buf, %out_buf_len
+    __db_dict_copy_handle_found_slot_%out_found = stack_alloc 8
+    __db_dict_copy_handle_written_slot_%out_written = stack_alloc 8
+    %out_status = call @sa_db_dict_value_copy_handle(%handle, &%dict_name, %dict_name_len, %id, &%out_buf, %out_buf_len, &__db_dict_copy_handle_found_slot_%out_found, &__db_dict_copy_handle_written_slot_%out_written)
+    %out_found = load __db_dict_copy_handle_found_slot_%out_found+0 as u64
+    %out_written = load __db_dict_copy_handle_written_slot_%out_written+0 as u64
+[END_MACRO]
+
 [MACRO] DB_COLUMN_LOGICAL_INFO_TYPE %out_logical_type, %info
     %out_logical_type = load %info+SaDbColumnLogicalInfo_logical_type as u64
 [END_MACRO]

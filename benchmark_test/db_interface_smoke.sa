@@ -126,6 +126,12 @@ L_ENTRY:
     EXPAND DB_SNAPSHOT_INFO_COLUMN_COUNT shape_columns, snapshot_info
     EXPAND DB_SNAPSHOT_INFO_ROW_BYTES shape_row_bytes, snapshot_info
     EXPAND DB_SNAPSHOT_INFO_EPOCH shape_epoch, snapshot_info
+    EXPAND DB_DICT_LOOKUP_HANDLE dict_handle_lookup_status, handle_lookup_paused_found, handle_lookup_paused_id, read_handle, DICT_STATUS, DICT_STATUS_LEN, STATUS_PAUSED, STATUS_PAUSED_LEN
+    EXPAND DB_DICT_LOOKUP_HANDLE dict_handle_missing_status, handle_lookup_closed_found, handle_lookup_closed_id, read_handle, DICT_STATUS, DICT_STATUS_LEN, STATUS_CLOSED, STATUS_CLOSED_LEN
+    EXPAND DB_DICT_VALUE_LEN_HANDLE dict_handle_len_status, handle_paused_value_found, handle_paused_value_len, read_handle, DICT_STATUS, DICT_STATUS_LEN, paused_status_id
+    EXPAND DB_DICT_VALUE_COPY_HANDLE dict_handle_copy_status, handle_paused_copy_found, handle_paused_copy_written, read_handle, DICT_STATUS, DICT_STATUS_LEN, paused_status_id, dict_value_buf, DICT_VALUE_BUF_BYTES
+    handle_paused_first_byte = load dict_value_buf+0 as u8
+    handle_paused_last_byte = load dict_value_buf+5 as u8
     EXPAND DB_COLUMN_INFO_HANDLE column_info_status, read_handle, 3, column_info
     EXPAND DB_COLUMN_INFO_STRIDE column_stride, column_info
     EXPAND DB_COLUMN_INFO_TYPE_CODE column_type, column_info
@@ -211,6 +217,20 @@ L_ENTRY:
     ok_paused_copy_written = eq paused_copy_written, 6
     ok_paused_first_byte = eq paused_first_byte, 112
     ok_paused_last_byte = eq paused_last_byte, 100
+    ok_dict_handle_lookup_status = eq dict_handle_lookup_status, SA_DB_OK
+    ok_handle_lookup_paused_found = eq handle_lookup_paused_found, 1
+    ok_handle_lookup_paused_id = eq handle_lookup_paused_id, paused_status_id
+    ok_dict_handle_missing_status = eq dict_handle_missing_status, SA_DB_OK
+    ok_handle_lookup_closed_found = eq handle_lookup_closed_found, 0
+    ok_handle_lookup_closed_id = eq handle_lookup_closed_id, 0
+    ok_dict_handle_len_status = eq dict_handle_len_status, SA_DB_OK
+    ok_handle_paused_value_found = eq handle_paused_value_found, 1
+    ok_handle_paused_value_len = eq handle_paused_value_len, 6
+    ok_dict_handle_copy_status = eq dict_handle_copy_status, SA_DB_OK
+    ok_handle_paused_copy_found = eq handle_paused_copy_found, 1
+    ok_handle_paused_copy_written = eq handle_paused_copy_written, 6
+    ok_handle_paused_first_byte = eq handle_paused_first_byte, 112
+    ok_handle_paused_last_byte = eq handle_paused_last_byte, 100
     ok_ingest = eq ingest_status, SA_DB_OK
     ok_rows = eq rows, ROWS
     ok_create_index_status = eq create_index_status, SA_DB_OK
@@ -345,7 +365,21 @@ L_ENTRY:
     ok_dict20 = and ok_dict19, ok_paused_copy_written
     ok_dict21 = and ok_dict20, ok_paused_first_byte
     ok_dict22 = and ok_dict21, ok_paused_last_byte
-    ok01a = and ok01, ok_dict22
+    ok_dict23 = and ok_dict22, ok_dict_handle_lookup_status
+    ok_dict24 = and ok_dict23, ok_handle_lookup_paused_found
+    ok_dict25 = and ok_dict24, ok_handle_lookup_paused_id
+    ok_dict26 = and ok_dict25, ok_dict_handle_missing_status
+    ok_dict27 = and ok_dict26, ok_handle_lookup_closed_found
+    ok_dict28 = and ok_dict27, ok_handle_lookup_closed_id
+    ok_dict29 = and ok_dict28, ok_dict_handle_len_status
+    ok_dict30 = and ok_dict29, ok_handle_paused_value_found
+    ok_dict31 = and ok_dict30, ok_handle_paused_value_len
+    ok_dict32 = and ok_dict31, ok_dict_handle_copy_status
+    ok_dict33 = and ok_dict32, ok_handle_paused_copy_found
+    ok_dict34 = and ok_dict33, ok_handle_paused_copy_written
+    ok_dict35 = and ok_dict34, ok_handle_paused_first_byte
+    ok_dict36 = and ok_dict35, ok_handle_paused_last_byte
+    ok01a = and ok01, ok_dict36
     ok02 = and ok01a, ok_ingest
     ok03 = and ok02, ok_rows
     ok04 = and ok03, ok_create_index_status
@@ -483,6 +517,20 @@ L_ENTRY:
     !paused_copy_written
     !paused_first_byte
     !paused_last_byte
+    !dict_handle_lookup_status
+    !handle_lookup_paused_found
+    !handle_lookup_paused_id
+    !dict_handle_missing_status
+    !handle_lookup_closed_found
+    !handle_lookup_closed_id
+    !dict_handle_len_status
+    !handle_paused_value_found
+    !handle_paused_value_len
+    !dict_handle_copy_status
+    !handle_paused_copy_found
+    !handle_paused_copy_written
+    !handle_paused_first_byte
+    !handle_paused_last_byte
     !ingest_status
     !rows
     !create_index_status
@@ -622,6 +670,20 @@ L_ENTRY:
     !ok_paused_copy_written
     !ok_paused_first_byte
     !ok_paused_last_byte
+    !ok_dict_handle_lookup_status
+    !ok_handle_lookup_paused_found
+    !ok_handle_lookup_paused_id
+    !ok_dict_handle_missing_status
+    !ok_handle_lookup_closed_found
+    !ok_handle_lookup_closed_id
+    !ok_dict_handle_len_status
+    !ok_handle_paused_value_found
+    !ok_handle_paused_value_len
+    !ok_dict_handle_copy_status
+    !ok_handle_paused_copy_found
+    !ok_handle_paused_copy_written
+    !ok_handle_paused_first_byte
+    !ok_handle_paused_last_byte
     !ok_ingest
     !ok_rows
     !ok_create_index_status
@@ -756,6 +818,20 @@ L_ENTRY:
     !ok_dict20
     !ok_dict21
     !ok_dict22
+    !ok_dict23
+    !ok_dict24
+    !ok_dict25
+    !ok_dict26
+    !ok_dict27
+    !ok_dict28
+    !ok_dict29
+    !ok_dict30
+    !ok_dict31
+    !ok_dict32
+    !ok_dict33
+    !ok_dict34
+    !ok_dict35
+    !ok_dict36
     !ok01a
     !ok02
     !ok03

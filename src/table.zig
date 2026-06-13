@@ -224,6 +224,12 @@ pub const ReadIndexSnapshot = struct {
     entries: []const u8,
 };
 
+pub const ReadDictSnapshot = struct {
+    name: []const u8,
+    bytes: []const u8,
+    entries: u64,
+};
+
 pub const U64CompareOp = enum(u32) {
     eq = 0,
     ne = 1,
@@ -282,6 +288,7 @@ pub const ReadSnapshot = struct {
     columns: []ColumnMeta,
     segments: []ReadSegmentSnapshot,
     indexes: []ReadIndexSnapshot,
+    dicts: []ReadDictSnapshot,
 
     pub fn destroy(self: *ReadSnapshot) void {
         const backing_allocator = self.backing_allocator;
@@ -3654,6 +3661,7 @@ pub fn openReadSnapshot(
         .columns = &.{},
         .segments = &.{},
         .indexes = &.{},
+        .dicts = &.{},
     };
     errdefer snapshot.destroy();
 
@@ -3670,6 +3678,7 @@ pub fn openReadSnapshot(
     snapshot.columns = try duplicateColumnMetasToArena(arena_allocator, parsed.value.columns);
     snapshot.segments = try arena_allocator.alloc(ReadSegmentSnapshot, parsed.value.segments.len);
     snapshot.indexes = try arena_allocator.alloc(ReadIndexSnapshot, parsed.value.indexes.len);
+    snapshot.dicts = try arena_allocator.alloc(ReadDictSnapshot, parsed.value.dicts.len);
 
     for (parsed.value.segments, 0..) |segment, segment_idx| {
         const segment_columns = try arena_allocator.alloc(ReadColumnSnapshot, segment.files.len);
@@ -3743,6 +3752,20 @@ pub fn openReadSnapshot(
         };
     }
 
+    for (parsed.value.dicts, 0..) |dict, dict_idx| {
+        try validateDictName(dict.name);
+        if (dict.path.len == 0 or dict.sha256.len != 64) return TableError.VerifyFailed;
+        for (parsed.value.dicts[0..dict_idx]) |previous| {
+            if (std.mem.eql(u8, previous.name, dict.name)) return TableError.VerifyFailed;
+        }
+        const bytes = try readDictBytes(arena_allocator, root_dir, dict);
+        snapshot.dicts[dict_idx] = .{
+            .name = try arena_allocator.dupe(u8, dict.name),
+            .bytes = bytes,
+            .entries = dict.entries,
+        };
+    }
+
     return snapshot;
 }
 
@@ -3780,6 +3803,37 @@ fn ensureSnapshotBoolColumn(snapshot: *const ReadSnapshot, column_index: usize) 
         .u64 => if (column.stride != 8) return TableError.InvalidFormat,
         else => return TableError.InvalidFormat,
     }
+}
+
+fn snapshotFindDictIndex(snapshot: *const ReadSnapshot, dict_name: []const u8) ?usize {
+    for (snapshot.dicts, 0..) |dict, idx| {
+        if (std.mem.eql(u8, dict.name, dict_name)) return idx;
+    }
+    return null;
+}
+
+pub fn snapshotDictLookup(snapshot: *const ReadSnapshot, dict_name: []const u8, value: []const u8) TableError!DictLookupResult {
+    try validateDictName(dict_name);
+    try validateDictValue(value);
+    const idx = snapshotFindDictIndex(snapshot, dict_name) orelse return .{ .found = false, .id = 0 };
+    if (try dictFindValueId(snapshot.dicts[idx].bytes, value)) |id| return .{ .found = true, .id = id };
+    return .{ .found = false, .id = 0 };
+}
+
+pub fn snapshotDictValueLen(snapshot: *const ReadSnapshot, dict_name: []const u8, id: u64) TableError!DictValueLenResult {
+    try validateDictName(dict_name);
+    const idx = snapshotFindDictIndex(snapshot, dict_name) orelse return .{ .found = false, .len = 0 };
+    const value = (try dictValueSliceById(snapshot.dicts[idx].bytes, id)) orelse return .{ .found = false, .len = 0 };
+    return .{ .found = true, .len = value.len };
+}
+
+pub fn snapshotDictValueCopy(snapshot: *const ReadSnapshot, dict_name: []const u8, id: u64, out: []u8) TableError!DictValueCopyResult {
+    try validateDictName(dict_name);
+    const idx = snapshotFindDictIndex(snapshot, dict_name) orelse return .{ .found = false, .written = 0 };
+    const value = (try dictValueSliceById(snapshot.dicts[idx].bytes, id)) orelse return .{ .found = false, .written = 0 };
+    if (out.len < value.len) return TableError.CursorOverflow;
+    @memcpy(out[0..value.len], value);
+    return .{ .found = true, .written = value.len };
 }
 
 fn readBoolColumnValue(column: ColumnMeta, bytes: []const u8, local_row: u64) TableError!bool {
