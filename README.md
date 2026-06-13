@@ -551,10 +551,12 @@ benchmarks. The required baseline is:
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
-  batch reads now cover the first ERP list-page shape, and indexed blob exact,
-  token, prefix, and contains filters plus fixed-first-key `u64_pair` filters
-  cover common high-frequency text and child-row equality/search shapes; next is
-  ERP benchmark coverage beyond raw fixed-width bytes and broader index planning.
+  batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
+  prefix, and contains filters plus fixed-first-key `u64_pair` filters cover
+  common high-frequency text and child-row equality/search shapes. The first ERP
+  workflow benchmark now covers customers, products, orders, order lines,
+  inventory movement, and invoices; next is the matching SQLite ERP comparison
+  and broader index planning.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
@@ -576,6 +578,11 @@ Dataset:
 - Columns: `id`, `plan`, `status`, `points`, all `u64`
 - Concurrent query: 4 workers, 100 total full-table SUM queries
 - Concurrent insert: 4 workers, 12,500 rows each
+- ERP workflow: 1,024 customers, 512 products, 8,192 orders, 32,768 order
+  lines, 16,384 inventory movements, and 8,192 invoices. It exercises
+  dictionary-backed status fields, `i64` decimal/date columns, unique and
+  non-unique `u64` indexes, `u64_pair` child-row indexes, range filters, count
+  filters, projection, and verification across multiple tables.
 
 Run db benchmarks:
 
@@ -613,6 +620,9 @@ sa build-exe db_member_bench.sa -o db_member_bench.out --no-incremental
 
 sa build-exe db_concurrent_bench.sa -o db_concurrent_bench.out --no-incremental
 ./db_concurrent_bench.out
+
+sa build-exe db_erp_workflow_bench.sa -o db_erp_workflow_bench.out --no-incremental
+./db_erp_workflow_bench.out
 ```
 
 Latest 5-run median results:
@@ -630,6 +640,11 @@ Latest 5-run median results:
 | serial 100x SUM with read handle | 122.111 ms | 308.089 ms | db plugin |
 | concurrent 4x25 SUM with read handles | 48.385 ms | 120.165 ms | db plugin |
 | concurrent insert, 4x12,500 rows | 55.618 ms | 90.713 ms | db plugin |
+
+Current ERP workflow benchmark coverage is db-only. The latest verification run
+reported correct totals for order lines, customer orders, due invoices,
+inventory movements, projected rows, and paid invoice count; add the SQLite ERP
+counterpart before treating ERP performance as a db-vs-SQLite comparison.
 
 Summary:
 
