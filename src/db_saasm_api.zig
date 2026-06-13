@@ -2891,6 +2891,115 @@ pub export fn sa_db_filter_rows_i64_range_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_filter_rows_decimal_i64_range_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    scale: u32,
+    min_negative: u32,
+    min_whole: u64,
+    min_fraction: u64,
+    max_negative: u32,
+    max_whole: u64,
+    max_fraction: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    var min_value: i64 = 0;
+    var max_value: i64 = 0;
+    var status = sa_db_decimal_from_parts(min_negative, min_whole, min_fraction, scale, &min_value);
+    if (status != SA_DB_OK) return status;
+    status = sa_db_decimal_from_parts(max_negative, max_whole, max_fraction, scale, &max_value);
+    if (status != SA_DB_OK) return status;
+    return sa_db_filter_rows_i64_range_handle(handle, column_index, in_rows_ptr, in_rows_len, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_filter_rows_date_range_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    min_year: i64,
+    min_month: u32,
+    min_day: u32,
+    max_year: i64,
+    max_month: u32,
+    max_day: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const min_value = daysFromCivil(min_year, min_month, min_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = daysFromCivil(max_year, max_month, max_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_filter_rows_i64_range_handle(handle, column_index, in_rows_ptr, in_rows_len, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_filter_rows_timestamp_ms_range_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    min_days: i64,
+    min_millis_of_day: u64,
+    max_days: i64,
+    max_millis_of_day: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const min_value = timestampFromParts(min_days, min_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_filter_rows_i64_range_handle(handle, column_index, in_rows_ptr, in_rows_len, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_filter_rows_timestamp_us_range_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    min_days: i64,
+    min_micros_of_day: u64,
+    max_days: i64,
+    max_micros_of_day: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const min_value = timestampFromParts(min_days, min_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_filter_rows_i64_range_handle(handle, column_index, in_rows_ptr, in_rows_len, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
 pub export fn sa_db_filter_rows_bool_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -3730,6 +3839,8 @@ test "db SA ABI filters candidate rows for ERP predicates" {
         \\#def COL_STATUS_ID_STRIDE = 8 // u64
         \\#def COL_POSTED_STRIDE = 1 // u8 bool
         \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+        \\#def COL_POSTED_MS_STRIDE = 8 // i64 timestamp_ms
+        \\#def COL_POSTED_US_STRIDE = 8 // i64 timestamp_us
     ;
     var info: SaDbTableInfo = undefined;
     try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "candidate_filters.sadb-schema".ptr, "candidate_filters.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
@@ -3739,12 +3850,16 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     var status_ids = [_]u64{ 1, 2, 2, 2, 1, 2 };
     var posted = [_]u8{ 1, 1, 0, 1, 1, 1 };
     var totals = [_]i64{ 1000, 2000, 3000, 4000, 5000, 7000 };
+    var posted_ms = [_]i64{ 0, 1000, 2000, 86_400_000, 86_400_001, 172_800_000 };
+    var posted_us = [_]i64{ 0, 1000, 2000, 86_400_000_000, 86_400_000_001, 172_800_000_000 };
     const cols = [_]SaDbColumnInput{
         .{ .data = @ptrCast(&customer_ids), .len = @sizeOf(@TypeOf(customer_ids)) },
         .{ .data = @ptrCast(&order_days), .len = @sizeOf(@TypeOf(order_days)) },
         .{ .data = @ptrCast(&status_ids), .len = @sizeOf(@TypeOf(status_ids)) },
         .{ .data = @ptrCast(&posted), .len = @sizeOf(@TypeOf(posted)) },
         .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+        .{ .data = @ptrCast(&posted_ms), .len = @sizeOf(@TypeOf(posted_ms)) },
+        .{ .data = @ptrCast(&posted_us), .len = @sizeOf(@TypeOf(posted_us)) },
     };
     try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, customer_ids.len, &cols, cols.len, &info));
     try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_i64_pair_index(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, 0, 1, 1, &info));
@@ -3758,16 +3873,42 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_i64_pair_handle(handle, 0, 1, 7, -5, 25, 0, rows.len, &rows, rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 5), total);
     try std.testing.expectEqual(@as(u64, 5), written);
+    const candidate_written = written;
 
-    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_u64_range_handle(handle, 2, &rows, written, 2, 2, 0, rows.len, &rows, rows.len, &written, &total));
+    var filtered = [_]u64{ 99, 99, 99, 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_date_range_handle(handle, 1, &rows, candidate_written, 1970, 1, 1, 1970, 1, 21, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[2]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_u64_range_handle(handle, 2, &rows, candidate_written, 2, 2, 0, rows.len, &rows, rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 3), total);
     try std.testing.expectEqual(@as(u64, 3), written);
     try std.testing.expectEqual(@as(u64, 1), rows[0]);
     try std.testing.expectEqual(@as(u64, 2), rows[1]);
     try std.testing.expectEqual(@as(u64, 5), rows[2]);
 
-    var filtered = [_]u64{ 99, 99, 99, 99 };
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_i64_range_handle(handle, 4, &rows, written, 1500, 5500, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_decimal_i64_range_handle(handle, 4, &rows, 3, 2, 0, 15, 0, 0, 55, 0, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_timestamp_ms_range_handle(handle, 5, &rows, 3, 0, 0, 0, 3000, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_timestamp_us_range_handle(handle, 6, &rows, 3, 0, 0, 0, 3000, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);
     try std.testing.expectEqual(@as(u64, 2), written);
     try std.testing.expectEqual(@as(u64, 1), filtered[0]);
@@ -3782,6 +3923,24 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     written = 123;
     total = 456;
     try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_filter_rows_bool_handle(handle, 3, &rows, 3, 2, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_filter_rows_date_range_handle(handle, 1, &rows, 3, 1970, 13, 1, 1970, 1, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_filter_rows_timestamp_ms_range_handle(handle, 5, &rows, 3, 0, MS_PER_DAY, 0, 0, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_filter_rows_timestamp_us_range_handle(handle, 6, &rows, 3, 0, US_PER_DAY, 0, 0, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 0), written);
     try std.testing.expectEqual(@as(u64, 0), total);
 

@@ -931,6 +931,38 @@
     %out_total = load __db_handle_filter_rows_i64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %scale, %min_negative, %min_whole, %min_fraction, %max_negative, %max_whole, %max_fraction, %offset, %limit
+    __db_handle_filter_rows_decimal_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_decimal_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_decimal_i64_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %scale, %min_negative, %min_whole, %min_fraction, %max_negative, %max_whole, %max_fraction, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_decimal_written_slot_%out_written, &__db_handle_filter_rows_decimal_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_decimal_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_decimal_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_DATE_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %offset, %limit
+    __db_handle_filter_rows_date_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_date_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_date_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_date_written_slot_%out_written, &__db_handle_filter_rows_date_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_date_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_date_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %offset, %limit
+    __db_handle_filter_rows_ts_ms_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_ts_ms_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_timestamp_ms_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_ts_ms_written_slot_%out_written, &__db_handle_filter_rows_ts_ms_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_ts_ms_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_ts_ms_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %offset, %limit
+    __db_handle_filter_rows_ts_us_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_ts_us_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_timestamp_us_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_ts_us_written_slot_%out_written, &__db_handle_filter_rows_ts_us_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_ts_us_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_ts_us_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_BOOL_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %expected, %offset, %limit
     __db_handle_filter_rows_bool_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_bool_total_slot_%out_total = stack_alloc 8

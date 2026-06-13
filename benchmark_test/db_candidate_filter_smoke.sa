@@ -3,18 +3,18 @@
 @const ROOT = utf8:"."
 @const TABLE = utf8:"candidate_filters"
 @const SCHEMA_PATH = utf8:"candidate_filters.sadb-schema"
-@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_CUSTOMER_ID_STRIDE = 8 // u64\n#def COL_ORDER_DAY_STRIDE = 8 // i64 date\n#def COL_STATUS_ID_STRIDE = 8 // u64\n#def COL_POSTED_STRIDE = 1 // u8 bool\n#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)\n"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_CUSTOMER_ID_STRIDE = 8 // u64\n#def COL_ORDER_DAY_STRIDE = 8 // i64 date\n#def COL_STATUS_ID_STRIDE = 8 // u64\n#def COL_POSTED_STRIDE = 1 // u8 bool\n#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)\n#def COL_POSTED_MS_STRIDE = 8 // i64 timestamp_ms\n#def COL_POSTED_US_STRIDE = 8 // i64 timestamp_us\n"
 
 #def ROOT_LEN = 1
 #def TABLE_LEN = 17
 #def SCHEMA_PATH_LEN = 29
-#def SCHEMA_LEN = 224
+#def SCHEMA_LEN = 324
 #def ROWS = 6
 #def U64_COL_BYTES = 48
 #def I64_COL_BYTES = 48
 #def BOOL_COL_BYTES = 6
-#def COLUMN_COUNT = 5
-#def COLUMNS_BYTES = 80
+#def COLUMN_COUNT = 7
+#def COLUMNS_BYTES = 112
 #def ROWS_CAP = 6
 #def ROWS_BYTES = 48
 
@@ -27,6 +27,8 @@ L_ENTRY:
     status_ids = alloc U64_COL_BYTES
     posted = alloc BOOL_COL_BYTES
     totals = alloc I64_COL_BYTES
+    posted_ms = alloc I64_COL_BYTES
+    posted_us = alloc I64_COL_BYTES
     candidate_rows = alloc ROWS_BYTES
     status_rows = alloc ROWS_BYTES
     final_rows = alloc ROWS_BYTES
@@ -61,6 +63,18 @@ L_ENTRY:
     store totals+24, 4000 as i64
     store totals+32, 5000 as i64
     store totals+40, 7000 as i64
+    store posted_ms+0, 0 as i64
+    store posted_ms+8, 1000 as i64
+    store posted_ms+16, 2000 as i64
+    store posted_ms+24, 86400000 as i64
+    store posted_ms+32, 86400001 as i64
+    store posted_ms+40, 172800000 as i64
+    store posted_us+0, 0 as i64
+    store posted_us+8, 1000 as i64
+    store posted_us+16, 2000 as i64
+    store posted_us+24, 86400000000 as i64
+    store posted_us+32, 86400000001 as i64
+    store posted_us+40, 172800000000 as i64
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
@@ -69,11 +83,17 @@ L_ENTRY:
     EXPAND DB_COLUMN_INPUT_SET columns, 2, status_ids, U64_COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 3, posted, BOOL_COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 4, totals, I64_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 5, posted_ms, I64_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 6, posted_us, I64_COL_BYTES
     EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
     EXPAND DB_CREATE_U64_I64_PAIR_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, 1, info
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
 
     EXPAND DB_RANGE_U64_I64_PAIR_HANDLE candidate_status, candidate_written, candidate_total, candidate_rows, ROWS_CAP, read_handle, 0, 1, 7, -5, 25, 0, ROWS_CAP
+    EXPAND DB_FILTER_ROWS_DATE_RANGE_HANDLE date_filter_status, date_written, date_total, final_rows, ROWS_CAP, read_handle, 1, candidate_rows, candidate_written, 1970, 1, 1, 1970, 1, 21, 0, ROWS_CAP
+    date_row0 = load final_rows+0 as u64
+    date_row1 = load final_rows+8 as u64
+    date_row2 = load final_rows+16 as u64
     EXPAND DB_FILTER_ROWS_U64_RANGE_HANDLE status_filter_status, status_written, status_total, status_rows, ROWS_CAP, read_handle, 2, candidate_rows, candidate_written, 2, 2, 0, ROWS_CAP
     status_row0 = load status_rows+0 as u64
     status_row1 = load status_rows+8 as u64
@@ -81,6 +101,15 @@ L_ENTRY:
     EXPAND DB_FILTER_ROWS_I64_RANGE_HANDLE amount_filter_status, amount_written, amount_total, final_rows, ROWS_CAP, read_handle, 4, status_rows, status_written, 1500, 5500, 0, ROWS_CAP
     amount_row0 = load final_rows+0 as u64
     amount_row1 = load final_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE decimal_filter_status, decimal_written, decimal_total, final_rows, ROWS_CAP, read_handle, 4, status_rows, status_written, 2, 0, 15, 0, 0, 55, 0, 0, ROWS_CAP
+    decimal_row0 = load final_rows+0 as u64
+    decimal_row1 = load final_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE timestamp_ms_filter_status, timestamp_ms_written, timestamp_ms_total, final_rows, ROWS_CAP, read_handle, 5, status_rows, status_written, 0, 0, 0, 3000, 0, ROWS_CAP
+    timestamp_ms_row0 = load final_rows+0 as u64
+    timestamp_ms_row1 = load final_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE timestamp_us_filter_status, timestamp_us_written, timestamp_us_total, final_rows, ROWS_CAP, read_handle, 6, status_rows, status_written, 0, 0, 0, 3000, 0, ROWS_CAP
+    timestamp_us_row0 = load final_rows+0 as u64
+    timestamp_us_row1 = load final_rows+8 as u64
     EXPAND DB_FILTER_ROWS_BOOL_HANDLE posted_filter_status, posted_written, posted_total, final_rows, ROWS_CAP, read_handle, 3, status_rows, status_written, 1, 0, ROWS_CAP
     posted_row0 = load final_rows+0 as u64
     posted_row1 = load final_rows+8 as u64
@@ -97,6 +126,12 @@ L_ENTRY:
     ok_candidate_status = eq candidate_status, SA_DB_OK
     ok_candidate_written = eq candidate_written, 5
     ok_candidate_total = eq candidate_total, 5
+    ok_date_filter_status = eq date_filter_status, SA_DB_OK
+    ok_date_written = eq date_written, 3
+    ok_date_total = eq date_total, 3
+    ok_date_row0 = eq date_row0, 1
+    ok_date_row1 = eq date_row1, 2
+    ok_date_row2 = eq date_row2, 4
     ok_status_filter_status = eq status_filter_status, SA_DB_OK
     ok_status_written = eq status_written, 3
     ok_status_total = eq status_total, 3
@@ -108,6 +143,21 @@ L_ENTRY:
     ok_amount_total = eq amount_total, 2
     ok_amount_row0 = eq amount_row0, 1
     ok_amount_row1 = eq amount_row1, 2
+    ok_decimal_filter_status = eq decimal_filter_status, SA_DB_OK
+    ok_decimal_written = eq decimal_written, 2
+    ok_decimal_total = eq decimal_total, 2
+    ok_decimal_row0 = eq decimal_row0, 1
+    ok_decimal_row1 = eq decimal_row1, 2
+    ok_timestamp_ms_filter_status = eq timestamp_ms_filter_status, SA_DB_OK
+    ok_timestamp_ms_written = eq timestamp_ms_written, 2
+    ok_timestamp_ms_total = eq timestamp_ms_total, 2
+    ok_timestamp_ms_row0 = eq timestamp_ms_row0, 1
+    ok_timestamp_ms_row1 = eq timestamp_ms_row1, 2
+    ok_timestamp_us_filter_status = eq timestamp_us_filter_status, SA_DB_OK
+    ok_timestamp_us_written = eq timestamp_us_written, 2
+    ok_timestamp_us_total = eq timestamp_us_total, 2
+    ok_timestamp_us_row0 = eq timestamp_us_row0, 1
+    ok_timestamp_us_row1 = eq timestamp_us_row1, 2
     ok_posted_filter_status = eq posted_filter_status, SA_DB_OK
     ok_posted_written = eq posted_written, 2
     ok_posted_total = eq posted_total, 2
@@ -126,27 +176,48 @@ L_ENTRY:
     ok05 = and ok04, ok_candidate_status
     ok06 = and ok05, ok_candidate_written
     ok07 = and ok06, ok_candidate_total
-    ok08 = and ok07, ok_status_filter_status
-    ok09 = and ok08, ok_status_written
-    ok10 = and ok09, ok_status_total
-    ok11 = and ok10, ok_status_row0
-    ok12 = and ok11, ok_status_row1
-    ok13 = and ok12, ok_status_row2
-    ok14 = and ok13, ok_amount_filter_status
-    ok15 = and ok14, ok_amount_written
-    ok16 = and ok15, ok_amount_total
-    ok17 = and ok16, ok_amount_row0
-    ok18 = and ok17, ok_amount_row1
-    ok19 = and ok18, ok_posted_filter_status
-    ok20 = and ok19, ok_posted_written
-    ok21 = and ok20, ok_posted_total
-    ok22 = and ok21, ok_posted_row0
-    ok23 = and ok22, ok_posted_row1
-    ok24 = and ok23, ok_invalid_bool_status
-    ok25 = and ok24, ok_invalid_bool_written
-    ok26 = and ok25, ok_invalid_bool_total
-    ok27 = and ok26, ok_close
-    ok = and ok27, ok_verify
+    ok08 = and ok07, ok_date_filter_status
+    ok09 = and ok08, ok_date_written
+    ok10 = and ok09, ok_date_total
+    ok11 = and ok10, ok_date_row0
+    ok12 = and ok11, ok_date_row1
+    ok13 = and ok12, ok_date_row2
+    ok14 = and ok13, ok_status_filter_status
+    ok15 = and ok14, ok_status_written
+    ok16 = and ok15, ok_status_total
+    ok17 = and ok16, ok_status_row0
+    ok18 = and ok17, ok_status_row1
+    ok19 = and ok18, ok_status_row2
+    ok20 = and ok19, ok_amount_filter_status
+    ok21 = and ok20, ok_amount_written
+    ok22 = and ok21, ok_amount_total
+    ok23 = and ok22, ok_amount_row0
+    ok24 = and ok23, ok_amount_row1
+    ok25 = and ok24, ok_decimal_filter_status
+    ok26 = and ok25, ok_decimal_written
+    ok27 = and ok26, ok_decimal_total
+    ok28 = and ok27, ok_decimal_row0
+    ok29 = and ok28, ok_decimal_row1
+    ok30 = and ok29, ok_timestamp_ms_filter_status
+    ok31 = and ok30, ok_timestamp_ms_written
+    ok32 = and ok31, ok_timestamp_ms_total
+    ok33 = and ok32, ok_timestamp_ms_row0
+    ok34 = and ok33, ok_timestamp_ms_row1
+    ok35 = and ok34, ok_timestamp_us_filter_status
+    ok36 = and ok35, ok_timestamp_us_written
+    ok37 = and ok36, ok_timestamp_us_total
+    ok38 = and ok37, ok_timestamp_us_row0
+    ok39 = and ok38, ok_timestamp_us_row1
+    ok40 = and ok39, ok_posted_filter_status
+    ok41 = and ok40, ok_posted_written
+    ok42 = and ok41, ok_posted_total
+    ok43 = and ok42, ok_posted_row0
+    ok44 = and ok43, ok_posted_row1
+    ok45 = and ok44, ok_invalid_bool_status
+    ok46 = and ok45, ok_invalid_bool_written
+    ok47 = and ok46, ok_invalid_bool_total
+    ok48 = and ok47, ok_close
+    ok = and ok48, ok_verify
 
     !remove_status
     !init_status
@@ -157,6 +228,12 @@ L_ENTRY:
     !candidate_status
     !candidate_written
     !candidate_total
+    !date_filter_status
+    !date_written
+    !date_total
+    !date_row0
+    !date_row1
+    !date_row2
     !status_filter_status
     !status_written
     !status_total
@@ -168,6 +245,21 @@ L_ENTRY:
     !amount_total
     !amount_row0
     !amount_row1
+    !decimal_filter_status
+    !decimal_written
+    !decimal_total
+    !decimal_row0
+    !decimal_row1
+    !timestamp_ms_filter_status
+    !timestamp_ms_written
+    !timestamp_ms_total
+    !timestamp_ms_row0
+    !timestamp_ms_row1
+    !timestamp_us_filter_status
+    !timestamp_us_written
+    !timestamp_us_total
+    !timestamp_us_row0
+    !timestamp_us_row1
     !posted_filter_status
     !posted_written
     !posted_total
@@ -186,6 +278,12 @@ L_ENTRY:
     !ok_candidate_status
     !ok_candidate_written
     !ok_candidate_total
+    !ok_date_filter_status
+    !ok_date_written
+    !ok_date_total
+    !ok_date_row0
+    !ok_date_row1
+    !ok_date_row2
     !ok_status_filter_status
     !ok_status_written
     !ok_status_total
@@ -197,6 +295,21 @@ L_ENTRY:
     !ok_amount_total
     !ok_amount_row0
     !ok_amount_row1
+    !ok_decimal_filter_status
+    !ok_decimal_written
+    !ok_decimal_total
+    !ok_decimal_row0
+    !ok_decimal_row1
+    !ok_timestamp_ms_filter_status
+    !ok_timestamp_ms_written
+    !ok_timestamp_ms_total
+    !ok_timestamp_ms_row0
+    !ok_timestamp_ms_row1
+    !ok_timestamp_us_filter_status
+    !ok_timestamp_us_written
+    !ok_timestamp_us_total
+    !ok_timestamp_us_row0
+    !ok_timestamp_us_row1
     !ok_posted_filter_status
     !ok_posted_written
     !ok_posted_total
@@ -234,11 +347,34 @@ L_ENTRY:
     !ok25
     !ok26
     !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !ok45
+    !ok46
+    !ok47
+    !ok48
     !customer_ids
     !order_days
     !status_ids
     !posted
     !totals
+    !posted_ms
+    !posted_us
     !candidate_rows
     !status_rows
     !final_rows

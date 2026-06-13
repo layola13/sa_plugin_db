@@ -150,6 +150,10 @@ Read-handle query calls:
 - `sa_db_filter_bool_handle`
 - `sa_db_filter_rows_u64_range_handle`
 - `sa_db_filter_rows_i64_range_handle`
+- `sa_db_filter_rows_decimal_i64_range_handle`
+- `sa_db_filter_rows_date_range_handle`
+- `sa_db_filter_rows_timestamp_ms_range_handle`
+- `sa_db_filter_rows_timestamp_us_range_handle`
 - `sa_db_filter_rows_bool_handle`
 - `sa_db_filter_blob_eq_handle`
 - `sa_db_filter_blob_contains_handle`
@@ -200,7 +204,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_U64_TIMESTAMP_US_PAIR_HANDLE`,
 `DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_ROWS_U64_RANGE_HANDLE`,
-`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_FILTER_ROWS_BOOL_HANDLE`,
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE`,
+`DB_FILTER_ROWS_DATE_RANGE_HANDLE`, `DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE`,
+`DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE`, `DB_FILTER_ROWS_BOOL_HANDLE`,
 `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
@@ -428,14 +434,22 @@ encoding.
 Candidate row filters are the first explicit composition layer above these
 indexes. `sa_db_filter_rows_u64_range_handle` /
 `DB_FILTER_ROWS_U64_RANGE_HANDLE`, `sa_db_filter_rows_i64_range_handle` /
-`DB_FILTER_ROWS_I64_RANGE_HANDLE`, and `sa_db_filter_rows_bool_handle` /
-`DB_FILTER_ROWS_BOOL_HANDLE` take an existing row-id list, preserve that list's
-order, apply an additional snapshot column predicate, and return the same
-`offset`/`limit`/`total` pagination contract. SA callers can therefore run an
-indexed customer/date or blob/text query first, then narrow the candidate rows by
-status, amount/date range, or posted/active bool without materializing full rows
-in SA code. This is a planner building block rather than a SQL optimizer: callers
-still choose the first selective index explicitly.
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `sa_db_filter_rows_decimal_i64_range_handle` /
+`DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE`, `sa_db_filter_rows_date_range_handle`
+/ `DB_FILTER_ROWS_DATE_RANGE_HANDLE`,
+`sa_db_filter_rows_timestamp_ms_range_handle` /
+`DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE`,
+`sa_db_filter_rows_timestamp_us_range_handle` /
+`DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE`, and
+`sa_db_filter_rows_bool_handle` / `DB_FILTER_ROWS_BOOL_HANDLE` take an existing
+row-id list, preserve that list's order, apply an additional snapshot column
+predicate, and return the same `offset`/`limit`/`total` pagination contract.
+Decimal/date/timestamp wrappers validate and encode the logical ERP values before
+using the signed integer scan path. SA callers can therefore run an indexed
+customer/date or blob/text query first, then narrow the candidate rows by status,
+amount/date/timestamp range, or posted/active bool without materializing full
+rows in SA code. This is a planner building block rather than a SQL optimizer:
+callers still choose the first selective index explicitly.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
