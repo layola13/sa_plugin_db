@@ -1032,6 +1032,29 @@ pub export fn sa_db_create_blob_token_index(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_create_blob_prefix_index(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createBlobPrefixIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_dict_intern(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -1674,6 +1697,39 @@ pub export fn sa_db_filter_blob_token_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotFilterBlobTokenRows(gpa.allocator(), snapshot, @intCast(column_index), store_name, value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_blob_prefix_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterBlobPrefixRows(gpa.allocator(), snapshot, @intCast(column_index), store_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
@@ -3386,6 +3442,7 @@ test "db SA ABI creates and queries blob token indexes" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_create_blob_token_index(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_blob_prefix_index(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, &info));
     try std.testing.expectEqual(@as(u64, 3), info.row_count);
 
     var read_handle: ?*anyopaque = null;
@@ -3402,6 +3459,20 @@ test "db SA ABI creates and queries blob token indexes" {
     try std.testing.expectEqual(@as(u64, 1), total);
     try std.testing.expectEqual(@as(u64, 2), rows[0]);
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_filter_blob_token_handle(read_handle, 1, store_name.ptr, store_name.len, "two words".ptr, "two words".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_blob_prefix_handle(read_handle, 1, store_name.ptr, store_name.len, "wid".ptr, "wid".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), rows[1]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_blob_prefix_handle(read_handle, 1, store_name.ptr, store_name.len, "SKU_".ptr, "SKU_".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 1), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_filter_blob_prefix_handle(read_handle, 1, store_name.ptr, store_name.len, "two words".ptr, "two words".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
 }
