@@ -413,6 +413,12 @@
     %out_count = load __db_handle_i64_cmp_slot_%out_count+0 as u64
 [END_MACRO]
 
+[MACRO] DB_COUNT_BOOL_HANDLE %out_status, %out_count, %handle, %column_index, %expected
+    __db_handle_bool_count_slot_%out_count = stack_alloc 8
+    %out_status = call @sa_db_count_bool_handle(%handle, %column_index, %expected, &__db_handle_bool_count_slot_%out_count)
+    %out_count = load __db_handle_bool_count_slot_%out_count+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FIND_U64_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %expected
     __db_handle_find_found_slot_%out_found = stack_alloc 8
     __db_handle_find_row_slot_%out_row_index = stack_alloc 8
@@ -427,6 +433,14 @@
     %out_status = call @sa_db_find_i64_handle(%handle, %column_index, %expected, &__db_handle_find_i64_found_slot_%out_found, &__db_handle_find_i64_row_slot_%out_row_index)
     %out_found = load __db_handle_find_i64_found_slot_%out_found+0 as u64
     %out_row_index = load __db_handle_find_i64_row_slot_%out_row_index+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FIND_BOOL_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %expected
+    __db_handle_find_bool_found_slot_%out_found = stack_alloc 8
+    __db_handle_find_bool_row_slot_%out_row_index = stack_alloc 8
+    %out_status = call @sa_db_find_bool_handle(%handle, %column_index, %expected, &__db_handle_find_bool_found_slot_%out_found, &__db_handle_find_bool_row_slot_%out_row_index)
+    %out_found = load __db_handle_find_bool_found_slot_%out_found+0 as u64
+    %out_row_index = load __db_handle_find_bool_row_slot_%out_row_index+0 as u64
 [END_MACRO]
 
 [MACRO] DB_FIND_U64_PAIR_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %column_index2, %key1, %key2
@@ -541,6 +555,14 @@
     %out_total = load __db_handle_range_pair_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_BOOL_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %expected, %offset, %limit
+    __db_handle_filter_bool_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_bool_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_bool_handle(%handle, %column_index, %expected, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_bool_written_slot_%out_written, &__db_handle_filter_bool_total_slot_%out_total)
+    %out_written = load __db_handle_filter_bool_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_bool_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_GET_U64_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
     __db_handle_get_slot_%out_value = stack_alloc 8
     %out_status = call @sa_db_get_u64_handle(%handle, %column_index, %row_index, &__db_handle_get_slot_%out_value)
@@ -551,6 +573,12 @@
     __db_handle_get_i64_slot_%out_value = stack_alloc 8
     %out_status = call @sa_db_get_i64_handle(%handle, %column_index, %row_index, &__db_handle_get_i64_slot_%out_value)
     %out_value = load __db_handle_get_i64_slot_%out_value+0 as i64
+[END_MACRO]
+
+[MACRO] DB_GET_BOOL_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
+    __db_handle_get_bool_slot_%out_value = stack_alloc 4
+    %out_status = call @sa_db_get_bool_handle(%handle, %column_index, %row_index, &__db_handle_get_bool_slot_%out_value)
+    %out_value = load __db_handle_get_bool_slot_%out_value+0 as u32
 [END_MACRO]
 
 [MACRO] DB_PROJECT_ROWS_HANDLE %out_status, %out_written_rows, %out_required_bytes, %out_bytes, %out_bytes_len, %handle, %row_indices, %row_indices_len, %column_indices, %column_indices_len

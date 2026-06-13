@@ -243,6 +243,11 @@ pub const U64RangeResult = struct {
     total: u64,
 };
 
+pub const BoolFilterResult = struct {
+    written: u64,
+    total: u64,
+};
+
 pub const ProjectRowsResult = struct {
     written_rows: u64,
     required_bytes: u64,
@@ -3502,6 +3507,37 @@ fn ensureSnapshotI64Column(snapshot: *const ReadSnapshot, column_index: usize) T
     if (column.stride != 8 or !std.mem.eql(u8, column.ty, "i64")) return TableError.InvalidFormat;
 }
 
+fn ensureSnapshotBoolColumn(snapshot: *const ReadSnapshot, column_index: usize) TableError!void {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    if (column.logical_type != schema.LOGICAL_BOOL) return TableError.InvalidFormat;
+    const ty = try parsePrimTypeTable(column.ty);
+    switch (ty) {
+        .i1, .u8 => if (column.stride != 1) return TableError.InvalidFormat,
+        .u64 => if (column.stride != 8) return TableError.InvalidFormat,
+        else => return TableError.InvalidFormat,
+    }
+}
+
+fn readBoolColumnValue(column: ColumnMeta, bytes: []const u8, local_row: u64) TableError!bool {
+    const stride = column.stride;
+    const offset_u64 = std.math.mul(u64, local_row, @as(u64, stride)) catch return TableError.CursorOverflow;
+    const end_u64 = std.math.add(u64, offset_u64, @as(u64, stride)) catch return TableError.CursorOverflow;
+    if (end_u64 > @as(u64, @intCast(bytes.len))) return TableError.VerifyFailed;
+    if (offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const offset: usize = @intCast(offset_u64);
+    const raw: u64 = switch (try parsePrimTypeTable(column.ty)) {
+        .i1, .u8 => bytes[offset],
+        .u64 => readU64LE(bytes, offset),
+        else => return TableError.InvalidFormat,
+    };
+    return switch (raw) {
+        0 => false,
+        1 => true,
+        else => TableError.InvalidFormat,
+    };
+}
+
 fn compareU64(value: u64, op: U64CompareOp, expected: u64) bool {
     return switch (op) {
         .eq => value == expected,
@@ -4251,6 +4287,76 @@ pub fn snapshotFindI64(snapshot: *const ReadSnapshot, column_index: usize, expec
     return .{ .found = false, .row_index = 0 };
 }
 
+pub fn snapshotCountBool(snapshot: *const ReadSnapshot, column_index: usize, expected: bool) TableError!u64 {
+    try ensureSnapshotBoolColumn(snapshot, column_index);
+    const column = snapshot.columns[column_index];
+    var count: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            if ((try readBoolColumnValue(column, bytes, i)) == expected) {
+                count = std.math.add(u64, count, 1) catch return TableError.CursorOverflow;
+            }
+        }
+    }
+    return count;
+}
+
+pub fn snapshotFindBool(snapshot: *const ReadSnapshot, column_index: usize, expected: bool) TableError!U64FindResult {
+    try ensureSnapshotBoolColumn(snapshot, column_index);
+    const column = snapshot.columns[column_index];
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            if ((try readBoolColumnValue(column, bytes, i)) == expected) {
+                return .{ .found = true, .row_index = row_base + i };
+            }
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    return .{ .found = false, .row_index = 0 };
+}
+
+pub fn snapshotFilterBoolRows(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    expected: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BoolFilterResult {
+    try ensureSnapshotBoolColumn(snapshot, column_index);
+    const column = snapshot.columns[column_index];
+    var total: u64 = 0;
+    var written: u64 = 0;
+    const out_capacity: u64 = @intCast(out_rows.len);
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            if ((try readBoolColumnValue(column, bytes, i)) == expected) {
+                if (total >= offset and limit != 0 and written < limit and written < out_capacity) {
+                    out_rows[@intCast(written)] = row_base + i;
+                    written += 1;
+                }
+                total = std.math.add(u64, total, 1) catch return TableError.CursorOverflow;
+            }
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    return .{ .written = written, .total = total };
+}
+
 pub fn snapshotFindU64Pair(snapshot: *const ReadSnapshot, column_index: usize, column_index2: usize, key1: u64, key2: u64) TableError!U64FindResult {
     try ensureSnapshotU64Column(snapshot, column_index);
     try ensureSnapshotU64Column(snapshot, column_index2);
@@ -4443,6 +4549,24 @@ pub fn snapshotGetI64(snapshot: *const ReadSnapshot, column_index: usize, row_in
             const local_row = row_index - row_base;
             const byte_offset: usize = @intCast(local_row * 8);
             return readI64LE(bytes, byte_offset);
+        }
+        row_base = segment_end;
+    }
+    return TableError.InvalidFormat;
+}
+
+pub fn snapshotGetBool(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!bool {
+    try ensureSnapshotBoolColumn(snapshot, column_index);
+    if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const bytes = segment.columns[column_index].bytes;
+            const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            return try readBoolColumnValue(column, bytes, row_index - row_base);
         }
         row_base = segment_end;
     }

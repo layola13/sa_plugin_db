@@ -1,0 +1,238 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"bool_members"
+@const SCHEMA_PATH = utf8:"bool_members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_ACTIVE_STRIDE = 1 // u8 bool\n#def COL_POSTED_STRIDE = 8 // u64 bool\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 12
+#def SCHEMA_PATH_LEN = 24
+#def SCHEMA_LEN = 125
+#def ROWS = 4
+#def COLUMN_COUNT = 3
+#def ID_COL_BYTES = 32
+#def ACTIVE_COL_BYTES = 4
+#def POSTED_COL_BYTES = 32
+#def COLUMNS_BYTES = 48
+#def FILTER_ROWS_CAP = 3
+#def FILTER_ROWS_BYTES = 24
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    logical_info = stack_alloc SaDbColumnLogicalInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc ID_COL_BYTES
+    active_col = alloc ACTIVE_COL_BYTES
+    posted_col = alloc POSTED_COL_BYTES
+    filter_rows = alloc FILTER_ROWS_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+    store active_col+0, 1 as u8
+    store active_col+1, 1 as u8
+    store active_col+2, 0 as u8
+    store active_col+3, 1 as u8
+    store posted_col+0, 0 as u64
+    store posted_col+8, 1 as u64
+    store posted_col+16, 1 as u64
+    store posted_col+24, 0 as u64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, ID_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, active_col, ACTIVE_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, posted_col, POSTED_COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_COLUMN_LOGICAL_INFO_HANDLE active_logical_status, read_handle, 1, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_TYPE active_logical_type, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_SCALE active_logical_scale, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_NULLABLE active_nullable, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_HANDLE posted_logical_status, read_handle, 2, logical_info
+    EXPAND DB_COLUMN_LOGICAL_INFO_TYPE posted_logical_type, logical_info
+
+    EXPAND DB_COUNT_BOOL_HANDLE count_true_status, true_count, read_handle, 1, 1
+    EXPAND DB_COUNT_BOOL_HANDLE count_false_status, false_count, read_handle, 1, 0
+    EXPAND DB_FIND_BOOL_HANDLE find_false_status, false_found, false_row, read_handle, 1, 0
+    EXPAND DB_FILTER_BOOL_HANDLE filter_status, filter_written, filter_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, 1, 1, 2
+    filter_row0 = load filter_rows+0 as u64
+    filter_row1 = load filter_rows+8 as u64
+    EXPAND DB_GET_BOOL_HANDLE get_active_status, active_row3, read_handle, 1, 3
+    EXPAND DB_GET_BOOL_HANDLE get_posted_status, posted_row2, read_handle, 2, 2
+    EXPAND DB_COUNT_BOOL_HANDLE invalid_expected_status, invalid_expected_count, read_handle, 1, 2
+    EXPAND DB_COUNT_BOOL_HANDLE invalid_column_status, invalid_column_count, read_handle, 0, 1
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_active_logical_status = eq active_logical_status, SA_DB_OK
+    ok_active_logical_type = eq active_logical_type, SA_DB_LOGICAL_BOOL
+    ok_active_logical_scale = eq active_logical_scale, 0
+    ok_active_nullable = eq active_nullable, 0
+    ok_posted_logical_status = eq posted_logical_status, SA_DB_OK
+    ok_posted_logical_type = eq posted_logical_type, SA_DB_LOGICAL_BOOL
+    ok_count_true_status = eq count_true_status, SA_DB_OK
+    ok_true_count = eq true_count, 3
+    ok_count_false_status = eq count_false_status, SA_DB_OK
+    ok_false_count = eq false_count, 1
+    ok_find_false_status = eq find_false_status, SA_DB_OK
+    ok_false_found = eq false_found, 1
+    ok_false_row = eq false_row, 2
+    ok_filter_status = eq filter_status, SA_DB_OK
+    ok_filter_written = eq filter_written, 2
+    ok_filter_total = eq filter_total, 3
+    ok_filter_row0 = eq filter_row0, 1
+    ok_filter_row1 = eq filter_row1, 3
+    ok_get_active_status = eq get_active_status, SA_DB_OK
+    ok_active_row3 = eq active_row3, 1
+    ok_get_posted_status = eq get_posted_status, SA_DB_OK
+    ok_posted_row2 = eq posted_row2, 1
+    ok_invalid_expected_status = eq invalid_expected_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_invalid_expected_count = eq invalid_expected_count, 0
+    ok_invalid_column_status = eq invalid_column_status, SA_DB_ERR_INVALID_FORMAT
+    ok_invalid_column_count = eq invalid_column_count, 0
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_open
+    ok04 = and ok03, ok_active_logical_status
+    ok05 = and ok04, ok_active_logical_type
+    ok06 = and ok05, ok_active_logical_scale
+    ok07 = and ok06, ok_active_nullable
+    ok08 = and ok07, ok_posted_logical_status
+    ok09 = and ok08, ok_posted_logical_type
+    ok10 = and ok09, ok_count_true_status
+    ok11 = and ok10, ok_true_count
+    ok12 = and ok11, ok_count_false_status
+    ok13 = and ok12, ok_false_count
+    ok14 = and ok13, ok_find_false_status
+    ok15 = and ok14, ok_false_found
+    ok16 = and ok15, ok_false_row
+    ok17 = and ok16, ok_filter_status
+    ok18 = and ok17, ok_filter_written
+    ok19 = and ok18, ok_filter_total
+    ok20 = and ok19, ok_filter_row0
+    ok21 = and ok20, ok_filter_row1
+    ok22 = and ok21, ok_get_active_status
+    ok23 = and ok22, ok_active_row3
+    ok24 = and ok23, ok_get_posted_status
+    ok25 = and ok24, ok_posted_row2
+    ok26 = and ok25, ok_invalid_expected_status
+    ok27 = and ok26, ok_invalid_expected_count
+    ok28 = and ok27, ok_invalid_column_status
+    ok29 = and ok28, ok_invalid_column_count
+    ok = and ok29, ok_close
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !open_status
+    !read_handle
+    !active_logical_status
+    !active_logical_type
+    !active_logical_scale
+    !active_nullable
+    !posted_logical_status
+    !posted_logical_type
+    !count_true_status
+    !true_count
+    !count_false_status
+    !false_count
+    !find_false_status
+    !false_found
+    !false_row
+    !filter_status
+    !filter_written
+    !filter_total
+    !filter_row0
+    !filter_row1
+    !get_active_status
+    !active_row3
+    !get_posted_status
+    !posted_row2
+    !invalid_expected_status
+    !invalid_expected_count
+    !invalid_column_status
+    !invalid_column_count
+    !close_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_open
+    !ok_active_logical_status
+    !ok_active_logical_type
+    !ok_active_logical_scale
+    !ok_active_nullable
+    !ok_posted_logical_status
+    !ok_posted_logical_type
+    !ok_count_true_status
+    !ok_true_count
+    !ok_count_false_status
+    !ok_false_count
+    !ok_find_false_status
+    !ok_false_found
+    !ok_false_row
+    !ok_filter_status
+    !ok_filter_written
+    !ok_filter_total
+    !ok_filter_row0
+    !ok_filter_row1
+    !ok_get_active_status
+    !ok_active_row3
+    !ok_get_posted_status
+    !ok_posted_row2
+    !ok_invalid_expected_status
+    !ok_invalid_expected_count
+    !ok_invalid_column_status
+    !ok_invalid_column_count
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !id_col
+    !active_col
+    !posted_col
+    !filter_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9006)

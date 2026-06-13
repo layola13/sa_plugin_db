@@ -232,6 +232,14 @@ fn u64CompareOpFromAbi(op: u32) ?table.U64CompareOp {
     };
 }
 
+fn boolFromAbi(value: u32) ?bool {
+    return switch (value) {
+        0 => false,
+        1 => true,
+        else => null,
+    };
+}
+
 fn decimalScaleFactor(scale: u32) ?u64 {
     if (scale > DECIMAL_MAX_SCALE) return null;
     var factor: u64 = 1;
@@ -1163,6 +1171,18 @@ pub export fn sa_db_count_i64_cmp_handle(handle: ?*anyopaque, column_index: u64,
     return SA_DB_OK;
 }
 
+pub export fn sa_db_count_bool_handle(handle: ?*anyopaque, column_index: u64, expected: u32, out_count: ?*u64) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    count_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const expected_bool = boolFromAbi(expected) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const count = table.snapshotCountBool(snapshot, @intCast(column_index), expected_bool) catch |err| return tableStatus(err);
+    count_slot.* = count;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_find_u64_handle(handle: ?*anyopaque, column_index: u64, expected: u64, out_found: ?*u64, out_row_index: ?*u64) u32 {
     const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const row_slot = out_row_index orelse return SA_DB_ERR_INVALID_ARGUMENT;
@@ -1186,6 +1206,21 @@ pub export fn sa_db_find_i64_handle(handle: ?*anyopaque, column_index: u64, expe
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotFindI64(snapshot, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    row_slot.* = result.row_index;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_find_bool_handle(handle: ?*anyopaque, column_index: u64, expected: u32, out_found: ?*u64, out_row_index: ?*u64) u32 {
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_slot = out_row_index orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    row_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const expected_bool = boolFromAbi(expected) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFindBool(snapshot, @intCast(column_index), expected_bool) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
     row_slot.* = result.row_index;
     return SA_DB_OK;
@@ -1529,6 +1564,32 @@ pub export fn sa_db_range_u64_pair_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_filter_bool_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const expected_bool = boolFromAbi(expected) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterBoolRows(snapshot, @intCast(column_index), expected_bool, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u64) u32 {
     const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -1536,6 +1597,17 @@ pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_i
     defer releaseReadSnapshot(snapshot);
     const value = table.snapshotGetU64(snapshot, @intCast(column_index), row_index) catch |err| return tableStatus(err);
     value_slot.* = value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_bool_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u32) u32 {
+    const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    value_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const value = table.snapshotGetBool(snapshot, @intCast(column_index), row_index) catch |err| return tableStatus(err);
+    value_slot.* = if (value) 1 else 0;
     return SA_DB_OK;
 }
 
@@ -1781,6 +1853,68 @@ test "db SA ABI interns and reads string dictionaries" {
     try std.testing.expectEqualStrings("paused", value_buf[0..@intCast(written)]);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "members".ptr, "members".len, &info));
+}
+
+test "db SA ABI queries logical bool columns" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_ACTIVE_STRIDE = 1 // u8 bool
+        \\#def COL_POSTED_STRIDE = 8 // u64 bool
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "bool_members.sadb-schema".ptr, "bool_members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var ids = [_]u64{ 1, 2, 3, 4 };
+    var active = [_]u8{ 1, 1, 0, 1 };
+    var posted = [_]u64{ 0, 1, 1, 0 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&active), .len = @sizeOf(@TypeOf(active)) },
+        .{ .data = @ptrCast(&posted), .len = @sizeOf(@TypeOf(posted)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "bool_members".ptr, "bool_members".len, active.len, &cols, cols.len, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "bool_members".ptr, "bool_members".len, &handle));
+    defer _ = sa_db_close_read_table(handle);
+
+    var count: u64 = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_count_bool_handle(handle, 1, 1, &count));
+    try std.testing.expectEqual(@as(u64, 3), count);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_count_bool_handle(handle, 1, 0, &count));
+    try std.testing.expectEqual(@as(u64, 1), count);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_count_bool_handle(handle, 1, 2, &count));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_count_bool_handle(handle, 0, 1, &count));
+
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_bool_handle(handle, 1, 0, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 2), row_index);
+
+    var rows = [_]u64{ 99, 99, 99 };
+    var written: u64 = 0;
+    var total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_bool_handle(handle, 1, 1, 1, 2, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), rows[1]);
+
+    var bool_value: u32 = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_bool_handle(handle, 1, 3, &bool_value));
+    try std.testing.expectEqual(@as(u32, 1), bool_value);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_bool_handle(handle, 2, 2, &bool_value));
+    try std.testing.expectEqual(@as(u32, 1), bool_value);
 }
 
 test "db SA ABI creates and queries u64 pair indexes" {

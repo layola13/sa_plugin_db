@@ -94,8 +94,10 @@ Read-handle query calls:
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
 - `sa_db_count_i64_cmp_handle`
+- `sa_db_count_bool_handle`
 - `sa_db_find_u64_handle`
 - `sa_db_find_i64_handle`
+- `sa_db_find_bool_handle`
 - `sa_db_find_u64_pair_handle`
 - `sa_db_range_u64_handle`
 - `sa_db_range_i64_handle`
@@ -110,8 +112,10 @@ Read-handle query calls:
 - `sa_db_range_timestamp_us_handle`
 - `sa_db_range_timestamp_us_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
+- `sa_db_filter_bool_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
+- `sa_db_get_bool_handle`
 - `sa_db_project_rows_handle`
 - `sa_db_get_row_handle`
 - `sa_db_get_row_u64_key_handle`
@@ -132,10 +136,11 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
-`DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_FIND_U64_HANDLE`,
-`DB_FIND_I64_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
-`DB_RANGE_I64_HANDLE`, `DB_RANGE_U64_PAIR_HANDLE`, `DB_GET_U64_HANDLE`,
-`DB_GET_I64_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
+`DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`,
+`DB_FIND_U64_HANDLE`, `DB_FIND_I64_HANDLE`, `DB_FIND_BOOL_HANDLE`,
+`DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`, `DB_RANGE_I64_HANDLE`,
+`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
+`DB_GET_I64_HANDLE`, `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
@@ -165,7 +170,9 @@ Read queries now use snapshots:
    `u64_pair -> row` index supports ERP composite keys such as
    `(order_id, line_no)`, `(product_id, warehouse_id)`, or
    `(customer_id, date_code)` with point lookup and fixed-first-key range
-   pagination over the second key. `project_rows_handle` copies only selected columns for a batch of
+   pagination over the second key. Logical `bool` columns expose count, first
+   match, row-list filtering, and get helpers over `u8`/`i1` or `u64` `0/1`
+   encodings. `project_rows_handle` copies only selected columns for a batch of
    row indices. `get_row_handle` copies a full fixed-width row by snapshot row
    index, while `get_row_u64_key_handle` requires a unique `u64` index and copies
    the matching row into the caller's row buffer.
@@ -177,9 +184,11 @@ Primitive type codes exported through `db.sal` match the schema compiler enum:
 while using the logical helper ABI for common business types: decimal/money is
 encoded as scaled `i64`, date as epoch days, timestamp as epoch milliseconds or
 microseconds, boolean as normalized `0/1`, and nullable fields as a sidecar null
-bitmap. These helpers deliberately do not introduce a new physical format yet,
-so existing `i64`/`u64` indexes, range reads, projections, and fixed-width row
-buffers remain the query surface.
+bitmap. Logical bool queries require a column annotation such as `// u8 bool` or
+`// u64 bool`, reject non-`0/1` stored values, and return filtered rows in
+snapshot row order. These helpers deliberately do not introduce a new physical
+format yet, so existing `i64`/`u64` indexes, range reads, projections, and
+fixed-width row buffers remain the query surface.
 Schema comments can now carry logical metadata after the primitive type and
 before an optional `:` description, for example `// i64 decimal(2) nullable`,
 `// i64 date`, `// i64 timestamp_ms`, `// i64 timestamp_us`, or `// u8 bool`.
