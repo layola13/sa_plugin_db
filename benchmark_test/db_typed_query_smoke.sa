@@ -1,0 +1,306 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"typed_orders"
+@const SCHEMA_PATH = utf8:"typed_orders.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_AMOUNT_STRIDE = 8 // i64\n#def COL_DUE_DATE_STRIDE = 8 // i64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 12
+#def SCHEMA_PATH_LEN = 24
+#def SCHEMA_LEN = 118
+#def ROWS = 4
+#def COLUMN_COUNT = 3
+#def COL_BYTES = 32
+#def COLUMNS_BYTES = 48
+#def RANGE_ROWS_CAP = 4
+#def RANGE_ROWS_BYTES = 32
+#def NULL_BITMAP_BYTES = 1
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc COL_BYTES
+    amount_col = alloc COL_BYTES
+    due_date_col = alloc COL_BYTES
+    range_rows = alloc RANGE_ROWS_BYTES
+    amount_nulls = alloc NULL_BITMAP_BYTES
+    due_date_nulls = alloc NULL_BITMAP_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+
+    EXPAND DB_DECIMAL_FROM_PARTS amount_100_status, amount_100, 0, 100, 0, 2
+    EXPAND DB_DECIMAL_FROM_PARTS amount_neg_1_status, amount_neg_1, 1, 1, 0, 2
+    EXPAND DB_DECIMAL_FROM_PARTS amount_42_status, amount_42, 0, 42, 50, 2
+    EXPAND DB_DECIMAL_FROM_PARTS amount_5_status, amount_5, 0, 5, 25, 2
+    store amount_col+0, amount_100 as i64
+    store amount_col+8, amount_neg_1 as i64
+    store amount_col+16, amount_42 as i64
+    store amount_col+24, amount_5 as i64
+
+    EXPAND DB_DATE_FROM_YMD due_jan_status, due_jan, 2024, 1, 15
+    EXPAND DB_DATE_FROM_YMD due_feb10_status, due_feb10, 2024, 2, 10
+    EXPAND DB_DATE_FROM_YMD due_feb20_status, due_feb20, 2024, 2, 20
+    EXPAND DB_DATE_FROM_YMD due_mar_status, due_mar, 2024, 3, 1
+    store due_date_col+0, due_jan as i64
+    store due_date_col+8, due_feb10 as i64
+    store due_date_col+16, due_feb20 as i64
+    store due_date_col+24, due_mar as i64
+
+    EXPAND DB_NULL_BITMAP_CLEAR amount_null_clear_status, amount_nulls, NULL_BITMAP_BYTES
+    EXPAND DB_NULL_BITMAP_CLEAR due_null_clear_status, due_date_nulls, NULL_BITMAP_BYTES
+    EXPAND DB_NULL_BITMAP_SET amount_null_set_status, amount_nulls, NULL_BITMAP_BYTES, 2, 1
+    EXPAND DB_NULL_BITMAP_SET due_null_set_status, due_date_nulls, NULL_BITMAP_BYTES, 2, 1
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, amount_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, due_date_col, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_I64_INDEX amount_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
+    EXPAND DB_CREATE_I64_INDEX due_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_RANGE_DECIMAL_I64_HANDLE amount_range_status, amount_range_written, amount_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 0, 0, 0, 0, 50, 0, 0, 4
+    amount_range_row0 = load range_rows+0 as u64
+    amount_range_row1 = load range_rows+8 as u64
+    EXPAND DB_RANGE_DECIMAL_I64_NULL_BITMAP_HANDLE amount_not_null_status, amount_not_null_written, amount_not_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 0, 0, 0, 0, 50, 0, amount_nulls, NULL_BITMAP_BYTES, 0, 0, 4
+    amount_not_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_DATE_NULL_BITMAP_HANDLE due_feb_not_null_status, due_feb_not_null_written, due_feb_not_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 2024, 2, 1, 2024, 2, 29, due_date_nulls, NULL_BITMAP_BYTES, 0, 0, 4
+    due_feb_not_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_DATE_NULL_BITMAP_HANDLE due_feb_null_status, due_feb_null_written, due_feb_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 2024, 2, 1, 2024, 2, 29, due_date_nulls, NULL_BITMAP_BYTES, 1, 0, 4
+    due_feb_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_DATE_HANDLE due_invalid_status, due_invalid_written, due_invalid_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 2023, 2, 29, 2024, 2, 29, 0, 4
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_amount_100_status = eq amount_100_status, SA_DB_OK
+    ok_amount_100 = eq amount_100, 10000
+    ok_amount_neg_1_status = eq amount_neg_1_status, SA_DB_OK
+    ok_amount_neg_1 = eq amount_neg_1, -100
+    ok_amount_42_status = eq amount_42_status, SA_DB_OK
+    ok_amount_42 = eq amount_42, 4250
+    ok_amount_5_status = eq amount_5_status, SA_DB_OK
+    ok_amount_5 = eq amount_5, 525
+    ok_due_jan_status = eq due_jan_status, SA_DB_OK
+    ok_due_feb10_status = eq due_feb10_status, SA_DB_OK
+    ok_due_feb20_status = eq due_feb20_status, SA_DB_OK
+    ok_due_mar_status = eq due_mar_status, SA_DB_OK
+    ok_amount_null_clear_status = eq amount_null_clear_status, SA_DB_OK
+    ok_due_null_clear_status = eq due_null_clear_status, SA_DB_OK
+    ok_amount_null_set_status = eq amount_null_set_status, SA_DB_OK
+    ok_due_null_set_status = eq due_null_set_status, SA_DB_OK
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_amount_index = eq amount_index_status, SA_DB_OK
+    ok_due_index = eq due_index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_amount_range_status = eq amount_range_status, SA_DB_OK
+    ok_amount_range_written = eq amount_range_written, 2
+    ok_amount_range_total = eq amount_range_total, 2
+    ok_amount_range_row0 = eq amount_range_row0, 3
+    ok_amount_range_row1 = eq amount_range_row1, 2
+    ok_amount_not_null_status = eq amount_not_null_status, SA_DB_OK
+    ok_amount_not_null_written = eq amount_not_null_written, 1
+    ok_amount_not_null_total = eq amount_not_null_total, 1
+    ok_amount_not_null_row0 = eq amount_not_null_row0, 3
+    ok_due_feb_not_null_status = eq due_feb_not_null_status, SA_DB_OK
+    ok_due_feb_not_null_written = eq due_feb_not_null_written, 1
+    ok_due_feb_not_null_total = eq due_feb_not_null_total, 1
+    ok_due_feb_not_null_row0 = eq due_feb_not_null_row0, 1
+    ok_due_feb_null_status = eq due_feb_null_status, SA_DB_OK
+    ok_due_feb_null_written = eq due_feb_null_written, 1
+    ok_due_feb_null_total = eq due_feb_null_total, 1
+    ok_due_feb_null_row0 = eq due_feb_null_row0, 2
+    ok_due_invalid_status = eq due_invalid_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_amount_100_status, ok_amount_100
+    ok02 = and ok01, ok_amount_neg_1_status
+    ok03 = and ok02, ok_amount_neg_1
+    ok04 = and ok03, ok_amount_42_status
+    ok05 = and ok04, ok_amount_42
+    ok06 = and ok05, ok_amount_5_status
+    ok07 = and ok06, ok_amount_5
+    ok08 = and ok07, ok_due_jan_status
+    ok09 = and ok08, ok_due_feb10_status
+    ok10 = and ok09, ok_due_feb20_status
+    ok11 = and ok10, ok_due_mar_status
+    ok12 = and ok11, ok_amount_null_clear_status
+    ok13 = and ok12, ok_due_null_clear_status
+    ok14 = and ok13, ok_amount_null_set_status
+    ok15 = and ok14, ok_due_null_set_status
+    ok16 = and ok15, ok_remove
+    ok17 = and ok16, ok_init
+    ok18 = and ok17, ok_ingest
+    ok19 = and ok18, ok_amount_index
+    ok20 = and ok19, ok_due_index
+    ok21 = and ok20, ok_open
+    ok22 = and ok21, ok_amount_range_status
+    ok23 = and ok22, ok_amount_range_written
+    ok24 = and ok23, ok_amount_range_total
+    ok25 = and ok24, ok_amount_range_row0
+    ok26 = and ok25, ok_amount_range_row1
+    ok27 = and ok26, ok_amount_not_null_status
+    ok28 = and ok27, ok_amount_not_null_written
+    ok29 = and ok28, ok_amount_not_null_total
+    ok30 = and ok29, ok_amount_not_null_row0
+    ok31 = and ok30, ok_due_feb_not_null_status
+    ok32 = and ok31, ok_due_feb_not_null_written
+    ok33 = and ok32, ok_due_feb_not_null_total
+    ok34 = and ok33, ok_due_feb_not_null_row0
+    ok35 = and ok34, ok_due_feb_null_status
+    ok36 = and ok35, ok_due_feb_null_written
+    ok37 = and ok36, ok_due_feb_null_total
+    ok38 = and ok37, ok_due_feb_null_row0
+    ok39 = and ok38, ok_due_invalid_status
+    ok = and ok39, ok_close
+
+    !amount_100_status
+    !amount_100
+    !amount_neg_1_status
+    !amount_neg_1
+    !amount_42_status
+    !amount_42
+    !amount_5_status
+    !amount_5
+    !due_jan_status
+    !due_jan
+    !due_feb10_status
+    !due_feb10
+    !due_feb20_status
+    !due_feb20
+    !due_mar_status
+    !due_mar
+    !amount_null_clear_status
+    !due_null_clear_status
+    !amount_null_set_status
+    !due_null_set_status
+    !remove_status
+    !init_status
+    !ingest_status
+    !amount_index_status
+    !due_index_status
+    !open_status
+    !read_handle
+    !amount_range_status
+    !amount_range_written
+    !amount_range_total
+    !amount_range_row0
+    !amount_range_row1
+    !amount_not_null_status
+    !amount_not_null_written
+    !amount_not_null_total
+    !amount_not_null_row0
+    !due_feb_not_null_status
+    !due_feb_not_null_written
+    !due_feb_not_null_total
+    !due_feb_not_null_row0
+    !due_feb_null_status
+    !due_feb_null_written
+    !due_feb_null_total
+    !due_feb_null_row0
+    !due_invalid_status
+    !due_invalid_written
+    !due_invalid_total
+    !close_status
+    !ok_amount_100_status
+    !ok_amount_100
+    !ok_amount_neg_1_status
+    !ok_amount_neg_1
+    !ok_amount_42_status
+    !ok_amount_42
+    !ok_amount_5_status
+    !ok_amount_5
+    !ok_due_jan_status
+    !ok_due_feb10_status
+    !ok_due_feb20_status
+    !ok_due_mar_status
+    !ok_amount_null_clear_status
+    !ok_due_null_clear_status
+    !ok_amount_null_set_status
+    !ok_due_null_set_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_amount_index
+    !ok_due_index
+    !ok_open
+    !ok_amount_range_status
+    !ok_amount_range_written
+    !ok_amount_range_total
+    !ok_amount_range_row0
+    !ok_amount_range_row1
+    !ok_amount_not_null_status
+    !ok_amount_not_null_written
+    !ok_amount_not_null_total
+    !ok_amount_not_null_row0
+    !ok_due_feb_not_null_status
+    !ok_due_feb_not_null_written
+    !ok_due_feb_not_null_total
+    !ok_due_feb_not_null_row0
+    !ok_due_feb_null_status
+    !ok_due_feb_null_written
+    !ok_due_feb_null_total
+    !ok_due_feb_null_row0
+    !ok_due_invalid_status
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !id_col
+    !amount_col
+    !due_date_col
+    !range_rows
+    !amount_nulls
+    !due_date_nulls
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9004)

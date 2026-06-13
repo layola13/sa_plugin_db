@@ -3649,6 +3649,53 @@ fn upperBoundU64Index(index: ReadIndexSnapshot, expected: u64) usize {
     return lo;
 }
 
+fn requiredNullBitmapBytes(row_count: u64) TableError!usize {
+    const required = row_count / 8 + if (row_count % 8 == 0) @as(u64, 0) else 1;
+    if (required > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    return @intCast(required);
+}
+
+fn ensureNullBitmapRows(row_count: u64, null_bitmap: []const u8) TableError!void {
+    if (null_bitmap.len < try requiredNullBitmapBytes(row_count)) return TableError.InvalidFormat;
+}
+
+fn nullBitmapRowIsNull(null_bitmap: []const u8, row_index: u64) bool {
+    const byte_index: usize = @intCast(row_index / 8);
+    const bit: u3 = @intCast(row_index & 7);
+    const mask: u8 = @as(u8, 1) << bit;
+    return (null_bitmap[byte_index] & mask) != 0;
+}
+
+fn copyRangeRowsWithNullBitmap(
+    index: ReadIndexSnapshot,
+    row_count: u64,
+    start: usize,
+    end: usize,
+    null_bitmap: []const u8,
+    want_null: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureNullBitmapRows(row_count, null_bitmap);
+    var total: u64 = 0;
+    var written: u64 = 0;
+    const out_capacity: u64 = @intCast(out_rows.len);
+    var i = start;
+    while (i < end) : (i += 1) {
+        const row = readIndexRow(index.entries, i);
+        if (row >= row_count) return TableError.VerifyFailed;
+        if (nullBitmapRowIsNull(null_bitmap, row) == want_null) {
+            if (total >= offset and limit != 0 and written < limit and written < out_capacity) {
+                out_rows[@intCast(written)] = row;
+                written += 1;
+            }
+            total = std.math.add(u64, total, 1) catch return TableError.CursorOverflow;
+        }
+    }
+    return .{ .written = written, .total = total };
+}
+
 fn countU64CmpInIndex(index: ReadIndexSnapshot, op: U64CompareOp, expected: u64) u64 {
     const n = index.entries.len / INDEX_RECORD_BYTES;
     const lower = lowerBoundU64Index(index, expected);
@@ -4219,6 +4266,27 @@ pub fn snapshotRangeU64Rows(
     return .{ .written = @intCast(write_count), .total = @intCast(total) };
 }
 
+pub fn snapshotRangeU64RowsNullBitmap(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u64,
+    max_value: u64,
+    null_bitmap: []const u8,
+    want_null: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    const index = snapshotIndexForU64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    try ensureNullBitmapRows(snapshot.row_count, null_bitmap);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+
+    const start = lowerBoundU64Index(index, min_value);
+    const end = upperBoundU64Index(index, max_value);
+    return try copyRangeRowsWithNullBitmap(index, snapshot.row_count, start, end, null_bitmap, want_null, offset, limit, out_rows);
+}
+
 pub fn snapshotRangeI64Rows(
     snapshot: *const ReadSnapshot,
     column_index: usize,
@@ -4253,6 +4321,27 @@ pub fn snapshotRangeI64Rows(
         out_rows[i] = readIndexRow(index.entries, page_start + i);
     }
     return .{ .written = @intCast(write_count), .total = @intCast(total) };
+}
+
+pub fn snapshotRangeI64RowsNullBitmap(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i64,
+    max_value: i64,
+    null_bitmap: []const u8,
+    want_null: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    const index = snapshotIndexForI64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    try ensureNullBitmapRows(snapshot.row_count, null_bitmap);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+
+    const start = lowerBoundU64Index(index, sortableI64Key(min_value));
+    const end = upperBoundU64Index(index, sortableI64Key(max_value));
+    return try copyRangeRowsWithNullBitmap(index, snapshot.row_count, start, end, null_bitmap, want_null, offset, limit, out_rows);
 }
 
 pub fn snapshotRangeU64PairRows(

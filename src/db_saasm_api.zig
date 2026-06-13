@@ -1234,6 +1234,166 @@ pub export fn sa_db_range_i64_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_range_u64_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_value: u64,
+    max_value: u64,
+    null_bitmap_ptr: ?[*]const u8,
+    null_bitmap_len: u64,
+    want_null: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const null_bitmap = inputBytes(null_bitmap_ptr, null_bitmap_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotRangeU64RowsNullBitmap(snapshot, @intCast(column_index), min_value, max_value, null_bitmap, want_null != 0, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_range_i64_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_value: i64,
+    max_value: i64,
+    null_bitmap_ptr: ?[*]const u8,
+    null_bitmap_len: u64,
+    want_null: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const null_bitmap = inputBytes(null_bitmap_ptr, null_bitmap_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotRangeI64RowsNullBitmap(snapshot, @intCast(column_index), min_value, max_value, null_bitmap, want_null != 0, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_range_decimal_i64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    scale: u32,
+    min_negative: u32,
+    min_whole: u64,
+    min_fraction: u64,
+    max_negative: u32,
+    max_whole: u64,
+    max_fraction: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    var min_value: i64 = 0;
+    var max_value: i64 = 0;
+    var status = sa_db_decimal_from_parts(min_negative, min_whole, min_fraction, scale, &min_value);
+    if (status != SA_DB_OK) return status;
+    status = sa_db_decimal_from_parts(max_negative, max_whole, max_fraction, scale, &max_value);
+    if (status != SA_DB_OK) return status;
+    return sa_db_range_i64_handle(handle, column_index, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_decimal_i64_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    scale: u32,
+    min_negative: u32,
+    min_whole: u64,
+    min_fraction: u64,
+    max_negative: u32,
+    max_whole: u64,
+    max_fraction: u64,
+    null_bitmap_ptr: ?[*]const u8,
+    null_bitmap_len: u64,
+    want_null: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    var min_value: i64 = 0;
+    var max_value: i64 = 0;
+    var status = sa_db_decimal_from_parts(min_negative, min_whole, min_fraction, scale, &min_value);
+    if (status != SA_DB_OK) return status;
+    status = sa_db_decimal_from_parts(max_negative, max_whole, max_fraction, scale, &max_value);
+    if (status != SA_DB_OK) return status;
+    return sa_db_range_i64_null_bitmap_handle(handle, column_index, min_value, max_value, null_bitmap_ptr, null_bitmap_len, want_null, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_date_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_year: i64,
+    min_month: u32,
+    min_day: u32,
+    max_year: i64,
+    max_month: u32,
+    max_day: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const min_value = daysFromCivil(min_year, min_month, min_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = daysFromCivil(max_year, max_month, max_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_i64_handle(handle, column_index, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_date_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_year: i64,
+    min_month: u32,
+    min_day: u32,
+    max_year: i64,
+    max_month: u32,
+    max_day: u32,
+    null_bitmap_ptr: ?[*]const u8,
+    null_bitmap_len: u64,
+    want_null: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const min_value = daysFromCivil(min_year, min_month, min_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = daysFromCivil(max_year, max_month, max_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_i64_null_bitmap_handle(handle, column_index, min_value, max_value, null_bitmap_ptr, null_bitmap_len, want_null, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
 pub export fn sa_db_range_u64_pair_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -1739,6 +1899,20 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(@as(u64, 2), range_written);
     try std.testing.expectEqual(@as(u64, 2), range_rows[0]);
     try std.testing.expectEqual(@as(u64, 3), range_rows[1]);
+    var null_bitmap = [_]u8{0};
+    var null_range_rows = [_]u64{ 99, 99 };
+    var null_range_written: u64 = 0;
+    var null_range_total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_set(&null_bitmap, null_bitmap.len, 3, 1));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_null_bitmap_handle(handle, 0, 2, 5, &null_bitmap, null_bitmap.len, 0, 0, 3, &null_range_rows, null_range_rows.len, &null_range_written, &null_range_total));
+    try std.testing.expectEqual(@as(u64, 3), null_range_total);
+    try std.testing.expectEqual(@as(u64, 2), null_range_written);
+    try std.testing.expectEqual(@as(u64, 1), null_range_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), null_range_rows[1]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_null_bitmap_handle(handle, 0, 2, 5, &null_bitmap, null_bitmap.len, 1, 0, 3, &null_range_rows, null_range_rows.len, &null_range_written, &null_range_total));
+    try std.testing.expectEqual(@as(u64, 1), null_range_total);
+    try std.testing.expectEqual(@as(u64, 1), null_range_written);
+    try std.testing.expectEqual(@as(u64, 3), null_range_rows[0]);
     var range_row: [16]u8 = undefined;
     try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_handle(handle, range_rows[1], &range_row, range_row.len));
     try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, range_row[0..8], .little));

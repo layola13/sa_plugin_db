@@ -98,6 +98,12 @@ Read-handle query calls:
 - `sa_db_find_u64_pair_handle`
 - `sa_db_range_u64_handle`
 - `sa_db_range_i64_handle`
+- `sa_db_range_u64_null_bitmap_handle`
+- `sa_db_range_i64_null_bitmap_handle`
+- `sa_db_range_decimal_i64_handle`
+- `sa_db_range_decimal_i64_null_bitmap_handle`
+- `sa_db_range_date_handle`
+- `sa_db_range_date_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
@@ -190,6 +196,19 @@ index into a fixed-width row buffer.
 `sa_db_range_i64_handle` / `DB_RANGE_I64_HANDLE` behaves the same for indexed
 `i64` columns, but uses signed ordering so negative values sort before zero and
 positive values.
+`sa_db_range_u64_null_bitmap_handle` / `DB_RANGE_U64_NULL_BITMAP_HANDLE` and
+`sa_db_range_i64_null_bitmap_handle` / `DB_RANGE_I64_NULL_BITMAP_HANDLE` add a
+sidecar null-bitmap predicate before pagination. The returned `total`, `offset`,
+and `limit` are computed after filtering, so list pages do not lose rows by
+filtering only the current page in SA code.
+`sa_db_range_decimal_i64_handle` / `DB_RANGE_DECIMAL_I64_HANDLE` and
+`sa_db_range_decimal_i64_null_bitmap_handle` /
+`DB_RANGE_DECIMAL_I64_NULL_BITMAP_HANDLE` accept decimal parts and scale, encode
+them as signed scaled `i64`, and then use the signed index. `sa_db_range_date_handle`
+/ `DB_RANGE_DATE_HANDLE` and `sa_db_range_date_null_bitmap_handle` /
+`DB_RANGE_DATE_NULL_BITMAP_HANDLE` do the same for Y-M-D date ranges encoded as
+epoch days. Invalid dates or decimal parts return `SA_DB_ERR_INVALID_ARGUMENT`
+without running the range query.
 `sa_db_create_u64_pair_index` / `DB_CREATE_U64_PAIR_INDEX` builds a persisted
 composite index over two `u64` columns. `unique=1` enforces uniqueness of the
 whole `(key1, key2)` tuple. `sa_db_find_u64_pair_handle` /
@@ -302,6 +321,8 @@ The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 `DB_NULL_BITMAP_SET`, and `DB_NULL_BITMAP_GET`. `DB_DECIMAL_FROM_PARTS(1, 1, 0,
 2)` encodes `-1.00` as `-100`, and a date such as `2024-02-29` encodes to epoch
 day `19782`; callers can build normal signed indexes over those `i64` columns.
+The typed range macros listed above now let SA query those same encoded columns
+directly with business parameters such as decimal parts or Y-M-D dates.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
@@ -320,8 +341,10 @@ benchmarks. The required baseline is:
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
   and dictionary-encoded strings. Primitive schema type codes, low-cardinality
   string dictionaries, and logical encode/decode helpers for decimal/date/time,
-  bool, and null bitmaps exist now; richer typed column families and nullable
-  query pushdown are next.
+  bool, and null bitmaps exist now. Indexed `u64`/`i64` range reads can now apply
+  a sidecar null bitmap before pagination, and decimal/date typed range wrappers
+  exist for ERP list filters. Richer typed column families and timestamp-specific
+  range wrappers are next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
@@ -358,6 +381,9 @@ sa build-exe db_interface_smoke.sa -o db_interface_smoke.out --no-incremental
 
 sa build-exe db_type_smoke.sa -o db_type_smoke.out --no-incremental
 ./db_type_smoke.out
+
+sa build-exe db_typed_query_smoke.sa -o db_typed_query_smoke.out --no-incremental
+./db_typed_query_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out
