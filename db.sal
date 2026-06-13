@@ -479,6 +479,38 @@
     %out_total = load __db_handle_range_date_null_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_RANGE_TIMESTAMP_MS_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %offset, %limit
+    __db_handle_range_ts_ms_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_ts_ms_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_timestamp_ms_handle(%handle, %column_index, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_ts_ms_written_slot_%out_written, &__db_handle_range_ts_ms_total_slot_%out_total)
+    %out_written = load __db_handle_range_ts_ms_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_ts_ms_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_RANGE_TIMESTAMP_MS_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_range_ts_ms_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_ts_ms_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_timestamp_ms_null_bitmap_handle(%handle, %column_index, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_ts_ms_null_written_slot_%out_written, &__db_handle_range_ts_ms_null_total_slot_%out_total)
+    %out_written = load __db_handle_range_ts_ms_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_ts_ms_null_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_RANGE_TIMESTAMP_US_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %offset, %limit
+    __db_handle_range_ts_us_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_ts_us_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_timestamp_us_handle(%handle, %column_index, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_ts_us_written_slot_%out_written, &__db_handle_range_ts_us_total_slot_%out_total)
+    %out_written = load __db_handle_range_ts_us_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_ts_us_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_RANGE_TIMESTAMP_US_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_range_ts_us_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_ts_us_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_timestamp_us_null_bitmap_handle(%handle, %column_index, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_ts_us_null_written_slot_%out_written, &__db_handle_range_ts_us_null_total_slot_%out_total)
+    %out_written = load __db_handle_range_ts_us_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_ts_us_null_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_RANGE_U64_PAIR_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %column_index2, %key1, %min_key2, %max_key2, %offset, %limit
     __db_handle_range_pair_written_slot_%out_written = stack_alloc 8
     __db_handle_range_pair_total_slot_%out_total = stack_alloc 8

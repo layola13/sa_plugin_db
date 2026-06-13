@@ -1394,6 +1394,88 @@ pub export fn sa_db_range_date_null_bitmap_handle(
     return sa_db_range_i64_null_bitmap_handle(handle, column_index, min_value, max_value, null_bitmap_ptr, null_bitmap_len, want_null, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
 }
 
+pub export fn sa_db_range_timestamp_ms_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_days: i64,
+    min_millis_of_day: u64,
+    max_days: i64,
+    max_millis_of_day: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const min_value = timestampFromParts(min_days, min_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_i64_handle(handle, column_index, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_timestamp_ms_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_days: i64,
+    min_millis_of_day: u64,
+    max_days: i64,
+    max_millis_of_day: u64,
+    null_bitmap_ptr: ?[*]const u8,
+    null_bitmap_len: u64,
+    want_null: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const min_value = timestampFromParts(min_days, min_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_i64_null_bitmap_handle(handle, column_index, min_value, max_value, null_bitmap_ptr, null_bitmap_len, want_null, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_timestamp_us_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_days: i64,
+    min_micros_of_day: u64,
+    max_days: i64,
+    max_micros_of_day: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const min_value = timestampFromParts(min_days, min_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_i64_handle(handle, column_index, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_timestamp_us_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_days: i64,
+    min_micros_of_day: u64,
+    max_days: i64,
+    max_micros_of_day: u64,
+    null_bitmap_ptr: ?[*]const u8,
+    null_bitmap_len: u64,
+    want_null: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const min_value = timestampFromParts(min_days, min_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_i64_null_bitmap_handle(handle, column_index, min_value, max_value, null_bitmap_ptr, null_bitmap_len, want_null, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
 pub export fn sa_db_range_u64_pair_handle(
     handle: ?*anyopaque,
     column_index: u64,

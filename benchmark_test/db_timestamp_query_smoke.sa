@@ -1,0 +1,349 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"typed_events"
+@const SCHEMA_PATH = utf8:"typed_events.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_TS_MS_STRIDE = 8 // i64\n#def COL_TS_US_STRIDE = 8 // i64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 12
+#def SCHEMA_PATH_LEN = 24
+#def SCHEMA_LEN = 114
+#def ROWS = 4
+#def COLUMN_COUNT = 3
+#def COL_BYTES = 32
+#def COLUMNS_BYTES = 48
+#def RANGE_ROWS_CAP = 4
+#def RANGE_ROWS_BYTES = 32
+#def NULL_BITMAP_BYTES = 1
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc COL_BYTES
+    ts_ms_col = alloc COL_BYTES
+    ts_us_col = alloc COL_BYTES
+    range_rows = alloc RANGE_ROWS_BYTES
+    ts_ms_nulls = alloc NULL_BITMAP_BYTES
+    ts_us_nulls = alloc NULL_BITMAP_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+
+    EXPAND DB_TIMESTAMP_MS_FROM_PARTS ts_ms_1_status, ts_ms_1, 0, 1000
+    EXPAND DB_TIMESTAMP_MS_FROM_PARTS ts_ms_2_status, ts_ms_2, 0, 2000
+    EXPAND DB_TIMESTAMP_MS_FROM_PARTS ts_ms_3_status, ts_ms_3, 0, 3000
+    EXPAND DB_TIMESTAMP_MS_FROM_PARTS ts_ms_4_status, ts_ms_4, 1, 0
+    store ts_ms_col+0, ts_ms_1 as i64
+    store ts_ms_col+8, ts_ms_2 as i64
+    store ts_ms_col+16, ts_ms_3 as i64
+    store ts_ms_col+24, ts_ms_4 as i64
+
+    EXPAND DB_TIMESTAMP_US_FROM_PARTS ts_us_1_status, ts_us_1, 0, 100
+    EXPAND DB_TIMESTAMP_US_FROM_PARTS ts_us_2_status, ts_us_2, 0, 200
+    EXPAND DB_TIMESTAMP_US_FROM_PARTS ts_us_3_status, ts_us_3, 0, 300
+    EXPAND DB_TIMESTAMP_US_FROM_PARTS ts_us_4_status, ts_us_4, 1, 0
+    store ts_us_col+0, ts_us_1 as i64
+    store ts_us_col+8, ts_us_2 as i64
+    store ts_us_col+16, ts_us_3 as i64
+    store ts_us_col+24, ts_us_4 as i64
+
+    EXPAND DB_NULL_BITMAP_CLEAR ts_ms_null_clear_status, ts_ms_nulls, NULL_BITMAP_BYTES
+    EXPAND DB_NULL_BITMAP_CLEAR ts_us_null_clear_status, ts_us_nulls, NULL_BITMAP_BYTES
+    EXPAND DB_NULL_BITMAP_SET ts_ms_null_set_status, ts_ms_nulls, NULL_BITMAP_BYTES, 2, 1
+    EXPAND DB_NULL_BITMAP_SET ts_us_null_set_status, ts_us_nulls, NULL_BITMAP_BYTES, 1, 1
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, ts_ms_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, ts_us_col, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_I64_INDEX ts_ms_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
+    EXPAND DB_CREATE_I64_INDEX ts_us_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_RANGE_TIMESTAMP_MS_HANDLE ms_range_status, ms_range_written, ms_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 0, 1500, 0, 3500, 0, 4
+    ms_range_row0 = load range_rows+0 as u64
+    ms_range_row1 = load range_rows+8 as u64
+    EXPAND DB_RANGE_TIMESTAMP_MS_NULL_BITMAP_HANDLE ms_not_null_status, ms_not_null_written, ms_not_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 0, 1500, 0, 3500, ts_ms_nulls, NULL_BITMAP_BYTES, 0, 0, 4
+    ms_not_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_TIMESTAMP_MS_NULL_BITMAP_HANDLE ms_null_status, ms_null_written, ms_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 0, 1500, 0, 3500, ts_ms_nulls, NULL_BITMAP_BYTES, 1, 0, 4
+    ms_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_TIMESTAMP_MS_HANDLE ms_invalid_status, ms_invalid_written, ms_invalid_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 0, 86400000, 1, 0, 0, 4
+
+    EXPAND DB_RANGE_TIMESTAMP_US_HANDLE us_range_status, us_range_written, us_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 0, 50, 0, 250, 0, 4
+    us_range_row0 = load range_rows+0 as u64
+    us_range_row1 = load range_rows+8 as u64
+    EXPAND DB_RANGE_TIMESTAMP_US_NULL_BITMAP_HANDLE us_not_null_status, us_not_null_written, us_not_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 0, 50, 0, 250, ts_us_nulls, NULL_BITMAP_BYTES, 0, 0, 4
+    us_not_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_TIMESTAMP_US_NULL_BITMAP_HANDLE us_null_status, us_null_written, us_null_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 0, 50, 0, 250, ts_us_nulls, NULL_BITMAP_BYTES, 1, 0, 4
+    us_null_row0 = load range_rows+0 as u64
+    EXPAND DB_RANGE_TIMESTAMP_US_HANDLE us_invalid_status, us_invalid_written, us_invalid_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, 0, 86400000000, 1, 0, 0, 4
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_ts_ms_1_status = eq ts_ms_1_status, SA_DB_OK
+    ok_ts_ms_2_status = eq ts_ms_2_status, SA_DB_OK
+    ok_ts_ms_3_status = eq ts_ms_3_status, SA_DB_OK
+    ok_ts_ms_4_status = eq ts_ms_4_status, SA_DB_OK
+    ok_ts_us_1_status = eq ts_us_1_status, SA_DB_OK
+    ok_ts_us_2_status = eq ts_us_2_status, SA_DB_OK
+    ok_ts_us_3_status = eq ts_us_3_status, SA_DB_OK
+    ok_ts_us_4_status = eq ts_us_4_status, SA_DB_OK
+    ok_ms_null_clear = eq ts_ms_null_clear_status, SA_DB_OK
+    ok_us_null_clear = eq ts_us_null_clear_status, SA_DB_OK
+    ok_ms_null_set = eq ts_ms_null_set_status, SA_DB_OK
+    ok_us_null_set = eq ts_us_null_set_status, SA_DB_OK
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_ms_index = eq ts_ms_index_status, SA_DB_OK
+    ok_us_index = eq ts_us_index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_ms_range_status = eq ms_range_status, SA_DB_OK
+    ok_ms_range_written = eq ms_range_written, 2
+    ok_ms_range_total = eq ms_range_total, 2
+    ok_ms_range_row0 = eq ms_range_row0, 1
+    ok_ms_range_row1 = eq ms_range_row1, 2
+    ok_ms_not_null_status = eq ms_not_null_status, SA_DB_OK
+    ok_ms_not_null_written = eq ms_not_null_written, 1
+    ok_ms_not_null_total = eq ms_not_null_total, 1
+    ok_ms_not_null_row0 = eq ms_not_null_row0, 1
+    ok_ms_null_status = eq ms_null_status, SA_DB_OK
+    ok_ms_null_written = eq ms_null_written, 1
+    ok_ms_null_total = eq ms_null_total, 1
+    ok_ms_null_row0 = eq ms_null_row0, 2
+    ok_ms_invalid_status = eq ms_invalid_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_us_range_status = eq us_range_status, SA_DB_OK
+    ok_us_range_written = eq us_range_written, 2
+    ok_us_range_total = eq us_range_total, 2
+    ok_us_range_row0 = eq us_range_row0, 0
+    ok_us_range_row1 = eq us_range_row1, 1
+    ok_us_not_null_status = eq us_not_null_status, SA_DB_OK
+    ok_us_not_null_written = eq us_not_null_written, 1
+    ok_us_not_null_total = eq us_not_null_total, 1
+    ok_us_not_null_row0 = eq us_not_null_row0, 0
+    ok_us_null_status = eq us_null_status, SA_DB_OK
+    ok_us_null_written = eq us_null_written, 1
+    ok_us_null_total = eq us_null_total, 1
+    ok_us_null_row0 = eq us_null_row0, 1
+    ok_us_invalid_status = eq us_invalid_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_ts_ms_1_status, ok_ts_ms_2_status
+    ok02 = and ok01, ok_ts_ms_3_status
+    ok03 = and ok02, ok_ts_ms_4_status
+    ok04 = and ok03, ok_ts_us_1_status
+    ok05 = and ok04, ok_ts_us_2_status
+    ok06 = and ok05, ok_ts_us_3_status
+    ok07 = and ok06, ok_ts_us_4_status
+    ok08 = and ok07, ok_ms_null_clear
+    ok09 = and ok08, ok_us_null_clear
+    ok10 = and ok09, ok_ms_null_set
+    ok11 = and ok10, ok_us_null_set
+    ok12 = and ok11, ok_remove
+    ok13 = and ok12, ok_init
+    ok14 = and ok13, ok_ingest
+    ok15 = and ok14, ok_ms_index
+    ok16 = and ok15, ok_us_index
+    ok17 = and ok16, ok_open
+    ok18 = and ok17, ok_ms_range_status
+    ok19 = and ok18, ok_ms_range_written
+    ok20 = and ok19, ok_ms_range_total
+    ok21 = and ok20, ok_ms_range_row0
+    ok22 = and ok21, ok_ms_range_row1
+    ok23 = and ok22, ok_ms_not_null_status
+    ok24 = and ok23, ok_ms_not_null_written
+    ok25 = and ok24, ok_ms_not_null_total
+    ok26 = and ok25, ok_ms_not_null_row0
+    ok27 = and ok26, ok_ms_null_status
+    ok28 = and ok27, ok_ms_null_written
+    ok29 = and ok28, ok_ms_null_total
+    ok30 = and ok29, ok_ms_null_row0
+    ok31 = and ok30, ok_ms_invalid_status
+    ok32 = and ok31, ok_us_range_status
+    ok33 = and ok32, ok_us_range_written
+    ok34 = and ok33, ok_us_range_total
+    ok35 = and ok34, ok_us_range_row0
+    ok36 = and ok35, ok_us_range_row1
+    ok37 = and ok36, ok_us_not_null_status
+    ok38 = and ok37, ok_us_not_null_written
+    ok39 = and ok38, ok_us_not_null_total
+    ok40 = and ok39, ok_us_not_null_row0
+    ok41 = and ok40, ok_us_null_status
+    ok42 = and ok41, ok_us_null_written
+    ok43 = and ok42, ok_us_null_total
+    ok44 = and ok43, ok_us_null_row0
+    ok45 = and ok44, ok_us_invalid_status
+    ok = and ok45, ok_close
+
+    !ts_ms_1_status
+    !ts_ms_1
+    !ts_ms_2_status
+    !ts_ms_2
+    !ts_ms_3_status
+    !ts_ms_3
+    !ts_ms_4_status
+    !ts_ms_4
+    !ts_us_1_status
+    !ts_us_1
+    !ts_us_2_status
+    !ts_us_2
+    !ts_us_3_status
+    !ts_us_3
+    !ts_us_4_status
+    !ts_us_4
+    !ts_ms_null_clear_status
+    !ts_us_null_clear_status
+    !ts_ms_null_set_status
+    !ts_us_null_set_status
+    !remove_status
+    !init_status
+    !ingest_status
+    !ts_ms_index_status
+    !ts_us_index_status
+    !open_status
+    !read_handle
+    !ms_range_status
+    !ms_range_written
+    !ms_range_total
+    !ms_range_row0
+    !ms_range_row1
+    !ms_not_null_status
+    !ms_not_null_written
+    !ms_not_null_total
+    !ms_not_null_row0
+    !ms_null_status
+    !ms_null_written
+    !ms_null_total
+    !ms_null_row0
+    !ms_invalid_status
+    !ms_invalid_written
+    !ms_invalid_total
+    !us_range_status
+    !us_range_written
+    !us_range_total
+    !us_range_row0
+    !us_range_row1
+    !us_not_null_status
+    !us_not_null_written
+    !us_not_null_total
+    !us_not_null_row0
+    !us_null_status
+    !us_null_written
+    !us_null_total
+    !us_null_row0
+    !us_invalid_status
+    !us_invalid_written
+    !us_invalid_total
+    !close_status
+    !ok_ts_ms_1_status
+    !ok_ts_ms_2_status
+    !ok_ts_ms_3_status
+    !ok_ts_ms_4_status
+    !ok_ts_us_1_status
+    !ok_ts_us_2_status
+    !ok_ts_us_3_status
+    !ok_ts_us_4_status
+    !ok_ms_null_clear
+    !ok_us_null_clear
+    !ok_ms_null_set
+    !ok_us_null_set
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_ms_index
+    !ok_us_index
+    !ok_open
+    !ok_ms_range_status
+    !ok_ms_range_written
+    !ok_ms_range_total
+    !ok_ms_range_row0
+    !ok_ms_range_row1
+    !ok_ms_not_null_status
+    !ok_ms_not_null_written
+    !ok_ms_not_null_total
+    !ok_ms_not_null_row0
+    !ok_ms_null_status
+    !ok_ms_null_written
+    !ok_ms_null_total
+    !ok_ms_null_row0
+    !ok_ms_invalid_status
+    !ok_us_range_status
+    !ok_us_range_written
+    !ok_us_range_total
+    !ok_us_range_row0
+    !ok_us_range_row1
+    !ok_us_not_null_status
+    !ok_us_not_null_written
+    !ok_us_not_null_total
+    !ok_us_not_null_row0
+    !ok_us_null_status
+    !ok_us_null_written
+    !ok_us_null_total
+    !ok_us_null_row0
+    !ok_us_invalid_status
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !ok45
+    !id_col
+    !ts_ms_col
+    !ts_us_col
+    !range_rows
+    !ts_ms_nulls
+    !ts_us_nulls
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9005)

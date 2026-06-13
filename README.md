@@ -104,6 +104,10 @@ Read-handle query calls:
 - `sa_db_range_decimal_i64_null_bitmap_handle`
 - `sa_db_range_date_handle`
 - `sa_db_range_date_null_bitmap_handle`
+- `sa_db_range_timestamp_ms_handle`
+- `sa_db_range_timestamp_ms_null_bitmap_handle`
+- `sa_db_range_timestamp_us_handle`
+- `sa_db_range_timestamp_us_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
@@ -207,8 +211,14 @@ filtering only the current page in SA code.
 them as signed scaled `i64`, and then use the signed index. `sa_db_range_date_handle`
 / `DB_RANGE_DATE_HANDLE` and `sa_db_range_date_null_bitmap_handle` /
 `DB_RANGE_DATE_NULL_BITMAP_HANDLE` do the same for Y-M-D date ranges encoded as
-epoch days. Invalid dates or decimal parts return `SA_DB_ERR_INVALID_ARGUMENT`
-without running the range query.
+epoch days. `sa_db_range_timestamp_ms_handle` / `DB_RANGE_TIMESTAMP_MS_HANDLE`,
+`sa_db_range_timestamp_ms_null_bitmap_handle` /
+`DB_RANGE_TIMESTAMP_MS_NULL_BITMAP_HANDLE`, `sa_db_range_timestamp_us_handle` /
+`DB_RANGE_TIMESTAMP_US_HANDLE`, and `sa_db_range_timestamp_us_null_bitmap_handle`
+/ `DB_RANGE_TIMESTAMP_US_NULL_BITMAP_HANDLE` do the same for timestamp columns
+encoded as epoch milliseconds or microseconds from `(epoch_day, subday_units)`.
+Invalid dates, decimal parts, or subday values outside the selected unit day
+return `SA_DB_ERR_INVALID_ARGUMENT` without running the range query.
 `sa_db_create_u64_pair_index` / `DB_CREATE_U64_PAIR_INDEX` builds a persisted
 composite index over two `u64` columns. `unique=1` enforces uniqueness of the
 whole `(key1, key2)` tuple. `sa_db_find_u64_pair_handle` /
@@ -342,9 +352,8 @@ benchmarks. The required baseline is:
   and dictionary-encoded strings. Primitive schema type codes, low-cardinality
   string dictionaries, and logical encode/decode helpers for decimal/date/time,
   bool, and null bitmaps exist now. Indexed `u64`/`i64` range reads can now apply
-  a sidecar null bitmap before pagination, and decimal/date typed range wrappers
-  exist for ERP list filters. Richer typed column families and timestamp-specific
-  range wrappers are next.
+  a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
+  wrappers exist for ERP list filters. Richer typed column families are next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
@@ -384,6 +393,9 @@ sa build-exe db_type_smoke.sa -o db_type_smoke.out --no-incremental
 
 sa build-exe db_typed_query_smoke.sa -o db_typed_query_smoke.out --no-incremental
 ./db_typed_query_smoke.out
+
+sa build-exe db_timestamp_query_smoke.sa -o db_timestamp_query_smoke.out --no-incremental
+./db_timestamp_query_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out
