@@ -7865,6 +7865,18 @@ pub fn snapshotRangeU64PairRows(
     return .{ .written = @intCast(write_count), .total = @intCast(total) };
 }
 
+pub fn snapshotFilterU64PairKey1Rows(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    column_index2: usize,
+    key1: u64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    return snapshotRangeU64PairRows(snapshot, column_index, column_index2, key1, 0, std.math.maxInt(u64), offset, limit, out_rows);
+}
+
 pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
     try ensureSnapshotU64Column(snapshot, column_index);
     if (row_index >= snapshot.row_count) return TableError.InvalidFormat;
@@ -9609,6 +9621,22 @@ test "table persistent u64 pair index supports ERP composite lookups" {
         try std.testing.expectEqual(@as(u64, 3), page.total);
         try std.testing.expectEqual(@as(u64, 1), page.written);
         try std.testing.expectEqual(@as(u64, 1), range_rows[0]);
+
+        const key1_rows = try snapshotFilterU64PairKey1Rows(snapshot, 0, 1, 10, 0, 4, &range_rows);
+        try std.testing.expectEqual(@as(u64, 3), key1_rows.total);
+        try std.testing.expectEqual(@as(u64, 3), key1_rows.written);
+        try std.testing.expectEqual(@as(u64, 0), range_rows[0]);
+        try std.testing.expectEqual(@as(u64, 1), range_rows[1]);
+        try std.testing.expectEqual(@as(u64, 3), range_rows[2]);
+
+        const key1_page = try snapshotFilterU64PairKey1Rows(snapshot, 0, 1, 10, 2, 1, &range_rows);
+        try std.testing.expectEqual(@as(u64, 3), key1_page.total);
+        try std.testing.expectEqual(@as(u64, 1), key1_page.written);
+        try std.testing.expectEqual(@as(u64, 3), range_rows[0]);
+
+        const key1_missing = try snapshotFilterU64PairKey1Rows(snapshot, 0, 1, 99, 0, 4, &range_rows);
+        try std.testing.expectEqual(@as(u64, 0), key1_missing.total);
+        try std.testing.expectEqual(@as(u64, 0), key1_missing.written);
         try std.testing.expectError(TableError.InvalidFormat, snapshotFindU64Pair(snapshot, 1, 0, 2, 10));
     }
 

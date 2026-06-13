@@ -2601,6 +2601,33 @@ pub export fn sa_db_range_u64_pair_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_filter_u64_pair_key1_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterU64PairKey1Rows(snapshot, @intCast(column_index), @intCast(column_index2), key1, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_filter_bool_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -3263,6 +3290,20 @@ test "db SA ABI creates and queries u64 pair indexes" {
     try std.testing.expectEqual(@as(u64, 0), rows[0]);
     try std.testing.expectEqual(@as(u64, 1), rows[1]);
     try std.testing.expectEqual(@as(u64, 3), rows[2]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_u64_pair_key1_handle(handle, 0, 1, 10, 0, 3, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), rows[1]);
+    try std.testing.expectEqual(@as(u64, 3), rows[2]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_u64_pair_key1_handle(handle, 0, 1, 10, 2, 1, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 3), rows[0]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_u64_pair_key1_handle(handle, 0, 1, 99, 0, 3, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), total);
+    try std.testing.expectEqual(@as(u64, 0), written);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "order_lines".ptr, "order_lines".len, &info));

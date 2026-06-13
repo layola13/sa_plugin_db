@@ -139,6 +139,7 @@ Read-handle query calls:
 - `sa_db_range_timestamp_us_handle`
 - `sa_db_range_timestamp_us_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
+- `sa_db_filter_u64_pair_key1_handle`
 - `sa_db_filter_bool_handle`
 - `sa_db_filter_blob_eq_handle`
 - `sa_db_filter_blob_contains_handle`
@@ -184,8 +185,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_I64_HANDLE`, `DB_RANGE_U32_HANDLE`, `DB_RANGE_I32_HANDLE`,
 `DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
 `DB_RANGE_I16_HANDLE`, `DB_RANGE_F32_HANDLE`, `DB_RANGE_F64_HANDLE`,
-`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`,
-`DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
+`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_U64_PAIR_KEY1_HANDLE`,
+`DB_FILTER_BOOL_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
 `DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`, `DB_GET_F32_HANDLE`,
@@ -240,8 +241,8 @@ Read queries now use snapshots:
    not stable business data. A persisted
    `u64_pair -> row` index supports ERP composite keys such as
    `(order_id, line_no)`, `(product_id, warehouse_id)`, or
-   `(customer_id, date_code)` with point lookup and fixed-first-key range
-   pagination over the second key. A persisted `blob_eq -> row` index accelerates
+   `(customer_id, date_code)` with point lookup, fixed-first-key list pagination,
+   and fixed-first-key range pagination over the second key. A persisted `blob_eq -> row` index accelerates
    exact filters over `blob_handle` columns for high-frequency text/blob equality
    predicates, while persisted `blob_token -> row` and `blob_prefix -> row`
    indexes accelerate ASCII token and token-prefix searches over ERP text/blob
@@ -379,7 +380,10 @@ whole `(key1, key2)` tuple. `sa_db_find_u64_pair_handle` /
 `DB_FIND_U64_PAIR_HANDLE` finds one exact tuple. `sa_db_range_u64_pair_handle` /
 `DB_RANGE_U64_PAIR_HANDLE` returns row indices for one fixed first key and an
 inclusive second-key range, with the same `offset`/`limit` pagination contract as
-single-column range reads.
+single-column range reads. `sa_db_filter_u64_pair_key1_handle` /
+`DB_FILTER_U64_PAIR_KEY1_HANDLE` lists every row matching a fixed first key with
+the same pagination contract, which covers ERP child-row screens such as all
+lines for one order or all stock movements for one product.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
@@ -548,9 +552,9 @@ benchmarks. The required baseline is:
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape, and indexed blob exact,
-  token, prefix, and contains filters cover common high-frequency text
-  equality/search shapes; next is ERP benchmark coverage beyond raw fixed-width
-  bytes and broader index planning.
+  token, prefix, and contains filters plus fixed-first-key `u64_pair` filters
+  cover common high-frequency text and child-row equality/search shapes; next is
+  ERP benchmark coverage beyond raw fixed-width bytes and broader index planning.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.

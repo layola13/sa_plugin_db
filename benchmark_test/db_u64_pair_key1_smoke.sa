@@ -1,0 +1,200 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"pair_key1_lines"
+@const SCHEMA_PATH = utf8:"pair_key1_lines.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ORDER_ID_STRIDE = 8 // u64\n#def COL_LINE_NO_STRIDE = 8 // u64\n#def COL_QTY_STRIDE = 8 // u64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 15
+#def SCHEMA_PATH_LEN = 27
+#def SCHEMA_LEN = 120
+#def ROWS = 4
+#def COL_BYTES = 32
+#def ROW_BYTES = 24
+#def COLUMN_COUNT = 3
+#def COLUMNS_BYTES = 48
+#def FILTER_ROWS_CAP = 4
+#def FILTER_ROWS_BYTES = 32
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    order_ids = alloc COL_BYTES
+    line_nos = alloc COL_BYTES
+    qtys = alloc COL_BYTES
+    filter_rows = alloc FILTER_ROWS_BYTES
+    fetched_row = alloc ROW_BYTES
+
+    store order_ids+0, 10 as u64
+    store order_ids+8, 10 as u64
+    store order_ids+16, 11 as u64
+    store order_ids+24, 10 as u64
+    store line_nos+0, 1 as u64
+    store line_nos+8, 2 as u64
+    store line_nos+16, 1 as u64
+    store line_nos+24, 3 as u64
+    store qtys+0, 5 as u64
+    store qtys+8, 7 as u64
+    store qtys+16, 9 as u64
+    store qtys+24, 11 as u64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, order_ids, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, line_nos, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, qtys, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U64_PAIR_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, 1, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_FILTER_U64_PAIR_KEY1_HANDLE list_status, list_written, list_total, filter_rows, FILTER_ROWS_CAP, read_handle, 0, 1, 10, 0, FILTER_ROWS_CAP
+    list_row0 = load filter_rows+0 as u64
+    list_row1 = load filter_rows+8 as u64
+    list_row2 = load filter_rows+16 as u64
+    EXPAND DB_FILTER_U64_PAIR_KEY1_HANDLE page_status, page_written, page_total, filter_rows, FILTER_ROWS_CAP, read_handle, 0, 1, 10, 2, 1
+    page_row0 = load filter_rows+0 as u64
+    EXPAND DB_FILTER_U64_PAIR_KEY1_HANDLE missing_status, missing_written, missing_total, filter_rows, FILTER_ROWS_CAP, read_handle, 0, 1, 99, 0, FILTER_ROWS_CAP
+    EXPAND DB_GET_ROW_HANDLE get_page_row_status, read_handle, page_row0, fetched_row, ROW_BYTES
+    page_order_id = load fetched_row+0 as u64
+    page_line_no = load fetched_row+8 as u64
+    page_qty = load fetched_row+16 as u64
+
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_index = eq index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_list_status = eq list_status, SA_DB_OK
+    ok_list_written = eq list_written, 3
+    ok_list_total = eq list_total, 3
+    ok_list_row0 = eq list_row0, 0
+    ok_list_row1 = eq list_row1, 1
+    ok_list_row2 = eq list_row2, 3
+    ok_page_status = eq page_status, SA_DB_OK
+    ok_page_written = eq page_written, 1
+    ok_page_total = eq page_total, 3
+    ok_page_row0 = eq page_row0, 3
+    ok_missing_status = eq missing_status, SA_DB_OK
+    ok_missing_written = eq missing_written, 0
+    ok_missing_total = eq missing_total, 0
+    ok_get_page_row = eq get_page_row_status, SA_DB_OK
+    ok_page_order_id = eq page_order_id, 10
+    ok_page_line_no = eq page_line_no, 3
+    ok_page_qty = eq page_qty, 11
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_index
+    ok04 = and ok03, ok_open
+    ok05 = and ok04, ok_list_status
+    ok06 = and ok05, ok_list_written
+    ok07 = and ok06, ok_list_total
+    ok08 = and ok07, ok_list_row0
+    ok09 = and ok08, ok_list_row1
+    ok10 = and ok09, ok_list_row2
+    ok11 = and ok10, ok_page_status
+    ok12 = and ok11, ok_page_written
+    ok13 = and ok12, ok_page_total
+    ok14 = and ok13, ok_page_row0
+    ok15 = and ok14, ok_missing_status
+    ok16 = and ok15, ok_missing_written
+    ok17 = and ok16, ok_missing_total
+    ok18 = and ok17, ok_get_page_row
+    ok19 = and ok18, ok_page_order_id
+    ok20 = and ok19, ok_page_line_no
+    ok21 = and ok20, ok_page_qty
+    ok22 = and ok21, ok_close
+    ok = and ok22, ok_verify
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !index_status
+    !open_status
+    !read_handle
+    !list_status
+    !list_written
+    !list_total
+    !list_row0
+    !list_row1
+    !list_row2
+    !page_status
+    !page_written
+    !page_total
+    !page_row0
+    !missing_status
+    !missing_written
+    !missing_total
+    !get_page_row_status
+    !page_order_id
+    !page_line_no
+    !page_qty
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_index
+    !ok_open
+    !ok_list_status
+    !ok_list_written
+    !ok_list_total
+    !ok_list_row0
+    !ok_list_row1
+    !ok_list_row2
+    !ok_page_status
+    !ok_page_written
+    !ok_page_total
+    !ok_page_row0
+    !ok_missing_status
+    !ok_missing_written
+    !ok_missing_total
+    !ok_get_page_row
+    !ok_page_order_id
+    !ok_page_line_no
+    !ok_page_qty
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !order_ids
+    !line_nos
+    !qtys
+    !filter_rows
+    !fetched_row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9020)
