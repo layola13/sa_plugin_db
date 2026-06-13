@@ -143,6 +143,8 @@ Read-handle query calls:
 - `sa_db_range_u64_pair_handle`
 - `sa_db_range_u64_i64_pair_handle`
 - `sa_db_range_u64_date_pair_handle`
+- `sa_db_range_u64_timestamp_ms_pair_handle`
+- `sa_db_range_u64_timestamp_us_pair_handle`
 - `sa_db_filter_u64_pair_key1_handle`
 - `sa_db_filter_u64_i64_pair_key1_handle`
 - `sa_db_filter_bool_handle`
@@ -191,7 +193,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
 `DB_RANGE_I16_HANDLE`, `DB_RANGE_F32_HANDLE`, `DB_RANGE_F64_HANDLE`,
 `DB_RANGE_U64_PAIR_HANDLE`, `DB_RANGE_U64_I64_PAIR_HANDLE`,
-`DB_RANGE_U64_DATE_PAIR_HANDLE`,
+`DB_RANGE_U64_DATE_PAIR_HANDLE`, `DB_RANGE_U64_TIMESTAMP_MS_PAIR_HANDLE`,
+`DB_RANGE_U64_TIMESTAMP_US_PAIR_HANDLE`,
 `DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
@@ -405,7 +408,13 @@ fixed first key over an inclusive signed second-key range, and
 `sa_db_range_u64_date_pair_handle` / `DB_RANGE_U64_DATE_PAIR_HANDLE` accepts the
 same range as `(min_year, min_month, min_day)` and `(max_year, max_month,
 max_day)`, validates both dates, encodes them to epoch days, and uses the same
-`u64_i64_pair` index.
+`u64_i64_pair` index. `sa_db_range_u64_timestamp_ms_pair_handle` /
+`DB_RANGE_U64_TIMESTAMP_MS_PAIR_HANDLE` and
+`sa_db_range_u64_timestamp_us_pair_handle` /
+`DB_RANGE_U64_TIMESTAMP_US_PAIR_HANDLE` do the same for timestamp second keys:
+callers pass `(epoch_day, subday_units)` bounds, the API validates the selected
+millisecond or microsecond day unit, encodes to signed epoch time, and uses the
+same `u64_i64_pair` index.
 `sa_db_filter_u64_i64_pair_key1_handle` /
 `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE` lists every row for the fixed first key.
 Use this for customer/date, status/due-date, product/posting-date, and other
@@ -574,7 +583,8 @@ benchmarks. The required baseline is:
   bool, and null bitmaps exist now. Indexed `u8/i8/u16/i16/u32/i32/u64/i64/f32/f64`
   range reads exist for ERP list filters; `u64/i64` range wrappers can also apply
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
-  wrappers are available. `blob_handle` stores now cover variable-width text and
+  wrappers are available, including typed date/timestamp wrappers for the second
+  key of `u64_i64_pair` ERP composite filters. `blob_handle` stores now cover variable-width text and
   bytes, with read-handle exact/contains/token/prefix filters; persisted exact,
   token, prefix, and trigram contains indexes cover high-frequency equality and
   text predicates.
@@ -615,7 +625,9 @@ Dataset:
   dictionary-backed status fields, `i64` decimal/date columns, unique and
   non-unique `u64` indexes, `u64_pair` child-row indexes, `u64_i64_pair`
   customer/date and status/due-date indexes, typed date-pair range filters,
-  count filters, projection, and verification across multiple tables.
+  count filters, projection, and verification across multiple tables. A dedicated
+  smoke test covers typed timestamp-pair range wrappers over the same composite
+  index shape.
 
 Run db benchmarks:
 
@@ -632,6 +644,9 @@ sa build-exe db_typed_query_smoke.sa -o db_typed_query_smoke.out --no-incrementa
 
 sa build-exe db_timestamp_query_smoke.sa -o db_timestamp_query_smoke.out --no-incremental
 ./db_timestamp_query_smoke.out
+
+sa build-exe db_u64_timestamp_pair_smoke.sa -o db_u64_timestamp_pair_smoke.out --no-incremental
+./db_u64_timestamp_pair_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out

@@ -2695,6 +2695,56 @@ pub export fn sa_db_range_u64_date_pair_handle(
     return sa_db_range_u64_i64_pair_handle(handle, column_index, column_index2, key1, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
 }
 
+pub export fn sa_db_range_u64_timestamp_ms_pair_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    min_days: i64,
+    min_millis_of_day: u64,
+    max_days: i64,
+    max_millis_of_day: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const min_value = timestampFromParts(min_days, min_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_u64_i64_pair_handle(handle, column_index, column_index2, key1, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
+pub export fn sa_db_range_u64_timestamp_us_pair_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    min_days: i64,
+    min_micros_of_day: u64,
+    max_days: i64,
+    max_micros_of_day: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const min_value = timestampFromParts(min_days, min_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = timestampFromParts(max_days, max_micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_u64_i64_pair_handle(handle, column_index, column_index2, key1, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
 pub export fn sa_db_filter_u64_pair_key1_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -3498,6 +3548,75 @@ test "db SA ABI creates and queries u64 i64 pair indexes" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "customer_orders".ptr, "customer_orders".len, &info));
+}
+
+test "db SA ABI queries u64 timestamp pair ranges" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_STORE_ID_STRIDE = 8 // u64
+        \\#def COL_POSTED_TS_STRIDE = 8 // i64 timestamp_ms
+        \\#def COL_AMOUNT_CENTS_STRIDE = 8 // i64 decimal(2)
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "timestamp_orders.sadb-schema".ptr, "timestamp_orders.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var store_ids = [_]u64{ 7, 7, 7, 8, 7 };
+    var posted_ts = [_]i64{
+        timestampFromParts(0, 1000, MS_PER_DAY).?,
+        timestampFromParts(0, 2000, MS_PER_DAY).?,
+        timestampFromParts(0, 3000, MS_PER_DAY).?,
+        timestampFromParts(0, 2500, MS_PER_DAY).?,
+        timestampFromParts(1, 0, MS_PER_DAY).?,
+    };
+    var amounts = [_]i64{ 1000, 2000, 3000, 4000, 5000 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&store_ids), .len = @sizeOf(@TypeOf(store_ids)) },
+        .{ .data = @ptrCast(&posted_ts), .len = @sizeOf(@TypeOf(posted_ts)) },
+        .{ .data = @ptrCast(&amounts), .len = @sizeOf(@TypeOf(amounts)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "timestamp_orders".ptr, "timestamp_orders".len, store_ids.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_i64_pair_index(root.ptr, root.len, "timestamp_orders".ptr, "timestamp_orders".len, 0, 1, 0, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "timestamp_orders".ptr, "timestamp_orders".len, &handle));
+
+    var rows = [_]u64{ 99, 99, 99, 99 };
+    var written: u64 = 123;
+    var total: u64 = 456;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_timestamp_ms_pair_handle(handle, 0, 1, 7, 0, 1500, 0, 3500, 0, 4, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), rows[1]);
+
+    @memset(rows[0..], 99);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_timestamp_us_pair_handle(handle, 0, 1, 7, 0, 1500, 0, 3500, 0, 4, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), rows[1]);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_range_u64_timestamp_ms_pair_handle(handle, 0, 1, 7, 0, MS_PER_DAY, 0, 0, 0, 4, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_range_u64_timestamp_us_pair_handle(handle, 0, 1, 7, 0, US_PER_DAY, 0, 0, 0, 4, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "timestamp_orders".ptr, "timestamp_orders".len, &info));
 }
 
 test "db SA ABI commits and rolls back write transactions" {
