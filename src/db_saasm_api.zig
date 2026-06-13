@@ -3089,6 +3089,68 @@ pub export fn sa_db_filter_rows_bool_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_sort_rows_u64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotSortRowsU64(gpa.allocator(), snapshot, @intCast(column_index), in_rows, sort_descending, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_sort_rows_i64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotSortRowsI64(gpa.allocator(), snapshot, @intCast(column_index), in_rows, sort_descending, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_get_u64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*u64) u32 {
     const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -3934,6 +3996,7 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 5), total);
     try std.testing.expectEqual(@as(u64, 5), written);
     const candidate_written = written;
+    const original_candidate_rows = rows;
 
     var filtered = [_]u64{ 99, 99, 99, 99, 99, 99 };
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_date_range_handle(handle, 1, &rows, candidate_written, 1970, 1, 1, 1970, 1, 21, 0, filtered.len, &filtered, filtered.len, &written, &total));
@@ -3949,12 +4012,13 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 1), rows[0]);
     try std.testing.expectEqual(@as(u64, 2), rows[1]);
     try std.testing.expectEqual(@as(u64, 5), rows[2]);
+    const status_written = written;
 
     var stats_count: u64 = 0;
     var stats_u64_sum: u64 = 0;
     var stats_u64_min: u64 = 0;
     var stats_u64_max: u64 = 0;
-    try std.testing.expectEqual(SA_DB_OK, sa_db_stats_rows_u64_handle(handle, 2, &rows, written, &stats_count, &stats_u64_sum, &stats_u64_min, &stats_u64_max));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_stats_rows_u64_handle(handle, 2, &rows, status_written, &stats_count, &stats_u64_sum, &stats_u64_min, &stats_u64_max));
     try std.testing.expectEqual(@as(u64, 3), stats_count);
     try std.testing.expectEqual(@as(u64, 6), stats_u64_sum);
     try std.testing.expectEqual(@as(u64, 2), stats_u64_min);
@@ -3963,11 +4027,38 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     var stats_i64_sum: i64 = 0;
     var stats_i64_min: i64 = 0;
     var stats_i64_max: i64 = 0;
-    try std.testing.expectEqual(SA_DB_OK, sa_db_stats_rows_i64_handle(handle, 4, &rows, written, &stats_count, &stats_i64_sum, &stats_i64_min, &stats_i64_max));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_stats_rows_i64_handle(handle, 4, &rows, status_written, &stats_count, &stats_i64_sum, &stats_i64_min, &stats_i64_max));
     try std.testing.expectEqual(@as(u64, 3), stats_count);
     try std.testing.expectEqual(@as(i64, 12000), stats_i64_sum);
     try std.testing.expectEqual(@as(i64, 2000), stats_i64_min);
     try std.testing.expectEqual(@as(i64, 7000), stats_i64_max);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_u64_handle(handle, 2, &original_candidate_rows, candidate_written, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 5), total);
+    try std.testing.expectEqual(@as(u64, 5), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 0), filtered[3]);
+    try std.testing.expectEqual(@as(u64, 4), filtered[4]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_i64_handle(handle, 4, &rows, status_written, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 5), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 1), filtered[2]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sort_rows_i64_handle(handle, 4, &rows, status_written, 1, 1, 1, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 2), filtered[0]);
+
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_sort_rows_i64_handle(handle, 4, &rows, status_written, 2, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
 
     stats_count = 123;
     stats_i64_sum = 456;
@@ -3980,7 +4071,13 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(i64, 0), stats_i64_min);
     try std.testing.expectEqual(@as(i64, 0), stats_i64_max);
 
-    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_i64_range_handle(handle, 4, &rows, written, 1500, 5500, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_sort_rows_i64_handle(handle, 4, &invalid_stats_rows, invalid_stats_rows.len, 1, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_i64_range_handle(handle, 4, &rows, status_written, 1500, 5500, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);
     try std.testing.expectEqual(@as(u64, 2), written);
     try std.testing.expectEqual(@as(u64, 1), filtered[0]);
