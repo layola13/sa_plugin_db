@@ -625,6 +625,38 @@ sa build-exe db_erp_workflow_bench.sa -o db_erp_workflow_bench.out --no-incremen
 ./db_erp_workflow_bench.out
 ```
 
+Run SQLite comparisons:
+
+```bash
+cd /home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test
+rm -rf sqlite_link_std
+mkdir -p sqlite_link_std
+(cd sqlite_link_std && ar x /home/vscode/.sa/std/libsa_std.a)
+objcopy --redefine-sym sqlite3_prepare=sa_std_stub_sqlite3_prepare \
+  --redefine-sym sqlite3_step=sa_std_stub_sqlite3_step \
+  --redefine-sym sqlite3_finalize=sa_std_stub_sqlite3_finalize \
+  sqlite_link_std/libsa_std.a.o
+(cd sqlite_link_std && ar rcs libsa_std_no_sqlite_stub.a *.o)
+
+sa build-obj sqlite_member_bench.sa -o sqlite_member_bench.o --no-incremental
+zig cc -O1 sqlite_member_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.a \
+  /lib/x86_64-linux-gnu/libsqlite3.so.0 \
+  -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_member_bench.out
+./sqlite_member_bench.out
+
+sa build-obj sqlite_concurrent_bench.sa -o sqlite_concurrent_bench.o --no-incremental
+zig cc -O1 sqlite_concurrent_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.a \
+  /lib/x86_64-linux-gnu/libsqlite3.so.0 \
+  -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_concurrent_bench.out
+./sqlite_concurrent_bench.out
+
+sa build-obj sqlite_erp_workflow_bench.sa -o sqlite_erp_workflow_bench.o --no-incremental
+zig cc -O1 sqlite_erp_workflow_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.a \
+  /lib/x86_64-linux-gnu/libsqlite3.so.0 \
+  -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_erp_workflow_bench.out
+./sqlite_erp_workflow_bench.out
+```
+
 Latest 5-run median results:
 
 | Operation | db plugin | SQLite | Fastest |
@@ -641,10 +673,9 @@ Latest 5-run median results:
 | concurrent 4x25 SUM with read handles | 48.385 ms | 120.165 ms | db plugin |
 | concurrent insert, 4x12,500 rows | 55.618 ms | 90.713 ms | db plugin |
 
-Current ERP workflow benchmark coverage is db-only. The latest verification run
-reported correct totals for order lines, customer orders, due invoices,
-inventory movements, projected rows, and paid invoice count; add the SQLite ERP
-counterpart before treating ERP performance as a db-vs-SQLite comparison.
+Current ERP workflow benchmark coverage now has db and SQLite programs, but only
+single verification runs are recorded so far. Use 5-run medians before treating
+the ERP numbers as stable performance claims.
 
 Summary:
 
