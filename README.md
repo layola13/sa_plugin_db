@@ -67,6 +67,11 @@ Core native calls:
 - `sa_db_dict_lookup_handle`
 - `sa_db_dict_value_len_handle`
 - `sa_db_dict_value_copy_handle`
+- `sa_db_blob_put`
+- `sa_db_blob_value_len`
+- `sa_db_blob_value_copy`
+- `sa_db_blob_value_len_handle`
+- `sa_db_blob_value_copy_handle`
 - `sa_db_delete_u64_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
@@ -184,7 +189,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
-`DB_DICT_VALUE_COPY_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_DICT_VALUE_COPY_HANDLE`, `DB_BLOB_PUT`, `DB_BLOB_VALUE_LEN`,
+`DB_BLOB_VALUE_COPY`, `DB_BLOB_VALUE_LEN_HANDLE`,
+`DB_BLOB_VALUE_COPY_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_MIN_U8_HANDLE`, `DB_MAX_U8_HANDLE`,
 `DB_MIN_I8_HANDLE`, `DB_MAX_I8_HANDLE`, `DB_MIN_U16_HANDLE`, `DB_MAX_U16_HANDLE`,
 `DB_MIN_I16_HANDLE`, `DB_MAX_I16_HANDLE`, `DB_MIN_F32_HANDLE`, `DB_MAX_F32_HANDLE`,
@@ -262,6 +269,19 @@ For read-heavy ERP list rendering, prefer the read-handle variants
 are already part of the immutable snapshot, so repeated lookups do not re-open the
 table metadata or dictionary artifact.
 
+General variable-width bytes and text use table-level blob stores plus a
+fixed-width `blob_handle` row column. `sa_db_blob_put` / `DB_BLOB_PUT` appends a
+value to a named store and returns a stable 1-based handle; handle `0` remains
+available for caller null/missing semantics. Empty values are valid, and repeated
+equal byte strings intentionally receive distinct handles because this path is
+for varchar/blob data rather than low-cardinality deduplication. Use
+`sa_db_blob_value_len` / `DB_BLOB_VALUE_LEN` and `sa_db_blob_value_copy` /
+`DB_BLOB_VALUE_COPY` to decode current table state. After
+`sa_db_open_read_table`, use `sa_db_blob_value_len_handle` /
+`DB_BLOB_VALUE_LEN_HANDLE` and `sa_db_blob_value_copy_handle` /
+`DB_BLOB_VALUE_COPY_HANDLE`; blob bytes are part of the immutable snapshot, so
+new blob writes are not visible to an already-open read handle.
+
 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE` returns row indices for an
 inclusive `[min, max]` range over an indexed `u64` column. It is designed for ERP
 list pages and key/date/order-number windows: callers pass `offset`, `limit`, and
@@ -337,12 +357,14 @@ same active-manifest protocol as the public table APIs. Segment metadata records
 whole-file SHA-256, byte counts, and 64KB block-level SHA-256 lists for newly
 written column segment files. Older metadata without block hashes remains
 readable, but new segment writes include block hashes and verification checks
-them. Single-column integer/float index files, U64-pair index files, and string dictionary files are also
-versioned, hashed, block-hashed, snapshotted, restored, and verified. Indexes are
+them. Single-column integer/float index files, U64-pair index files, string
+dictionary files, and blob store files are also versioned, hashed, block-hashed,
+snapshotted, restored, and verified. Indexes are
 rebuilt on ingest/update/compact/qmod writes. Verification checks schema hash,
 segment hash, segment block hashes, index hash, index block hashes, index
-shape/order, dictionary hash, dictionary block hashes, recorded size, dictionary
-entry count, and the expected `rows * column_stride` size. `recover` scans versioned metadata files
+shape/order, dictionary hash, dictionary block hashes, dictionary entry count,
+blob store hash, blob store block hashes, blob store entry count, recorded size,
+and the expected `rows * column_stride` size. `recover` scans versioned metadata files
 and rebuilds the manifest to the highest valid epoch, which covers corrupted or
 missing manifest files after an interrupted commit.
 Single-table transactions add explicit recovery markers: commit writes
@@ -409,6 +431,14 @@ for stable labels that can be represented as integer IDs in fixed-width rows.
 Read handles expose dictionary lookup and ID-to-bytes helpers directly, which is
 the recommended path for decoding list rows back to labels inside one snapshot.
 
+`sa_db_blob_put` / `DB_BLOB_PUT` is the general variable-width layer for ERP text
+and small/medium binary fields. Rows store a normal 8-byte `blob_handle` value,
+while the named blob store owns the bytes. The blob artifact is part of the table
+lifecycle: snapshot, restore, verify, recover, lock, unlock, and remove all carry
+it with whole-file and block-level hashes. This keeps ordinary row/index queries
+fixed-width while allowing notes, descriptions, addresses, and external payload
+keys to live outside the column row buffer.
+
 The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 `DB_DECIMAL_TO_PARTS`, `DB_DATE_FROM_YMD`, `DB_DATE_TO_YMD`,
 `DB_TIMESTAMP_MS_FROM_PARTS`, `DB_TIMESTAMP_MS_TO_PARTS`,
@@ -423,8 +453,8 @@ directly with business parameters such as decimal parts or Y-M-D dates.
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
 ERP foundation work is to extend the current single-table transaction/recovery
-baseline into block checksums, optional WAL, and multi-table semantics without
-losing the fast read-handle scan path.
+baseline into broader fault injection, optional WAL, richer indexes/search, and
+multi-table semantics without losing the fast read-handle scan path.
 
 ## ERP Foundation Roadmap
 
@@ -440,12 +470,13 @@ benchmarks. The required baseline is:
   bool, and null bitmaps exist now. Indexed `u8/i8/u16/i16/u32/i32/u64/i64/f32/f64`
   range reads exist for ERP list filters; `u64/i64` range wrappers can also apply
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
-  wrappers are available. Wider string/blob handling is next.
+  wrappers are available. `blob_handle` stores now cover variable-width text and
+  bytes; secondary indexing/search over those values is next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
-  batch reads now cover the first ERP list-page shape; next is richer string/blob
-  handling beyond raw fixed-width bytes.
+  batch reads now cover the first ERP list-page shape; next is richer text/blob
+  filtering and ERP benchmark coverage beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.

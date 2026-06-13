@@ -21,6 +21,7 @@ var read_handle_mutex = std.Thread.Mutex{};
 var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
 var tx_handle_mutex = std.Thread.Mutex{};
 var tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
+var empty_output_bytes: [0]u8 = .{};
 
 const ReadHandleEntry = struct {
     snapshot: *table.ReadSnapshot,
@@ -79,6 +80,14 @@ fn outputBytes(ptr: ?[*]u8, len: u64) ?[]u8 {
     if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
     const n: usize = @intCast(len);
     if (n == 0) return null;
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
+fn outputBytesAllowEmpty(ptr: ?[*]u8, len: u64) ?[]u8 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return empty_output_bytes[0..];
     const p = ptr orelse return null;
     return p[0..n];
 }
@@ -1072,6 +1081,92 @@ pub export fn sa_db_dict_value_copy(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_blob_put(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_id: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    id_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.putBlobValue(gpa.allocator(), root, table_name, store_name, value) catch |err| return tableStatus(err);
+    id_slot.* = result.id;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_blob_value_len(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    id: u64,
+    out_found: ?*u64,
+    out_len: ?*u64,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const len_slot = out_len orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    len_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.blobValueLen(gpa.allocator(), root, table_name, store_name, id) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    len_slot.* = result.len;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_blob_value_copy(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    id: u64,
+    out_buf_ptr: ?[*]u8,
+    out_buf_len: u64,
+    out_found: ?*u64,
+    out_written: ?*u64,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_buf = outputBytesAllowEmpty(out_buf_ptr, out_buf_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    written_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.copyBlobValue(gpa.allocator(), root, table_name, store_name, id, out_buf) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    written_slot.* = result.written;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_delete_u64_key(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -1363,6 +1458,53 @@ pub export fn sa_db_dict_value_copy_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotDictValueCopy(snapshot, dict_name, id, out_buf) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    written_slot.* = result.written;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_blob_value_len_handle(
+    handle: ?*anyopaque,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    id: u64,
+    out_found: ?*u64,
+    out_len: ?*u64,
+) u32 {
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const len_slot = out_len orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    len_slot.* = 0;
+
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotBlobValueLen(snapshot, store_name, id) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    len_slot.* = result.len;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_blob_value_copy_handle(
+    handle: ?*anyopaque,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    id: u64,
+    out_buf_ptr: ?[*]u8,
+    out_buf_len: u64,
+    out_found: ?*u64,
+    out_written: ?*u64,
+) u32 {
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_buf = outputBytesAllowEmpty(out_buf_ptr, out_buf_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    written_slot.* = 0;
+
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotBlobValueCopy(snapshot, store_name, id, out_buf) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
     written_slot.* = result.written;
     return SA_DB_OK;

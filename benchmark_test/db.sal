@@ -317,6 +317,28 @@
     %out_written = load __db_dict_copy_written_slot_%out_written+0 as u64
 [END_MACRO]
 
+[MACRO] DB_BLOB_PUT %out_status, %out_id, %root, %root_len, %table_name, %table_name_len, %store_name, %store_name_len, %value, %value_len, %out_info
+    __db_blob_put_id_slot_%out_id = stack_alloc 8
+    %out_status = call @sa_db_blob_put(&%root, %root_len, &%table_name, %table_name_len, &%store_name, %store_name_len, &%value, %value_len, &__db_blob_put_id_slot_%out_id, &%out_info)
+    %out_id = load __db_blob_put_id_slot_%out_id+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BLOB_VALUE_LEN %out_status, %out_found, %out_len, %root, %root_len, %table_name, %table_name_len, %store_name, %store_name_len, %id
+    __db_blob_value_found_slot_%out_found = stack_alloc 8
+    __db_blob_value_len_slot_%out_len = stack_alloc 8
+    %out_status = call @sa_db_blob_value_len(&%root, %root_len, &%table_name, %table_name_len, &%store_name, %store_name_len, %id, &__db_blob_value_found_slot_%out_found, &__db_blob_value_len_slot_%out_len)
+    %out_found = load __db_blob_value_found_slot_%out_found+0 as u64
+    %out_len = load __db_blob_value_len_slot_%out_len+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BLOB_VALUE_COPY %out_status, %out_found, %out_written, %root, %root_len, %table_name, %table_name_len, %store_name, %store_name_len, %id, %out_buf, %out_buf_len
+    __db_blob_copy_found_slot_%out_found = stack_alloc 8
+    __db_blob_copy_written_slot_%out_written = stack_alloc 8
+    %out_status = call @sa_db_blob_value_copy(&%root, %root_len, &%table_name, %table_name_len, &%store_name, %store_name_len, %id, &%out_buf, %out_buf_len, &__db_blob_copy_found_slot_%out_found, &__db_blob_copy_written_slot_%out_written)
+    %out_found = load __db_blob_copy_found_slot_%out_found+0 as u64
+    %out_written = load __db_blob_copy_written_slot_%out_written+0 as u64
+[END_MACRO]
+
 [MACRO] DB_DELETE_U64_KEY %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %out_info
     %out_status = call @sa_db_delete_u64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%out_info)
 [END_MACRO]
@@ -431,6 +453,22 @@
     %out_status = call @sa_db_dict_value_copy_handle(%handle, &%dict_name, %dict_name_len, %id, &%out_buf, %out_buf_len, &__db_dict_copy_handle_found_slot_%out_found, &__db_dict_copy_handle_written_slot_%out_written)
     %out_found = load __db_dict_copy_handle_found_slot_%out_found+0 as u64
     %out_written = load __db_dict_copy_handle_written_slot_%out_written+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BLOB_VALUE_LEN_HANDLE %out_status, %out_found, %out_len, %handle, %store_name, %store_name_len, %id
+    __db_blob_value_handle_found_slot_%out_found = stack_alloc 8
+    __db_blob_value_handle_len_slot_%out_len = stack_alloc 8
+    %out_status = call @sa_db_blob_value_len_handle(%handle, &%store_name, %store_name_len, %id, &__db_blob_value_handle_found_slot_%out_found, &__db_blob_value_handle_len_slot_%out_len)
+    %out_found = load __db_blob_value_handle_found_slot_%out_found+0 as u64
+    %out_len = load __db_blob_value_handle_len_slot_%out_len+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BLOB_VALUE_COPY_HANDLE %out_status, %out_found, %out_written, %handle, %store_name, %store_name_len, %id, %out_buf, %out_buf_len
+    __db_blob_copy_handle_found_slot_%out_found = stack_alloc 8
+    __db_blob_copy_handle_written_slot_%out_written = stack_alloc 8
+    %out_status = call @sa_db_blob_value_copy_handle(%handle, &%store_name, %store_name_len, %id, &%out_buf, %out_buf_len, &__db_blob_copy_handle_found_slot_%out_found, &__db_blob_copy_handle_written_slot_%out_written)
+    %out_found = load __db_blob_copy_handle_found_slot_%out_found+0 as u64
+    %out_written = load __db_blob_copy_handle_written_slot_%out_written+0 as u64
 [END_MACRO]
 
 [MACRO] DB_COLUMN_LOGICAL_INFO_TYPE %out_logical_type, %info

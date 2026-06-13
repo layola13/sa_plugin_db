@@ -79,6 +79,16 @@ pub const DictMeta = struct {
     block_sha256: [][]const u8 = &.{},
 };
 
+pub const BlobStoreMeta = struct {
+    name: []const u8,
+    path: []const u8,
+    sha256: []const u8,
+    bytes: u64,
+    entries: u64,
+    block_size: u64 = 0,
+    block_sha256: [][]const u8 = &.{},
+};
+
 pub const TableMeta = struct {
     magic: []const u8,
     version: u32,
@@ -95,6 +105,7 @@ pub const TableMeta = struct {
     segments: []SegmentMeta,
     indexes: []IndexMeta = &.{},
     dicts: []DictMeta = &.{},
+    blobs: []BlobStoreMeta = &.{},
 
     pub fn deinit(self: *TableMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.magic);
@@ -112,6 +123,7 @@ pub const TableMeta = struct {
         allocator.free(self.segments);
         freeIndexMetas(allocator, self.indexes);
         freeDictMetas(allocator, self.dicts);
+        freeBlobStoreMetas(allocator, self.blobs);
         self.* = undefined;
     }
 };
@@ -133,6 +145,21 @@ pub const DictValueLenResult = struct {
 };
 
 pub const DictValueCopyResult = struct {
+    found: bool,
+    written: u64,
+};
+
+pub const BlobPutResult = struct {
+    info: TableInfo,
+    id: u64,
+};
+
+pub const BlobValueLenResult = struct {
+    found: bool,
+    len: u64,
+};
+
+pub const BlobValueCopyResult = struct {
     found: bool,
     written: u64,
 };
@@ -230,6 +257,12 @@ pub const ReadDictSnapshot = struct {
     entries: u64,
 };
 
+pub const ReadBlobStoreSnapshot = struct {
+    name: []const u8,
+    bytes: []const u8,
+    entries: u64,
+};
+
 pub const U64CompareOp = enum(u32) {
     eq = 0,
     ne = 1,
@@ -289,6 +322,7 @@ pub const ReadSnapshot = struct {
     segments: []ReadSegmentSnapshot,
     indexes: []ReadIndexSnapshot,
     dicts: []ReadDictSnapshot,
+    blobs: []ReadBlobStoreSnapshot,
 
     pub fn destroy(self: *ReadSnapshot) void {
         const backing_allocator = self.backing_allocator;
@@ -461,6 +495,10 @@ fn pairIndexFileName(allocator: std.mem.Allocator, table_name: []const u8, kind:
 
 fn dictFileName(allocator: std.mem.Allocator, table_name: []const u8, dict_name: []const u8, epoch: u64) TableError![]u8 {
     return allocPrintPath(allocator, "{s}.dict.{s}.{d}.dat", .{ table_name, dict_name, epoch });
+}
+
+fn blobStoreFileName(allocator: std.mem.Allocator, table_name: []const u8, store_name: []const u8, epoch: u64) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}.blob.{s}.{d}.dat", .{ table_name, store_name, epoch });
 }
 
 fn snapshotDir(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
@@ -750,6 +788,9 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
     const dicts = try duplicateDictMetas(allocator, meta.dicts);
     errdefer freeDictMetas(allocator, dicts);
 
+    const blobs = try duplicateBlobStoreMetas(allocator, meta.blobs);
+    errdefer freeBlobStoreMetas(allocator, blobs);
+
     return .{
         .magic = try allocator.dupe(u8, meta.magic),
         .version = meta.version,
@@ -766,6 +807,7 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
         .segments = segments,
         .indexes = indexes,
         .dicts = dicts,
+        .blobs = blobs,
     };
 }
 
@@ -792,6 +834,7 @@ fn buildInitialMeta(
         .segments = try allocator.alloc(SegmentMeta, 0),
         .indexes = try allocator.alloc(IndexMeta, 0),
         .dicts = try allocator.alloc(DictMeta, 0),
+        .blobs = try allocator.alloc(BlobStoreMeta, 0),
     };
 }
 
@@ -933,6 +976,10 @@ fn validateIndexBlockHashes(index: IndexMeta, bytes: []const u8) TableError!void
 
 fn validateDictBlockHashes(dict: DictMeta, bytes: []const u8) TableError!void {
     try validateBlockSha256List(dict.block_size, dict.block_sha256, bytes);
+}
+
+fn validateBlobStoreBlockHashes(blob: BlobStoreMeta, bytes: []const u8) TableError!void {
+    try validateBlockSha256List(blob.block_size, blob.block_sha256, bytes);
 }
 
 fn validateFileMetaBytes(file: FileMeta, bytes: []const u8) TableError!void {
@@ -1082,6 +1129,56 @@ fn duplicateDictMetas(allocator: std.mem.Allocator, dicts: []const DictMeta) Tab
     errdefer freeDictMetas(allocator, out);
     for (dicts, 0..) |dict, idx| {
         out[idx] = try duplicateDictMeta(allocator, dict);
+    }
+    return out;
+}
+
+fn emptyBlobStoreMeta() BlobStoreMeta {
+    return .{ .name = &.{}, .path = &.{}, .sha256 = &.{}, .bytes = 0, .entries = 0 };
+}
+
+fn initBlobStoreMetas(blobs: []BlobStoreMeta) void {
+    for (blobs) |*blob| blob.* = emptyBlobStoreMeta();
+}
+
+fn freeBlobStoreMeta(allocator: std.mem.Allocator, blob: BlobStoreMeta) void {
+    allocator.free(blob.name);
+    allocator.free(blob.path);
+    allocator.free(blob.sha256);
+    freeBlockSha256List(allocator, blob.block_sha256);
+}
+
+fn freeBlobStoreMetas(allocator: std.mem.Allocator, blobs: []BlobStoreMeta) void {
+    for (blobs) |blob| freeBlobStoreMeta(allocator, blob);
+    allocator.free(blobs);
+}
+
+fn duplicateBlobStoreMeta(allocator: std.mem.Allocator, blob: BlobStoreMeta) TableError!BlobStoreMeta {
+    const name = try allocator.dupe(u8, blob.name);
+    errdefer allocator.free(name);
+    const path = try allocator.dupe(u8, blob.path);
+    errdefer allocator.free(path);
+    const sha256 = try allocator.dupe(u8, blob.sha256);
+    errdefer allocator.free(sha256);
+    const block_sha256 = try duplicateBlockSha256List(allocator, blob.block_sha256);
+    errdefer freeBlockSha256List(allocator, block_sha256);
+    return .{
+        .name = name,
+        .path = path,
+        .sha256 = sha256,
+        .bytes = blob.bytes,
+        .entries = blob.entries,
+        .block_size = blob.block_size,
+        .block_sha256 = block_sha256,
+    };
+}
+
+fn duplicateBlobStoreMetas(allocator: std.mem.Allocator, blobs: []const BlobStoreMeta) TableError![]BlobStoreMeta {
+    const out = try allocator.alloc(BlobStoreMeta, blobs.len);
+    initBlobStoreMetas(out);
+    errdefer freeBlobStoreMetas(allocator, out);
+    for (blobs, 0..) |blob, idx| {
+        out[idx] = try duplicateBlobStoreMeta(allocator, blob);
     }
     return out;
 }
@@ -1278,6 +1375,14 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
         defer allocator.free(dst_path);
         try copyFile(allocator, src_path, dst_path);
     }
+
+    for (meta.blobs) |blob| {
+        const src_path = try activePath(allocator, root_dir, blob.path);
+        defer allocator.free(src_path);
+        const dst_path = try joinPath(allocator, &.{ snapshot_dir_path, blob.path });
+        defer allocator.free(dst_path);
+        try copyFile(allocator, src_path, dst_path);
+    }
 }
 
 fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError!TableInfo {
@@ -1325,6 +1430,14 @@ fn restoreSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
         const src_path = try joinPath(allocator, &.{ snapshot_dir_path, dict.path });
         defer allocator.free(src_path);
         const dst_path = try activePath(allocator, root_dir, dict.path);
+        defer allocator.free(dst_path);
+        try copyFile(allocator, src_path, dst_path);
+    }
+
+    for (parsed.value.blobs) |blob| {
+        const src_path = try joinPath(allocator, &.{ snapshot_dir_path, blob.path });
+        defer allocator.free(src_path);
+        const dst_path = try activePath(allocator, root_dir, blob.path);
         defer allocator.free(dst_path);
         try copyFile(allocator, src_path, dst_path);
     }
@@ -1458,6 +1571,8 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
 
 const DICT_MAX_NAME_BYTES: usize = 64;
 const DICT_MAX_VALUE_BYTES: usize = 1024 * 1024;
+const BLOB_STORE_MAX_NAME_BYTES: usize = 64;
+const BLOB_MAX_VALUE_BYTES: usize = 16 * 1024 * 1024;
 
 fn validateDictName(dict_name: []const u8) TableError!void {
     if (dict_name.len == 0 or dict_name.len > DICT_MAX_NAME_BYTES) return TableError.InvalidFormat;
@@ -1469,6 +1584,18 @@ fn validateDictName(dict_name: []const u8) TableError!void {
 
 fn validateDictValue(value: []const u8) TableError!void {
     if (value.len == 0 or value.len > DICT_MAX_VALUE_BYTES) return TableError.InvalidFormat;
+}
+
+fn validateBlobStoreName(store_name: []const u8) TableError!void {
+    if (store_name.len == 0 or store_name.len > BLOB_STORE_MAX_NAME_BYTES) return TableError.InvalidFormat;
+    for (store_name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return TableError.InvalidFormat;
+    }
+}
+
+fn validateBlobValue(value: []const u8) TableError!void {
+    if (value.len > BLOB_MAX_VALUE_BYTES) return TableError.InvalidFormat;
 }
 
 fn dictEntryCount(bytes: []const u8) TableError!u64 {
@@ -1552,6 +1679,76 @@ fn validateDictFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: T
             if (std.mem.eql(u8, previous.name, dict.name)) return TableError.VerifyFailed;
         }
         const bytes = try readDictBytes(allocator, root_dir, dict);
+        allocator.free(bytes);
+    }
+}
+
+fn blobEntryCount(bytes: []const u8) TableError!u64 {
+    if (bytes.len < 8) return TableError.VerifyFailed;
+    const count = readU64LE(bytes, 0);
+    var offset: usize = 8;
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        if (offset > bytes.len or bytes.len - offset < 8) return TableError.VerifyFailed;
+        const len_u64 = readU64LE(bytes, offset);
+        if (len_u64 > BLOB_MAX_VALUE_BYTES) return TableError.VerifyFailed;
+        if (len_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        if (offset > bytes.len or bytes.len - offset < len) return TableError.VerifyFailed;
+        offset += len;
+    }
+    if (offset != bytes.len) return TableError.VerifyFailed;
+    return count;
+}
+
+fn blobValueSliceById(bytes: []const u8, id: u64) TableError!?[]const u8 {
+    if (id == 0) return null;
+    const count = try blobEntryCount(bytes);
+    if (id > count) return null;
+    var offset: usize = 8;
+    var current_id: u64 = 1;
+    while (current_id <= count) : (current_id += 1) {
+        const len_u64 = readU64LE(bytes, offset);
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        const value = bytes[offset .. offset + len];
+        if (current_id == id) return value;
+        offset += len;
+    }
+    return null;
+}
+
+fn findBlobStoreMetaIndex(meta: TableMeta, store_name: []const u8) ?usize {
+    for (meta.blobs, 0..) |blob, idx| {
+        if (std.mem.eql(u8, blob.name, store_name)) return idx;
+    }
+    return null;
+}
+
+fn readBlobStoreBytes(allocator: std.mem.Allocator, root_dir: []const u8, blob: BlobStoreMeta) TableError![]u8 {
+    const path = try activePath(allocator, root_dir, blob.path);
+    defer allocator.free(path);
+    const bytes = try readFileAlloc(allocator, path, 1 << 30);
+    errdefer allocator.free(bytes);
+    if (bytes.len != blob.bytes) return TableError.VerifyFailed;
+    const count = try blobEntryCount(bytes);
+    if (count != blob.entries) return TableError.VerifyFailed;
+    const hash = hashBytes(bytes);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    if (!std.mem.eql(u8, hex[0..], blob.sha256)) return TableError.VerifyFailed;
+    try validateBlobStoreBlockHashes(blob, bytes);
+    return bytes;
+}
+
+fn validateBlobStoreFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    for (meta.blobs, 0..) |blob, idx| {
+        try validateBlobStoreName(blob.name);
+        if (blob.path.len == 0 or blob.sha256.len != 64) return TableError.VerifyFailed;
+        for (meta.blobs[0..idx]) |previous| {
+            if (std.mem.eql(u8, previous.name, blob.name)) return TableError.VerifyFailed;
+        }
+        const bytes = try readBlobStoreBytes(allocator, root_dir, blob);
         allocator.free(bytes);
     }
 }
@@ -1641,6 +1838,19 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
             else => return mapFileError(err),
         }
     }
+
+    for (meta.blobs) |blob| {
+        const path = try activePath(allocator, root_dir, blob.path);
+        defer allocator.free(path);
+        if (std.fs.cwd().openFile(path, .{})) |file| {
+            var f = file;
+            defer f.close();
+            f.chmod(0o444) catch {};
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
+        }
+    }
 }
 
 fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
@@ -1654,6 +1864,7 @@ fn validateRecoverCandidate(allocator: std.mem.Allocator, root_dir: []const u8, 
     try validateSegmentHashes(allocator, root_dir, meta);
     try validateIndexFiles(allocator, root_dir, meta);
     try validateDictFiles(allocator, root_dir, meta);
+    try validateBlobStoreFiles(allocator, root_dir, meta);
 }
 
 fn maybeSelectRecoveryMeta(
@@ -1830,6 +2041,19 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     for (meta.dicts) |dict| {
         const path = try activePath(allocator, root_dir, dict.path);
+        defer allocator.free(path);
+        if (std.fs.cwd().openFile(path, .{})) |file| {
+            var f = file;
+            defer f.close();
+            f.chmod(0o644) catch {};
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
+        }
+    }
+
+    for (meta.blobs) |blob| {
+        const path = try activePath(allocator, root_dir, blob.path);
         defer allocator.free(path);
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
@@ -2330,6 +2554,11 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
             defer allocator.free(path);
             try deleteIfExists(path);
         }
+        for (owned.blobs) |blob| {
+            const path = try activePath(allocator, root_dir, blob.path);
+            defer allocator.free(path);
+            try deleteIfExists(path);
+        }
     } else |err| switch (err) {
         TableError.NotFound => {},
         else => return err,
@@ -2792,6 +3021,46 @@ fn makeDictMeta(allocator: std.mem.Allocator, dict_name: []const u8, path: []con
     };
 }
 
+fn buildBlobBytesWithValue(allocator: std.mem.Allocator, old_bytes: []const u8, old_count: u64, value: []const u8) TableError![]u8 {
+    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const extra = std.math.add(usize, 8, value.len) catch return TableError.CursorOverflow;
+    const total = std.math.add(usize, old_bytes.len, if (old_bytes.len == 0) 8 + extra else extra) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+
+    const entry_offset: usize = if (old_bytes.len == 0) blk: {
+        writeU64LE(out, 0, new_count);
+        break :blk 8;
+    } else blk: {
+        @memcpy(out[0..old_bytes.len], old_bytes);
+        writeU64LE(out, 0, new_count);
+        break :blk old_bytes.len;
+    };
+    writeU64LE(out, entry_offset, @intCast(value.len));
+    if (value.len != 0) @memcpy(out[entry_offset + 8 .. entry_offset + 8 + value.len], value);
+    return out;
+}
+
+fn makeBlobStoreMeta(allocator: std.mem.Allocator, store_name: []const u8, path: []const u8, bytes: []const u8, entries: u64) TableError!BlobStoreMeta {
+    const name = try allocator.dupe(u8, store_name);
+    errdefer allocator.free(name);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const sha256 = try hashHexAlloc(allocator, bytes);
+    errdefer allocator.free(sha256);
+    const block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer freeBlockSha256List(allocator, block_sha256);
+    return .{
+        .name = name,
+        .path = owned_path,
+        .sha256 = sha256,
+        .bytes = bytes.len,
+        .entries = entries,
+        .block_size = artifactBlockSize(bytes),
+        .block_sha256 = block_sha256,
+    };
+}
+
 fn putDictMeta(allocator: std.mem.Allocator, meta: *TableMeta, dict: DictMeta) TableError!void {
     if (findDictMetaIndex(meta.*, dict.name)) |idx| {
         freeDictMeta(allocator, meta.dicts[idx]);
@@ -2805,6 +3074,21 @@ fn putDictMeta(allocator: std.mem.Allocator, meta: *TableMeta, dict: DictMeta) T
     new_dicts[old_dicts.len] = dict;
     allocator.free(old_dicts);
     meta.dicts = new_dicts;
+}
+
+fn putBlobStoreMeta(allocator: std.mem.Allocator, meta: *TableMeta, blob: BlobStoreMeta) TableError!void {
+    if (findBlobStoreMetaIndex(meta.*, blob.name)) |idx| {
+        freeBlobStoreMeta(allocator, meta.blobs[idx]);
+        meta.blobs[idx] = blob;
+        return;
+    }
+
+    const old_blobs = meta.blobs;
+    const new_blobs = try allocator.alloc(BlobStoreMeta, old_blobs.len + 1);
+    @memcpy(new_blobs[0..old_blobs.len], old_blobs);
+    new_blobs[old_blobs.len] = blob;
+    allocator.free(old_blobs);
+    meta.blobs = new_blobs;
 }
 
 pub fn internStringDict(
@@ -2912,6 +3196,91 @@ pub fn copyStringDictValue(
     const value = (try dictValueSliceById(bytes, id)) orelse return .{ .found = false, .written = 0 };
     if (out.len < value.len) return TableError.CursorOverflow;
     @memcpy(out[0..value.len], value);
+    return .{ .found = true, .written = value.len };
+}
+
+pub fn putBlobValue(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    store_name: []const u8,
+    value: []const u8,
+) TableError!BlobPutResult {
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(value);
+
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+
+    var old_bytes: []u8 = &.{};
+    var old_count: u64 = 0;
+    var has_old = false;
+    if (findBlobStoreMetaIndex(meta, store_name)) |idx| {
+        old_bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[idx]);
+        has_old = true;
+        old_count = try blobEntryCount(old_bytes);
+    }
+    defer if (has_old) allocator.free(old_bytes);
+
+    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const new_bytes = try buildBlobBytesWithValue(allocator, old_bytes, old_count, value);
+    defer allocator.free(new_bytes);
+
+    const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
+    const basename = try blobStoreFileName(allocator, table_name, store_name, next_epoch);
+    defer allocator.free(basename);
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
+
+    const new_meta = try makeBlobStoreMeta(allocator, store_name, basename, new_bytes, new_count);
+    var consumed = false;
+    errdefer if (!consumed) freeBlobStoreMeta(allocator, new_meta);
+    try putBlobStoreMeta(allocator, &meta, new_meta);
+    consumed = true;
+    meta.epoch = next_epoch;
+    try writeMeta(allocator, root_dir, table_name, meta);
+    return .{ .info = tableInfo(meta), .id = new_count };
+}
+
+pub fn blobValueLen(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    store_name: []const u8,
+    id: u64,
+) TableError!BlobValueLenResult {
+    try validateBlobStoreName(store_name);
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    const idx = findBlobStoreMetaIndex(meta, store_name) orelse return .{ .found = false, .len = 0 };
+    const bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[idx]);
+    defer allocator.free(bytes);
+    const value = (try blobValueSliceById(bytes, id)) orelse return .{ .found = false, .len = 0 };
+    return .{ .found = true, .len = value.len };
+}
+
+pub fn copyBlobValue(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    store_name: []const u8,
+    id: u64,
+    out: []u8,
+) TableError!BlobValueCopyResult {
+    try validateBlobStoreName(store_name);
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    const idx = findBlobStoreMetaIndex(meta, store_name) orelse return .{ .found = false, .written = 0 };
+    const bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[idx]);
+    defer allocator.free(bytes);
+    const value = (try blobValueSliceById(bytes, id)) orelse return .{ .found = false, .written = 0 };
+    if (out.len < value.len) return TableError.CursorOverflow;
+    if (value.len != 0) @memcpy(out[0..value.len], value);
     return .{ .found = true, .written = value.len };
 }
 
@@ -4047,6 +4416,7 @@ pub fn openReadSnapshot(
         .segments = &.{},
         .indexes = &.{},
         .dicts = &.{},
+        .blobs = &.{},
     };
     errdefer snapshot.destroy();
 
@@ -4064,6 +4434,7 @@ pub fn openReadSnapshot(
     snapshot.segments = try arena_allocator.alloc(ReadSegmentSnapshot, parsed.value.segments.len);
     snapshot.indexes = try arena_allocator.alloc(ReadIndexSnapshot, parsed.value.indexes.len);
     snapshot.dicts = try arena_allocator.alloc(ReadDictSnapshot, parsed.value.dicts.len);
+    snapshot.blobs = try arena_allocator.alloc(ReadBlobStoreSnapshot, parsed.value.blobs.len);
 
     for (parsed.value.segments, 0..) |segment, segment_idx| {
         const segment_columns = try arena_allocator.alloc(ReadColumnSnapshot, segment.files.len);
@@ -4175,6 +4546,20 @@ pub fn openReadSnapshot(
         };
     }
 
+    for (parsed.value.blobs, 0..) |blob, blob_idx| {
+        try validateBlobStoreName(blob.name);
+        if (blob.path.len == 0 or blob.sha256.len != 64) return TableError.VerifyFailed;
+        for (parsed.value.blobs[0..blob_idx]) |previous| {
+            if (std.mem.eql(u8, previous.name, blob.name)) return TableError.VerifyFailed;
+        }
+        const bytes = try readBlobStoreBytes(arena_allocator, root_dir, blob);
+        snapshot.blobs[blob_idx] = .{
+            .name = try arena_allocator.dupe(u8, blob.name),
+            .bytes = bytes,
+            .entries = blob.entries,
+        };
+    }
+
     return snapshot;
 }
 
@@ -4272,6 +4657,29 @@ pub fn snapshotDictValueCopy(snapshot: *const ReadSnapshot, dict_name: []const u
     const value = (try dictValueSliceById(snapshot.dicts[idx].bytes, id)) orelse return .{ .found = false, .written = 0 };
     if (out.len < value.len) return TableError.CursorOverflow;
     @memcpy(out[0..value.len], value);
+    return .{ .found = true, .written = value.len };
+}
+
+fn snapshotFindBlobStoreIndex(snapshot: *const ReadSnapshot, store_name: []const u8) ?usize {
+    for (snapshot.blobs, 0..) |blob, idx| {
+        if (std.mem.eql(u8, blob.name, store_name)) return idx;
+    }
+    return null;
+}
+
+pub fn snapshotBlobValueLen(snapshot: *const ReadSnapshot, store_name: []const u8, id: u64) TableError!BlobValueLenResult {
+    try validateBlobStoreName(store_name);
+    const idx = snapshotFindBlobStoreIndex(snapshot, store_name) orelse return .{ .found = false, .len = 0 };
+    const value = (try blobValueSliceById(snapshot.blobs[idx].bytes, id)) orelse return .{ .found = false, .len = 0 };
+    return .{ .found = true, .len = value.len };
+}
+
+pub fn snapshotBlobValueCopy(snapshot: *const ReadSnapshot, store_name: []const u8, id: u64, out: []u8) TableError!BlobValueCopyResult {
+    try validateBlobStoreName(store_name);
+    const idx = snapshotFindBlobStoreIndex(snapshot, store_name) orelse return .{ .found = false, .written = 0 };
+    const value = (try blobValueSliceById(snapshot.blobs[idx].bytes, id)) orelse return .{ .found = false, .written = 0 };
+    if (out.len < value.len) return TableError.CursorOverflow;
+    if (value.len != 0) @memcpy(out[0..value.len], value);
     return .{ .found = true, .written = value.len };
 }
 
@@ -6893,6 +7301,7 @@ pub fn verifyTable(
     try validateSegmentHashes(allocator, root_dir, meta);
     try validateIndexFiles(allocator, root_dir, meta);
     try validateDictFiles(allocator, root_dir, meta);
+    try validateBlobStoreFiles(allocator, root_dir, meta);
     return tableInfo(meta);
 }
 
@@ -6926,6 +7335,7 @@ pub fn unlockTable(
     try validateSegmentHashes(allocator, root_dir, owned);
     try validateIndexFiles(allocator, root_dir, owned);
     try validateDictFiles(allocator, root_dir, owned);
+    try validateBlobStoreFiles(allocator, root_dir, owned);
     if (owned.locked) {
         owned.locked = false;
         owned.epoch += 1;
@@ -7272,6 +7682,93 @@ test "table string dictionary is persisted snapshotted restored and verified" {
     const dict_path = try activePath(std.testing.allocator, ".", meta.dicts[0].path);
     defer std.testing.allocator.free(dict_path);
     try writeFile(std.testing.allocator, dict_path, "corrupt");
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table blob store persists variable bytes and read snapshots are isolated" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "blob_items";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_items.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const empty = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "");
+    try std.testing.expectEqual(@as(u64, 1), empty.id);
+    try std.testing.expectEqual(@as(u64, 1), empty.info.epoch);
+    const first = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+    try std.testing.expectEqual(@as(u64, 2), first.id);
+    try std.testing.expectEqual(@as(u64, 2), first.info.epoch);
+
+    var row_bytes: [16]u8 = undefined;
+    writeU64LE(&row_bytes, 0, 100);
+    writeU64LE(&row_bytes, 8, first.id);
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+
+    const read_snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer read_snapshot.destroy();
+
+    const duplicate = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+    try std.testing.expectEqual(@as(u64, 3), duplicate.id);
+    try std.testing.expectEqual(@as(u64, 4), duplicate.info.epoch);
+
+    const empty_len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", empty.id);
+    try std.testing.expect(empty_len.found);
+    try std.testing.expectEqual(@as(u64, 0), empty_len.len);
+    var empty_buf: [0]u8 = .{};
+    const copied_empty = try copyBlobValue(std.testing.allocator, ".", table_name, "notes", empty.id, &empty_buf);
+    try std.testing.expect(copied_empty.found);
+    try std.testing.expectEqual(@as(u64, 0), copied_empty.written);
+
+    const first_len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", first.id);
+    try std.testing.expect(first_len.found);
+    try std.testing.expectEqual(@as(u64, 10), first_len.len);
+    var value_buf: [16]u8 = undefined;
+    const copied = try copyBlobValue(std.testing.allocator, ".", table_name, "notes", first.id, &value_buf);
+    try std.testing.expect(copied.found);
+    try std.testing.expectEqual(@as(u64, 10), copied.written);
+    try std.testing.expectEqualStrings("first note", value_buf[0..@intCast(copied.written)]);
+    var too_small: [4]u8 = undefined;
+    try std.testing.expectError(TableError.CursorOverflow, copyBlobValue(std.testing.allocator, ".", table_name, "notes", first.id, &too_small));
+
+    const snapshot_first_len = try snapshotBlobValueLen(read_snapshot, "notes", first.id);
+    try std.testing.expect(snapshot_first_len.found);
+    try std.testing.expectEqual(@as(u64, 10), snapshot_first_len.len);
+    const snapshot_duplicate_len = try snapshotBlobValueLen(read_snapshot, "notes", duplicate.id);
+    try std.testing.expect(!snapshot_duplicate_len.found);
+
+    var projected_row: [16]u8 = undefined;
+    try snapshotGetRow(read_snapshot, 0, &projected_row);
+    try std.testing.expectEqual(@as(u64, 100), readU64LE(&projected_row, 0));
+    try std.testing.expectEqual(first.id, readU64LE(&projected_row, 8));
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 4), verified.epoch);
+    const snap = try snapshotTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 4), snap.epoch);
+
+    const after_snapshot = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "after snapshot");
+    try std.testing.expectEqual(@as(u64, 4), after_snapshot.id);
+    _ = try restoreTable(std.testing.allocator, ".", table_name, snap.epoch);
+    const restored_after_snapshot = try blobValueLen(std.testing.allocator, ".", table_name, "notes", after_snapshot.id);
+    try std.testing.expect(!restored_after_snapshot.found);
+    const restored_duplicate = try blobValueLen(std.testing.allocator, ".", table_name, "notes", duplicate.id);
+    try std.testing.expect(restored_duplicate.found);
+
+    var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), meta.blobs.len);
+    const blob_path = try activePath(std.testing.allocator, ".", meta.blobs[0].path);
+    defer std.testing.allocator.free(blob_path);
+    try writeFile(std.testing.allocator, blob_path, "corrupt");
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
 }
 

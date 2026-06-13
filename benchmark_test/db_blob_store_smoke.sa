@@ -1,0 +1,255 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"blob_items"
+@const SCHEMA_PATH = utf8:"blob_items.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 4\n#def COL_ID_STRIDE = 8 // u64\n#def COL_NOTE_STRIDE = 8 // blob_handle\n"
+@const STORE = utf8:"notes"
+@const VALUE_A = utf8:"first note"
+@const VALUE_B = utf8:"second note with details"
+@const VALUE_C = utf8:"after open"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 10
+#def SCHEMA_PATH_LEN = 22
+#def SCHEMA_LEN = 88
+#def STORE_LEN = 5
+#def VALUE_A_LEN = 10
+#def VALUE_B_LEN = 24
+#def VALUE_C_LEN = 10
+#def ROW_BYTES = 16
+#def COPY_BUF_BYTES = 32
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+    out_row = alloc ROW_BYTES
+    copy_buf = alloc COPY_BUF_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+
+    EXPAND DB_BLOB_PUT put_a_status, blob_a_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, info
+    EXPAND DB_BLOB_PUT put_b_status, blob_b_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, VALUE_B, VALUE_B_LEN, info
+    EXPAND DB_BLOB_VALUE_LEN len_a_status, len_a_found, len_a, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_a_id
+    EXPAND DB_BLOB_VALUE_COPY copy_a_status, copy_a_found, copy_a_written, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_a_id, copy_buf, COPY_BUF_BYTES
+    copy_a_first = load copy_buf+0 as u8
+    copy_a_last = load copy_buf+9 as u8
+
+    store row+0, 100 as u64
+    store row+8, blob_a_id as u64
+    EXPAND DB_INSERT_ROW insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_GET_ROW_HANDLE get_row_status, read_handle, 0, out_row, ROW_BYTES
+    row_id = load out_row+0 as u64
+    row_blob_id = load out_row+8 as u64
+    EXPAND DB_BLOB_VALUE_LEN_HANDLE handle_len_status, handle_len_found, handle_len, read_handle, STORE, STORE_LEN, row_blob_id
+    EXPAND DB_BLOB_VALUE_COPY_HANDLE handle_copy_status, handle_copy_found, handle_copy_written, read_handle, STORE, STORE_LEN, row_blob_id, copy_buf, COPY_BUF_BYTES
+    handle_copy_first = load copy_buf+0 as u8
+    handle_copy_last = load copy_buf+9 as u8
+
+    EXPAND DB_BLOB_PUT put_c_status, blob_c_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, VALUE_C, VALUE_C_LEN, info
+    EXPAND DB_BLOB_VALUE_LEN_HANDLE handle_len_c_status, handle_len_c_found, handle_len_c, read_handle, STORE, STORE_LEN, blob_c_id
+    EXPAND DB_BLOB_VALUE_LEN len_c_status, len_c_found, len_c, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_c_id
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_put_a_status = eq put_a_status, SA_DB_OK
+    ok_blob_a_id = eq blob_a_id, 1
+    ok_put_b_status = eq put_b_status, SA_DB_OK
+    ok_blob_b_id = eq blob_b_id, 2
+    ok_len_a_status = eq len_a_status, SA_DB_OK
+    ok_len_a_found = eq len_a_found, 1
+    ok_len_a = eq len_a, VALUE_A_LEN
+    ok_copy_a_status = eq copy_a_status, SA_DB_OK
+    ok_copy_a_found = eq copy_a_found, 1
+    ok_copy_a_written = eq copy_a_written, VALUE_A_LEN
+    ok_copy_a_first = eq copy_a_first, 102
+    ok_copy_a_last = eq copy_a_last, 101
+    ok_insert = eq insert_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_get_row = eq get_row_status, SA_DB_OK
+    ok_row_id = eq row_id, 100
+    ok_row_blob_id = eq row_blob_id, blob_a_id
+    ok_handle_len_status = eq handle_len_status, SA_DB_OK
+    ok_handle_len_found = eq handle_len_found, 1
+    ok_handle_len = eq handle_len, VALUE_A_LEN
+    ok_handle_copy_status = eq handle_copy_status, SA_DB_OK
+    ok_handle_copy_found = eq handle_copy_found, 1
+    ok_handle_copy_written = eq handle_copy_written, VALUE_A_LEN
+    ok_handle_copy_first = eq handle_copy_first, 102
+    ok_handle_copy_last = eq handle_copy_last, 101
+    ok_put_c_status = eq put_c_status, SA_DB_OK
+    ok_blob_c_id = eq blob_c_id, 3
+    ok_handle_len_c_status = eq handle_len_c_status, SA_DB_OK
+    ok_handle_len_c_found = eq handle_len_c_found, 0
+    ok_handle_len_c = eq handle_len_c, 0
+    ok_len_c_status = eq len_c_status, SA_DB_OK
+    ok_len_c_found = eq len_c_found, 1
+    ok_len_c = eq len_c, VALUE_C_LEN
+    ok_verify = eq verify_status, SA_DB_OK
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_put_a_status
+    ok03 = and ok02, ok_blob_a_id
+    ok04 = and ok03, ok_put_b_status
+    ok05 = and ok04, ok_blob_b_id
+    ok06 = and ok05, ok_len_a_status
+    ok07 = and ok06, ok_len_a_found
+    ok08 = and ok07, ok_len_a
+    ok09 = and ok08, ok_copy_a_status
+    ok10 = and ok09, ok_copy_a_found
+    ok11 = and ok10, ok_copy_a_written
+    ok12 = and ok11, ok_copy_a_first
+    ok13 = and ok12, ok_copy_a_last
+    ok14 = and ok13, ok_insert
+    ok15 = and ok14, ok_open
+    ok16 = and ok15, ok_get_row
+    ok17 = and ok16, ok_row_id
+    ok18 = and ok17, ok_row_blob_id
+    ok19 = and ok18, ok_handle_len_status
+    ok20 = and ok19, ok_handle_len_found
+    ok21 = and ok20, ok_handle_len
+    ok22 = and ok21, ok_handle_copy_status
+    ok23 = and ok22, ok_handle_copy_found
+    ok24 = and ok23, ok_handle_copy_written
+    ok25 = and ok24, ok_handle_copy_first
+    ok26 = and ok25, ok_handle_copy_last
+    ok27 = and ok26, ok_put_c_status
+    ok28 = and ok27, ok_blob_c_id
+    ok29 = and ok28, ok_handle_len_c_status
+    ok30 = and ok29, ok_handle_len_c_found
+    ok31 = and ok30, ok_handle_len_c
+    ok32 = and ok31, ok_len_c_status
+    ok33 = and ok32, ok_len_c_found
+    ok34 = and ok33, ok_len_c
+    ok35 = and ok34, ok_verify
+    ok = and ok35, ok_close
+
+    !remove_status
+    !init_status
+    !put_a_status
+    !blob_a_id
+    !put_b_status
+    !blob_b_id
+    !len_a_status
+    !len_a_found
+    !len_a
+    !copy_a_status
+    !copy_a_found
+    !copy_a_written
+    !copy_a_first
+    !copy_a_last
+    !insert_status
+    !open_status
+    !get_row_status
+    !row_id
+    !row_blob_id
+    !handle_len_status
+    !handle_len_found
+    !handle_len
+    !handle_copy_status
+    !handle_copy_found
+    !handle_copy_written
+    !handle_copy_first
+    !handle_copy_last
+    !put_c_status
+    !blob_c_id
+    !handle_len_c_status
+    !handle_len_c_found
+    !handle_len_c
+    !len_c_status
+    !len_c_found
+    !len_c
+    !verify_status
+    !close_status
+    !read_handle
+    !ok_remove
+    !ok_init
+    !ok_put_a_status
+    !ok_blob_a_id
+    !ok_put_b_status
+    !ok_blob_b_id
+    !ok_len_a_status
+    !ok_len_a_found
+    !ok_len_a
+    !ok_copy_a_status
+    !ok_copy_a_found
+    !ok_copy_a_written
+    !ok_copy_a_first
+    !ok_copy_a_last
+    !ok_insert
+    !ok_open
+    !ok_get_row
+    !ok_row_id
+    !ok_row_blob_id
+    !ok_handle_len_status
+    !ok_handle_len_found
+    !ok_handle_len
+    !ok_handle_copy_status
+    !ok_handle_copy_found
+    !ok_handle_copy_written
+    !ok_handle_copy_first
+    !ok_handle_copy_last
+    !ok_put_c_status
+    !ok_blob_c_id
+    !ok_handle_len_c_status
+    !ok_handle_len_c_found
+    !ok_handle_len_c
+    !ok_len_c_status
+    !ok_len_c_found
+    !ok_len_c
+    !ok_verify
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !row
+    !out_row
+    !copy_buf
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9011)
