@@ -182,6 +182,7 @@ pub const WriteTransaction = struct {
     meta: TableMeta,
     buffers: []std.ArrayList(u8),
     dirty: bool = false,
+    rows_dirty: bool = false,
 
     pub fn deinit(self: *WriteTransaction, allocator: std.mem.Allocator) void {
         self.write_lock.release();
@@ -2845,6 +2846,7 @@ fn txAppendRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!void 
     if (offset != row_bytes.len) return TableError.InvalidFormat;
     tx.meta.row_count = next_row_count;
     tx.dirty = true;
+    tx.rows_dirty = true;
 }
 
 fn txReplaceRawRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8) TableError!void {
@@ -2865,6 +2867,7 @@ fn txReplaceRawRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8)
     }
     if (row_offset != row_bytes.len) return TableError.InvalidFormat;
     tx.dirty = true;
+    tx.rows_dirty = true;
 }
 
 fn removeBufferRange(buf: *std.ArrayList(u8), start: usize, len: usize) void {
@@ -2886,6 +2889,7 @@ fn txDeleteRow(tx: *WriteTransaction, row_index: u64) TableError!void {
     }
     tx.meta.row_count -= 1;
     tx.dirty = true;
+    tx.rows_dirty = true;
 }
 
 fn rewriteSegmentsFromTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!void {
@@ -2991,6 +2995,45 @@ pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, 
     return tableInfo(tx.meta);
 }
 
+pub fn writeTransactionPutBlobValue(
+    allocator: std.mem.Allocator,
+    tx: *WriteTransaction,
+    store_name: []const u8,
+    value: []const u8,
+) TableError!BlobPutResult {
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(value);
+
+    var old_bytes: []u8 = &.{};
+    var old_count: u64 = 0;
+    var has_old = false;
+    if (findBlobStoreMetaIndex(tx.meta, store_name)) |idx| {
+        old_bytes = try readBlobStoreBytes(allocator, tx.root_dir, tx.meta.blobs[idx]);
+        has_old = true;
+        old_count = try blobEntryCount(old_bytes);
+    }
+    defer if (has_old) allocator.free(old_bytes);
+
+    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const new_bytes = try buildBlobBytesWithValue(allocator, old_bytes, old_count, value);
+    defer allocator.free(new_bytes);
+
+    const target_epoch = std.math.add(u64, tx.meta.epoch, 1) catch return TableError.CursorOverflow;
+    const basename = try blobStoreFileName(allocator, tx.table_name, store_name, target_epoch);
+    defer allocator.free(basename);
+    const path = try activePath(allocator, tx.root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
+
+    const new_meta = try makeBlobStoreMeta(allocator, store_name, basename, new_bytes, new_count);
+    var consumed = false;
+    errdefer if (!consumed) freeBlobStoreMeta(allocator, new_meta);
+    try putBlobStoreMeta(allocator, &tx.meta, new_meta);
+    consumed = true;
+    tx.dirty = true;
+    return .{ .info = tableInfo(tx.meta), .id = new_count };
+}
+
 pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!TableInfo {
     if (!tx.dirty) return tableInfo(tx.meta);
     const previous_epoch = tx.meta.epoch;
@@ -2999,7 +3042,11 @@ pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransactio
     var pending_marker_live = true;
     errdefer if (pending_marker_live) deleteTxPendingMarkerIfExists(allocator, tx.root_dir, tx.table_name, target_epoch) catch {};
 
-    try rewriteSegmentsFromTransaction(allocator, tx);
+    if (tx.rows_dirty) {
+        try rewriteSegmentsFromTransaction(allocator, tx);
+    } else {
+        tx.meta.epoch = target_epoch;
+    }
     try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
     var written = try writeVersionedMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
     defer written.deinit(allocator);
@@ -3008,6 +3055,7 @@ pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransactio
     deleteTxPendingMarkerIfExists(allocator, tx.root_dir, tx.table_name, tx.meta.epoch) catch {};
     pending_marker_live = false;
     tx.dirty = false;
+    tx.rows_dirty = false;
     return tableInfo(tx.meta);
 }
 
@@ -8476,6 +8524,75 @@ test "table write transaction commits atomically and preserves previous epoch on
         defer snapshot.destroy();
         try std.testing.expectEqual(@as(u64, 55), try snapshotSumU64(snapshot, 1));
     }
+}
+
+test "table write transaction commits blob handles with rows atomically" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "tx_blob_items";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "tx_blob_items.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+    _ = try createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "notes", false);
+
+    var tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    const note = try writeTransactionPutBlobValue(std.testing.allocator, tx, "notes", "created in tx");
+    try std.testing.expectEqual(@as(u64, 1), note.id);
+    const not_visible_before_commit = try blobValueLen(std.testing.allocator, ".", table_name, "notes", note.id);
+    try std.testing.expect(!not_visible_before_commit.found);
+
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, 100);
+    writeU64LE(&row, 8, note.id);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 1), committed.row_count);
+    try std.testing.expectEqual(@as(u64, 2), committed.epoch);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        var rows: [2]u64 = undefined;
+        const exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "created in tx", 0, 2, &rows);
+        try std.testing.expectEqual(@as(u64, 1), exact.total);
+        try std.testing.expectEqual(@as(u64, 1), exact.written);
+        try std.testing.expectEqual(@as(u64, 0), rows[0]);
+        const len = try snapshotBlobValueLen(snapshot, "notes", note.id);
+        try std.testing.expect(len.found);
+        try std.testing.expectEqual(@as(u64, 13), len.len);
+    }
+
+    tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    const blob_only = try writeTransactionPutBlobValue(std.testing.allocator, tx, "notes", "blob only");
+    try std.testing.expectEqual(@as(u64, 2), blob_only.id);
+    const blob_only_commit = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 1), blob_only_commit.row_count);
+    try std.testing.expectEqual(@as(u64, 3), blob_only_commit.epoch);
+    destroyWriteTransaction(std.testing.allocator, tx);
+    const blob_only_len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", blob_only.id);
+    try std.testing.expect(blob_only_len.found);
+    try std.testing.expectEqual(@as(u64, 9), blob_only_len.len);
+
+    tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    const rolled_back = try writeTransactionPutBlobValue(std.testing.allocator, tx, "notes", "rolled back");
+    try std.testing.expectEqual(@as(u64, 3), rolled_back.id);
+    destroyWriteTransaction(std.testing.allocator, tx);
+    const rolled_back_len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", rolled_back.id);
+    try std.testing.expect(!rolled_back_len.found);
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 3), verified.epoch);
+    try std.testing.expectEqual(@as(u64, 1), verified.row_count);
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {

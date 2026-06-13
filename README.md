@@ -45,6 +45,7 @@ Core native calls:
 - `sa_db_upsert_row_u64_key`
 - `sa_db_tx_begin`
 - `sa_db_tx_insert_row`
+- `sa_db_tx_blob_put`
 - `sa_db_tx_upsert_row_u64_key`
 - `sa_db_tx_delete_u64_key`
 - `sa_db_tx_commit`
@@ -186,6 +187,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
+`DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
@@ -422,17 +424,20 @@ column ingest path, so the write advances the table epoch and rebuilds any
 persisted `u64` indexes.
 
 `sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
-returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_UPSERT_ROW_U64_KEY`, and
-`DB_TX_DELETE_U64_KEY` mutate an in-memory transaction image; no new table epoch
-or manifest is published until `sa_db_tx_commit` / `DB_TX_COMMIT`. Commit writes
-one replacement segment, rebuilds all persisted indexes, then advances the active
-manifest once. A pending/commit marker pair lets `recover` distinguish incomplete
-transaction metadata from committed metadata whose manifest update was
-interrupted. If commit fails, for example because a batch introduces duplicate
-keys for a unique index, the previous active manifest remains visible and the
-transaction handle is closed. `sa_db_tx_rollback` / `DB_TX_ROLLBACK` drops the
-in-memory image without publishing any rows. This is currently a single-table,
-single-writer transaction model; read handles still see only committed snapshots.
+returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_BLOB_PUT`,
+`DB_TX_UPSERT_ROW_U64_KEY`, and `DB_TX_DELETE_U64_KEY` mutate a transaction
+image; no new table epoch or manifest is published until `sa_db_tx_commit` /
+`DB_TX_COMMIT`. Commit writes changed row segments when needed, versioned blob
+artifacts referenced by the transaction metadata, rebuilds all persisted indexes,
+then advances the active manifest once. Blob-only transactions are valid and
+advance the epoch without rewriting row segments. A pending/commit marker pair
+lets `recover` distinguish incomplete transaction metadata from committed
+metadata whose manifest update was interrupted. If commit fails, for example
+because a batch introduces duplicate keys for a unique index, the previous active
+manifest remains visible and the transaction handle is closed. `sa_db_tx_rollback`
+/ `DB_TX_ROLLBACK` drops the transaction image without publishing rows or blob
+handles. This is currently a single-table, single-writer transaction model; read
+handles still see only committed snapshots.
 
 `sa_db_upsert_row_u64_key` / `DB_UPSERT_ROW_U64_KEY` upserts one fixed-width row
 by a unique `u64` key. The target column must already have a unique `u64` index.
@@ -552,6 +557,9 @@ sa build-exe db_timestamp_query_smoke.sa -o db_timestamp_query_smoke.out --no-in
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out
+
+sa build-exe db_tx_blob_smoke.sa -o db_tx_blob_smoke.out --no-incremental
+./db_tx_blob_smoke.out
 
 sa build-exe db_member_bench.sa -o db_member_bench.out --no-incremental
 ./db_member_bench.out

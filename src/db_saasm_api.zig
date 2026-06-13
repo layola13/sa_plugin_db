@@ -666,6 +666,29 @@ pub export fn sa_db_tx_insert_row(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_tx_blob_put(
+    handle: ?*anyopaque,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_id: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    id_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    const result = table.writeTransactionPutBlobValue(std.heap.page_allocator, tx, store_name, value) catch |err| return tableStatus(err);
+    id_slot.* = result.id;
+    return fillInfo(out_info, result.info);
+}
+
 pub export fn sa_db_tx_upsert_row_u64_key(
     handle: ?*anyopaque,
     column_index: u64,
@@ -3187,6 +3210,83 @@ test "db SA ABI commits and rolls back write transactions" {
     try std.testing.expectEqual(@as(u64, 55), sum);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "tx_members".ptr, "tx_members".len, &info));
+}
+
+test "db SA ABI commits and rolls back transaction blob handles" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "tx_blob_abi";
+    const store_name = "notes";
+    const value_a = "created in tx";
+    const value_b = "blob only";
+    const value_c = "rolled back";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_blob_abi.sadb-schema".ptr, "tx_blob_abi.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_blob_eq_index(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, 0, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    var blob_a_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_blob_put(tx_handle, store_name.ptr, store_name.len, value_a.ptr, value_a.len, &blob_a_id, &info));
+    try std.testing.expectEqual(@as(u64, 1), blob_a_id);
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 100, .little);
+    std.mem.writeInt(u64, row[8..16], blob_a_id, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_insert_row(tx_handle, &row, row.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 1), info.row_count);
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+
+    var found: u64 = 0;
+    var len: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_value_len(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, blob_a_id, &found, &len));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, value_a.len), len);
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &read_handle));
+    var rows = [_]u64{ 99, 99 };
+    var written: u64 = 0;
+    var total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_blob_eq_handle(read_handle, 1, store_name.ptr, store_name.len, value_a.ptr, value_a.len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 1), total);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    var blob_b_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_blob_put(tx_handle, store_name.ptr, store_name.len, value_b.ptr, value_b.len, &blob_b_id, &info));
+    try std.testing.expectEqual(@as(u64, 2), blob_b_id);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 1), info.row_count);
+    try std.testing.expectEqual(@as(u64, 3), info.epoch);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_value_len(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, blob_b_id, &found, &len));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, value_b.len), len);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    var blob_c_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_blob_put(tx_handle, store_name.ptr, store_name.len, value_c.ptr, value_c.len, &blob_c_id, &info));
+    try std.testing.expectEqual(@as(u64, 3), blob_c_id);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(tx_handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_value_len(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, blob_c_id, &found, &len));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(@as(u64, 0), len);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
+    try std.testing.expectEqual(@as(u64, 1), info.row_count);
+    try std.testing.expectEqual(@as(u64, 3), info.epoch);
 }
 
 test "db SA ABI creates ingests updates and scans raw columns" {

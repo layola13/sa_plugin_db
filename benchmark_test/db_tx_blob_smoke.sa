@@ -1,0 +1,303 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"tx_blob_sa"
+@const SCHEMA_PATH = utf8:"tx_blob_sa.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_NOTE_STRIDE = 8 // blob_handle\n"
+@const STORE = utf8:"notes"
+@const VALUE_A = utf8:"created in tx"
+@const VALUE_B = utf8:"blob only"
+@const VALUE_C = utf8:"rolled back"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 10
+#def SCHEMA_PATH_LEN = 22
+#def SCHEMA_LEN = 88
+#def STORE_LEN = 5
+#def VALUE_A_LEN = 13
+#def VALUE_B_LEN = 9
+#def VALUE_C_LEN = 11
+#def ROW_BYTES = 16
+#def FILTER_ROWS_CAP = 2
+#def FILTER_ROWS_BYTES = 16
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+    out_row = alloc ROW_BYTES
+    filter_rows = alloc FILTER_ROWS_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_CREATE_BLOB_EQ_INDEX create_blob_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, STORE, STORE_LEN, 0, info
+
+    EXPAND DB_TX_BEGIN tx1_begin_status, tx1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_TX_BLOB_PUT tx1_blob_status, blob_a_id, tx1, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, info
+    EXPAND DB_BLOB_VALUE_LEN tx1_pre_len_status, tx1_pre_found, tx1_pre_len, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_a_id
+    store row+0, 100 as u64
+    store row+8, blob_a_id as u64
+    EXPAND DB_TX_INSERT_ROW tx1_insert_status, tx1, row, ROW_BYTES, info
+    EXPAND DB_TX_COMMIT tx1_commit_status, tx1, info
+    EXPAND DB_INFO_ROW_COUNT tx1_rows, info
+    EXPAND DB_INFO_EPOCH tx1_epoch, info
+    EXPAND DB_BLOB_VALUE_LEN len_a_status, len_a_found, len_a, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_a_id
+
+    EXPAND DB_OPEN_READ_TABLE open1_status, read1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_FILTER_BLOB_EQ_HANDLE eq_status, eq_written, eq_total, filter_rows, FILTER_ROWS_CAP, read1, 1, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, 0, FILTER_ROWS_CAP
+    eq_row0 = load filter_rows+0 as u64
+    EXPAND DB_GET_ROW_HANDLE get_row_status, read1, eq_row0, out_row, ROW_BYTES
+    row_id = load out_row+0 as u64
+    row_blob_id = load out_row+8 as u64
+    EXPAND DB_CLOSE_READ_TABLE close1_status, read1
+
+    EXPAND DB_TX_BEGIN tx2_begin_status, tx2, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_TX_BLOB_PUT tx2_blob_status, blob_b_id, tx2, STORE, STORE_LEN, VALUE_B, VALUE_B_LEN, info
+    EXPAND DB_TX_COMMIT tx2_commit_status, tx2, info
+    EXPAND DB_INFO_ROW_COUNT tx2_rows, info
+    EXPAND DB_INFO_EPOCH tx2_epoch, info
+    EXPAND DB_BLOB_VALUE_LEN len_b_status, len_b_found, len_b, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_b_id
+
+    EXPAND DB_TX_BEGIN tx3_begin_status, tx3, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_TX_BLOB_PUT tx3_blob_status, blob_c_id, tx3, STORE, STORE_LEN, VALUE_C, VALUE_C_LEN, info
+    EXPAND DB_TX_ROLLBACK tx3_rollback_status, tx3
+    EXPAND DB_BLOB_VALUE_LEN len_c_status, len_c_found, len_c, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, blob_c_id
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_ROW_COUNT verify_rows, info
+    EXPAND DB_INFO_EPOCH verify_epoch, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_create_blob_index = eq create_blob_index_status, SA_DB_OK
+    ok_tx1_begin = eq tx1_begin_status, SA_DB_OK
+    ok_tx1_blob = eq tx1_blob_status, SA_DB_OK
+    ok_blob_a_id = eq blob_a_id, 1
+    ok_tx1_pre_len_status = eq tx1_pre_len_status, SA_DB_OK
+    ok_tx1_pre_found = eq tx1_pre_found, 0
+    ok_tx1_pre_len = eq tx1_pre_len, 0
+    ok_tx1_insert = eq tx1_insert_status, SA_DB_OK
+    ok_tx1_commit = eq tx1_commit_status, SA_DB_OK
+    ok_tx1_rows = eq tx1_rows, 1
+    ok_tx1_epoch = eq tx1_epoch, 2
+    ok_len_a_status = eq len_a_status, SA_DB_OK
+    ok_len_a_found = eq len_a_found, 1
+    ok_len_a = eq len_a, VALUE_A_LEN
+    ok_open1 = eq open1_status, SA_DB_OK
+    ok_eq_status = eq eq_status, SA_DB_OK
+    ok_eq_written = eq eq_written, 1
+    ok_eq_total = eq eq_total, 1
+    ok_eq_row0 = eq eq_row0, 0
+    ok_get_row = eq get_row_status, SA_DB_OK
+    ok_row_id = eq row_id, 100
+    ok_row_blob_id = eq row_blob_id, blob_a_id
+    ok_close1 = eq close1_status, SA_DB_OK
+    ok_tx2_begin = eq tx2_begin_status, SA_DB_OK
+    ok_tx2_blob = eq tx2_blob_status, SA_DB_OK
+    ok_blob_b_id = eq blob_b_id, 2
+    ok_tx2_commit = eq tx2_commit_status, SA_DB_OK
+    ok_tx2_rows = eq tx2_rows, 1
+    ok_tx2_epoch = eq tx2_epoch, 3
+    ok_len_b_status = eq len_b_status, SA_DB_OK
+    ok_len_b_found = eq len_b_found, 1
+    ok_len_b = eq len_b, VALUE_B_LEN
+    ok_tx3_begin = eq tx3_begin_status, SA_DB_OK
+    ok_tx3_blob = eq tx3_blob_status, SA_DB_OK
+    ok_blob_c_id = eq blob_c_id, 3
+    ok_tx3_rollback = eq tx3_rollback_status, SA_DB_OK
+    ok_len_c_status = eq len_c_status, SA_DB_OK
+    ok_len_c_found = eq len_c_found, 0
+    ok_len_c = eq len_c, 0
+    ok_verify = eq verify_status, SA_DB_OK
+    ok_verify_rows = eq verify_rows, 1
+    ok_verify_epoch = eq verify_epoch, 3
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_create_blob_index
+    ok03 = and ok02, ok_tx1_begin
+    ok04 = and ok03, ok_tx1_blob
+    ok05 = and ok04, ok_blob_a_id
+    ok06 = and ok05, ok_tx1_pre_len_status
+    ok07 = and ok06, ok_tx1_pre_found
+    ok08 = and ok07, ok_tx1_pre_len
+    ok09 = and ok08, ok_tx1_insert
+    ok10 = and ok09, ok_tx1_commit
+    ok11 = and ok10, ok_tx1_rows
+    ok12 = and ok11, ok_tx1_epoch
+    ok13 = and ok12, ok_len_a_status
+    ok14 = and ok13, ok_len_a_found
+    ok15 = and ok14, ok_len_a
+    ok16 = and ok15, ok_open1
+    ok17 = and ok16, ok_eq_status
+    ok18 = and ok17, ok_eq_written
+    ok19 = and ok18, ok_eq_total
+    ok20 = and ok19, ok_eq_row0
+    ok21 = and ok20, ok_get_row
+    ok22 = and ok21, ok_row_id
+    ok23 = and ok22, ok_row_blob_id
+    ok24 = and ok23, ok_close1
+    ok25 = and ok24, ok_tx2_begin
+    ok26 = and ok25, ok_tx2_blob
+    ok27 = and ok26, ok_blob_b_id
+    ok28 = and ok27, ok_tx2_commit
+    ok29 = and ok28, ok_tx2_rows
+    ok30 = and ok29, ok_tx2_epoch
+    ok31 = and ok30, ok_len_b_status
+    ok32 = and ok31, ok_len_b_found
+    ok33 = and ok32, ok_len_b
+    ok34 = and ok33, ok_tx3_begin
+    ok35 = and ok34, ok_tx3_blob
+    ok36 = and ok35, ok_blob_c_id
+    ok37 = and ok36, ok_tx3_rollback
+    ok38 = and ok37, ok_len_c_status
+    ok39 = and ok38, ok_len_c_found
+    ok40 = and ok39, ok_len_c
+    ok41 = and ok40, ok_verify
+    ok42 = and ok41, ok_verify_rows
+    ok = and ok42, ok_verify_epoch
+
+    !remove_status
+    !init_status
+    !create_blob_index_status
+    !tx1_begin_status
+    !tx1
+    !tx1_blob_status
+    !blob_a_id
+    !tx1_pre_len_status
+    !tx1_pre_found
+    !tx1_pre_len
+    !tx1_insert_status
+    !tx1_commit_status
+    !tx1_rows
+    !tx1_epoch
+    !len_a_status
+    !len_a_found
+    !len_a
+    !open1_status
+    !read1
+    !eq_status
+    !eq_written
+    !eq_total
+    !eq_row0
+    !get_row_status
+    !row_id
+    !row_blob_id
+    !close1_status
+    !tx2_begin_status
+    !tx2
+    !tx2_blob_status
+    !blob_b_id
+    !tx2_commit_status
+    !tx2_rows
+    !tx2_epoch
+    !len_b_status
+    !len_b_found
+    !len_b
+    !tx3_begin_status
+    !tx3
+    !tx3_blob_status
+    !blob_c_id
+    !tx3_rollback_status
+    !len_c_status
+    !len_c_found
+    !len_c
+    !verify_status
+    !verify_rows
+    !verify_epoch
+    !ok_remove
+    !ok_init
+    !ok_create_blob_index
+    !ok_tx1_begin
+    !ok_tx1_blob
+    !ok_blob_a_id
+    !ok_tx1_pre_len_status
+    !ok_tx1_pre_found
+    !ok_tx1_pre_len
+    !ok_tx1_insert
+    !ok_tx1_commit
+    !ok_tx1_rows
+    !ok_tx1_epoch
+    !ok_len_a_status
+    !ok_len_a_found
+    !ok_len_a
+    !ok_open1
+    !ok_eq_status
+    !ok_eq_written
+    !ok_eq_total
+    !ok_eq_row0
+    !ok_get_row
+    !ok_row_id
+    !ok_row_blob_id
+    !ok_close1
+    !ok_tx2_begin
+    !ok_tx2_blob
+    !ok_blob_b_id
+    !ok_tx2_commit
+    !ok_tx2_rows
+    !ok_tx2_epoch
+    !ok_len_b_status
+    !ok_len_b_found
+    !ok_len_b
+    !ok_tx3_begin
+    !ok_tx3_blob
+    !ok_blob_c_id
+    !ok_tx3_rollback
+    !ok_len_c_status
+    !ok_len_c_found
+    !ok_len_c
+    !ok_verify
+    !ok_verify_rows
+    !ok_verify_epoch
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !row
+    !out_row
+    !filter_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9015)

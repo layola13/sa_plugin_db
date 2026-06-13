@@ -22,6 +22,7 @@
 @extern sa_db_upsert_row_u64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_begin(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_handle: ptr) -> u32
 @extern sa_db_tx_insert_row(handle: ptr, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_blob_put(handle: ptr, &store_name: ptr, store_name_len: u64, &value: ptr, value_len: u64, &out_id: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_upsert_row_u64_key(handle: ptr, column_index: u64, expected: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u64_key(handle: ptr, column_index: u64, expected: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_commit(handle: ptr, &out_info: ptr) -> u32

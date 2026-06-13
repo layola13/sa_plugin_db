@@ -223,6 +223,12 @@
     %out_status = call @sa_db_tx_insert_row(%handle, &%row, %row_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_TX_BLOB_PUT %out_status, %out_id, %handle, %store_name, %store_name_len, %value, %value_len, %out_info
+    __db_tx_blob_put_id_slot_%out_id = stack_alloc 8
+    %out_status = call @sa_db_tx_blob_put(%handle, &%store_name, %store_name_len, &%value, %value_len, &__db_tx_blob_put_id_slot_%out_id, &%out_info)
+    %out_id = load __db_tx_blob_put_id_slot_%out_id+0 as u64
+[END_MACRO]
+
 [MACRO] DB_TX_UPSERT_ROW_U64_KEY %out_status, %out_inserted, %handle, %column_index, %expected, %row, %row_len, %out_info
     __db_tx_upsert_inserted_slot_%out_inserted = stack_alloc 8
     %out_status = call @sa_db_tx_upsert_row_u64_key(%handle, %column_index, %expected, &%row, %row_len, &__db_tx_upsert_inserted_slot_%out_inserted, &%out_info)
