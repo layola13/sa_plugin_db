@@ -1349,12 +1349,37 @@ fn fileMetasEqual(current: table_mod.FileMeta, expected: table_mod.FileMeta) boo
     if (!std.mem.eql(u8, current.path, expected.path)) return false;
     if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
     if (current.bytes != expected.bytes) return false;
-    if (current.block_size != expected.block_size) return false;
-    if (current.block_sha256.len != expected.block_sha256.len) return false;
-    for (current.block_sha256, expected.block_sha256) |current_hash, expected_hash| {
+    return blockHashMetadataEqual(current.block_size, current.block_sha256, expected.block_size, expected.block_sha256);
+}
+
+fn blockHashMetadataEqual(current_size: u64, current_hashes: []const []const u8, expected_size: u64, expected_hashes: []const []const u8) bool {
+    if (current_size != expected_size) return false;
+    if (current_hashes.len != expected_hashes.len) return false;
+    for (current_hashes, expected_hashes) |current_hash, expected_hash| {
         if (!std.mem.eql(u8, current_hash, expected_hash)) return false;
     }
     return true;
+}
+
+fn indexMetasEqual(current: table_mod.IndexMeta, expected: table_mod.IndexMeta) bool {
+    if (!std.mem.eql(u8, current.name, expected.name)) return false;
+    if (!std.mem.eql(u8, current.kind, expected.kind)) return false;
+    if (current.column_index != expected.column_index) return false;
+    if (current.column_index2 != expected.column_index2) return false;
+    if (current.unique != expected.unique) return false;
+    if (!std.mem.eql(u8, current.path, expected.path)) return false;
+    if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
+    if (current.bytes != expected.bytes) return false;
+    return blockHashMetadataEqual(current.block_size, current.block_sha256, expected.block_size, expected.block_sha256);
+}
+
+fn dictMetasEqual(current: table_mod.DictMeta, expected: table_mod.DictMeta) bool {
+    if (!std.mem.eql(u8, current.name, expected.name)) return false;
+    if (!std.mem.eql(u8, current.path, expected.path)) return false;
+    if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
+    if (current.bytes != expected.bytes) return false;
+    if (current.entries != expected.entries) return false;
+    return blockHashMetadataEqual(current.block_size, current.block_sha256, expected.block_size, expected.block_sha256);
 }
 
 fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!bool {
@@ -1372,7 +1397,7 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
     if (current.value.max_rows != expected.max_rows) return false;
     if (current.value.row_bytes != expected.row_bytes) return false;
     if (current.value.next_segment_id != expected.next_segment_id) return false;
-    if (current.value.columns.len != expected.columns.len or current.value.segments.len != expected.segments.len or current.value.indexes.len != expected.indexes.len) return false;
+    if (current.value.columns.len != expected.columns.len or current.value.segments.len != expected.segments.len or current.value.indexes.len != expected.indexes.len or current.value.dicts.len != expected.dicts.len) return false;
     for (current.value.columns, expected.columns) |current_col, expected_col| {
         if (!std.mem.eql(u8, current_col.name, expected_col.name)) return false;
         if (!std.mem.eql(u8, current_col.ty, expected_col.ty)) return false;
@@ -1386,13 +1411,10 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
         }
     }
     for (current.value.indexes, expected.indexes) |current_index, expected_index| {
-        if (!std.mem.eql(u8, current_index.name, expected_index.name)) return false;
-        if (!std.mem.eql(u8, current_index.kind, expected_index.kind)) return false;
-        if (current_index.column_index != expected_index.column_index) return false;
-        if (current_index.unique != expected_index.unique) return false;
-        if (!std.mem.eql(u8, current_index.path, expected_index.path)) return false;
-        if (!std.mem.eql(u8, current_index.sha256, expected_index.sha256)) return false;
-        if (current_index.bytes != expected_index.bytes) return false;
+        if (!indexMetasEqual(current_index, expected_index)) return false;
+    }
+    for (current.value.dicts, expected.dicts) |current_dict, expected_dict| {
+        if (!dictMetasEqual(current_dict, expected_dict)) return false;
     }
     return true;
 }

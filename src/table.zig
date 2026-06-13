@@ -62,6 +62,8 @@ pub const IndexMeta = struct {
     path: []const u8,
     sha256: []const u8,
     bytes: u64,
+    block_size: u64 = 0,
+    block_sha256: [][]const u8 = &.{},
 };
 
 pub const DictMeta = struct {
@@ -70,6 +72,8 @@ pub const DictMeta = struct {
     sha256: []const u8,
     bytes: u64,
     entries: u64,
+    block_size: u64 = 0,
+    block_sha256: [][]const u8 = &.{},
 };
 
 pub const TableMeta = struct {
@@ -103,19 +107,8 @@ pub const TableMeta = struct {
             freeFileMetas(allocator, segment.files);
         }
         allocator.free(self.segments);
-        for (self.indexes) |index| {
-            allocator.free(index.name);
-            allocator.free(index.kind);
-            allocator.free(index.path);
-            allocator.free(index.sha256);
-        }
-        allocator.free(self.indexes);
-        for (self.dicts) |dict| {
-            allocator.free(dict.name);
-            allocator.free(dict.path);
-            allocator.free(dict.sha256);
-        }
-        allocator.free(self.dicts);
+        freeIndexMetas(allocator, self.indexes);
+        freeDictMetas(allocator, self.dicts);
         self.* = undefined;
     }
 };
@@ -829,6 +822,30 @@ fn duplicateBlockSha256List(allocator: std.mem.Allocator, hashes: []const []cons
     return out;
 }
 
+fn artifactBlockSize(bytes: []const u8) u64 {
+    return if (bytes.len == 0) 0 else FILE_BLOCK_BYTES;
+}
+
+fn validateBlockSha256List(block_size_value: u64, block_sha256: []const []const u8, bytes: []const u8) TableError!void {
+    if (block_size_value == 0) {
+        if (block_sha256.len != 0) return TableError.VerifyFailed;
+        return;
+    }
+    if (block_size_value > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
+    const block_size: usize = @intCast(block_size_value);
+    if (block_size == 0) return TableError.VerifyFailed;
+    const expected_count = blockHashCount(bytes.len, block_size);
+    if (block_sha256.len != expected_count) return TableError.VerifyFailed;
+    for (block_sha256, 0..) |expected_hash, idx| {
+        if (expected_hash.len != 64) return TableError.VerifyFailed;
+        const start = idx * block_size;
+        const end = @min(start + block_size, bytes.len);
+        const actual_hash = hashBytes(bytes[start..end]);
+        const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
+        if (!std.mem.eql(u8, actual_hex[0..], expected_hash)) return TableError.VerifyFailed;
+    }
+}
+
 fn makeFileMeta(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!FileMeta {
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
@@ -840,7 +857,7 @@ fn makeFileMeta(allocator: std.mem.Allocator, path: []const u8, bytes: []const u
         .path = owned_path,
         .sha256 = sha256,
         .bytes = bytes.len,
-        .block_size = if (bytes.len == 0) 0 else FILE_BLOCK_BYTES,
+        .block_size = artifactBlockSize(bytes),
         .block_sha256 = block_sha256,
     };
 }
@@ -880,23 +897,23 @@ fn initSegmentMetas(segments: []SegmentMeta) void {
 }
 
 pub fn validateFileBlockHashes(file: FileMeta, bytes: []const u8) TableError!void {
-    if (file.block_size == 0) {
-        if (file.block_sha256.len != 0) return TableError.VerifyFailed;
-        return;
-    }
-    if (file.block_size > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
-    const block_size: usize = @intCast(file.block_size);
-    if (block_size == 0) return TableError.VerifyFailed;
-    const expected_count = blockHashCount(bytes.len, block_size);
-    if (file.block_sha256.len != expected_count) return TableError.VerifyFailed;
-    for (file.block_sha256, 0..) |expected_hash, idx| {
-        if (expected_hash.len != 64) return TableError.VerifyFailed;
-        const start = idx * block_size;
-        const end = @min(start + block_size, bytes.len);
-        const actual_hash = hashBytes(bytes[start..end]);
-        const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
-        if (!std.mem.eql(u8, actual_hex[0..], expected_hash)) return TableError.VerifyFailed;
-    }
+    try validateBlockSha256List(file.block_size, file.block_sha256, bytes);
+}
+
+fn validateIndexBlockHashes(index: IndexMeta, bytes: []const u8) TableError!void {
+    try validateBlockSha256List(index.block_size, index.block_sha256, bytes);
+}
+
+fn validateDictBlockHashes(dict: DictMeta, bytes: []const u8) TableError!void {
+    try validateBlockSha256List(dict.block_size, dict.block_sha256, bytes);
+}
+
+fn validateFileMetaBytes(file: FileMeta, bytes: []const u8) TableError!void {
+    if (bytes.len != file.bytes) return TableError.VerifyFailed;
+    const hash = hashBytes(bytes);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    if (!std.mem.eql(u8, hex[0..], file.sha256)) return TableError.VerifyFailed;
+    try validateFileBlockHashes(file, bytes);
 }
 
 fn writeSegmentFiles(
@@ -937,20 +954,74 @@ fn freeSegmentMetas(allocator: std.mem.Allocator, segments: []SegmentMeta) void 
     allocator.free(segments);
 }
 
+fn emptyIndexMeta() IndexMeta {
+    return .{
+        .name = &.{},
+        .kind = &.{},
+        .column_index = 0,
+        .column_index2 = null,
+        .unique = false,
+        .path = &.{},
+        .sha256 = &.{},
+        .bytes = 0,
+    };
+}
+
+fn initIndexMetas(indexes: []IndexMeta) void {
+    for (indexes) |*index| index.* = emptyIndexMeta();
+}
+
+fn freeIndexMeta(allocator: std.mem.Allocator, index: IndexMeta) void {
+    allocator.free(index.name);
+    allocator.free(index.kind);
+    allocator.free(index.path);
+    allocator.free(index.sha256);
+    freeBlockSha256List(allocator, index.block_sha256);
+}
+
 fn freeIndexMetas(allocator: std.mem.Allocator, indexes: []IndexMeta) void {
-    for (indexes) |index| {
-        allocator.free(index.name);
-        allocator.free(index.kind);
-        allocator.free(index.path);
-        allocator.free(index.sha256);
-    }
+    for (indexes) |index| freeIndexMeta(allocator, index);
     allocator.free(indexes);
+}
+
+fn duplicateIndexMeta(allocator: std.mem.Allocator, index: IndexMeta) TableError!IndexMeta {
+    const name = try allocator.dupe(u8, index.name);
+    errdefer allocator.free(name);
+    const kind = try allocator.dupe(u8, index.kind);
+    errdefer allocator.free(kind);
+    const path = try allocator.dupe(u8, index.path);
+    errdefer allocator.free(path);
+    const sha256 = try allocator.dupe(u8, index.sha256);
+    errdefer allocator.free(sha256);
+    const block_sha256 = try duplicateBlockSha256List(allocator, index.block_sha256);
+    errdefer freeBlockSha256List(allocator, block_sha256);
+    return .{
+        .name = name,
+        .kind = kind,
+        .column_index = index.column_index,
+        .column_index2 = index.column_index2,
+        .unique = index.unique,
+        .path = path,
+        .sha256 = sha256,
+        .bytes = index.bytes,
+        .block_size = index.block_size,
+        .block_sha256 = block_sha256,
+    };
+}
+
+fn emptyDictMeta() DictMeta {
+    return .{ .name = &.{}, .path = &.{}, .sha256 = &.{}, .bytes = 0, .entries = 0 };
+}
+
+fn initDictMetas(dicts: []DictMeta) void {
+    for (dicts) |*dict| dict.* = emptyDictMeta();
 }
 
 fn freeDictMeta(allocator: std.mem.Allocator, dict: DictMeta) void {
     allocator.free(dict.name);
     allocator.free(dict.path);
     allocator.free(dict.sha256);
+    freeBlockSha256List(allocator, dict.block_sha256);
 }
 
 fn freeDictMetas(allocator: std.mem.Allocator, dicts: []DictMeta) void {
@@ -958,24 +1029,32 @@ fn freeDictMetas(allocator: std.mem.Allocator, dicts: []DictMeta) void {
     allocator.free(dicts);
 }
 
+fn duplicateDictMeta(allocator: std.mem.Allocator, dict: DictMeta) TableError!DictMeta {
+    const name = try allocator.dupe(u8, dict.name);
+    errdefer allocator.free(name);
+    const path = try allocator.dupe(u8, dict.path);
+    errdefer allocator.free(path);
+    const sha256 = try allocator.dupe(u8, dict.sha256);
+    errdefer allocator.free(sha256);
+    const block_sha256 = try duplicateBlockSha256List(allocator, dict.block_sha256);
+    errdefer freeBlockSha256List(allocator, block_sha256);
+    return .{
+        .name = name,
+        .path = path,
+        .sha256 = sha256,
+        .bytes = dict.bytes,
+        .entries = dict.entries,
+        .block_size = dict.block_size,
+        .block_sha256 = block_sha256,
+    };
+}
+
 fn duplicateDictMetas(allocator: std.mem.Allocator, dicts: []const DictMeta) TableError![]DictMeta {
     const out = try allocator.alloc(DictMeta, dicts.len);
-    for (out) |*dict| dict.* = .{
-        .name = &.{},
-        .path = &.{},
-        .sha256 = &.{},
-        .bytes = 0,
-        .entries = 0,
-    };
+    initDictMetas(out);
     errdefer freeDictMetas(allocator, out);
     for (dicts, 0..) |dict, idx| {
-        out[idx] = .{
-            .name = try allocator.dupe(u8, dict.name),
-            .path = try allocator.dupe(u8, dict.path),
-            .sha256 = try allocator.dupe(u8, dict.sha256),
-            .bytes = dict.bytes,
-            .entries = dict.entries,
-        };
+        out[idx] = try duplicateDictMeta(allocator, dict);
     }
     return out;
 }
@@ -1012,28 +1091,10 @@ fn duplicateSegmentMetas(allocator: std.mem.Allocator, segments: []const Segment
 
 fn duplicateIndexMetas(allocator: std.mem.Allocator, indexes: []const IndexMeta) TableError![]IndexMeta {
     const out = try allocator.alloc(IndexMeta, indexes.len);
-    for (out) |*index| index.* = .{
-        .name = &.{},
-        .kind = &.{},
-        .column_index = 0,
-        .column_index2 = null,
-        .unique = false,
-        .path = &.{},
-        .sha256 = &.{},
-        .bytes = 0,
-    };
+    initIndexMetas(out);
     errdefer freeIndexMetas(allocator, out);
     for (indexes, 0..) |index, idx| {
-        out[idx] = .{
-            .name = try allocator.dupe(u8, index.name),
-            .kind = try allocator.dupe(u8, index.kind),
-            .column_index = index.column_index,
-            .column_index2 = index.column_index2,
-            .unique = index.unique,
-            .path = try allocator.dupe(u8, index.path),
-            .sha256 = try allocator.dupe(u8, index.sha256),
-            .bytes = index.bytes,
-        };
+        out[idx] = try duplicateIndexMeta(allocator, index);
     }
     return out;
 }
@@ -1267,10 +1328,7 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
             defer allocator.free(path);
             const bytes = try readFileAlloc(allocator, path, 1 << 30);
             defer allocator.free(bytes);
-            const hash = hashBytes(bytes);
-            const hex = std.fmt.bytesToHex(hash, .lower);
-            if (!std.mem.eql(u8, hex[0..], file.sha256)) return TableError.VerifyFailed;
-            try validateFileBlockHashes(file, bytes);
+            try validateFileMetaBytes(file, bytes);
             if (bytes.len != expected_bytes) return TableError.VerifyFailed;
         }
     }
@@ -1306,6 +1364,7 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
         const hash = hashBytes(bytes);
         const hex = std.fmt.bytesToHex(hash, .lower);
         if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
+        try validateIndexBlockHashes(index, bytes);
         if (std.mem.eql(u8, index.kind, "u64_pair")) {
             try validateU64PairIndexBytesShape(bytes, meta.row_count, index.unique);
         } else {
@@ -1406,6 +1465,7 @@ fn readDictBytes(allocator: std.mem.Allocator, root_dir: []const u8, dict: DictM
     const hash = hashBytes(bytes);
     const hex = std.fmt.bytesToHex(hash, .lower);
     if (!std.mem.eql(u8, hex[0..], dict.sha256)) return TableError.VerifyFailed;
+    try validateDictBlockHashes(dict, bytes);
     return bytes;
 }
 
@@ -2387,10 +2447,7 @@ fn buildAllColumnBuffers(allocator: std.mem.Allocator, root_dir: []const u8, met
             defer allocator.free(bytes);
             const expected_len = try expectedColumnBytes(segment.rows, column.stride);
             if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
-            const actual_hash = hashBytes(bytes);
-            const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
-            if (!std.mem.eql(u8, actual_hex[0..], file_meta.sha256)) return TableError.VerifyFailed;
-            try validateFileBlockHashes(file_meta, bytes);
+            try validateFileMetaBytes(file_meta, bytes);
             try buffers[col_idx].appendSlice(bytes);
             copied_rows = std.math.add(u64, copied_rows, segment.rows) catch return TableError.CursorOverflow;
         }
@@ -2647,12 +2704,16 @@ fn makeDictMeta(allocator: std.mem.Allocator, dict_name: []const u8, path: []con
     errdefer allocator.free(owned_path);
     const sha256 = try hashHexAlloc(allocator, bytes);
     errdefer allocator.free(sha256);
+    const block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer freeBlockSha256List(allocator, block_sha256);
     return .{
         .name = name,
         .path = owned_path,
         .sha256 = sha256,
         .bytes = bytes.len,
         .entries = entries,
+        .block_size = artifactBlockSize(bytes),
+        .block_sha256 = block_sha256,
     };
 }
 
@@ -2803,30 +2864,12 @@ pub fn createU64Index(
 
     const old_indexes = meta.indexes;
     const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    for (new_indexes) |*index| index.* = .{
-        .name = &.{},
-        .kind = &.{},
-        .column_index = 0,
-        .column_index2 = null,
-        .unique = false,
-        .path = &.{},
-        .sha256 = &.{},
-        .bytes = 0,
-    };
+    initIndexMetas(new_indexes);
     var assigned_indexes = false;
     errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
 
     for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = .{
-            .name = try allocator.dupe(u8, index.name),
-            .kind = try allocator.dupe(u8, index.kind),
-            .column_index = index.column_index,
-            .column_index2 = index.column_index2,
-            .unique = index.unique,
-            .path = try allocator.dupe(u8, index.path),
-            .sha256 = try allocator.dupe(u8, index.sha256),
-            .bytes = index.bytes,
-        };
+        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
     }
 
     const new_index = &new_indexes[old_indexes.len];
@@ -2874,30 +2917,12 @@ pub fn createI64Index(
 
     const old_indexes = meta.indexes;
     const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    for (new_indexes) |*index| index.* = .{
-        .name = &.{},
-        .kind = &.{},
-        .column_index = 0,
-        .column_index2 = null,
-        .unique = false,
-        .path = &.{},
-        .sha256 = &.{},
-        .bytes = 0,
-    };
+    initIndexMetas(new_indexes);
     var assigned_indexes = false;
     errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
 
     for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = .{
-            .name = try allocator.dupe(u8, index.name),
-            .kind = try allocator.dupe(u8, index.kind),
-            .column_index = index.column_index,
-            .column_index2 = index.column_index2,
-            .unique = index.unique,
-            .path = try allocator.dupe(u8, index.path),
-            .sha256 = try allocator.dupe(u8, index.sha256),
-            .bytes = index.bytes,
-        };
+        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
     }
 
     const new_index = &new_indexes[old_indexes.len];
@@ -2950,30 +2975,12 @@ pub fn createU64PairIndex(
 
     const old_indexes = meta.indexes;
     const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    for (new_indexes) |*index| index.* = .{
-        .name = &.{},
-        .kind = &.{},
-        .column_index = 0,
-        .column_index2 = null,
-        .unique = false,
-        .path = &.{},
-        .sha256 = &.{},
-        .bytes = 0,
-    };
+    initIndexMetas(new_indexes);
     var assigned_indexes = false;
     errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
 
     for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = .{
-            .name = try allocator.dupe(u8, index.name),
-            .kind = try allocator.dupe(u8, index.kind),
-            .column_index = index.column_index,
-            .column_index2 = index.column_index2,
-            .unique = index.unique,
-            .path = try allocator.dupe(u8, index.path),
-            .sha256 = try allocator.dupe(u8, index.sha256),
-            .bytes = index.bytes,
-        };
+        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
     }
 
     const new_index = &new_indexes[old_indexes.len];
@@ -3350,11 +3357,16 @@ fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *Tab
     errdefer allocator.free(next_path);
     const next_hash = try hashHexAlloc(allocator, bytes);
     errdefer allocator.free(next_hash);
+    const next_block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer freeBlockSha256List(allocator, next_block_sha256);
     allocator.free(index.path);
     allocator.free(index.sha256);
+    freeBlockSha256List(allocator, index.block_sha256);
     index.path = next_path;
     index.sha256 = next_hash;
     index.bytes = bytes.len;
+    index.block_size = artifactBlockSize(bytes);
+    index.block_sha256 = next_block_sha256;
 }
 
 pub fn rebuildIndexes(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta) TableError!void {
@@ -3403,6 +3415,7 @@ pub fn openReadSnapshot(
             defer backing_allocator.free(path);
             const bytes = try readFileAlloc(arena_allocator, path, 1 << 30);
             if (bytes.len != expected_len) return TableError.VerifyFailed;
+            try validateFileMetaBytes(file_meta, bytes);
             segment_columns[column_idx] = .{ .bytes = bytes };
         }
         snapshot.segments[segment_idx] = .{
@@ -3441,6 +3454,7 @@ pub fn openReadSnapshot(
         const hash = hashBytes(bytes);
         const hex = std.fmt.bytesToHex(hash, .lower);
         if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
+        try validateIndexBlockHashes(index, bytes);
         if (std.mem.eql(u8, index.kind, "u64_pair")) {
             try validateU64PairIndexBytesShape(bytes, parsed.value.row_count, index.unique);
         } else {
@@ -4811,6 +4825,117 @@ test "table segment files record block checksums and old metadata remains readab
     meta.segments[0].files[0].block_size = 0;
     try writeMeta(std.testing.allocator, ".", table_name, meta);
     _ = try verifyTable(std.testing.allocator, ".", table_name);
+}
+
+test "table index files record block checksums and old metadata remains readable" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "block_checked_indexes";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "block_checked_indexes.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_QTY_STRIDE = 8 // u64
+    );
+
+    var ids = [_]u64{ 1, 2 };
+    var qtys = [_]u64{ 5, 8 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(qtys[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), meta.indexes.len);
+    try std.testing.expectEqual(@as(u64, FILE_BLOCK_BYTES), meta.indexes[0].block_size);
+    try std.testing.expectEqual(@as(usize, 1), meta.indexes[0].block_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), meta.indexes[0].block_sha256[0].len);
+
+    const original_hash = try std.testing.allocator.dupe(u8, meta.indexes[0].block_sha256[0]);
+    defer std.testing.allocator.free(original_hash);
+    std.testing.allocator.free(meta.indexes[0].block_sha256[0]);
+    meta.indexes[0].block_sha256[0] = try std.testing.allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000");
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+    try std.testing.expectError(TableError.VerifyFailed, openReadSnapshot(std.testing.allocator, ".", table_name));
+
+    std.testing.allocator.free(meta.indexes[0].block_sha256[0]);
+    meta.indexes[0].block_sha256[0] = try std.testing.allocator.dupe(u8, original_hash);
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+    }
+
+    freeBlockSha256List(std.testing.allocator, meta.indexes[0].block_sha256);
+    meta.indexes[0].block_sha256 = try std.testing.allocator.alloc([]const u8, 0);
+    meta.indexes[0].block_size = 0;
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+    }
+}
+
+test "table dictionary files record block checksums and old metadata remains readable" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "block_checked_dicts";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "block_checked_dicts.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+    _ = try internStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    _ = try internStringDict(std.testing.allocator, ".", table_name, "status", "paused");
+
+    var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), meta.dicts.len);
+    try std.testing.expectEqual(@as(u64, FILE_BLOCK_BYTES), meta.dicts[0].block_size);
+    try std.testing.expectEqual(@as(usize, 1), meta.dicts[0].block_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), meta.dicts[0].block_sha256[0].len);
+
+    const original_hash = try std.testing.allocator.dupe(u8, meta.dicts[0].block_sha256[0]);
+    defer std.testing.allocator.free(original_hash);
+    std.testing.allocator.free(meta.dicts[0].block_sha256[0]);
+    meta.dicts[0].block_sha256[0] = try std.testing.allocator.dupe(u8, "1111111111111111111111111111111111111111111111111111111111111111");
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+    try std.testing.expectError(TableError.VerifyFailed, lookupStringDict(std.testing.allocator, ".", table_name, "status", "active"));
+
+    std.testing.allocator.free(meta.dicts[0].block_sha256[0]);
+    meta.dicts[0].block_sha256[0] = try std.testing.allocator.dupe(u8, original_hash);
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+    const active = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    try std.testing.expect(active.found);
+    try std.testing.expectEqual(@as(u64, 1), active.id);
+
+    freeBlockSha256List(std.testing.allocator, meta.dicts[0].block_sha256);
+    meta.dicts[0].block_sha256 = try std.testing.allocator.alloc([]const u8, 0);
+    meta.dicts[0].block_size = 0;
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+    const paused = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "paused");
+    try std.testing.expect(paused.found);
+    try std.testing.expectEqual(@as(u64, 2), paused.id);
 }
 
 test "table string dictionary is persisted snapshotted restored and verified" {
