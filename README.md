@@ -580,8 +580,8 @@ benchmarks. The required baseline is:
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
   customer/date, status/due-date, and product/posting-date shapes. The first ERP
   workflow benchmark now covers customers, products, orders, order lines,
-  inventory movement, and invoices; next is the matching SQLite ERP comparison
-  and broader index planning.
+  inventory movement, and invoices, with a matching SQLite comparison for the
+  same composite ERP filters; next is broader index planning.
 - Generalized primary-key and secondary indexes beyond the current persisted
   small-integer, float, `u64`, `i64`, `u64_pair`, and `u64_i64_pair` index
   shapes, including broader planner support for common ERP filters and
@@ -607,8 +607,9 @@ Dataset:
 - ERP workflow: 1,024 customers, 512 products, 8,192 orders, 32,768 order
   lines, 16,384 inventory movements, and 8,192 invoices. It exercises
   dictionary-backed status fields, `i64` decimal/date columns, unique and
-  non-unique `u64` indexes, `u64_pair` child-row indexes, range filters, count
-  filters, projection, and verification across multiple tables.
+  non-unique `u64` indexes, `u64_pair` child-row indexes, `u64_i64_pair`
+  customer/date and status/due-date indexes, range filters, count filters,
+  projection, and verification across multiple tables.
 
 Run db benchmarks:
 
@@ -699,19 +700,19 @@ Latest 5-run median results:
 | concurrent 4x25 SUM with read handles | 48.385 ms | 120.165 ms | db plugin |
 | concurrent insert, 4x12,500 rows | 55.618 ms | 90.713 ms | db plugin |
 
-ERP workflow 5-run median results:
+ERP workflow 7-run median results:
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 6 ERP tables | 179.537 ms | 1.329 ms | SQLite |
-| ingest ERP rows | 142.905 ms | 97.366 ms | SQLite |
-| build ERP indexes | 221.795 ms | 26.309 ms | SQLite |
-| order lines by order id | 0.023 ms | 0.049 ms | db plugin |
-| project order line columns | 0.005 ms | 0.033 ms | db plugin |
-| orders by customer id | 0.006 ms | 0.023 ms | db plugin |
-| due invoice range | 0.010 ms | 0.238 ms | db plugin |
-| inventory moves by product id | 0.010 ms | 0.033 ms | db plugin |
-| verify/integrity | 163.732 ms | 45.411 ms | SQLite |
+| init 6 ERP tables | 153.576 ms | 1.301 ms | SQLite |
+| ingest ERP rows | 131.877 ms | 93.332 ms | SQLite |
+| build ERP indexes | 175.708 ms | 19.449 ms | SQLite |
+| order lines by order id | 0.019 ms | 0.052 ms | db plugin |
+| project order line columns | 0.005 ms | 0.031 ms | db plugin |
+| orders by customer/date | 0.006 ms | 0.028 ms | db plugin |
+| paid due invoices by status/date | 0.010 ms | 0.248 ms | db plugin |
+| inventory moves by product id | 0.007 ms | 0.027 ms | db plugin |
+| verify/integrity | 147.362 ms | 38.938 ms | SQLite |
 
 Summary:
 
@@ -719,7 +720,7 @@ Summary:
 - Concurrent read-handle SUM is about 2.5x faster than the SQLite comparison.
 - Concurrent insert is about 1.6x faster than the SQLite comparison.
 - ERP indexed list/projection queries favor the db plugin in the current
-  workflow, especially due-invoice range scans and projected order lines.
+  workflow, especially status/date due-invoice scans and projected order lines.
 - Single SUM queries can still favor SQLite when db handle open/snapshot cost is
   included.
 - SQLite remains stronger for SQL, index creation, ACID, WAL, crash recovery,

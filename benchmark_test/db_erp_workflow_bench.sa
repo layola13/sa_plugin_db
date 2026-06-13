@@ -102,7 +102,7 @@
 #def EXPECTED_CUSTOMER_ORDERS = 8
 #def EXPECTED_ORDER_LINES = 4
 #def EXPECTED_INVENTORY_MOVES = 32
-#def EXPECTED_DUE_INVOICES = 1280
+#def EXPECTED_DUE_INVOICES = 640
 #def EXPECTED_PAID_INVOICES = 4096
 
 #def ERP_INIT_LEN = 15
@@ -577,13 +577,11 @@ L_ENTRY:
     t_index0 = call @sa_time_instant_ns()
     EXPAND DB_CREATE_U64_INDEX customer_id_index_status, ROOT, ROOT_LEN, TABLE_CUSTOMERS, TABLE_CUSTOMERS_LEN, 0, 1, info
     EXPAND DB_CREATE_U64_INDEX product_id_index_status, ROOT, ROOT_LEN, TABLE_PRODUCTS, TABLE_PRODUCTS_LEN, 0, 1, info
-    EXPAND DB_CREATE_U64_INDEX order_customer_index_status, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, 1, 0, info
-    EXPAND DB_CREATE_I64_INDEX order_day_index_status, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, 3, 0, info
+    EXPAND DB_CREATE_U64_I64_PAIR_INDEX order_customer_day_index_status, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, 1, 3, 0, info
     EXPAND DB_CREATE_U64_PAIR_INDEX line_pair_index_status, ROOT, ROOT_LEN, TABLE_LINES, TABLE_LINES_LEN, 0, 1, 1, info
     EXPAND DB_CREATE_U64_INDEX line_product_index_status, ROOT, ROOT_LEN, TABLE_LINES, TABLE_LINES_LEN, 2, 0, info
     EXPAND DB_CREATE_U64_PAIR_INDEX inventory_pair_index_status, ROOT, ROOT_LEN, TABLE_INVENTORY, TABLE_INVENTORY_LEN, 0, 1, 1, info
-    EXPAND DB_CREATE_I64_INDEX invoice_due_index_status, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, 3, 0, info
-    EXPAND DB_CREATE_U64_INDEX invoice_status_index_status, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, 2, 0, info
+    EXPAND DB_CREATE_U64_I64_PAIR_INDEX invoice_status_due_index_status, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, 2, 3, 0, info
     EXPAND DB_CREATE_U64_INDEX invoice_order_index_status, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, 1, 1, info
     t_index1 = call @sa_time_instant_ns()
     db_erp_index_ns = sub t_index1, t_index0
@@ -602,15 +600,15 @@ L_ENTRY:
 
     EXPAND DB_OPEN_READ_TABLE open_orders_status, orders_handle, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN
     t_customer0 = call @sa_time_instant_ns()
-    EXPAND DB_RANGE_U64_HANDLE customer_orders_status, customer_orders_written, customer_orders_total, result_rows, RESULT_ROWS_CAP, orders_handle, 1, TARGET_CUSTOMER, TARGET_CUSTOMER, 0, RESULT_ROWS_CAP
+    EXPAND DB_RANGE_U64_I64_PAIR_HANDLE customer_orders_status, customer_orders_written, customer_orders_total, result_rows, RESULT_ROWS_CAP, orders_handle, 1, 3, TARGET_CUSTOMER, min_due_day, max_due_day, 0, RESULT_ROWS_CAP
     t_customer1 = call @sa_time_instant_ns()
     db_erp_customer_orders_ns = sub t_customer1, t_customer0
     EXPAND DB_CLOSE_READ_TABLE close_orders_status, orders_handle
 
     EXPAND DB_OPEN_READ_TABLE open_invoices_status, invoices_handle, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN
     t_due0 = call @sa_time_instant_ns()
-    EXPAND DB_RANGE_I64_HANDLE due_invoice_status, due_invoice_written, due_invoice_total, result_rows, RESULT_ROWS_CAP, invoices_handle, 3, min_due_day, max_due_day, 0, RESULT_ROWS_CAP
-    EXPAND DB_COUNT_U64_EQ_HANDLE paid_count_status, paid_invoice_count, invoices_handle, 2, invoice_paid_id
+    EXPAND DB_RANGE_U64_I64_PAIR_HANDLE due_invoice_status, due_invoice_written, due_invoice_total, result_rows, RESULT_ROWS_CAP, invoices_handle, 2, 3, invoice_paid_id, min_due_day, max_due_day, 0, RESULT_ROWS_CAP
+    EXPAND DB_FILTER_U64_I64_PAIR_KEY1_HANDLE paid_count_status, paid_count_written, paid_invoice_count, result_rows, RESULT_ROWS_CAP, invoices_handle, 2, 3, invoice_paid_id, 0, RESULT_ROWS_CAP
     t_due1 = call @sa_time_instant_ns()
     db_erp_due_invoices_ns = sub t_due1, t_due0
     EXPAND DB_CLOSE_READ_TABLE close_invoices_status, invoices_handle
@@ -680,14 +678,12 @@ L_ENTRY:
     ok_ingest06 = eq ingest_invoices_status, SA_DB_OK
     ok_index01 = eq customer_id_index_status, SA_DB_OK
     ok_index02 = eq product_id_index_status, SA_DB_OK
-    ok_index03 = eq order_customer_index_status, SA_DB_OK
-    ok_index04 = eq order_day_index_status, SA_DB_OK
-    ok_index05 = eq line_pair_index_status, SA_DB_OK
-    ok_index06 = eq line_product_index_status, SA_DB_OK
-    ok_index07 = eq inventory_pair_index_status, SA_DB_OK
-    ok_index08 = eq invoice_due_index_status, SA_DB_OK
-    ok_index09 = eq invoice_status_index_status, SA_DB_OK
-    ok_index10 = eq invoice_order_index_status, SA_DB_OK
+    ok_index03 = eq order_customer_day_index_status, SA_DB_OK
+    ok_index04 = eq line_pair_index_status, SA_DB_OK
+    ok_index05 = eq line_product_index_status, SA_DB_OK
+    ok_index06 = eq inventory_pair_index_status, SA_DB_OK
+    ok_index07 = eq invoice_status_due_index_status, SA_DB_OK
+    ok_index08 = eq invoice_order_index_status, SA_DB_OK
     ok_lines_open = eq open_lines_status, SA_DB_OK
     ok_lines_status = eq line_query_status, SA_DB_OK
     ok_lines_written = eq line_written, EXPECTED_ORDER_LINES
@@ -705,6 +701,7 @@ L_ENTRY:
     ok_due_status = eq due_invoice_status, SA_DB_OK
     ok_due_total = eq due_invoice_total, EXPECTED_DUE_INVOICES
     ok_paid_status = eq paid_count_status, SA_DB_OK
+    ok_paid_written = eq paid_count_written, RESULT_ROWS_CAP
     ok_paid_count = eq paid_invoice_count, EXPECTED_PAID_INVOICES
     ok_invoices_close = eq close_invoices_status, SA_DB_OK
     ok_inventory_open = eq open_inventory_status, SA_DB_OK
@@ -754,37 +751,36 @@ L_ENTRY:
     ok34 = and ok33, ok_index06
     ok35 = and ok34, ok_index07
     ok36 = and ok35, ok_index08
-    ok37 = and ok36, ok_index09
-    ok38 = and ok37, ok_index10
-    ok39 = and ok38, ok_lines_open
-    ok40 = and ok39, ok_lines_status
-    ok41 = and ok40, ok_lines_written
-    ok42 = and ok41, ok_lines_total
-    ok43 = and ok42, ok_lines_row0
-    ok44 = and ok43, ok_project_status
-    ok45 = and ok44, ok_project_written
-    ok46 = and ok45, ok_project_required
-    ok47 = and ok46, ok_lines_close
-    ok48 = and ok47, ok_orders_open
-    ok49 = and ok48, ok_customer_status
-    ok50 = and ok49, ok_customer_total
-    ok51 = and ok50, ok_orders_close
-    ok52 = and ok51, ok_invoices_open
-    ok53 = and ok52, ok_due_status
-    ok54 = and ok53, ok_due_total
-    ok55 = and ok54, ok_paid_status
-    ok56 = and ok55, ok_paid_count
-    ok57 = and ok56, ok_invoices_close
-    ok58 = and ok57, ok_inventory_open
-    ok59 = and ok58, ok_inventory_status
-    ok60 = and ok59, ok_inventory_total
-    ok61 = and ok60, ok_inventory_close
-    ok62 = and ok61, ok_verify01
-    ok63 = and ok62, ok_verify02
-    ok64 = and ok63, ok_verify03
-    ok65 = and ok64, ok_verify04
-    ok66 = and ok65, ok_verify05
-    ok = and ok66, ok_verify06
+    ok37 = and ok36, ok_lines_open
+    ok38 = and ok37, ok_lines_status
+    ok39 = and ok38, ok_lines_written
+    ok40 = and ok39, ok_lines_total
+    ok41 = and ok40, ok_lines_row0
+    ok42 = and ok41, ok_project_status
+    ok43 = and ok42, ok_project_written
+    ok44 = and ok43, ok_project_required
+    ok45 = and ok44, ok_lines_close
+    ok46 = and ok45, ok_orders_open
+    ok47 = and ok46, ok_customer_status
+    ok48 = and ok47, ok_customer_total
+    ok49 = and ok48, ok_orders_close
+    ok50 = and ok49, ok_invoices_open
+    ok51 = and ok50, ok_due_status
+    ok52 = and ok51, ok_due_total
+    ok53 = and ok52, ok_paid_status
+    ok54 = and ok53, ok_paid_written
+    ok55 = and ok54, ok_paid_count
+    ok56 = and ok55, ok_invoices_close
+    ok57 = and ok56, ok_inventory_open
+    ok58 = and ok57, ok_inventory_status
+    ok59 = and ok58, ok_inventory_total
+    ok60 = and ok59, ok_inventory_close
+    ok61 = and ok60, ok_verify01
+    ok62 = and ok61, ok_verify02
+    ok63 = and ok62, ok_verify03
+    ok64 = and ok63, ok_verify04
+    ok65 = and ok64, ok_verify05
+    ok = and ok65, ok_verify06
 
     br ok -> L_OK, L_FAIL
 
