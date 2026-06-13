@@ -955,6 +955,54 @@
     %out_total = load __db_handle_filter_rows_i64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_ROWS_U32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_u32_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_u32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_u32_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_u32_written_slot_%out_written, &__db_handle_filter_rows_u32_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_u32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_u32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_I32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_i32_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_i32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_i32_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_i32_written_slot_%out_written, &__db_handle_filter_rows_i32_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_i32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_i32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_U8_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_u8_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_u8_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_u8_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_u8_written_slot_%out_written, &__db_handle_filter_rows_u8_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_u8_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_u8_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_I8_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_i8_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_i8_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_i8_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_i8_written_slot_%out_written, &__db_handle_filter_rows_i8_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_i8_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_i8_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_U16_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_u16_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_u16_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_u16_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_u16_written_slot_%out_written, &__db_handle_filter_rows_u16_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_u16_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_u16_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_I16_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_i16_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_i16_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_i16_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_i16_written_slot_%out_written, &__db_handle_filter_rows_i16_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_i16_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_i16_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %scale, %min_negative, %min_whole, %min_fraction, %max_negative, %max_whole, %max_fraction, %offset, %limit
     __db_handle_filter_rows_decimal_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_decimal_total_slot_%out_total = stack_alloc 8

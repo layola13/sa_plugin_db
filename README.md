@@ -152,6 +152,12 @@ Read-handle query calls:
 - `sa_db_filter_bool_handle`
 - `sa_db_filter_rows_u64_range_handle`
 - `sa_db_filter_rows_i64_range_handle`
+- `sa_db_filter_rows_u32_range_handle`
+- `sa_db_filter_rows_i32_range_handle`
+- `sa_db_filter_rows_u8_range_handle`
+- `sa_db_filter_rows_i8_range_handle`
+- `sa_db_filter_rows_u16_range_handle`
+- `sa_db_filter_rows_i16_range_handle`
 - `sa_db_filter_rows_decimal_i64_range_handle`
 - `sa_db_filter_rows_date_range_handle`
 - `sa_db_filter_rows_timestamp_ms_range_handle`
@@ -209,7 +215,10 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_U64_TIMESTAMP_US_PAIR_HANDLE`,
 `DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_ROWS_U64_RANGE_HANDLE`,
-`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE`,
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_FILTER_ROWS_U32_RANGE_HANDLE`,
+`DB_FILTER_ROWS_I32_RANGE_HANDLE`, `DB_FILTER_ROWS_U8_RANGE_HANDLE`,
+`DB_FILTER_ROWS_I8_RANGE_HANDLE`, `DB_FILTER_ROWS_U16_RANGE_HANDLE`,
+`DB_FILTER_ROWS_I16_RANGE_HANDLE`, `DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE`,
 `DB_FILTER_ROWS_DATE_RANGE_HANDLE`, `DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE`,
 `DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE`, `DB_FILTER_ROWS_BOOL_HANDLE`,
 `DB_SORT_ROWS_U64_HANDLE`, `DB_SORT_ROWS_I64_HANDLE`,
@@ -440,7 +449,12 @@ encoding.
 Candidate row filters are the first explicit composition layer above these
 indexes. `sa_db_filter_rows_u64_range_handle` /
 `DB_FILTER_ROWS_U64_RANGE_HANDLE`, `sa_db_filter_rows_i64_range_handle` /
-`DB_FILTER_ROWS_I64_RANGE_HANDLE`, `sa_db_filter_rows_decimal_i64_range_handle` /
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, compact integer variants
+`sa_db_filter_rows_u32_range_handle`, `sa_db_filter_rows_i32_range_handle`,
+`sa_db_filter_rows_u8_range_handle`, `sa_db_filter_rows_i8_range_handle`,
+`sa_db_filter_rows_u16_range_handle`, and
+`sa_db_filter_rows_i16_range_handle` with matching `DB_FILTER_ROWS_*_RANGE_HANDLE`
+macros, `sa_db_filter_rows_decimal_i64_range_handle` /
 `DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE`, `sa_db_filter_rows_date_range_handle`
 / `DB_FILTER_ROWS_DATE_RANGE_HANDLE`,
 `sa_db_filter_rows_timestamp_ms_range_handle` /
@@ -453,9 +467,10 @@ predicate, and return the same `offset`/`limit`/`total` pagination contract.
 Decimal/date/timestamp wrappers validate and encode the logical ERP values before
 using the signed integer scan path. SA callers can therefore run an indexed
 customer/date or blob/text query first, then narrow the candidate rows by status,
-amount/date/timestamp range, or posted/active bool without materializing full
-rows in SA code. This is a planner building block rather than a SQL optimizer:
-callers still choose the first selective index explicitly.
+compact warehouse/category/priority codes, amount/date/timestamp range, or
+posted/active bool without materializing full rows in SA code. This is a planner
+building block rather than a SQL optimizer: callers still choose the first
+selective index explicitly.
 `sa_db_stats_rows_u64_handle` / `DB_STATS_ROWS_U64_HANDLE` and
 `sa_db_stats_rows_i64_handle` / `DB_STATS_ROWS_I64_HANDLE` aggregate an existing
 candidate row list and return `count`, `sum`, `min`, and `max` in one snapshot

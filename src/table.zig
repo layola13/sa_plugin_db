@@ -6646,6 +6646,42 @@ fn snapshotI64AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_inde
     return readI64LE(located.bytes, byte_offset);
 }
 
+fn snapshotU32AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u32 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 4);
+    const byte_offset: usize = @intCast(located.local_row * 4);
+    return readU32LE(located.bytes, byte_offset);
+}
+
+fn snapshotI32AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!i32 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 4);
+    const byte_offset: usize = @intCast(located.local_row * 4);
+    return readI32LE(located.bytes, byte_offset);
+}
+
+fn snapshotU8AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u8 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 1);
+    const byte_offset: usize = @intCast(located.local_row);
+    return located.bytes[byte_offset];
+}
+
+fn snapshotI8AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!i8 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 1);
+    const byte_offset: usize = @intCast(located.local_row);
+    return readI8(located.bytes, byte_offset);
+}
+
+fn snapshotU16AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u16 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 2);
+    const byte_offset: usize = @intCast(located.local_row * 2);
+    return readU16LE(located.bytes, byte_offset);
+}
+
+fn snapshotI16AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!i16 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 2);
+    const byte_offset: usize = @intCast(located.local_row * 2);
+    return readI16LE(located.bytes, byte_offset);
+}
+
 fn snapshotBoolAtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!bool {
     const column = snapshot.columns[column_index];
     const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, column.stride);
@@ -6696,6 +6732,78 @@ const FilterRowsI64RangeContext = struct {
 
 fn matchesRowsI64Range(context: FilterRowsI64RangeContext, row: u64) TableError!bool {
     const value = try snapshotI64AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsU32RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u32,
+    max_value: u32,
+};
+
+fn matchesRowsU32Range(context: FilterRowsU32RangeContext, row: u64) TableError!bool {
+    const value = try snapshotU32AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsI32RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i32,
+    max_value: i32,
+};
+
+fn matchesRowsI32Range(context: FilterRowsI32RangeContext, row: u64) TableError!bool {
+    const value = try snapshotI32AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsU8RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u8,
+    max_value: u8,
+};
+
+fn matchesRowsU8Range(context: FilterRowsU8RangeContext, row: u64) TableError!bool {
+    const value = try snapshotU8AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsI8RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i8,
+    max_value: i8,
+};
+
+fn matchesRowsI8Range(context: FilterRowsI8RangeContext, row: u64) TableError!bool {
+    const value = try snapshotI8AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsU16RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u16,
+    max_value: u16,
+};
+
+fn matchesRowsU16Range(context: FilterRowsU16RangeContext, row: u64) TableError!bool {
+    const value = try snapshotU16AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsI16RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i16,
+    max_value: i16,
+};
+
+fn matchesRowsI16Range(context: FilterRowsI16RangeContext, row: u64) TableError!bool {
+    const value = try snapshotI16AtRow(context.snapshot, context.column_index, row);
     return value >= context.min_value and value <= context.max_value;
 }
 
@@ -8317,6 +8425,126 @@ pub fn snapshotFilterRowsI64Range(
         .min_value = min_value,
         .max_value = max_value,
     }, matchesRowsI64Range);
+}
+
+pub fn snapshotFilterRowsU32Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: u32,
+    max_value: u32,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU32Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsU32RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsU32Range);
+}
+
+pub fn snapshotFilterRowsI32Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: i32,
+    max_value: i32,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI32Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsI32RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsI32Range);
+}
+
+pub fn snapshotFilterRowsU8Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: u8,
+    max_value: u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU8Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsU8RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsU8Range);
+}
+
+pub fn snapshotFilterRowsI8Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: i8,
+    max_value: i8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI8Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsI8RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsI8Range);
+}
+
+pub fn snapshotFilterRowsU16Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: u16,
+    max_value: u16,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU16Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsU16RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsU16Range);
+}
+
+pub fn snapshotFilterRowsI16Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: i16,
+    max_value: i16,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI16Column(snapshot, column_index);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsI16RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+    }, matchesRowsI16Range);
 }
 
 pub fn snapshotFilterRowsBool(
@@ -10266,6 +10494,12 @@ test "table filters candidate rows for ERP composite predicates" {
         \\#def COL_STATUS_ID_STRIDE = 8 // u64
         \\#def COL_POSTED_STRIDE = 1 // u8 bool
         \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+        \\#def COL_CHANNEL_ID_STRIDE = 4 // u32
+        \\#def COL_ADJUSTMENT_STRIDE = 4 // i32
+        \\#def COL_PRIORITY_STRIDE = 1 // u8
+        \\#def COL_SIGNED_FLAG_STRIDE = 1 // i8
+        \\#def COL_WAREHOUSE_ID_STRIDE = 2 // u16
+        \\#def COL_QTY_DELTA_STRIDE = 2 // i16
     );
 
     var customer_ids = [_]u64{ 7, 7, 7, 8, 7, 7 };
@@ -10273,12 +10507,24 @@ test "table filters candidate rows for ERP composite predicates" {
     var status_ids = [_]u64{ 1, 2, 2, 2, 1, 2 };
     var posted = [_]u8{ 1, 1, 0, 1, 1, 1 };
     var totals = [_]i64{ 1000, 2000, 3000, 4000, 5000, 7000 };
+    var channel_ids = [_]u32{ 10, 20, 20, 30, 10, 40 };
+    var adjustments = [_]i32{ -3, 5, 7, 9, -1, 11 };
+    var priorities = [_]u8{ 1, 2, 3, 1, 2, 3 };
+    var signed_flags = [_]i8{ -1, 0, 1, 0, -1, 1 };
+    var warehouse_ids = [_]u16{ 100, 200, 200, 300, 100, 200 };
+    var qty_deltas = [_]i16{ -5, 10, 20, 30, -15, 40 };
     const columns = [_]RawColumnBytes{
         .{ .bytes = std.mem.sliceAsBytes(customer_ids[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(order_days[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(status_ids[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(posted[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(totals[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(channel_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(adjustments[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(priorities[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(signed_flags[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(warehouse_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(qty_deltas[0..]) },
     };
     _ = try ingestRawColumns(std.testing.allocator, ".", table_name, customer_ids.len, &columns);
     _ = try createU64I64PairIndex(std.testing.allocator, ".", table_name, 0, 1, true);
@@ -10341,6 +10587,48 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 1), amount_page.written);
     try std.testing.expectEqual(@as(u64, 2), sorted_rows[0]);
 
+    const channel_result = try snapshotFilterRowsU32Range(snapshot, 5, original_candidate_rows[0..candidate_len], 20, 40, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), channel_result.total);
+    try std.testing.expectEqual(@as(u64, 3), channel_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[2]);
+
+    const adjustment_result = try snapshotFilterRowsI32Range(snapshot, 6, original_candidate_rows[0..candidate_len], 0, 10, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 2), adjustment_result.total);
+    try std.testing.expectEqual(@as(u64, 2), adjustment_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+
+    const priority_result = try snapshotFilterRowsU8Range(snapshot, 7, original_candidate_rows[0..candidate_len], 2, 3, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 4), priority_result.total);
+    try std.testing.expectEqual(@as(u64, 4), priority_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 4), filtered_rows[2]);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[3]);
+
+    const signed_flag_result = try snapshotFilterRowsI8Range(snapshot, 8, original_candidate_rows[0..candidate_len], -1, 0, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), signed_flag_result.total);
+    try std.testing.expectEqual(@as(u64, 3), signed_flag_result.written);
+    try std.testing.expectEqual(@as(u64, 0), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 4), filtered_rows[2]);
+
+    const warehouse_result = try snapshotFilterRowsU16Range(snapshot, 9, original_candidate_rows[0..candidate_len], 200, 200, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), warehouse_result.total);
+    try std.testing.expectEqual(@as(u64, 3), warehouse_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[2]);
+
+    const qty_delta_result = try snapshotFilterRowsI16Range(snapshot, 10, original_candidate_rows[0..candidate_len], -20, 15, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), qty_delta_result.total);
+    try std.testing.expectEqual(@as(u64, 3), qty_delta_result.written);
+    try std.testing.expectEqual(@as(u64, 0), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 4), filtered_rows[2]);
+
     const amount_result = try snapshotFilterRowsI64Range(snapshot, 4, candidate_rows[0..status_len], 1500, 5500, 0, filtered_rows.len, &filtered_rows);
     try std.testing.expectEqual(@as(u64, 2), amount_result.total);
     try std.testing.expectEqual(@as(u64, 2), amount_result.written);
@@ -10364,6 +10652,7 @@ test "table filters candidate rows for ERP composite predicates" {
 
     const invalid_rows = [_]u64{999};
     try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsU64Range(snapshot, 2, &invalid_rows, 2, 2, 0, filtered_rows.len, &filtered_rows));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsU16Range(snapshot, 9, &invalid_rows, 200, 200, 0, filtered_rows.len, &filtered_rows));
     try std.testing.expectError(TableError.InvalidFormat, snapshotStatsRowsU64(snapshot, 2, &invalid_rows));
     try std.testing.expectError(TableError.InvalidFormat, snapshotSortRowsI64(std.testing.allocator, snapshot, 4, &invalid_rows, true, 0, filtered_rows.len, &filtered_rows));
 }
