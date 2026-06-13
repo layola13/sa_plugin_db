@@ -867,6 +867,14 @@
     %out_total = load __db_handle_range_u64_i64_pair_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_RANGE_U64_DATE_PAIR_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %column_index2, %key1, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %offset, %limit
+    __db_handle_range_u64_date_pair_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_u64_date_pair_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_u64_date_pair_handle(%handle, %column_index, %column_index2, %key1, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_u64_date_pair_written_slot_%out_written, &__db_handle_range_u64_date_pair_total_slot_%out_total)
+    %out_written = load __db_handle_range_u64_date_pair_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_u64_date_pair_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_U64_PAIR_KEY1_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %column_index2, %key1, %offset, %limit
     __db_handle_filter_pair_key1_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_pair_key1_total_slot_%out_total = stack_alloc 8

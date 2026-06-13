@@ -142,6 +142,7 @@ Read-handle query calls:
 - `sa_db_range_timestamp_us_null_bitmap_handle`
 - `sa_db_range_u64_pair_handle`
 - `sa_db_range_u64_i64_pair_handle`
+- `sa_db_range_u64_date_pair_handle`
 - `sa_db_filter_u64_pair_key1_handle`
 - `sa_db_filter_u64_i64_pair_key1_handle`
 - `sa_db_filter_bool_handle`
@@ -190,6 +191,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
 `DB_RANGE_I16_HANDLE`, `DB_RANGE_F32_HANDLE`, `DB_RANGE_F64_HANDLE`,
 `DB_RANGE_U64_PAIR_HANDLE`, `DB_RANGE_U64_I64_PAIR_HANDLE`,
+`DB_RANGE_U64_DATE_PAIR_HANDLE`,
 `DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
 `DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
@@ -400,6 +402,10 @@ second column. `sa_db_find_u64_i64_pair_handle` /
 `DB_FIND_U64_I64_PAIR_HANDLE` finds one exact tuple,
 `sa_db_range_u64_i64_pair_handle` / `DB_RANGE_U64_I64_PAIR_HANDLE` pages one
 fixed first key over an inclusive signed second-key range, and
+`sa_db_range_u64_date_pair_handle` / `DB_RANGE_U64_DATE_PAIR_HANDLE` accepts the
+same range as `(min_year, min_month, min_day)` and `(max_year, max_month,
+max_day)`, validates both dates, encodes them to epoch days, and uses the same
+`u64_i64_pair` index.
 `sa_db_filter_u64_i64_pair_key1_handle` /
 `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE` lists every row for the fixed first key.
 Use this for customer/date, status/due-date, product/posting-date, and other
@@ -608,8 +614,8 @@ Dataset:
   lines, 16,384 inventory movements, and 8,192 invoices. It exercises
   dictionary-backed status fields, `i64` decimal/date columns, unique and
   non-unique `u64` indexes, `u64_pair` child-row indexes, `u64_i64_pair`
-  customer/date and status/due-date indexes, range filters, count filters,
-  projection, and verification across multiple tables.
+  customer/date and status/due-date indexes, typed date-pair range filters,
+  count filters, projection, and verification across multiple tables.
 
 Run db benchmarks:
 

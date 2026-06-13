@@ -2668,6 +2668,33 @@ pub export fn sa_db_range_u64_i64_pair_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_range_u64_date_pair_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    min_year: i64,
+    min_month: u32,
+    min_day: u32,
+    max_year: i64,
+    max_month: u32,
+    max_day: u32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const min_value = daysFromCivil(min_year, min_month, min_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_value = daysFromCivil(max_year, max_month, max_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return sa_db_range_u64_i64_pair_handle(handle, column_index, column_index2, key1, min_value, max_value, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total);
+}
+
 pub export fn sa_db_filter_u64_pair_key1_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -3453,6 +3480,15 @@ test "db SA ABI creates and queries u64 i64 pair indexes" {
     try std.testing.expectEqual(@as(u64, 0), rows[0]);
     try std.testing.expectEqual(@as(u64, 1), rows[1]);
     try std.testing.expectEqual(@as(u64, 2), rows[2]);
+
+    @memset(rows[0..], 99);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_u64_date_pair_handle(handle, 0, 1, 7, 1969, 12, 27, 1970, 1, 11, 0, 4, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), rows[2]);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_range_u64_date_pair_handle(handle, 0, 1, 7, 2023, 2, 29, 2024, 2, 29, 0, 4, &rows, rows.len, &written, &total));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_u64_i64_pair_key1_handle(handle, 0, 1, 7, 1, 2, &rows, rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 4), total);

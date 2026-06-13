@@ -57,6 +57,11 @@ L_ENTRY:
     range_row0 = load range_rows+0 as u64
     range_row1 = load range_rows+8 as u64
     range_row2 = load range_rows+16 as u64
+    EXPAND DB_RANGE_U64_DATE_PAIR_HANDLE date_range_status, date_range_written, date_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 1, 7, 1969, 12, 27, 1970, 1, 11, 0, RANGE_ROWS_CAP
+    date_range_row0 = load range_rows+0 as u64
+    date_range_row1 = load range_rows+8 as u64
+    date_range_row2 = load range_rows+16 as u64
+    EXPAND DB_RANGE_U64_DATE_PAIR_HANDLE invalid_date_status, invalid_date_written, invalid_date_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 1, 7, 2023, 2, 29, 2024, 2, 29, 0, RANGE_ROWS_CAP
     EXPAND DB_FILTER_U64_I64_PAIR_KEY1_HANDLE page_status, page_written, page_total, range_rows, RANGE_ROWS_CAP, read_handle, 0, 1, 7, 1, 2
     page_row0 = load range_rows+0 as u64
     page_row1 = load range_rows+8 as u64
@@ -82,6 +87,13 @@ L_ENTRY:
     ok_range_row0 = eq range_row0, 0
     ok_range_row1 = eq range_row1, 1
     ok_range_row2 = eq range_row2, 2
+    ok_date_range_status = eq date_range_status, SA_DB_OK
+    ok_date_range_written = eq date_range_written, 3
+    ok_date_range_total = eq date_range_total, 3
+    ok_date_range_row0 = eq date_range_row0, 0
+    ok_date_range_row1 = eq date_range_row1, 1
+    ok_date_range_row2 = eq date_range_row2, 2
+    ok_invalid_date = eq invalid_date_status, SA_DB_ERR_INVALID_ARGUMENT
     ok_page_status = eq page_status, SA_DB_OK
     ok_page_written = eq page_written, 2
     ok_page_total = eq page_total, 4
@@ -107,17 +119,24 @@ L_ENTRY:
     ok11 = and ok10, ok_range_row0
     ok12 = and ok11, ok_range_row1
     ok13 = and ok12, ok_range_row2
-    ok14 = and ok13, ok_page_status
-    ok15 = and ok14, ok_page_written
-    ok16 = and ok15, ok_page_total
-    ok17 = and ok16, ok_page_row0
-    ok18 = and ok17, ok_page_row1
-    ok19 = and ok18, ok_get_row
-    ok20 = and ok19, ok_fetched_customer
-    ok21 = and ok20, ok_fetched_day
-    ok22 = and ok21, ok_fetched_total
-    ok23 = and ok22, ok_close
-    ok = and ok23, ok_verify
+    ok14 = and ok13, ok_date_range_status
+    ok15 = and ok14, ok_date_range_written
+    ok16 = and ok15, ok_date_range_total
+    ok17 = and ok16, ok_date_range_row0
+    ok18 = and ok17, ok_date_range_row1
+    ok19 = and ok18, ok_date_range_row2
+    ok20 = and ok19, ok_invalid_date
+    ok21 = and ok20, ok_page_status
+    ok22 = and ok21, ok_page_written
+    ok23 = and ok22, ok_page_total
+    ok24 = and ok23, ok_page_row0
+    ok25 = and ok24, ok_page_row1
+    ok26 = and ok25, ok_get_row
+    ok27 = and ok26, ok_fetched_customer
+    ok28 = and ok27, ok_fetched_day
+    ok29 = and ok28, ok_fetched_total
+    ok30 = and ok29, ok_close
+    ok = and ok30, ok_verify
 
     !remove_status
     !init_status
@@ -134,6 +153,15 @@ L_ENTRY:
     !range_row0
     !range_row1
     !range_row2
+    !date_range_status
+    !date_range_written
+    !date_range_total
+    !date_range_row0
+    !date_range_row1
+    !date_range_row2
+    !invalid_date_status
+    !invalid_date_written
+    !invalid_date_total
     !page_status
     !page_written
     !page_total
@@ -159,6 +187,13 @@ L_ENTRY:
     !ok_range_row0
     !ok_range_row1
     !ok_range_row2
+    !ok_date_range_status
+    !ok_date_range_written
+    !ok_date_range_total
+    !ok_date_range_row0
+    !ok_date_range_row1
+    !ok_date_range_row2
+    !ok_invalid_date
     !ok_page_status
     !ok_page_written
     !ok_page_total
@@ -193,6 +228,13 @@ L_ENTRY:
     !ok21
     !ok22
     !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
     !customer_ids
     !order_days
     !totals

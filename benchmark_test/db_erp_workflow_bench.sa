@@ -525,8 +525,6 @@ L_ENTRY:
     EXPAND DB_DICT_INTERN invoice_paid_status, invoice_paid_id, invoice_paid_inserted, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, INVOICE_STATUS_DICT, INVOICE_STATUS_DICT_LEN, STATUS_PAID, STATUS_PAID_LEN, info
     EXPAND DB_DICT_INTERN invoice_unpaid_status, invoice_unpaid_id, invoice_unpaid_inserted, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, INVOICE_STATUS_DICT, INVOICE_STATUS_DICT_LEN, STATUS_UNPAID, STATUS_UNPAID_LEN, info
     EXPAND DB_DATE_FROM_YMD base_day_status, base_day, 2026, 1, 1
-    min_due_day = add base_day, 10
-    max_due_day = add base_day, 19
     t_init1 = call @sa_time_instant_ns()
     db_erp_init_ns = sub t_init1, t_init0
 
@@ -600,14 +598,14 @@ L_ENTRY:
 
     EXPAND DB_OPEN_READ_TABLE open_orders_status, orders_handle, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN
     t_customer0 = call @sa_time_instant_ns()
-    EXPAND DB_RANGE_U64_I64_PAIR_HANDLE customer_orders_status, customer_orders_written, customer_orders_total, result_rows, RESULT_ROWS_CAP, orders_handle, 1, 3, TARGET_CUSTOMER, min_due_day, max_due_day, 0, RESULT_ROWS_CAP
+    EXPAND DB_RANGE_U64_DATE_PAIR_HANDLE customer_orders_status, customer_orders_written, customer_orders_total, result_rows, RESULT_ROWS_CAP, orders_handle, 1, 3, TARGET_CUSTOMER, 2026, 1, 11, 2026, 1, 20, 0, RESULT_ROWS_CAP
     t_customer1 = call @sa_time_instant_ns()
     db_erp_customer_orders_ns = sub t_customer1, t_customer0
     EXPAND DB_CLOSE_READ_TABLE close_orders_status, orders_handle
 
     EXPAND DB_OPEN_READ_TABLE open_invoices_status, invoices_handle, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN
     t_due0 = call @sa_time_instant_ns()
-    EXPAND DB_RANGE_U64_I64_PAIR_HANDLE due_invoice_status, due_invoice_written, due_invoice_total, result_rows, RESULT_ROWS_CAP, invoices_handle, 2, 3, invoice_paid_id, min_due_day, max_due_day, 0, RESULT_ROWS_CAP
+    EXPAND DB_RANGE_U64_DATE_PAIR_HANDLE due_invoice_status, due_invoice_written, due_invoice_total, result_rows, RESULT_ROWS_CAP, invoices_handle, 2, 3, invoice_paid_id, 2026, 1, 11, 2026, 1, 20, 0, RESULT_ROWS_CAP
     EXPAND DB_FILTER_U64_I64_PAIR_KEY1_HANDLE paid_count_status, paid_count_written, paid_invoice_count, result_rows, RESULT_ROWS_CAP, invoices_handle, 2, 3, invoice_paid_id, 0, RESULT_ROWS_CAP
     t_due1 = call @sa_time_instant_ns()
     db_erp_due_invoices_ns = sub t_due1, t_due0
