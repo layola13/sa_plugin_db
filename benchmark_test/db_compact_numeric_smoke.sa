@@ -1,0 +1,285 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"compact_items"
+@const SCHEMA_PATH = utf8:"compact_items.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 4 // u32\n#def COL_DELTA_STRIDE = 4 // i32\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 13
+#def SCHEMA_PATH_LEN = 25
+#def SCHEMA_LEN = 115
+#def ROWS = 4
+#def COLUMN_COUNT = 3
+#def ID_COL_BYTES = 32
+#def STATUS_COL_BYTES = 16
+#def DELTA_COL_BYTES = 16
+#def COLUMNS_BYTES = 48
+#def RANGE_ROWS_CAP = 3
+#def RANGE_ROWS_BYTES = 24
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    id_col = alloc ID_COL_BYTES
+    status_col = alloc STATUS_COL_BYTES
+    delta_col = alloc DELTA_COL_BYTES
+    range_rows = alloc RANGE_ROWS_BYTES
+
+    store id_col+0, 1 as u64
+    store id_col+8, 2 as u64
+    store id_col+16, 3 as u64
+    store id_col+24, 4 as u64
+    store status_col+0, 10 as u32
+    store status_col+4, 2 as u32
+    store status_col+8, 10 as u32
+    store status_col+12, 7 as u32
+    store delta_col+0, -3 as i32
+    store delta_col+4, 0 as i32
+    store delta_col+8, 5 as i32
+    store delta_col+12, -1 as i32
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, ID_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, status_col, STATUS_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, delta_col, DELTA_COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U32_INDEX u32_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
+    EXPAND DB_CREATE_I32_INDEX i32_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_COUNT_U32_CMP_HANDLE count_status_status, status_ge_count, read_handle, 1, SA_DB_CMP_GE, 7
+    EXPAND DB_FIND_U32_HANDLE find_status_status, status_found, status_row, read_handle, 1, 7
+    EXPAND DB_RANGE_U32_HANDLE status_range_status, status_range_written, status_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 10, 1, 2
+    status_range_row0 = load range_rows+0 as u64
+    status_range_row1 = load range_rows+8 as u64
+    EXPAND DB_GET_U32_HANDLE get_status_status, status_value, read_handle, 1, status_row
+    EXPAND DB_MIN_U32_HANDLE min_status_status, min_status, read_handle, 1
+    EXPAND DB_MAX_U32_HANDLE max_status_status, max_status, read_handle, 1
+
+    EXPAND DB_COUNT_I32_CMP_HANDLE count_delta_status, delta_lt_count, read_handle, 2, SA_DB_CMP_LT, 0
+    EXPAND DB_FIND_I32_HANDLE find_delta_status, delta_found, delta_row, read_handle, 2, -1
+    EXPAND DB_RANGE_I32_HANDLE delta_range_status, delta_range_written, delta_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 2, -3, 0, 0, 3
+    delta_range_row0 = load range_rows+0 as u64
+    delta_range_row1 = load range_rows+8 as u64
+    delta_range_row2 = load range_rows+16 as u64
+    EXPAND DB_GET_I32_HANDLE get_delta_status, delta_value, read_handle, 2, delta_row
+    EXPAND DB_MIN_I32_HANDLE min_delta_status, min_delta, read_handle, 2
+    EXPAND DB_MAX_I32_HANDLE max_delta_status, max_delta, read_handle, 2
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_u32_index = eq u32_index_status, SA_DB_OK
+    ok_i32_index = eq i32_index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_count_status_status = eq count_status_status, SA_DB_OK
+    ok_status_ge_count = eq status_ge_count, 3
+    ok_find_status_status = eq find_status_status, SA_DB_OK
+    ok_status_found = eq status_found, 1
+    ok_status_row = eq status_row, 3
+    ok_status_range_status = eq status_range_status, SA_DB_OK
+    ok_status_range_written = eq status_range_written, 2
+    ok_status_range_total = eq status_range_total, 4
+    ok_status_range_row0 = eq status_range_row0, 3
+    ok_status_range_row1 = eq status_range_row1, 0
+    ok_get_status_status = eq get_status_status, SA_DB_OK
+    ok_status_value = eq status_value, 7
+    ok_min_status_status = eq min_status_status, SA_DB_OK
+    ok_min_status = eq min_status, 2
+    ok_max_status_status = eq max_status_status, SA_DB_OK
+    ok_max_status = eq max_status, 10
+    ok_count_delta_status = eq count_delta_status, SA_DB_OK
+    ok_delta_lt_count = eq delta_lt_count, 2
+    ok_find_delta_status = eq find_delta_status, SA_DB_OK
+    ok_delta_found = eq delta_found, 1
+    ok_delta_row = eq delta_row, 3
+    ok_delta_range_status = eq delta_range_status, SA_DB_OK
+    ok_delta_range_written = eq delta_range_written, 3
+    ok_delta_range_total = eq delta_range_total, 3
+    ok_delta_range_row0 = eq delta_range_row0, 0
+    ok_delta_range_row1 = eq delta_range_row1, 3
+    ok_delta_range_row2 = eq delta_range_row2, 1
+    ok_get_delta_status = eq get_delta_status, SA_DB_OK
+    ok_delta_value = eq delta_value, -1
+    ok_min_delta_status = eq min_delta_status, SA_DB_OK
+    ok_min_delta = eq min_delta, -3
+    ok_max_delta_status = eq max_delta_status, SA_DB_OK
+    ok_max_delta = eq max_delta, 5
+    ok_close = eq close_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_u32_index
+    ok04 = and ok03, ok_i32_index
+    ok05 = and ok04, ok_open
+    ok06 = and ok05, ok_count_status_status
+    ok07 = and ok06, ok_status_ge_count
+    ok08 = and ok07, ok_find_status_status
+    ok09 = and ok08, ok_status_found
+    ok10 = and ok09, ok_status_row
+    ok11 = and ok10, ok_status_range_status
+    ok12 = and ok11, ok_status_range_written
+    ok13 = and ok12, ok_status_range_total
+    ok14 = and ok13, ok_status_range_row0
+    ok15 = and ok14, ok_status_range_row1
+    ok16 = and ok15, ok_get_status_status
+    ok17 = and ok16, ok_status_value
+    ok18 = and ok17, ok_min_status_status
+    ok19 = and ok18, ok_min_status
+    ok20 = and ok19, ok_max_status_status
+    ok21 = and ok20, ok_max_status
+    ok22 = and ok21, ok_count_delta_status
+    ok23 = and ok22, ok_delta_lt_count
+    ok24 = and ok23, ok_find_delta_status
+    ok25 = and ok24, ok_delta_found
+    ok26 = and ok25, ok_delta_row
+    ok27 = and ok26, ok_delta_range_status
+    ok28 = and ok27, ok_delta_range_written
+    ok29 = and ok28, ok_delta_range_total
+    ok30 = and ok29, ok_delta_range_row0
+    ok31 = and ok30, ok_delta_range_row1
+    ok32 = and ok31, ok_delta_range_row2
+    ok33 = and ok32, ok_get_delta_status
+    ok34 = and ok33, ok_delta_value
+    ok35 = and ok34, ok_min_delta_status
+    ok36 = and ok35, ok_min_delta
+    ok37 = and ok36, ok_max_delta_status
+    ok38 = and ok37, ok_max_delta
+    ok = and ok38, ok_close
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !u32_index_status
+    !i32_index_status
+    !open_status
+    !read_handle
+    !count_status_status
+    !status_ge_count
+    !find_status_status
+    !status_found
+    !status_row
+    !status_range_status
+    !status_range_written
+    !status_range_total
+    !status_range_row0
+    !status_range_row1
+    !get_status_status
+    !status_value
+    !min_status_status
+    !min_status
+    !max_status_status
+    !max_status
+    !count_delta_status
+    !delta_lt_count
+    !find_delta_status
+    !delta_found
+    !delta_row
+    !delta_range_status
+    !delta_range_written
+    !delta_range_total
+    !delta_range_row0
+    !delta_range_row1
+    !delta_range_row2
+    !get_delta_status
+    !delta_value
+    !min_delta_status
+    !min_delta
+    !max_delta_status
+    !max_delta
+    !close_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_u32_index
+    !ok_i32_index
+    !ok_open
+    !ok_count_status_status
+    !ok_status_ge_count
+    !ok_find_status_status
+    !ok_status_found
+    !ok_status_row
+    !ok_status_range_status
+    !ok_status_range_written
+    !ok_status_range_total
+    !ok_status_range_row0
+    !ok_status_range_row1
+    !ok_get_status_status
+    !ok_status_value
+    !ok_min_status_status
+    !ok_min_status
+    !ok_max_status_status
+    !ok_max_status
+    !ok_count_delta_status
+    !ok_delta_lt_count
+    !ok_find_delta_status
+    !ok_delta_found
+    !ok_delta_row
+    !ok_delta_range_status
+    !ok_delta_range_written
+    !ok_delta_range_total
+    !ok_delta_range_row0
+    !ok_delta_range_row1
+    !ok_delta_range_row2
+    !ok_get_delta_status
+    !ok_delta_value
+    !ok_min_delta_status
+    !ok_min_delta
+    !ok_max_delta_status
+    !ok_max_delta
+    !ok_close
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !id_col
+    !status_col
+    !delta_col
+    !range_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9007)

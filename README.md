@@ -51,6 +51,8 @@ Core native calls:
 - `sa_db_tx_rollback`
 - `sa_db_create_u64_index`
 - `sa_db_create_i64_index`
+- `sa_db_create_u32_index`
+- `sa_db_create_i32_index`
 - `sa_db_create_u64_pair_index`
 - `sa_db_dict_intern`
 - `sa_db_dict_lookup`
@@ -94,13 +96,19 @@ Read-handle query calls:
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
 - `sa_db_count_i64_cmp_handle`
+- `sa_db_count_u32_cmp_handle`
+- `sa_db_count_i32_cmp_handle`
 - `sa_db_count_bool_handle`
 - `sa_db_find_u64_handle`
 - `sa_db_find_i64_handle`
+- `sa_db_find_u32_handle`
+- `sa_db_find_i32_handle`
 - `sa_db_find_bool_handle`
 - `sa_db_find_u64_pair_handle`
 - `sa_db_range_u64_handle`
 - `sa_db_range_i64_handle`
+- `sa_db_range_u32_handle`
+- `sa_db_range_i32_handle`
 - `sa_db_range_u64_null_bitmap_handle`
 - `sa_db_range_i64_null_bitmap_handle`
 - `sa_db_range_decimal_i64_handle`
@@ -115,6 +123,8 @@ Read-handle query calls:
 - `sa_db_filter_bool_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
+- `sa_db_get_u32_handle`
+- `sa_db_get_i32_handle`
 - `sa_db_get_bool_handle`
 - `sa_db_project_rows_handle`
 - `sa_db_get_row_handle`
@@ -123,6 +133,10 @@ Read-handle query calls:
 - `sa_db_max_u64_handle`
 - `sa_db_min_i64_handle`
 - `sa_db_max_i64_handle`
+- `sa_db_min_u32_handle`
+- `sa_db_max_u32_handle`
+- `sa_db_min_i32_handle`
+- `sa_db_max_i32_handle`
 
 Public status constants include `SA_DB_ERR_CONSTRAINT` for writes that violate
 unique indexes.
@@ -136,16 +150,19 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
-`DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`,
-`DB_FIND_U64_HANDLE`, `DB_FIND_I64_HANDLE`, `DB_FIND_BOOL_HANDLE`,
-`DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`, `DB_RANGE_I64_HANDLE`,
+`DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
+`DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`, `DB_FIND_U64_HANDLE`,
+`DB_FIND_I64_HANDLE`, `DB_FIND_U32_HANDLE`, `DB_FIND_I32_HANDLE`,
+`DB_FIND_BOOL_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
+`DB_RANGE_I64_HANDLE`, `DB_RANGE_U32_HANDLE`, `DB_RANGE_I32_HANDLE`,
 `DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
-`DB_GET_I64_HANDLE`, `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
+`DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`,
+`DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
-`DB_CREATE_U64_PAIR_INDEX`,
+`DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
@@ -166,7 +183,11 @@ Read queries now use snapshots:
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
    the column. Signed `i64` columns now have the same point/range/count/min/max
    read-handle surface through a persisted signed-order index, which is suitable
-   for ERP amount cents, balances, and timestamp encodings. A persisted
+   for ERP amount cents, balances, and timestamp encodings. Compact `u32` and
+   `i32` columns now also support persisted indexes plus count/find/range/get
+   and min/max helpers, which fits status codes, warehouse IDs, line numbers,
+   small foreign keys, and signed adjustment fields without forcing 8-byte
+   storage. A persisted
    `u64_pair -> row` index supports ERP composite keys such as
    `(order_id, line_no)`, `(product_id, warehouse_id)`, or
    `(customer_id, date_code)` with point lookup and fixed-first-key range
@@ -187,8 +208,8 @@ microseconds, boolean as normalized `0/1`, and nullable fields as a sidecar null
 bitmap. Logical bool queries require a column annotation such as `// u8 bool` or
 `// u64 bool`, reject non-`0/1` stored values, and return filtered rows in
 snapshot row order. These helpers deliberately do not introduce a new physical
-format yet, so existing `i64`/`u64` indexes, range reads, projections, and
-fixed-width row buffers remain the query surface.
+format yet, so existing `i32`/`u32`/`i64`/`u64` indexes, range reads,
+projections, and fixed-width row buffers remain the query surface.
 Schema comments can now carry logical metadata after the primitive type and
 before an optional `:` description, for example `// i64 decimal(2) nullable`,
 `// i64 date`, `// i64 timestamp_ms`, `// i64 timestamp_us`, or `// u8 bool`.
@@ -221,6 +242,11 @@ index into a fixed-width row buffer.
 `sa_db_range_i64_handle` / `DB_RANGE_I64_HANDLE` behaves the same for indexed
 `i64` columns, but uses signed ordering so negative values sort before zero and
 positive values.
+`sa_db_range_u32_handle` / `DB_RANGE_U32_HANDLE` and
+`sa_db_range_i32_handle` / `DB_RANGE_I32_HANDLE` provide the same indexed
+pagination for compact 4-byte columns, with `i32` using signed ordering. These
+are intended for ERP status codes, warehouse IDs, line numbers, compact foreign
+keys, and signed adjustment fields.
 `sa_db_range_u64_null_bitmap_handle` / `DB_RANGE_U64_NULL_BITMAP_HANDLE` and
 `sa_db_range_i64_null_bitmap_handle` / `DB_RANGE_I64_NULL_BITMAP_HANDLE` add a
 sidecar null-bitmap predicate before pagination. The returned `total`, `offset`,
