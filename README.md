@@ -57,6 +57,8 @@ Core native calls:
 - `sa_db_create_i8_index`
 - `sa_db_create_u16_index`
 - `sa_db_create_i16_index`
+- `sa_db_create_f32_index`
+- `sa_db_create_f64_index`
 - `sa_db_create_u64_pair_index`
 - `sa_db_dict_intern`
 - `sa_db_dict_lookup`
@@ -159,28 +161,34 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
 `DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_U8_CMP_HANDLE`, `DB_COUNT_I8_CMP_HANDLE`,
-`DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`, `DB_FIND_U64_HANDLE`,
+`DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_F32_CMP_HANDLE`,
+`DB_COUNT_F64_CMP_HANDLE`, `DB_COUNT_BOOL_HANDLE`, `DB_FIND_U64_HANDLE`,
 `DB_FIND_I64_HANDLE`, `DB_FIND_U32_HANDLE`, `DB_FIND_I32_HANDLE`, `DB_FIND_U8_HANDLE`,
-`DB_FIND_I8_HANDLE`, `DB_FIND_U16_HANDLE`, `DB_FIND_I16_HANDLE`,
+`DB_FIND_I8_HANDLE`, `DB_FIND_U16_HANDLE`, `DB_FIND_I16_HANDLE`, `DB_FIND_F32_HANDLE`,
+`DB_FIND_F64_HANDLE`,
 `DB_FIND_BOOL_HANDLE`, `DB_FIND_U64_PAIR_HANDLE`, `DB_RANGE_U64_HANDLE`,
 `DB_RANGE_I64_HANDLE`, `DB_RANGE_U32_HANDLE`, `DB_RANGE_I32_HANDLE`,
 `DB_RANGE_U8_HANDLE`, `DB_RANGE_I8_HANDLE`, `DB_RANGE_U16_HANDLE`,
-`DB_RANGE_I16_HANDLE`, `DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
+`DB_RANGE_I16_HANDLE`, `DB_RANGE_F32_HANDLE`, `DB_RANGE_F64_HANDLE`,
+`DB_RANGE_U64_PAIR_HANDLE`, `DB_FILTER_BOOL_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
-`DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`,
+`DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`, `DB_GET_F32_HANDLE`,
+`DB_GET_F64_HANDLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
-`DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
+`DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_F32_INDEX`,
+`DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`,
 `DB_DICT_INTERN`, `DB_DICT_LOOKUP`, `DB_DICT_VALUE_LEN`,
 `DB_DICT_VALUE_COPY`, `DB_DICT_LOOKUP_HANDLE`, `DB_DICT_VALUE_LEN_HANDLE`,
 `DB_DICT_VALUE_COPY_HANDLE`, `DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_MIN_U8_HANDLE`, `DB_MAX_U8_HANDLE`,
 `DB_MIN_I8_HANDLE`, `DB_MAX_I8_HANDLE`, `DB_MIN_U16_HANDLE`, `DB_MAX_U16_HANDLE`,
-`DB_MIN_I16_HANDLE`, `DB_MAX_I16_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
+`DB_MIN_I16_HANDLE`, `DB_MAX_I16_HANDLE`, `DB_MIN_F32_HANDLE`, `DB_MAX_F32_HANDLE`,
+`DB_MIN_F64_HANDLE`, `DB_MAX_F64_HANDLE`, `DB_SNAPSHOT`, `DB_RESTORE`, and
 `DB_RECOVER`.
 
 ## Query Model
@@ -202,7 +210,10 @@ Read queries now use snapshots:
    `u16`, `i16`, `u32`, and `i32` columns now also support persisted indexes plus count/find/range/get
    and min/max helpers, which fits status codes, warehouse IDs, line numbers,
    small foreign keys, and signed adjustment fields without forcing 8-byte
-   storage. A persisted
+   storage. Finite `f32` and `f64` columns also support persisted indexes plus
+   count/find/range/get/min/max for weights, rates, dimensions, and other
+   non-money measurements; NaN and +/-Inf are rejected because their ordering is
+   not stable business data. A persisted
    `u64_pair -> row` index supports ERP composite keys such as
    `(order_id, line_no)`, `(product_id, warehouse_id)`, or
    `(customer_id, date_code)` with point lookup and fixed-first-key range
@@ -223,7 +234,7 @@ microseconds, boolean as normalized `0/1`, and nullable fields as a sidecar null
 bitmap. Logical bool queries require a column annotation such as `// u8 bool` or
 `// u64 bool`, reject non-`0/1` stored values, and return filtered rows in
 snapshot row order. These helpers deliberately do not introduce a new physical
-format yet, so existing `i32`/`u32`/`i64`/`u64` indexes, range reads,
+format yet, so existing integer and finite-float indexes, range reads,
 projections, and fixed-width row buffers remain the query surface.
 Schema comments can now carry logical metadata after the primitive type and
 before an optional `:` description, for example `// i64 decimal(2) nullable`,
@@ -269,6 +280,10 @@ positive values.
 provide the same indexed pagination for compact 1-, 2-, and 4-byte columns, with signed types using signed ordering. These
 are intended for ERP status codes, warehouse IDs, line numbers, compact foreign
 keys, and signed adjustment fields.
+`sa_db_range_f32_handle` / `DB_RANGE_F32_HANDLE` and `sa_db_range_f64_handle` /
+`DB_RANGE_F64_HANDLE` provide the same indexed pagination for finite float
+columns; use scaled `i64` decimal helpers for money where exact arithmetic is
+required.
 `sa_db_range_u64_null_bitmap_handle` / `DB_RANGE_U64_NULL_BITMAP_HANDLE` and
 `sa_db_range_i64_null_bitmap_handle` / `DB_RANGE_I64_NULL_BITMAP_HANDLE` add a
 sidecar null-bitmap predicate before pagination. The returned `total`, `offset`,
@@ -322,7 +337,7 @@ same active-manifest protocol as the public table APIs. Segment metadata records
 whole-file SHA-256, byte counts, and 64KB block-level SHA-256 lists for newly
 written column segment files. Older metadata without block hashes remains
 readable, but new segment writes include block hashes and verification checks
-them. U64, I64, U64-pair index files and string dictionary files are also
+them. Single-column integer/float index files, U64-pair index files, and string dictionary files are also
 versioned, hashed, block-hashed, snapshotted, restored, and verified. Indexes are
 rebuilt on ingest/update/compact/qmod writes. Verification checks schema hash,
 segment hash, segment block hashes, index hash, index block hashes, index
@@ -422,16 +437,17 @@ benchmarks. The required baseline is:
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
   and dictionary-encoded strings. Primitive schema type codes, low-cardinality
   string dictionaries, and logical encode/decode helpers for decimal/date/time,
-  bool, and null bitmaps exist now. Indexed `u8/i8/u16/i16/u32/i32/u64/i64` range reads can now apply
+  bool, and null bitmaps exist now. Indexed `u8/i8/u16/i16/u32/i32/u64/i64/f32/f64`
+  range reads exist for ERP list filters; `u64/i64` range wrappers can also apply
   a sidecar null bitmap before pagination, and decimal/date/timestamp typed range
-  wrappers exist for ERP list filters. Richer typed column families such as floats and wider string/blob handling are next.
+  wrappers are available. Wider string/blob handling is next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
-  batch reads now cover the first ERP list-page shape; next is typed column
-  families beyond raw fixed-width bytes.
+  batch reads now cover the first ERP list-page shape; next is richer string/blob
+  handling beyond raw fixed-width bytes.
 - Generalized primary-key and secondary indexes beyond the current persisted
-  small-integer, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
+  small-integer, float, `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
 - Remaining crash-recovery hardening such as a broader fault-injection matrix,
   then multi-table transaction semantics, optional WAL, and async batch flush.

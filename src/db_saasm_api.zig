@@ -888,6 +888,48 @@ pub export fn sa_db_create_i16_index(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_create_f32_index(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    unique: u32,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createF32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_create_f64_index(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    unique: u32,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createF64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_create_u64_pair_index(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -1434,6 +1476,28 @@ pub export fn sa_db_count_i16_cmp_handle(handle: ?*anyopaque, column_index: u64,
     return SA_DB_OK;
 }
 
+pub export fn sa_db_count_f32_cmp_handle(handle: ?*anyopaque, column_index: u64, op: u32, expected: f32, out_count: ?*u64) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const cmp_op = u64CompareOpFromAbi(op) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const count = table.snapshotCountF32Cmp(snapshot, @intCast(column_index), cmp_op, expected) catch |err| return tableStatus(err);
+    count_slot.* = count;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_count_f64_cmp_handle(handle: ?*anyopaque, column_index: u64, op: u32, expected: f64, out_count: ?*u64) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const cmp_op = u64CompareOpFromAbi(op) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const count = table.snapshotCountF64Cmp(snapshot, @intCast(column_index), cmp_op, expected) catch |err| return tableStatus(err);
+    count_slot.* = count;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_count_bool_handle(handle: ?*anyopaque, column_index: u64, expected: u32, out_count: ?*u64) u32 {
     const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
     count_slot.* = 0;
@@ -1553,6 +1617,34 @@ pub export fn sa_db_find_i16_handle(handle: ?*anyopaque, column_index: u64, expe
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotFindI16(snapshot, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    row_slot.* = result.row_index;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_find_f32_handle(handle: ?*anyopaque, column_index: u64, expected: f32, out_found: ?*u64, out_row_index: ?*u64) u32 {
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_slot = out_row_index orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    row_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFindF32(snapshot, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    found_slot.* = if (result.found) 1 else 0;
+    row_slot.* = result.row_index;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_find_f64_handle(handle: ?*anyopaque, column_index: u64, expected: f64, out_found: ?*u64, out_row_index: ?*u64) u32 {
+    const found_slot = out_found orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_slot = out_row_index orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    found_slot.* = 0;
+    row_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFindF64(snapshot, @intCast(column_index), expected) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
     row_slot.* = result.row_index;
     return SA_DB_OK;
@@ -1791,6 +1883,58 @@ pub export fn sa_db_range_i16_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotRangeI16Rows(snapshot, @intCast(column_index), min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_range_f32_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_value: f32,
+    max_value: f32,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotRangeF32Rows(snapshot, @intCast(column_index), min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_range_f64_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    min_value: f64,
+    max_value: f64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotRangeF64Rows(snapshot, @intCast(column_index), min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
@@ -2184,6 +2328,26 @@ pub export fn sa_db_get_i16_handle(handle: ?*anyopaque, column_index: u64, row_i
     return SA_DB_OK;
 }
 
+pub export fn sa_db_get_f32_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*f32) u32 {
+    const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const value = table.snapshotGetF32(snapshot, @intCast(column_index), row_index) catch |err| return tableStatus(err);
+    value_slot.* = value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_f64_handle(handle: ?*anyopaque, column_index: u64, row_index: u64, out_value: ?*f64) u32 {
+    const value_slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const value = table.snapshotGetF64(snapshot, @intCast(column_index), row_index) catch |err| return tableStatus(err);
+    value_slot.* = value;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_project_rows_handle(
     handle: ?*anyopaque,
     row_indices_ptr: ?[*]const u64,
@@ -2400,6 +2564,46 @@ pub export fn sa_db_max_i16_handle(handle: ?*anyopaque, column_index: u64, out_m
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const max_value = table.snapshotMaxI16(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    max_slot.* = max_value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_min_f32_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*f32) u32 {
+    const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const min_value = table.snapshotMinF32(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    min_slot.* = min_value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_max_f32_handle(handle: ?*anyopaque, column_index: u64, out_max: ?*f32) u32 {
+    const max_slot = out_max orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const max_value = table.snapshotMaxF32(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    max_slot.* = max_value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_min_f64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*f64) u32 {
+    const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const min_value = table.snapshotMinF64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    min_slot.* = min_value;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_max_f64_handle(handle: ?*anyopaque, column_index: u64, out_max: ?*f64) u32 {
+    const max_slot = out_max orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const max_value = table.snapshotMaxF64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
     max_slot.* = max_value;
     return SA_DB_OK;
 }

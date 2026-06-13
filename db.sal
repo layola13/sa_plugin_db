@@ -273,6 +273,14 @@
     %out_status = call @sa_db_create_i16_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_CREATE_F32_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %unique, %out_info
+    %out_status = call @sa_db_create_f32_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_CREATE_F64_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %unique, %out_info
+    %out_status = call @sa_db_create_f64_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_CREATE_U64_PAIR_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %column_index2, %unique, %out_info
     %out_status = call @sa_db_create_u64_pair_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %column_index2, %unique, &%out_info)
 [END_MACRO]
@@ -497,6 +505,18 @@
     %out_count = load __db_handle_i16_cmp_slot_%out_count+0 as u64
 [END_MACRO]
 
+[MACRO] DB_COUNT_F32_CMP_HANDLE %out_status, %out_count, %handle, %column_index, %op, %expected
+    __db_handle_f32_cmp_slot_%out_count = stack_alloc 8
+    %out_status = call @sa_db_count_f32_cmp_handle(%handle, %column_index, %op, %expected, &__db_handle_f32_cmp_slot_%out_count)
+    %out_count = load __db_handle_f32_cmp_slot_%out_count+0 as u64
+[END_MACRO]
+
+[MACRO] DB_COUNT_F64_CMP_HANDLE %out_status, %out_count, %handle, %column_index, %op, %expected
+    __db_handle_f64_cmp_slot_%out_count = stack_alloc 8
+    %out_status = call @sa_db_count_f64_cmp_handle(%handle, %column_index, %op, %expected, &__db_handle_f64_cmp_slot_%out_count)
+    %out_count = load __db_handle_f64_cmp_slot_%out_count+0 as u64
+[END_MACRO]
+
 [MACRO] DB_COUNT_BOOL_HANDLE %out_status, %out_count, %handle, %column_index, %expected
     __db_handle_bool_count_slot_%out_count = stack_alloc 8
     %out_status = call @sa_db_count_bool_handle(%handle, %column_index, %expected, &__db_handle_bool_count_slot_%out_count)
@@ -565,6 +585,22 @@
     %out_status = call @sa_db_find_i16_handle(%handle, %column_index, %expected, &__db_handle_find_i16_found_slot_%out_found, &__db_handle_find_i16_row_slot_%out_row_index)
     %out_found = load __db_handle_find_i16_found_slot_%out_found+0 as u64
     %out_row_index = load __db_handle_find_i16_row_slot_%out_row_index+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FIND_F32_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %expected
+    __db_handle_find_f32_found_slot_%out_found = stack_alloc 8
+    __db_handle_find_f32_row_slot_%out_row_index = stack_alloc 8
+    %out_status = call @sa_db_find_f32_handle(%handle, %column_index, %expected, &__db_handle_find_f32_found_slot_%out_found, &__db_handle_find_f32_row_slot_%out_row_index)
+    %out_found = load __db_handle_find_f32_found_slot_%out_found+0 as u64
+    %out_row_index = load __db_handle_find_f32_row_slot_%out_row_index+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FIND_F64_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %expected
+    __db_handle_find_f64_found_slot_%out_found = stack_alloc 8
+    __db_handle_find_f64_row_slot_%out_row_index = stack_alloc 8
+    %out_status = call @sa_db_find_f64_handle(%handle, %column_index, %expected, &__db_handle_find_f64_found_slot_%out_found, &__db_handle_find_f64_row_slot_%out_row_index)
+    %out_found = load __db_handle_find_f64_found_slot_%out_found+0 as u64
+    %out_row_index = load __db_handle_find_f64_row_slot_%out_row_index+0 as u64
 [END_MACRO]
 
 [MACRO] DB_FIND_BOOL_HANDLE %out_status, %out_found, %out_row_index, %handle, %column_index, %expected
@@ -645,6 +681,22 @@
     %out_status = call @sa_db_range_i16_handle(%handle, %column_index, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_i16_written_slot_%out_written, &__db_handle_range_i16_total_slot_%out_total)
     %out_written = load __db_handle_range_i16_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_range_i16_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_RANGE_F32_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_value, %max_value, %offset, %limit
+    __db_handle_range_f32_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_f32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_f32_handle(%handle, %column_index, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_f32_written_slot_%out_written, &__db_handle_range_f32_total_slot_%out_total)
+    %out_written = load __db_handle_range_f32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_f32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_RANGE_F64_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_value, %max_value, %offset, %limit
+    __db_handle_range_f64_written_slot_%out_written = stack_alloc 8
+    __db_handle_range_f64_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_range_f64_handle(%handle, %column_index, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_range_f64_written_slot_%out_written, &__db_handle_range_f64_total_slot_%out_total)
+    %out_written = load __db_handle_range_f64_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_range_f64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_RANGE_U64_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %min_value, %max_value, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
@@ -791,6 +843,18 @@
     %out_value = load __db_handle_get_i16_slot_%out_value+0 as i16
 [END_MACRO]
 
+[MACRO] DB_GET_F32_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
+    __db_handle_get_f32_slot_%out_value = stack_alloc 4
+    %out_status = call @sa_db_get_f32_handle(%handle, %column_index, %row_index, &__db_handle_get_f32_slot_%out_value)
+    %out_value = load __db_handle_get_f32_slot_%out_value+0 as f32
+[END_MACRO]
+
+[MACRO] DB_GET_F64_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
+    __db_handle_get_f64_slot_%out_value = stack_alloc 8
+    %out_status = call @sa_db_get_f64_handle(%handle, %column_index, %row_index, &__db_handle_get_f64_slot_%out_value)
+    %out_value = load __db_handle_get_f64_slot_%out_value+0 as f64
+[END_MACRO]
+
 [MACRO] DB_GET_BOOL_HANDLE %out_status, %out_value, %handle, %column_index, %row_index
     __db_handle_get_bool_slot_%out_value = stack_alloc 4
     %out_status = call @sa_db_get_bool_handle(%handle, %column_index, %row_index, &__db_handle_get_bool_slot_%out_value)
@@ -907,4 +971,28 @@
     __db_handle_max_i16_slot_%out_max = stack_alloc 2
     %out_status = call @sa_db_max_i16_handle(%handle, %column_index, &__db_handle_max_i16_slot_%out_max)
     %out_max = load __db_handle_max_i16_slot_%out_max+0 as i16
+[END_MACRO]
+
+[MACRO] DB_MIN_F32_HANDLE %out_status, %out_min, %handle, %column_index
+    __db_handle_min_f32_slot_%out_min = stack_alloc 4
+    %out_status = call @sa_db_min_f32_handle(%handle, %column_index, &__db_handle_min_f32_slot_%out_min)
+    %out_min = load __db_handle_min_f32_slot_%out_min+0 as f32
+[END_MACRO]
+
+[MACRO] DB_MAX_F32_HANDLE %out_status, %out_max, %handle, %column_index
+    __db_handle_max_f32_slot_%out_max = stack_alloc 4
+    %out_status = call @sa_db_max_f32_handle(%handle, %column_index, &__db_handle_max_f32_slot_%out_max)
+    %out_max = load __db_handle_max_f32_slot_%out_max+0 as f32
+[END_MACRO]
+
+[MACRO] DB_MIN_F64_HANDLE %out_status, %out_min, %handle, %column_index
+    __db_handle_min_f64_slot_%out_min = stack_alloc 8
+    %out_status = call @sa_db_min_f64_handle(%handle, %column_index, &__db_handle_min_f64_slot_%out_min)
+    %out_min = load __db_handle_min_f64_slot_%out_min+0 as f64
+[END_MACRO]
+
+[MACRO] DB_MAX_F64_HANDLE %out_status, %out_max, %handle, %column_index
+    __db_handle_max_f64_slot_%out_max = stack_alloc 8
+    %out_status = call @sa_db_max_f64_handle(%handle, %column_index, &__db_handle_max_f64_slot_%out_max)
+    %out_max = load __db_handle_max_f64_slot_%out_max+0 as f64
 [END_MACRO]
