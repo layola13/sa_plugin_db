@@ -35,6 +35,13 @@
 #def SA_DB_TYPE_BLOB_HANDLE = 13
 #def SA_DB_TYPE_V128 = 14
 
+#def SA_DB_LOGICAL_DECIMAL_I64 = 1
+#def SA_DB_LOGICAL_DATE_DAYS = 2
+#def SA_DB_LOGICAL_TIMESTAMP_MS = 3
+#def SA_DB_LOGICAL_TIMESTAMP_US = 4
+#def SA_DB_LOGICAL_BOOL = 5
+#def SA_DB_LOGICAL_NULL_BITMAP = 6
+
 #def SaDbTableInfo_SIZE = 32
 #def SaDbTableInfo_row_count = +0
 #def SaDbTableInfo_segment_count = +8
@@ -59,6 +66,98 @@
 
 [MACRO] DB_STATUS_IS_OK %out_bool, %status
     %out_bool = eq %status, SA_DB_OK
+[END_MACRO]
+
+[MACRO] DB_DECIMAL_FROM_PARTS %out_status, %out_value, %negative, %whole, %fraction, %scale
+    __db_decimal_value_slot_%out_value = stack_alloc 8
+    %out_status = call @sa_db_decimal_from_parts(%negative, %whole, %fraction, %scale, &__db_decimal_value_slot_%out_value)
+    %out_value = load __db_decimal_value_slot_%out_value+0 as i64
+[END_MACRO]
+
+[MACRO] DB_DECIMAL_TO_PARTS %out_status, %out_negative, %out_whole, %out_fraction, %value, %scale
+    __db_decimal_negative_slot_%out_negative = stack_alloc 4
+    __db_decimal_whole_slot_%out_whole = stack_alloc 8
+    __db_decimal_fraction_slot_%out_fraction = stack_alloc 8
+    %out_status = call @sa_db_decimal_to_parts(%value, %scale, &__db_decimal_negative_slot_%out_negative, &__db_decimal_whole_slot_%out_whole, &__db_decimal_fraction_slot_%out_fraction)
+    %out_negative = load __db_decimal_negative_slot_%out_negative+0 as u32
+    %out_whole = load __db_decimal_whole_slot_%out_whole+0 as u64
+    %out_fraction = load __db_decimal_fraction_slot_%out_fraction+0 as u64
+[END_MACRO]
+
+[MACRO] DB_DATE_FROM_YMD %out_status, %out_days, %year, %month, %day
+    __db_date_days_slot_%out_days = stack_alloc 8
+    %out_status = call @sa_db_date_from_ymd(%year, %month, %day, &__db_date_days_slot_%out_days)
+    %out_days = load __db_date_days_slot_%out_days+0 as i64
+[END_MACRO]
+
+[MACRO] DB_DATE_TO_YMD %out_status, %out_year, %out_month, %out_day, %days
+    __db_date_year_slot_%out_year = stack_alloc 8
+    __db_date_month_slot_%out_month = stack_alloc 4
+    __db_date_day_slot_%out_day = stack_alloc 4
+    %out_status = call @sa_db_date_to_ymd(%days, &__db_date_year_slot_%out_year, &__db_date_month_slot_%out_month, &__db_date_day_slot_%out_day)
+    %out_year = load __db_date_year_slot_%out_year+0 as i64
+    %out_month = load __db_date_month_slot_%out_month+0 as u32
+    %out_day = load __db_date_day_slot_%out_day+0 as u32
+[END_MACRO]
+
+[MACRO] DB_TIMESTAMP_MS_FROM_PARTS %out_status, %out_ms, %days, %millis_of_day
+    __db_timestamp_ms_slot_%out_ms = stack_alloc 8
+    %out_status = call @sa_db_timestamp_ms_from_parts(%days, %millis_of_day, &__db_timestamp_ms_slot_%out_ms)
+    %out_ms = load __db_timestamp_ms_slot_%out_ms+0 as i64
+[END_MACRO]
+
+[MACRO] DB_TIMESTAMP_MS_TO_PARTS %out_status, %out_days, %out_millis_of_day, %value_ms
+    __db_timestamp_ms_days_slot_%out_days = stack_alloc 8
+    __db_timestamp_ms_subday_slot_%out_millis_of_day = stack_alloc 8
+    %out_status = call @sa_db_timestamp_ms_to_parts(%value_ms, &__db_timestamp_ms_days_slot_%out_days, &__db_timestamp_ms_subday_slot_%out_millis_of_day)
+    %out_days = load __db_timestamp_ms_days_slot_%out_days+0 as i64
+    %out_millis_of_day = load __db_timestamp_ms_subday_slot_%out_millis_of_day+0 as u64
+[END_MACRO]
+
+[MACRO] DB_TIMESTAMP_US_FROM_PARTS %out_status, %out_us, %days, %micros_of_day
+    __db_timestamp_us_slot_%out_us = stack_alloc 8
+    %out_status = call @sa_db_timestamp_us_from_parts(%days, %micros_of_day, &__db_timestamp_us_slot_%out_us)
+    %out_us = load __db_timestamp_us_slot_%out_us+0 as i64
+[END_MACRO]
+
+[MACRO] DB_TIMESTAMP_US_TO_PARTS %out_status, %out_days, %out_micros_of_day, %value_us
+    __db_timestamp_us_days_slot_%out_days = stack_alloc 8
+    __db_timestamp_us_subday_slot_%out_micros_of_day = stack_alloc 8
+    %out_status = call @sa_db_timestamp_us_to_parts(%value_us, &__db_timestamp_us_days_slot_%out_days, &__db_timestamp_us_subday_slot_%out_micros_of_day)
+    %out_days = load __db_timestamp_us_days_slot_%out_days+0 as i64
+    %out_micros_of_day = load __db_timestamp_us_subday_slot_%out_micros_of_day+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BOOL_ENCODE %out_status, %out_encoded, %value
+    __db_bool_encoded_slot_%out_encoded = stack_alloc 8
+    %out_status = call @sa_db_bool_encode(%value, &__db_bool_encoded_slot_%out_encoded)
+    %out_encoded = load __db_bool_encoded_slot_%out_encoded+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BOOL_DECODE %out_status, %out_value, %encoded
+    __db_bool_value_slot_%out_value = stack_alloc 4
+    %out_status = call @sa_db_bool_decode(%encoded, &__db_bool_value_slot_%out_value)
+    %out_value = load __db_bool_value_slot_%out_value+0 as u32
+[END_MACRO]
+
+[MACRO] DB_NULL_BITMAP_REQUIRED_BYTES %out_status, %out_len, %row_count
+    __db_null_bitmap_len_slot_%out_len = stack_alloc 8
+    %out_status = call @sa_db_null_bitmap_required_bytes(%row_count, &__db_null_bitmap_len_slot_%out_len)
+    %out_len = load __db_null_bitmap_len_slot_%out_len+0 as u64
+[END_MACRO]
+
+[MACRO] DB_NULL_BITMAP_CLEAR %out_status, %bitmap, %bitmap_len
+    %out_status = call @sa_db_null_bitmap_clear(&%bitmap, %bitmap_len)
+[END_MACRO]
+
+[MACRO] DB_NULL_BITMAP_SET %out_status, %bitmap, %bitmap_len, %row_index, %is_null
+    %out_status = call @sa_db_null_bitmap_set(&%bitmap, %bitmap_len, %row_index, %is_null)
+[END_MACRO]
+
+[MACRO] DB_NULL_BITMAP_GET %out_status, %out_is_null, %bitmap, %bitmap_len, %row_index
+    __db_null_bitmap_get_slot_%out_is_null = stack_alloc 4
+    %out_status = call @sa_db_null_bitmap_get(&%bitmap, %bitmap_len, %row_index, &__db_null_bitmap_get_slot_%out_is_null)
+    %out_is_null = load __db_null_bitmap_get_slot_%out_is_null+0 as u32
 [END_MACRO]
 
 [MACRO] DB_COLUMN_INPUT_SET %columns, %index, %data, %len

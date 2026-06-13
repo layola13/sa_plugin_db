@@ -1,5 +1,20 @@
 // SA database plugin public native interface.
 
+@extern sa_db_decimal_from_parts(negative: u32, whole: u64, fraction: u64, scale: u32, &out_value: ptr) -> u32
+@extern sa_db_decimal_to_parts(value: i64, scale: u32, &out_negative: ptr, &out_whole: ptr, &out_fraction: ptr) -> u32
+@extern sa_db_date_from_ymd(year: i64, month: u32, day: u32, &out_days: ptr) -> u32
+@extern sa_db_date_to_ymd(days: i64, &out_year: ptr, &out_month: ptr, &out_day: ptr) -> u32
+@extern sa_db_timestamp_ms_from_parts(days: i64, millis_of_day: u64, &out_ms: ptr) -> u32
+@extern sa_db_timestamp_ms_to_parts(value_ms: i64, &out_days: ptr, &out_millis_of_day: ptr) -> u32
+@extern sa_db_timestamp_us_from_parts(days: i64, micros_of_day: u64, &out_us: ptr) -> u32
+@extern sa_db_timestamp_us_to_parts(value_us: i64, &out_days: ptr, &out_micros_of_day: ptr) -> u32
+@extern sa_db_bool_encode(value: u32, &out_encoded: ptr) -> u32
+@extern sa_db_bool_decode(encoded: u64, &out_value: ptr) -> u32
+@extern sa_db_null_bitmap_required_bytes(row_count: u64, &out_len: ptr) -> u32
+@extern sa_db_null_bitmap_clear(&bitmap: ptr, bitmap_len: u64) -> u32
+@extern sa_db_null_bitmap_set(&bitmap: ptr, bitmap_len: u64, row_index: u64, is_null: u32) -> u32
+@extern sa_db_null_bitmap_get(&bitmap: ptr, bitmap_len: u64, row_index: u64, &out_is_null: ptr) -> u32
+
 @extern sa_db_init_schema(&root: ptr, root_len: u64, &schema_path: ptr, schema_path_len: u64, &schema_source: ptr, schema_source_len: u64, &out_info: ptr) -> u32
 @extern sa_db_remove_table(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_ingest_columns(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, row_count: u64, columns: ptr, columns_len: u64, &out_info: ptr) -> u32

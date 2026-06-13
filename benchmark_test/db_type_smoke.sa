@@ -1,0 +1,277 @@
+@import "db.sal"
+
+#def NULL_BITMAP_BYTES = 1
+
+@main() -> i32:
+L_ENTRY:
+    null_bitmap = alloc NULL_BITMAP_BYTES
+
+    EXPAND DB_DECIMAL_FROM_PARTS decimal_negative_status, decimal_negative_value, 1, 1, 0, 2
+    EXPAND DB_DECIMAL_FROM_PARTS decimal_positive_status, decimal_positive_value, 0, 1, 25, 2
+    EXPAND DB_DECIMAL_TO_PARTS decimal_parts_status, decimal_negative, decimal_whole, decimal_fraction, decimal_positive_value, 2
+    EXPAND DB_DECIMAL_FROM_PARTS decimal_invalid_status, decimal_invalid_value, 0, 1, 100, 2
+
+    EXPAND DB_DATE_FROM_YMD date_status, date_days, 2024, 2, 29
+    EXPAND DB_DATE_TO_YMD date_parts_status, date_year, date_month, date_day, date_days
+    EXPAND DB_DATE_FROM_YMD date_invalid_status, date_invalid_days, 2023, 2, 29
+
+    EXPAND DB_TIMESTAMP_MS_FROM_PARTS timestamp_status, timestamp_ms, date_days, 3600000
+    EXPAND DB_TIMESTAMP_MS_TO_PARTS timestamp_parts_status, timestamp_days, timestamp_millis, timestamp_ms
+    EXPAND DB_TIMESTAMP_MS_TO_PARTS timestamp_negative_parts_status, timestamp_negative_days, timestamp_negative_millis, -1
+    EXPAND DB_TIMESTAMP_US_FROM_PARTS timestamp_us_status, timestamp_us, -1, 86399999999
+    EXPAND DB_TIMESTAMP_US_TO_PARTS timestamp_us_parts_status, timestamp_us_days, timestamp_us_micros, timestamp_us
+
+    EXPAND DB_BOOL_ENCODE bool_encode_status, bool_encoded, 99
+    EXPAND DB_BOOL_DECODE bool_decode_status, bool_decoded, bool_encoded
+    EXPAND DB_BOOL_DECODE bool_invalid_status, bool_invalid_value, 2
+
+    EXPAND DB_NULL_BITMAP_REQUIRED_BYTES null_len_status, null_len, 6
+    EXPAND DB_NULL_BITMAP_CLEAR null_clear_status, null_bitmap, NULL_BITMAP_BYTES
+    EXPAND DB_NULL_BITMAP_SET null_set_status, null_bitmap, NULL_BITMAP_BYTES, 5, 1
+    EXPAND DB_NULL_BITMAP_GET null_get_status, row5_is_null, null_bitmap, NULL_BITMAP_BYTES, 5
+    EXPAND DB_NULL_BITMAP_SET null_unset_status, null_bitmap, NULL_BITMAP_BYTES, 5, 0
+    EXPAND DB_NULL_BITMAP_GET null_get_clear_status, row5_is_null_after_clear, null_bitmap, NULL_BITMAP_BYTES, 5
+
+    ok_decimal_negative_status = eq decimal_negative_status, SA_DB_OK
+    ok_decimal_negative_value = eq decimal_negative_value, -100
+    ok_decimal_positive_status = eq decimal_positive_status, SA_DB_OK
+    ok_decimal_positive_value = eq decimal_positive_value, 125
+    ok_decimal_parts_status = eq decimal_parts_status, SA_DB_OK
+    ok_decimal_negative = eq decimal_negative, 0
+    ok_decimal_whole = eq decimal_whole, 1
+    ok_decimal_fraction = eq decimal_fraction, 25
+    ok_decimal_invalid_status = eq decimal_invalid_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_decimal_invalid_value = eq decimal_invalid_value, 0
+
+    ok_date_status = eq date_status, SA_DB_OK
+    ok_date_days = eq date_days, 19782
+    ok_date_parts_status = eq date_parts_status, SA_DB_OK
+    ok_date_year = eq date_year, 2024
+    ok_date_month = eq date_month, 2
+    ok_date_day = eq date_day, 29
+    ok_date_invalid_status = eq date_invalid_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_date_invalid_days = eq date_invalid_days, 0
+
+    ok_timestamp_status = eq timestamp_status, SA_DB_OK
+    ok_timestamp_ms = eq timestamp_ms, 1709168400000
+    ok_timestamp_parts_status = eq timestamp_parts_status, SA_DB_OK
+    ok_timestamp_days = eq timestamp_days, date_days
+    ok_timestamp_millis = eq timestamp_millis, 3600000
+    ok_timestamp_negative_parts_status = eq timestamp_negative_parts_status, SA_DB_OK
+    ok_timestamp_negative_days = eq timestamp_negative_days, -1
+    ok_timestamp_negative_millis = eq timestamp_negative_millis, 86399999
+    ok_timestamp_us_status = eq timestamp_us_status, SA_DB_OK
+    ok_timestamp_us = eq timestamp_us, -1
+    ok_timestamp_us_parts_status = eq timestamp_us_parts_status, SA_DB_OK
+    ok_timestamp_us_days = eq timestamp_us_days, -1
+    ok_timestamp_us_micros = eq timestamp_us_micros, 86399999999
+
+    ok_bool_encode_status = eq bool_encode_status, SA_DB_OK
+    ok_bool_encoded = eq bool_encoded, 1
+    ok_bool_decode_status = eq bool_decode_status, SA_DB_OK
+    ok_bool_decoded = eq bool_decoded, 1
+    ok_bool_invalid_status = eq bool_invalid_status, SA_DB_ERR_INVALID_ARGUMENT
+    ok_bool_invalid_value = eq bool_invalid_value, 0
+
+    ok_null_len_status = eq null_len_status, SA_DB_OK
+    ok_null_len = eq null_len, NULL_BITMAP_BYTES
+    ok_null_clear_status = eq null_clear_status, SA_DB_OK
+    ok_null_set_status = eq null_set_status, SA_DB_OK
+    ok_null_get_status = eq null_get_status, SA_DB_OK
+    ok_row5_is_null = eq row5_is_null, 1
+    ok_null_unset_status = eq null_unset_status, SA_DB_OK
+    ok_null_get_clear_status = eq null_get_clear_status, SA_DB_OK
+    ok_row5_is_null_after_clear = eq row5_is_null_after_clear, 0
+
+    ok01 = and ok_decimal_negative_status, ok_decimal_negative_value
+    ok02 = and ok01, ok_decimal_positive_status
+    ok03 = and ok02, ok_decimal_positive_value
+    ok04 = and ok03, ok_decimal_parts_status
+    ok05 = and ok04, ok_decimal_negative
+    ok06 = and ok05, ok_decimal_whole
+    ok07 = and ok06, ok_decimal_fraction
+    ok08 = and ok07, ok_decimal_invalid_status
+    ok09 = and ok08, ok_decimal_invalid_value
+    ok10 = and ok09, ok_date_status
+    ok11 = and ok10, ok_date_days
+    ok12 = and ok11, ok_date_parts_status
+    ok13 = and ok12, ok_date_year
+    ok14 = and ok13, ok_date_month
+    ok15 = and ok14, ok_date_day
+    ok16 = and ok15, ok_date_invalid_status
+    ok17 = and ok16, ok_date_invalid_days
+    ok18 = and ok17, ok_timestamp_status
+    ok19 = and ok18, ok_timestamp_ms
+    ok20 = and ok19, ok_timestamp_parts_status
+    ok21 = and ok20, ok_timestamp_days
+    ok22 = and ok21, ok_timestamp_millis
+    ok23 = and ok22, ok_timestamp_negative_parts_status
+    ok24 = and ok23, ok_timestamp_negative_days
+    ok25 = and ok24, ok_timestamp_negative_millis
+    ok26 = and ok25, ok_timestamp_us_status
+    ok27 = and ok26, ok_timestamp_us
+    ok28 = and ok27, ok_timestamp_us_parts_status
+    ok29 = and ok28, ok_timestamp_us_days
+    ok30 = and ok29, ok_timestamp_us_micros
+    ok31 = and ok30, ok_bool_encode_status
+    ok32 = and ok31, ok_bool_encoded
+    ok33 = and ok32, ok_bool_decode_status
+    ok34 = and ok33, ok_bool_decoded
+    ok35 = and ok34, ok_bool_invalid_status
+    ok36 = and ok35, ok_bool_invalid_value
+    ok37 = and ok36, ok_null_len_status
+    ok38 = and ok37, ok_null_len
+    ok39 = and ok38, ok_null_clear_status
+    ok40 = and ok39, ok_null_set_status
+    ok41 = and ok40, ok_null_get_status
+    ok42 = and ok41, ok_row5_is_null
+    ok43 = and ok42, ok_null_unset_status
+    ok44 = and ok43, ok_null_get_clear_status
+    ok = and ok44, ok_row5_is_null_after_clear
+
+    !decimal_negative_status
+    !decimal_negative_value
+    !decimal_positive_status
+    !decimal_positive_value
+    !decimal_parts_status
+    !decimal_negative
+    !decimal_whole
+    !decimal_fraction
+    !decimal_invalid_status
+    !decimal_invalid_value
+    !date_status
+    !date_days
+    !date_parts_status
+    !date_year
+    !date_month
+    !date_day
+    !date_invalid_status
+    !date_invalid_days
+    !timestamp_status
+    !timestamp_ms
+    !timestamp_parts_status
+    !timestamp_days
+    !timestamp_millis
+    !timestamp_negative_parts_status
+    !timestamp_negative_days
+    !timestamp_negative_millis
+    !timestamp_us_status
+    !timestamp_us
+    !timestamp_us_parts_status
+    !timestamp_us_days
+    !timestamp_us_micros
+    !bool_encode_status
+    !bool_encoded
+    !bool_decode_status
+    !bool_decoded
+    !bool_invalid_status
+    !bool_invalid_value
+    !null_len_status
+    !null_len
+    !null_clear_status
+    !null_set_status
+    !null_get_status
+    !row5_is_null
+    !null_unset_status
+    !null_get_clear_status
+    !row5_is_null_after_clear
+    !ok_decimal_negative_status
+    !ok_decimal_negative_value
+    !ok_decimal_positive_status
+    !ok_decimal_positive_value
+    !ok_decimal_parts_status
+    !ok_decimal_negative
+    !ok_decimal_whole
+    !ok_decimal_fraction
+    !ok_decimal_invalid_status
+    !ok_decimal_invalid_value
+    !ok_date_status
+    !ok_date_days
+    !ok_date_parts_status
+    !ok_date_year
+    !ok_date_month
+    !ok_date_day
+    !ok_date_invalid_status
+    !ok_date_invalid_days
+    !ok_timestamp_status
+    !ok_timestamp_ms
+    !ok_timestamp_parts_status
+    !ok_timestamp_days
+    !ok_timestamp_millis
+    !ok_timestamp_negative_parts_status
+    !ok_timestamp_negative_days
+    !ok_timestamp_negative_millis
+    !ok_timestamp_us_status
+    !ok_timestamp_us
+    !ok_timestamp_us_parts_status
+    !ok_timestamp_us_days
+    !ok_timestamp_us_micros
+    !ok_bool_encode_status
+    !ok_bool_encoded
+    !ok_bool_decode_status
+    !ok_bool_decoded
+    !ok_bool_invalid_status
+    !ok_bool_invalid_value
+    !ok_null_len_status
+    !ok_null_len
+    !ok_null_clear_status
+    !ok_null_set_status
+    !ok_null_get_status
+    !ok_row5_is_null
+    !ok_null_unset_status
+    !ok_null_get_clear_status
+    !ok_row5_is_null_after_clear
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !null_bitmap
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9003)

@@ -12,6 +12,10 @@ const SA_DB_ERR_OUT_OF_MEMORY: u32 = 7;
 const SA_DB_ERR_IO: u32 = 8;
 const SA_DB_ERR_CONSTRAINT: u32 = 9;
 
+const DECIMAL_MAX_SCALE: u32 = 18;
+const MS_PER_DAY: u64 = 86_400_000;
+const US_PER_DAY: u64 = 86_400_000_000;
+
 var mutation_mutex = std.Thread.Mutex{};
 var read_handle_mutex = std.Thread.Mutex{};
 var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
@@ -210,6 +214,261 @@ fn u64CompareOpFromAbi(op: u32) ?table.U64CompareOp {
         5 => .ge,
         else => null,
     };
+}
+
+fn decimalScaleFactor(scale: u32) ?u64 {
+    if (scale > DECIMAL_MAX_SCALE) return null;
+    var factor: u64 = 1;
+    var i: u32 = 0;
+    while (i < scale) : (i += 1) {
+        factor *= 10;
+    }
+    return factor;
+}
+
+fn isLeapYear(year: i64) bool {
+    return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+}
+
+fn daysInMonth(year: i64, month: u32) ?u32 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => null,
+    };
+}
+
+const CivilDate = struct {
+    year: i64,
+    month: u32,
+    day: u32,
+};
+
+fn daysFromCivil(year: i64, month: u32, day: u32) ?i64 {
+    const month_days = daysInMonth(year, month) orelse return null;
+    if (day == 0 or day > month_days) return null;
+
+    var y: i128 = year;
+    if (month <= 2) y -= 1;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const month_i: i128 = month;
+    const mp = if (month > 2) month_i - 3 else month_i + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + @as(i128, day) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    if (days < std.math.minInt(i64) or days > std.math.maxInt(i64)) return null;
+    return @intCast(days);
+}
+
+fn civilFromDays(days: i64) ?CivilDate {
+    const z: i128 = @as(i128, days) + 719468;
+    const era = @divFloor(z, 146097);
+    const doe = z - era * 146097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+    var y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    const m = mp + if (mp < 10) @as(i128, 3) else -9;
+    if (m <= 2) y += 1;
+    if (y < std.math.minInt(i64) or y > std.math.maxInt(i64)) return null;
+    return .{ .year = @intCast(y), .month = @intCast(m), .day = @intCast(d) };
+}
+
+fn timestampFromParts(days: i64, subday: u64, units_per_day: u64) ?i64 {
+    if (subday >= units_per_day) return null;
+    const total = @as(i128, days) * @as(i128, units_per_day) + @as(i128, subday);
+    if (total < std.math.minInt(i64) or total > std.math.maxInt(i64)) return null;
+    return @intCast(total);
+}
+
+const TimestampParts = struct {
+    days: i64,
+    subday: u64,
+};
+
+fn timestampToParts(value: i64, units_per_day: u64) ?TimestampParts {
+    const total: i128 = value;
+    const unit: i128 = units_per_day;
+    const days = @divFloor(total, unit);
+    const subday = total - days * unit;
+    if (days < std.math.minInt(i64) or days > std.math.maxInt(i64)) return null;
+    return .{ .days = @intCast(days), .subday = @intCast(subday) };
+}
+
+pub export fn sa_db_decimal_from_parts(
+    negative: u32,
+    whole: u64,
+    fraction: u64,
+    scale: u32,
+    out_value: ?*i64,
+) u32 {
+    const slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = 0;
+    const factor = decimalScaleFactor(scale) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (fraction >= factor) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    const total = @as(u128, whole) * @as(u128, factor) + @as(u128, fraction);
+    const positive_limit: u128 = @intCast(std.math.maxInt(i64));
+    const negative_limit = positive_limit + 1;
+    if (negative == 0) {
+        if (total > positive_limit) return SA_DB_ERR_INVALID_ARGUMENT;
+        slot.* = @intCast(total);
+    } else {
+        if (total > negative_limit) return SA_DB_ERR_INVALID_ARGUMENT;
+        if (total == negative_limit) {
+            slot.* = std.math.minInt(i64);
+        } else {
+            slot.* = -@as(i64, @intCast(total));
+        }
+    }
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_decimal_to_parts(
+    value: i64,
+    scale: u32,
+    out_negative: ?*u32,
+    out_whole: ?*u64,
+    out_fraction: ?*u64,
+) u32 {
+    const negative_slot = out_negative orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const whole_slot = out_whole orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const fraction_slot = out_fraction orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    negative_slot.* = 0;
+    whole_slot.* = 0;
+    fraction_slot.* = 0;
+    const factor = decimalScaleFactor(scale) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var magnitude: u128 = 0;
+    if (value < 0) {
+        negative_slot.* = 1;
+        magnitude = if (value == std.math.minInt(i64))
+            @as(u128, @intCast(std.math.maxInt(i64))) + 1
+        else
+            @intCast(-value);
+    } else {
+        magnitude = @intCast(value);
+    }
+    whole_slot.* = @intCast(magnitude / factor);
+    fraction_slot.* = @intCast(magnitude % factor);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_date_from_ymd(year: i64, month: u32, day: u32, out_days: ?*i64) u32 {
+    const slot = out_days orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = 0;
+    slot.* = daysFromCivil(year, month, day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_date_to_ymd(days: i64, out_year: ?*i64, out_month: ?*u32, out_day: ?*u32) u32 {
+    const year_slot = out_year orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const month_slot = out_month orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const day_slot = out_day orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    year_slot.* = 0;
+    month_slot.* = 0;
+    day_slot.* = 0;
+    const date = civilFromDays(days) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    year_slot.* = date.year;
+    month_slot.* = date.month;
+    day_slot.* = date.day;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_timestamp_ms_from_parts(days: i64, millis_of_day: u64, out_ms: ?*i64) u32 {
+    const slot = out_ms orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = 0;
+    slot.* = timestampFromParts(days, millis_of_day, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_timestamp_ms_to_parts(value_ms: i64, out_days: ?*i64, out_millis_of_day: ?*u64) u32 {
+    const days_slot = out_days orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const subday_slot = out_millis_of_day orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    days_slot.* = 0;
+    subday_slot.* = 0;
+    const parts = timestampToParts(value_ms, MS_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    days_slot.* = parts.days;
+    subday_slot.* = parts.subday;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_timestamp_us_from_parts(days: i64, micros_of_day: u64, out_us: ?*i64) u32 {
+    const slot = out_us orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = 0;
+    slot.* = timestampFromParts(days, micros_of_day, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_timestamp_us_to_parts(value_us: i64, out_days: ?*i64, out_micros_of_day: ?*u64) u32 {
+    const days_slot = out_days orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const subday_slot = out_micros_of_day orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    days_slot.* = 0;
+    subday_slot.* = 0;
+    const parts = timestampToParts(value_us, US_PER_DAY) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    days_slot.* = parts.days;
+    subday_slot.* = parts.subday;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_bool_encode(value: u32, out_encoded: ?*u64) u32 {
+    const slot = out_encoded orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = if (value == 0) 0 else 1;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_bool_decode(encoded: u64, out_value: ?*u32) u32 {
+    const slot = out_value orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = 0;
+    if (encoded > 1) return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = @intCast(encoded);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_null_bitmap_required_bytes(row_count: u64, out_len: ?*u64) u32 {
+    const slot = out_len orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = row_count / 8 + if (row_count % 8 == 0) @as(u64, 0) else 1;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_null_bitmap_clear(bitmap_ptr: ?[*]u8, bitmap_len: u64) u32 {
+    if (bitmap_len > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const len: usize = @intCast(bitmap_len);
+    if (len == 0) return SA_DB_OK;
+    const ptr = bitmap_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    @memset(ptr[0..len], 0);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_null_bitmap_set(bitmap_ptr: ?[*]u8, bitmap_len: u64, row_index: u64, is_null: u32) u32 {
+    const bytes = outputBytes(bitmap_ptr, bitmap_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const byte_index_u64 = row_index / 8;
+    if (byte_index_u64 >= bytes.len) return SA_DB_ERR_INVALID_ARGUMENT;
+    const byte_index: usize = @intCast(byte_index_u64);
+    const bit: u3 = @intCast(row_index & 7);
+    const mask: u8 = @as(u8, 1) << bit;
+    if (is_null == 0) {
+        bytes[byte_index] &= ~mask;
+    } else {
+        bytes[byte_index] |= mask;
+    }
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_null_bitmap_get(bitmap_ptr: ?[*]const u8, bitmap_len: u64, row_index: u64, out_is_null: ?*u32) u32 {
+    const slot = out_is_null orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = 0;
+    const bytes = inputBytes(bitmap_ptr, bitmap_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const byte_index_u64 = row_index / 8;
+    if (byte_index_u64 >= bytes.len) return SA_DB_ERR_INVALID_ARGUMENT;
+    const byte_index: usize = @intCast(byte_index_u64);
+    const bit: u3 = @intCast(row_index & 7);
+    const mask: u8 = @as(u8, 1) << bit;
+    slot.* = if ((bytes[byte_index] & mask) == 0) 0 else 1;
+    return SA_DB_OK;
 }
 
 pub export fn sa_db_init_schema(
@@ -1122,6 +1381,84 @@ pub export fn sa_db_max_i64_handle(handle: ?*anyopaque, column_index: u64, out_m
     const max_value = table.snapshotMaxI64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
     max_slot.* = max_value;
     return SA_DB_OK;
+}
+
+test "db SA ABI logical type helpers" {
+    var decimal: i64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_decimal_from_parts(0, 123, 45, 2, &decimal));
+    try std.testing.expectEqual(@as(i64, 12345), decimal);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_decimal_from_parts(1, 10, 5, 2, &decimal));
+    try std.testing.expectEqual(@as(i64, -1005), decimal);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_decimal_from_parts(1, 9223372036854775808, 0, 0, &decimal));
+    try std.testing.expectEqual(std.math.minInt(i64), decimal);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_decimal_from_parts(0, 9223372036854775808, 0, 0, &decimal));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_decimal_from_parts(0, 1, 100, 2, &decimal));
+
+    var negative: u32 = 0;
+    var whole: u64 = 0;
+    var fraction: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_decimal_to_parts(-1005, 2, &negative, &whole, &fraction));
+    try std.testing.expectEqual(@as(u32, 1), negative);
+    try std.testing.expectEqual(@as(u64, 10), whole);
+    try std.testing.expectEqual(@as(u64, 5), fraction);
+
+    var days: i64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_date_from_ymd(1970, 1, 1, &days));
+    try std.testing.expectEqual(@as(i64, 0), days);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_date_from_ymd(2024, 2, 29, &days));
+    try std.testing.expectEqual(@as(i64, 19782), days);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_date_from_ymd(2023, 2, 29, &days));
+
+    var year: i64 = 0;
+    var month: u32 = 0;
+    var day: u32 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_date_to_ymd(19782, &year, &month, &day));
+    try std.testing.expectEqual(@as(i64, 2024), year);
+    try std.testing.expectEqual(@as(u32, 2), month);
+    try std.testing.expectEqual(@as(u32, 29), day);
+
+    var timestamp: i64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_timestamp_ms_from_parts(0, 1, &timestamp));
+    try std.testing.expectEqual(@as(i64, 1), timestamp);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_timestamp_ms_from_parts(-1, MS_PER_DAY - 1, &timestamp));
+    try std.testing.expectEqual(@as(i64, -1), timestamp);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_timestamp_ms_from_parts(0, MS_PER_DAY, &timestamp));
+
+    var subday: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_timestamp_ms_to_parts(-1, &days, &subday));
+    try std.testing.expectEqual(@as(i64, -1), days);
+    try std.testing.expectEqual(@as(u64, MS_PER_DAY - 1), subday);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_timestamp_us_from_parts(-1, US_PER_DAY - 1, &timestamp));
+    try std.testing.expectEqual(@as(i64, -1), timestamp);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_timestamp_us_to_parts(-1, &days, &subday));
+    try std.testing.expectEqual(@as(i64, -1), days);
+    try std.testing.expectEqual(@as(u64, US_PER_DAY - 1), subday);
+
+    var encoded_bool: u64 = 0;
+    var decoded_bool: u32 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_bool_encode(99, &encoded_bool));
+    try std.testing.expectEqual(@as(u64, 1), encoded_bool);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_bool_decode(encoded_bool, &decoded_bool));
+    try std.testing.expectEqual(@as(u32, 1), decoded_bool);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_bool_decode(2, &decoded_bool));
+
+    var bitmap_len: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_required_bytes(9, &bitmap_len));
+    try std.testing.expectEqual(@as(u64, 2), bitmap_len);
+    var bitmap: [2]u8 = .{ 0xff, 0xff };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_clear(&bitmap, bitmap.len));
+    try std.testing.expectEqual(@as(u8, 0), bitmap[0]);
+    try std.testing.expectEqual(@as(u8, 0), bitmap[1]);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_set(&bitmap, bitmap.len, 8, 1));
+    var is_null: u32 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_get(&bitmap, bitmap.len, 0, &is_null));
+    try std.testing.expectEqual(@as(u32, 0), is_null);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_get(&bitmap, bitmap.len, 8, &is_null));
+    try std.testing.expectEqual(@as(u32, 1), is_null);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_set(&bitmap, bitmap.len, 8, 0));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_null_bitmap_get(&bitmap, bitmap.len, 8, &is_null));
+    try std.testing.expectEqual(@as(u32, 0), is_null);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_null_bitmap_get(&bitmap, bitmap.len, 16, &is_null));
 }
 
 test "db SA ABI interns and reads string dictionaries" {

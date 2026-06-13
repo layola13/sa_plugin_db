@@ -66,6 +66,23 @@ Core native calls:
 - `sa_db_unlock`
 - `sa_db_update_u64_add`
 
+Logical ERP type helper calls:
+
+- `sa_db_decimal_from_parts`
+- `sa_db_decimal_to_parts`
+- `sa_db_date_from_ymd`
+- `sa_db_date_to_ymd`
+- `sa_db_timestamp_ms_from_parts`
+- `sa_db_timestamp_ms_to_parts`
+- `sa_db_timestamp_us_from_parts`
+- `sa_db_timestamp_us_to_parts`
+- `sa_db_bool_encode`
+- `sa_db_bool_decode`
+- `sa_db_null_bitmap_required_bytes`
+- `sa_db_null_bitmap_clear`
+- `sa_db_null_bitmap_set`
+- `sa_db_null_bitmap_get`
+
 Read-handle query calls:
 
 - `sa_db_open_read_table`
@@ -143,9 +160,13 @@ Read queries now use snapshots:
 
 Primitive type codes exported through `db.sal` match the schema compiler enum:
 `SA_DB_TYPE_I1`, `I8`, `I16`, `I32`, `I64`, `U8`, `U16`, `U32`, `U64`, `F32`,
-`F64`, `PTR`, `BLOB_HANDLE`, and `V128`. ERP code can map `i1` to boolean,
-`i64`/`u64` to scaled decimals or date/time encodings, and fixed-width columns
-to packed row buffers while higher-level decimal/date helpers are added.
+`F64`, `PTR`, `BLOB_HANDLE`, and `V128`. ERP code can keep storage primitive
+while using the logical helper ABI for common business types: decimal/money is
+encoded as scaled `i64`, date as epoch days, timestamp as epoch milliseconds or
+microseconds, boolean as normalized `0/1`, and nullable fields as a sidecar null
+bitmap. These helpers deliberately do not introduce a new physical format yet,
+so existing `i64`/`u64` indexes, range reads, projections, and fixed-width row
+buffers remain the query surface.
 
 Low-cardinality strings are supported through table-level dictionaries rather
 than variable-width string columns. `sa_db_dict_intern` / `DB_DICT_INTERN` maps a
@@ -273,6 +294,15 @@ and table removal handle it with the same consistency rules as columns and
 indexes. It is not a general varchar/blob store; it is intentionally optimized
 for stable labels that can be represented as integer IDs in fixed-width rows.
 
+The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
+`DB_DECIMAL_TO_PARTS`, `DB_DATE_FROM_YMD`, `DB_DATE_TO_YMD`,
+`DB_TIMESTAMP_MS_FROM_PARTS`, `DB_TIMESTAMP_MS_TO_PARTS`,
+`DB_TIMESTAMP_US_FROM_PARTS`, `DB_TIMESTAMP_US_TO_PARTS`, `DB_BOOL_ENCODE`,
+`DB_BOOL_DECODE`, `DB_NULL_BITMAP_REQUIRED_BYTES`, `DB_NULL_BITMAP_CLEAR`,
+`DB_NULL_BITMAP_SET`, and `DB_NULL_BITMAP_GET`. `DB_DECIMAL_FROM_PARTS(1, 1, 0,
+2)` encodes `-1.00` as `-100`, and a date such as `2024-02-29` encodes to epoch
+day `19782`; callers can build normal signed indexes over those `i64` columns.
+
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
 ERP foundation work is to extend the current single-table transaction/recovery
@@ -288,9 +318,10 @@ benchmarks. The required baseline is:
   orders, invoices/payments, and journal entries, with SQLite comparisons for
   single-threaded, concurrent, and mixed read/write workloads.
 - Typed ERP storage for signed decimals, dates/times, booleans, nullable values,
-  and dictionary-encoded strings. Primitive schema type codes are exposed and the
-  first low-cardinality string dictionary API exists; decimal/date/null helpers
-  and richer typed column families still need dedicated encode/query helpers.
+  and dictionary-encoded strings. Primitive schema type codes, low-cardinality
+  string dictionaries, and logical encode/decode helpers for decimal/date/time,
+  bool, and null bitmaps exist now; richer typed column families and nullable
+  query pushdown are next.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert, range query handles, delete by
   unique `u64` key, and single-table batch transactions exist now. Projected
@@ -324,6 +355,9 @@ Run db benchmarks:
 cd /home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test
 sa build-exe db_interface_smoke.sa -o db_interface_smoke.out --no-incremental
 ./db_interface_smoke.out
+
+sa build-exe db_type_smoke.sa -o db_type_smoke.out --no-incremental
+./db_type_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out
