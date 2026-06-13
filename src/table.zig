@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const schema = @import("schema.zig");
 
 var temp_write_counter = std.atomic.Value(u64).init(0);
+const FILE_BLOCK_BYTES: usize = 64 * 1024;
 
 pub const TableError = error{
     OutOfMemory,
@@ -42,6 +43,8 @@ pub const FileMeta = struct {
     path: []const u8,
     sha256: []const u8,
     bytes: u64,
+    block_size: u64 = 0,
+    block_sha256: [][]const u8 = &.{},
 };
 
 pub const SegmentMeta = struct {
@@ -97,11 +100,7 @@ pub const TableMeta = struct {
         }
         allocator.free(self.columns);
         for (self.segments) |segment| {
-            for (segment.files) |file| {
-                allocator.free(file.path);
-                allocator.free(file.sha256);
-            }
-            allocator.free(segment.files);
+            freeFileMetas(allocator, segment.files);
         }
         allocator.free(self.segments);
         for (self.indexes) |index| {
@@ -701,31 +700,22 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
     }
 
     const segments = try allocator.alloc(SegmentMeta, meta.segments.len);
+    initSegmentMetas(segments);
     errdefer {
         for (segments) |segment| {
-            for (segment.files) |file| {
-                allocator.free(file.path);
-                allocator.free(file.sha256);
-            }
-            allocator.free(segment.files);
+            freeFileMetas(allocator, segment.files);
         }
         allocator.free(segments);
     }
     for (meta.segments, 0..) |segment, idx| {
         const files = try allocator.alloc(FileMeta, segment.files.len);
+        initFileMetas(files);
         errdefer {
-            for (files) |file| {
-                allocator.free(file.path);
-                allocator.free(file.sha256);
-            }
+            for (files) |file| freeFileMeta(allocator, file);
             allocator.free(files);
         }
         for (segment.files, 0..) |file, file_idx| {
-            files[file_idx] = .{
-                .path = try allocator.dupe(u8, file.path),
-                .sha256 = try allocator.dupe(u8, file.sha256),
-                .bytes = file.bytes,
-            };
+            files[file_idx] = try duplicateFileMeta(allocator, file);
         }
         segments[idx] = .{
             .id = segment.id,
@@ -804,12 +794,109 @@ fn schemaHashFromFile(allocator: std.mem.Allocator, root_dir: []const u8, table_
     return try hashHexAlloc(allocator, source);
 }
 
+fn blockHashCount(byte_len: usize, block_size: usize) usize {
+    if (byte_len == 0) return 0;
+    return (byte_len + block_size - 1) / block_size;
+}
+
+fn makeBlockSha256List(allocator: std.mem.Allocator, bytes: []const u8, block_size: usize) TableError![][]const u8 {
+    const count = blockHashCount(bytes.len, block_size);
+    const out = try allocator.alloc([]const u8, count);
+    for (out) |*hash| hash.* = &.{};
+    errdefer {
+        for (out) |hash| allocator.free(hash);
+        allocator.free(out);
+    }
+
+    for (out, 0..) |*slot, idx| {
+        const start = idx * block_size;
+        const end = @min(start + block_size, bytes.len);
+        slot.* = try hashHexAlloc(allocator, bytes[start..end]);
+    }
+    return out;
+}
+
+fn freeBlockSha256List(allocator: std.mem.Allocator, hashes: [][]const u8) void {
+    for (hashes) |hash| allocator.free(hash);
+    allocator.free(hashes);
+}
+
+fn duplicateBlockSha256List(allocator: std.mem.Allocator, hashes: []const []const u8) TableError![][]const u8 {
+    const out = try allocator.alloc([]const u8, hashes.len);
+    for (out) |*hash| hash.* = &.{};
+    errdefer freeBlockSha256List(allocator, out);
+    for (hashes, 0..) |hash, idx| out[idx] = try allocator.dupe(u8, hash);
+    return out;
+}
+
 fn makeFileMeta(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!FileMeta {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const sha256 = try hashHexAlloc(allocator, bytes);
+    errdefer allocator.free(sha256);
+    const block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer freeBlockSha256List(allocator, block_sha256);
     return .{
-        .path = try allocator.dupe(u8, path),
-        .sha256 = try hashHexAlloc(allocator, bytes),
+        .path = owned_path,
+        .sha256 = sha256,
         .bytes = bytes.len,
+        .block_size = if (bytes.len == 0) 0 else FILE_BLOCK_BYTES,
+        .block_sha256 = block_sha256,
     };
+}
+
+fn freeFileMeta(allocator: std.mem.Allocator, file: FileMeta) void {
+    allocator.free(file.path);
+    allocator.free(file.sha256);
+    freeBlockSha256List(allocator, file.block_sha256);
+}
+
+fn duplicateFileMeta(allocator: std.mem.Allocator, file: FileMeta) TableError!FileMeta {
+    const path = try allocator.dupe(u8, file.path);
+    errdefer allocator.free(path);
+    const sha256 = try allocator.dupe(u8, file.sha256);
+    errdefer allocator.free(sha256);
+    const block_sha256 = try duplicateBlockSha256List(allocator, file.block_sha256);
+    errdefer freeBlockSha256List(allocator, block_sha256);
+    return .{
+        .path = path,
+        .sha256 = sha256,
+        .bytes = file.bytes,
+        .block_size = file.block_size,
+        .block_sha256 = block_sha256,
+    };
+}
+
+fn emptyFileMeta() FileMeta {
+    return .{ .path = &.{}, .sha256 = &.{}, .bytes = 0 };
+}
+
+fn initFileMetas(files: []FileMeta) void {
+    for (files) |*file| file.* = emptyFileMeta();
+}
+
+fn initSegmentMetas(segments: []SegmentMeta) void {
+    for (segments) |*segment| segment.* = .{ .id = 0, .rows = 0, .files = &.{} };
+}
+
+pub fn validateFileBlockHashes(file: FileMeta, bytes: []const u8) TableError!void {
+    if (file.block_size == 0) {
+        if (file.block_sha256.len != 0) return TableError.VerifyFailed;
+        return;
+    }
+    if (file.block_size > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
+    const block_size: usize = @intCast(file.block_size);
+    if (block_size == 0) return TableError.VerifyFailed;
+    const expected_count = blockHashCount(bytes.len, block_size);
+    if (file.block_sha256.len != expected_count) return TableError.VerifyFailed;
+    for (file.block_sha256, 0..) |expected_hash, idx| {
+        if (expected_hash.len != 64) return TableError.VerifyFailed;
+        const start = idx * block_size;
+        const end = @min(start + block_size, bytes.len);
+        const actual_hash = hashBytes(bytes[start..end]);
+        const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
+        if (!std.mem.eql(u8, actual_hex[0..], expected_hash)) return TableError.VerifyFailed;
+    }
 }
 
 fn writeSegmentFiles(
@@ -820,11 +907,9 @@ fn writeSegmentFiles(
     buffers: []std.ArrayList(u8),
 ) TableError![]FileMeta {
     const files = try allocator.alloc(FileMeta, buffers.len);
+    initFileMetas(files);
     errdefer {
-        for (files) |file| {
-            allocator.free(file.path);
-            allocator.free(file.sha256);
-        }
+        for (files) |file| freeFileMeta(allocator, file);
         allocator.free(files);
     }
 
@@ -841,10 +926,7 @@ fn writeSegmentFiles(
 }
 
 fn freeFileMetas(allocator: std.mem.Allocator, files: []FileMeta) void {
-    for (files) |file| {
-        allocator.free(file.path);
-        allocator.free(file.sha256);
-    }
+    for (files) |file| freeFileMeta(allocator, file);
     allocator.free(files);
 }
 
@@ -900,6 +982,7 @@ fn duplicateDictMetas(allocator: std.mem.Allocator, dicts: []const DictMeta) Tab
 
 fn duplicateSegmentMetas(allocator: std.mem.Allocator, segments: []const SegmentMeta) TableError![]SegmentMeta {
     const out = try allocator.alloc(SegmentMeta, segments.len);
+    initSegmentMetas(out);
     errdefer {
         for (out) |segment| {
             freeFileMetas(allocator, segment.files);
@@ -909,19 +992,13 @@ fn duplicateSegmentMetas(allocator: std.mem.Allocator, segments: []const Segment
 
     for (segments, 0..) |segment, idx| {
         const files = try allocator.alloc(FileMeta, segment.files.len);
+        initFileMetas(files);
         errdefer {
-            for (files) |file| {
-                allocator.free(file.path);
-                allocator.free(file.sha256);
-            }
+            for (files) |file| freeFileMeta(allocator, file);
             allocator.free(files);
         }
         for (segment.files, 0..) |file, file_idx| {
-            files[file_idx] = .{
-                .path = try allocator.dupe(u8, file.path),
-                .sha256 = try allocator.dupe(u8, file.sha256),
-                .bytes = file.bytes,
-            };
+            files[file_idx] = try duplicateFileMeta(allocator, file);
         }
         out[idx] = .{
             .id = segment.id,
@@ -1001,6 +1078,7 @@ fn mergeSegmentFiles(
     new_seg_id: u64,
 ) TableError![]FileMeta {
     const files = try allocator.alloc(FileMeta, meta.columns.len);
+    initFileMetas(files);
     errdefer freeFileMetas(allocator, files);
 
     for (0..meta.columns.len) |col_idx| {
@@ -1192,6 +1270,7 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
             const hash = hashBytes(bytes);
             const hex = std.fmt.bytesToHex(hash, .lower);
             if (!std.mem.eql(u8, hex[0..], file.sha256)) return TableError.VerifyFailed;
+            try validateFileBlockHashes(file, bytes);
             if (bytes.len != expected_bytes) return TableError.VerifyFailed;
         }
     }
@@ -2311,6 +2390,7 @@ fn buildAllColumnBuffers(allocator: std.mem.Allocator, root_dir: []const u8, met
             const actual_hash = hashBytes(bytes);
             const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
             if (!std.mem.eql(u8, actual_hex[0..], file_meta.sha256)) return TableError.VerifyFailed;
+            try validateFileBlockHashes(file_meta, bytes);
             try buffers[col_idx].appendSlice(bytes);
             copied_rows = std.math.add(u64, copied_rows, segment.rows) catch return TableError.CursorOverflow;
         }
@@ -4373,8 +4453,7 @@ pub fn updateU64ColumnAdd(
         }
 
         const updated_file = try rewriteColumnFileForEpoch(allocator, root_dir, file_meta.path, next_epoch, mutable);
-        allocator.free(file_meta.path);
-        allocator.free(file_meta.sha256);
+        freeFileMeta(allocator, file_meta.*);
         file_meta.* = updated_file;
         updated += local_count;
     }
@@ -4678,6 +4757,60 @@ test "table verify rejects segment byte-count metadata mismatch" {
     try writeMeta(std.testing.allocator, ".", table_name, owned);
 
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table segment files record block checksums and old metadata remains readable" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "block_checked_orders";
+    try writeFileToTemp(tmp_dir.dir, "block_checked_orders.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_QTY_STRIDE = 8 // u64
+    );
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "block_checked_orders.sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_QTY_STRIDE = 8 // u64
+    );
+
+    var ids = [_]u64{ 1, 2 };
+    var qtys = [_]u64{ 5, 8 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(qtys[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+
+    var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, FILE_BLOCK_BYTES), meta.segments[0].files[0].block_size);
+    try std.testing.expectEqual(@as(usize, 1), meta.segments[0].files[0].block_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), meta.segments[0].files[0].block_sha256[0].len);
+
+    const original_hash = try std.testing.allocator.dupe(u8, meta.segments[0].files[0].block_sha256[0]);
+    defer std.testing.allocator.free(original_hash);
+    std.testing.allocator.free(meta.segments[0].files[0].block_sha256[0]);
+    meta.segments[0].files[0].block_sha256[0] = try std.testing.allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000");
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+
+    std.testing.allocator.free(meta.segments[0].files[0].block_sha256[0]);
+    meta.segments[0].files[0].block_sha256[0] = try std.testing.allocator.dupe(u8, original_hash);
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+
+    freeBlockSha256List(std.testing.allocator, meta.segments[0].files[0].block_sha256);
+    meta.segments[0].files[0].block_sha256 = try std.testing.allocator.alloc([]const u8, 0);
+    meta.segments[0].files[0].block_size = 0;
+    try writeMeta(std.testing.allocator, ".", table_name, meta);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
 }
 
 test "table string dictionary is persisted snapshotted restored and verified" {

@@ -200,11 +200,14 @@ metadata file (`<table>.meta.<epoch>`). Mutating existing column data writes a n
 versioned column file and then advances the manifest, so a crash before manifest
 replacement leaves the previous epoch readable. Qmod read/write paths use the
 same active-manifest protocol as the public table APIs. Segment metadata records
-SHA-256 and byte counts. U64, I64, U64-pair index files and string dictionary
+whole-file SHA-256, byte counts, and 64KB block-level SHA-256 lists for newly
+written column segment files. Older metadata without block hashes remains
+readable, but new segment writes include block hashes and verification checks
+them. U64, I64, U64-pair index files and string dictionary
 files are also versioned, hashed, snapshotted, restored, and verified. Indexes are rebuilt on
 ingest/update/compact/qmod writes. Verification checks schema hash, segment hash,
-index hash, index shape/order, dictionary hash, recorded size, dictionary entry count, and the
-expected `rows * column_stride` size. `recover` scans versioned metadata files
+segment block hashes, index hash, index shape/order, dictionary hash, recorded
+size, dictionary entry count, and the expected `rows * column_stride` size. `recover` scans versioned metadata files
 and rebuilds the manifest to the highest valid epoch, which covers corrupted or
 missing manifest files after an interrupted commit.
 Single-table transactions add explicit recovery markers: commit writes
@@ -295,8 +298,9 @@ benchmarks. The required baseline is:
 - Generalized primary-key and secondary indexes beyond the current persisted
   `u64`, `i64`, and first `u64_pair` index shapes, including date/customer/product
   filters and broader inventory/order workflows.
-- Remaining crash-recovery hardening such as block checksums and fault-injection
-  tests, then multi-table transaction semantics, optional WAL, and async batch flush.
+- Remaining crash-recovery hardening such as index/dictionary block hashes and
+  fault-injection tests, then multi-table transaction semantics, optional WAL,
+  and async batch flush.
 - mmap snapshots, block min/max indexes, predicate pushdown, and later SIMD
   aggregation as performance work after the reliability/data-model baseline.
 

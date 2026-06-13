@@ -258,6 +258,13 @@ fn readActiveTableMetaSource(allocator: std.mem.Allocator, table_name: []const u
     return table_mod.readActiveMetaSource(allocator, ".", table_name) catch |err| return mapTableError(err);
 }
 
+fn validateQmodFileBytes(file_meta: table_mod.FileMeta, bytes: []const u8) ExecError!void {
+    if (bytes.len != file_meta.bytes) return ExecError.SnapshotCorrupted;
+    const actual_hash = hashHex(bytes);
+    if (!std.mem.eql(u8, actual_hash[0..], file_meta.sha256)) return ExecError.SnapshotCorrupted;
+    table_mod.validateFileBlockHashes(file_meta, bytes) catch |err| return mapTableError(err);
+}
+
 fn ensureRegistryDir() ExecError!void {
     std.fs.cwd().makePath(".sa/db/qmods") catch return ExecError.InvalidPath;
 }
@@ -683,9 +690,7 @@ fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError
             const file_meta = segment.files[col_idx];
             const bytes = try readFileAlloc(allocator, file_meta.path, 1 << 30);
             defer allocator.free(bytes);
-            if (bytes.len != file_meta.bytes) return ExecError.SnapshotCorrupted;
-            const actual_hash = hashHex(bytes);
-            if (!std.mem.eql(u8, actual_hash[0..], file_meta.sha256)) return ExecError.SnapshotCorrupted;
+            try validateQmodFileBytes(file_meta, bytes);
             if (bytes.len != segment.rows * meta_column.stride) return ExecError.SnapshotCorrupted;
             merged.appendSlice(bytes) catch return ExecError.OutOfMemory;
         }
@@ -739,9 +744,7 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
             const file_meta = segment_meta.files[col_idx];
             const bytes = try readFileAlloc(allocator, file_meta.path, 1 << 30);
             errdefer allocator.free(bytes);
-            if (bytes.len != file_meta.bytes) return ExecError.SnapshotCorrupted;
-            const actual_hash = hashHex(bytes);
-            if (!std.mem.eql(u8, actual_hash[0..], file_meta.sha256)) return ExecError.SnapshotCorrupted;
+            try validateQmodFileBytes(file_meta, bytes);
             if (bytes.len != segment_meta.rows * meta_column.stride) return ExecError.SnapshotCorrupted;
             segments[seg_idx] = .{ .path = file_meta.path, .rows = segment_meta.rows, .bytes = bytes };
         }
@@ -1342,6 +1345,18 @@ fn evalAtomicRmwAdd(line: []const u8, values: *ValueMap, cursors: *std.StringHas
     return .{ .dst = dst, .old = old };
 }
 
+fn fileMetasEqual(current: table_mod.FileMeta, expected: table_mod.FileMeta) bool {
+    if (!std.mem.eql(u8, current.path, expected.path)) return false;
+    if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
+    if (current.bytes != expected.bytes) return false;
+    if (current.block_size != expected.block_size) return false;
+    if (current.block_sha256.len != expected.block_sha256.len) return false;
+    for (current.block_sha256, expected.block_sha256) |current_hash, expected_hash| {
+        if (!std.mem.eql(u8, current_hash, expected_hash)) return false;
+    }
+    return true;
+}
+
 fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!bool {
     const meta_bytes = try readActiveTableMetaSource(allocator, write_table.parsed.value.table_name);
     defer allocator.free(meta_bytes);
@@ -1367,9 +1382,7 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
         if (current_segment.id != expected_segment.id or current_segment.rows != expected_segment.rows) return false;
         if (current_segment.files.len != expected_segment.files.len) return false;
         for (current_segment.files, expected_segment.files) |current_file, expected_file| {
-            if (!std.mem.eql(u8, current_file.path, expected_file.path)) return false;
-            if (!std.mem.eql(u8, current_file.sha256, expected_file.sha256)) return false;
-            if (current_file.bytes != expected_file.bytes) return false;
+            if (!fileMetasEqual(current_file, expected_file)) return false;
         }
     }
     for (current.value.indexes, expected.indexes) |current_index, expected_index| {
@@ -1396,6 +1409,14 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
         for (owned_hashes.items) |hash| allocator.free(hash);
         owned_hashes.deinit();
     }
+    var owned_block_hashes = std.ArrayList([][]const u8).init(allocator);
+    defer {
+        for (owned_block_hashes.items) |hashes| {
+            for (hashes) |hash| allocator.free(hash);
+            allocator.free(hashes);
+        }
+        owned_block_hashes.deinit();
+    }
     for (write_table.columns) |*column| {
         for (column.segments) |*segment| {
             if (segment.dirty) any_dirty = true;
@@ -1412,11 +1433,15 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
             errdefer {
                 allocator.free(file_meta.path);
                 allocator.free(file_meta.sha256);
+                for (file_meta.block_sha256) |hash| allocator.free(hash);
+                allocator.free(file_meta.block_sha256);
             }
             owned_paths.append(file_meta.path) catch return ExecError.OutOfMemory;
             errdefer _ = owned_paths.pop();
             owned_hashes.append(file_meta.sha256) catch return ExecError.OutOfMemory;
             errdefer _ = owned_hashes.pop();
+            owned_block_hashes.append(file_meta.block_sha256) catch return ExecError.OutOfMemory;
+            errdefer _ = owned_block_hashes.pop();
             const target = &write_table.parsed.value.segments[seg_idx].files[col_idx];
             target.* = file_meta;
             segment.path = target.path;
@@ -2771,6 +2796,55 @@ test "qmod exec rejects corrupted table snapshot segment" {
     try std.testing.expectError(ExecError.SnapshotCorrupted, execQuery(std.testing.allocator, hash_hex, null));
 }
 
+test "qmod exec rejects table snapshot block checksum metadata drift" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\1
+        \\2
+    );
+    _ = try table_mod.ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    var query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\value = load col_id+0 as u64
+        \\return value
+    );
+
+    var result = try registerQuery(std.testing.allocator, "sum.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    var meta = try table_mod.loadActiveMeta(std.testing.allocator, ".", "simple");
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expect(meta.segments[0].files[0].block_sha256.len > 0);
+    std.testing.allocator.free(meta.segments[0].files[0].block_sha256[0]);
+    meta.segments[0].files[0].block_sha256[0] = try std.testing.allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000");
+    try table_mod.commitTableMetaUnlocked(std.testing.allocator, ".", "simple", meta);
+
+    try std.testing.expectError(ExecError.SnapshotCorrupted, execQuery(std.testing.allocator, hash_hex, null));
+}
+
 test "qmod exec rejects corrupted table snapshot metadata" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();
@@ -3409,6 +3483,44 @@ test "qmod write commit rejects stale table metadata" {
     const read_column = findColumn(read_table, "id") orelse return ExecError.InvalidFormat;
     try std.testing.expectEqual(@as(u64, 5), try loadColumnValue(read_column.*, 0));
     try std.testing.expectEqual(@as(u64, 6), try loadColumnValue(read_column.*, 8));
+}
+
+test "qmod write commit rejects stale block checksum metadata" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\5
+    );
+    _ = try table_mod.ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    var write_table = try loadWriteTable(std.testing.allocator, "simple");
+    defer write_table.deinit(std.testing.allocator);
+    const id_column = findWriteColumn(&write_table, "id") orelse return ExecError.InvalidFormat;
+    try storeColumnValue(id_column, 0, 9);
+
+    var meta = try table_mod.loadActiveMeta(std.testing.allocator, ".", "simple");
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expect(meta.segments[0].files[0].block_sha256.len > 0);
+    std.testing.allocator.free(meta.segments[0].files[0].block_sha256[0]);
+    meta.segments[0].files[0].block_sha256[0] = try std.testing.allocator.dupe(u8, "1111111111111111111111111111111111111111111111111111111111111111");
+    try table_mod.commitTableMetaUnlocked(std.testing.allocator, ".", "simple", meta);
+
+    try std.testing.expectError(ExecError.StaleMetadata, commitWriteTable(std.testing.allocator, &write_table));
 }
 
 test "qmod exec filters u64 DB column values" {
