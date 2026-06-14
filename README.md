@@ -44,6 +44,8 @@ Core native calls:
 - `sa_db_insert_row`
 - `sa_db_upsert_row_u64_key`
 - `sa_db_update_row_u64_key`
+- `sa_db_upsert_row_u64_pair_key`
+- `sa_db_update_row_u64_pair_key`
 - `sa_db_tx_begin`
 - `sa_db_tx_insert_row`
 - `sa_db_tx_dict_intern`
@@ -51,6 +53,9 @@ Core native calls:
 - `sa_db_tx_upsert_row_u64_key`
 - `sa_db_tx_update_row_u64_key`
 - `sa_db_tx_delete_u64_key`
+- `sa_db_tx_upsert_row_u64_pair_key`
+- `sa_db_tx_update_row_u64_pair_key`
+- `sa_db_tx_delete_u64_pair_key`
 - `sa_db_tx_commit`
 - `sa_db_tx_rollback`
 - `sa_db_create_u64_index`
@@ -82,6 +87,7 @@ Core native calls:
 - `sa_db_blob_value_len_handle`
 - `sa_db_blob_value_copy_handle`
 - `sa_db_delete_u64_key`
+- `sa_db_delete_u64_pair_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
 - `sa_db_recover`
@@ -255,10 +261,14 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_F64_HANDLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
-`DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
+`DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`,
+`DB_UPSERT_ROW_U64_PAIR_KEY`, `DB_UPDATE_ROW_U64_PAIR_KEY`,
+`DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
-`DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
-`DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
+`DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`,
+`DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`,
+`DB_TX_DELETE_U64_PAIR_KEY`, `DB_TX_COMMIT`, `DB_TX_ROLLBACK`,
+`DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
 `DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_F32_INDEX`,
 `DB_CREATE_F64_INDEX`, `DB_CREATE_U64_PAIR_INDEX`, `DB_CREATE_U64_I64_PAIR_INDEX`,
@@ -271,7 +281,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_BLOB_VALUE_COPY_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`,
 `DB_FILTER_BLOB_CONTAINS_HANDLE`, `DB_FILTER_BLOB_TOKEN_HANDLE`,
 `DB_FILTER_BLOB_PREFIX_HANDLE`,
-`DB_DELETE_U64_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
+`DB_DELETE_U64_KEY`, `DB_DELETE_U64_PAIR_KEY`, `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_MIN_U8_HANDLE`, `DB_MAX_U8_HANDLE`,
 `DB_MIN_I8_HANDLE`, `DB_MAX_I8_HANDLE`, `DB_MIN_U16_HANDLE`, `DB_MAX_U16_HANDLE`,
 `DB_MIN_I16_HANDLE`, `DB_MAX_I16_HANDLE`, `DB_MIN_F32_HANDLE`, `DB_MAX_F32_HANDLE`,
@@ -625,10 +635,11 @@ persisted `u64` indexes.
 `sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
 returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, and
-`DB_TX_DELETE_U64_KEY` mutate a transaction
-image; no new table epoch or manifest is published until `sa_db_tx_commit` /
-`DB_TX_COMMIT`. Commit writes changed row segments when needed, versioned
-dictionary/blob artifacts referenced by the transaction metadata, rebuilds all
+`DB_TX_DELETE_U64_KEY`, plus the composite-key forms
+`DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`, and
+`DB_TX_DELETE_U64_PAIR_KEY`, mutate a transaction image; no new table epoch or
+manifest is published until `sa_db_tx_commit` / `DB_TX_COMMIT`. Commit writes
+changed row segments when needed, versioned dictionary/blob artifacts referenced by the transaction metadata, rebuilds all
 persisted indexes, then advances the active manifest once. Dictionary-only and
 blob-only transactions are valid and advance the epoch without rewriting row
 segments. A pending/commit marker pair
@@ -649,6 +660,15 @@ same indexed ingest path and `out_inserted` is `1`. The `expected` key must matc
 the `u64` value encoded in the row's key column, otherwise the call returns
 `SA_DB_ERR_INVALID_FORMAT` without committing a new epoch.
 
+`sa_db_upsert_row_u64_pair_key` / `DB_UPSERT_ROW_U64_PAIR_KEY` applies the same
+strict row-write contract to a unique `u64_pair` index. The row's two key
+columns must match `(key1, key2)`, and the table must already have a unique
+`sa_db_create_u64_pair_index(..., unique=1)` index over those columns. This is
+the ERP child-row primary-key path for shapes such as `(order_id, line_no)` or
+`(product_id, warehouse_id)`: existing tuples are replaced with
+`out_inserted=0`, missing tuples are appended with `out_inserted=1`, and all
+persisted indexes are rebuilt for the new epoch.
+
 `sa_db_update_row_u64_key` / `DB_UPDATE_ROW_U64_KEY` is the strict update form
 for ERP screens that must not accidentally insert a new customer, order, item,
 or ledger row. It has the same fixed-width row layout and unique-key requirement
@@ -656,11 +676,23 @@ as upsert, but it returns `SA_DB_ERR_NOT_FOUND` when the key is absent and never
 appends. `sa_db_tx_update_row_u64_key` / `DB_TX_UPDATE_ROW_U64_KEY` provides the
 same semantics inside a single-table transaction image.
 
+`sa_db_update_row_u64_pair_key` / `DB_UPDATE_ROW_U64_PAIR_KEY` is the strict
+composite-key update form and never inserts a missing tuple. The transaction
+variant `sa_db_tx_update_row_u64_pair_key` /
+`DB_TX_UPDATE_ROW_U64_PAIR_KEY` works against the transaction image, so ERP
+screens can modify multiple child rows and commit or roll them back together.
+
 `sa_db_delete_u64_key` / `DB_DELETE_U64_KEY` deletes one row by a unique `u64`
 key. The target column must already have a unique `u64` index, so the operation
 has primary-key semantics instead of deleting an arbitrary non-unique match. The
 delete rewrites the remaining rows into a new column segment, rebuilds indexes,
 advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
+
+`sa_db_delete_u64_pair_key` / `DB_DELETE_U64_PAIR_KEY` deletes one row by a
+unique `(u64, u64)` tuple. `sa_db_tx_delete_u64_pair_key` /
+`DB_TX_DELETE_U64_PAIR_KEY` provides the same behavior inside a write
+transaction. This covers deleting one order line or one inventory-balance row
+without scanning the whole child table.
 
 `sa_db_dict_intern` / `DB_DICT_INTERN` provides the first string data-model layer
 for ERP fields with small repeated value sets. `sa_db_tx_dict_intern` /
@@ -730,8 +762,9 @@ benchmarks. The required baseline is:
   token, prefix, and trigram contains indexes cover high-frequency equality and
   text predicates.
 - Row-oriented public operations on top of the column store: fixed-width insert,
-  read by row index or unique `u64` key, upsert, range query handles, delete by
-  unique `u64` key, and single-table batch transactions exist now. Projected
+  read by row index or unique `u64` key, upsert/update/delete by unique `u64`
+  key or unique `(u64, u64)` tuple, range query handles, and single-table batch
+  transactions exist now. Projected
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
   prefix, and contains filters plus fixed-first-key `u64_pair` and
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
