@@ -221,6 +221,7 @@ Read-handle query calls:
 - `sa_db_plan_u64_blob_eq_handle`
 - `sa_db_plan_i64_blob_eq_handle`
 - `sa_db_plan_u64_i64_blob_eq_handle`
+- `sa_db_plan_u64_i64_bool_handle`
 - `sa_db_filter_rows_f32_range_handle`
 - `sa_db_filter_rows_f64_range_handle`
 - `sa_db_filter_rows_u32_range_handle`
@@ -315,6 +316,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_PLAN_U64_U64_RANGES_HANDLE`, `DB_PLAN_I64_I64_RANGES_HANDLE`,
 `DB_PLAN_U64_BLOB_EQ_HANDLE`, `DB_PLAN_I64_BLOB_EQ_HANDLE`,
 `DB_PLAN_U64_I64_BLOB_EQ_HANDLE`,
+`DB_PLAN_U64_I64_BOOL_HANDLE`,
 `DB_FILTER_ROWS_U32_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I32_RANGE_HANDLE`, `DB_FILTER_ROWS_U8_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I8_RANGE_HANDLE`, `DB_FILTER_ROWS_U16_RANGE_HANDLE`,
@@ -654,14 +656,16 @@ codes plus amount/date ranges, two dictionary/status predicates, two signed
 amount/date/timestamp ranges, and numeric range plus exact text/blob business
 keys such as status/doc-type or due-date/business-code. Broader shapes still use
 the explicit building blocks above.
-For the common ERP three-filter list shape, `sa_db_plan_u64_i64_blob_eq_handle` /
-`DB_PLAN_U64_I64_BLOB_EQ_HANDLE` estimates a `u64` range, an `i64` range, and an
-exact text/blob predicate, then orders all three by candidate count before
-filtering. It returns `SaDbPlan3Info` (`written`, `total`, and three
-`predicate`/`total` pairs). Predicate ids are `1` for the `u64` range, `2` for
-the `i64` range, and `3` for the `blob_eq` predicate. This covers list pages such
-as status + due date + document type without forcing SA code to materialize and
-intersect three row-id lists manually.
+For common ERP three-filter list shapes, `sa_db_plan_u64_i64_blob_eq_handle` /
+`DB_PLAN_U64_I64_BLOB_EQ_HANDLE` and `sa_db_plan_u64_i64_bool_handle` /
+`DB_PLAN_U64_I64_BOOL_HANDLE` estimate a `u64` range, an `i64` range, and either
+an exact text/blob predicate or a bool predicate, then order all three by
+candidate count before filtering. They return `SaDbPlan3Info` (`written`,
+`total`, and three `predicate`/`total` pairs). Predicate ids are `1` for the
+`u64` range, `2` for the `i64` range, and `3` for `blob_eq` in the blob planner
+or `bool` in the bool planner. This covers list pages such as status + due date
+plus document type or status + due date plus posted/active flag without forcing
+SA code to materialize and intersect three row-id lists manually.
 `sa_db_filter_rows_blob_eq_handle` / `DB_FILTER_ROWS_BLOB_EQ_HANDLE`,
 `sa_db_filter_rows_blob_contains_handle` / `DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE`,
 `sa_db_filter_rows_blob_token_handle` / `DB_FILTER_ROWS_BLOB_TOKEN_HANDLE`, and
@@ -1006,8 +1010,8 @@ benchmarks. The required baseline is:
   intersection/union/exclusion compose independently indexed result sets for
   AND/OR/not-in filters, two-predicate planners choose the smaller indexed side
   automatically for `u64+i64`, `u64+u64`, `i64+i64`, `u64+blob_eq`, and
-  `i64+blob_eq` shapes, the first three-predicate planner covers
-  `u64+i64+blob_eq`, and candidate row sorting covers integer and finite float
+  `i64+blob_eq` shapes, three-predicate planners cover `u64+i64+blob_eq` and
+  `u64+i64+bool`, and candidate row sorting covers integer and finite float
   list ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
@@ -1094,6 +1098,9 @@ sa build-exe db_planner_smoke.sa -o db_planner_smoke.out --no-incremental
 
 sa build-exe db_blob_planner_smoke.sa -o db_blob_planner_smoke.out --no-incremental
 ./db_blob_planner_smoke.out
+
+sa build-exe db_bool_planner_smoke.sa -o db_bool_planner_smoke.out --no-incremental
+./db_bool_planner_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out

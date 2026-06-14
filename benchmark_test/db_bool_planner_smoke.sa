@@ -1,0 +1,322 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"bool_planner_orders"
+@const SCHEMA_PATH = utf8:"bool_planner_orders.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_DUE_DAY_STRIDE = 8 // i64 date\n#def COL_POSTED_STRIDE = 1 // u8 bool\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 19
+#def SCHEMA_PATH_LEN = 31
+#def SCHEMA_LEN = 160
+#def ROW_BYTES = 25
+#def ROWS_CAP = 6
+#def ROWS_BYTES = 48
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    plan3_info = stack_alloc SaDbPlan3Info_SIZE
+    row = alloc ROW_BYTES
+    plan_rows = alloc ROWS_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+
+    store row+0, 100 as u64
+    store row+8, 1 as u64
+    store row+16, -5 as i64
+    store row+24, 1 as u8
+    EXPAND DB_INSERT_ROW insert0_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 101 as u64
+    store row+8, 2 as u64
+    store row+16, 0 as i64
+    store row+24, 1 as u8
+    EXPAND DB_INSERT_ROW insert1_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 102 as u64
+    store row+8, 2 as u64
+    store row+16, 10 as i64
+    store row+24, 0 as u8
+    EXPAND DB_INSERT_ROW insert2_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 103 as u64
+    store row+8, 2 as u64
+    store row+16, -3 as i64
+    store row+24, 1 as u8
+    EXPAND DB_INSERT_ROW insert3_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 104 as u64
+    store row+8, 1 as u64
+    store row+16, 20 as i64
+    store row+24, 1 as u8
+    EXPAND DB_INSERT_ROW insert4_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 105 as u64
+    store row+8, 2 as u64
+    store row+16, 25 as i64
+    store row+24, 1 as u8
+    EXPAND DB_INSERT_ROW insert5_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+
+    EXPAND DB_CREATE_U64_INDEX status_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
+    EXPAND DB_CREATE_I64_INDEX due_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_PLAN_U64_I64_BOOL_HANDLE i64_first_status, plan_rows, ROWS_CAP, plan3_info, read_handle, 1, 2, 2, 2, 0, 20, 3, 1, 0, ROWS_CAP
+    EXPAND DB_PLAN3_INFO_WRITTEN i64_first_written, plan3_info
+    EXPAND DB_PLAN3_INFO_TOTAL i64_first_total, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_PREDICATE i64_first_first_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_TOTAL i64_first_first_total, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_PREDICATE i64_first_second_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_TOTAL i64_first_second_total, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_PREDICATE i64_first_third_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_TOTAL i64_first_third_total, plan3_info
+    i64_first_row0 = load plan_rows+0 as u64
+
+    EXPAND DB_PLAN_U64_I64_BOOL_HANDLE bool_first_status, plan_rows, ROWS_CAP, plan3_info, read_handle, 1, 2, 2, 2, -5, 25, 3, 0, 0, ROWS_CAP
+    EXPAND DB_PLAN3_INFO_WRITTEN bool_first_written, plan3_info
+    EXPAND DB_PLAN3_INFO_TOTAL bool_first_total, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_PREDICATE bool_first_first_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_TOTAL bool_first_first_total, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_PREDICATE bool_first_second_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_TOTAL bool_first_second_total, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_PREDICATE bool_first_third_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_TOTAL bool_first_third_total, plan3_info
+    bool_first_row0 = load plan_rows+0 as u64
+
+    EXPAND DB_PLAN_U64_I64_BOOL_HANDLE u64_first_page_status, plan_rows, ROWS_CAP, plan3_info, read_handle, 1, 1, 1, 2, -5, 25, 3, 1, 1, 1
+    EXPAND DB_PLAN3_INFO_WRITTEN u64_first_page_written, plan3_info
+    EXPAND DB_PLAN3_INFO_TOTAL u64_first_page_total, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_PREDICATE u64_first_page_first_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_TOTAL u64_first_page_first_total, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_PREDICATE u64_first_page_second_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_TOTAL u64_first_page_second_total, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_PREDICATE u64_first_page_third_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_TOTAL u64_first_page_third_total, plan3_info
+    u64_first_page_row0 = load plan_rows+0 as u64
+
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_insert0 = eq insert0_status, SA_DB_OK
+    ok_insert1 = eq insert1_status, SA_DB_OK
+    ok_insert2 = eq insert2_status, SA_DB_OK
+    ok_insert3 = eq insert3_status, SA_DB_OK
+    ok_insert4 = eq insert4_status, SA_DB_OK
+    ok_insert5 = eq insert5_status, SA_DB_OK
+    ok_status_index = eq status_index_status, SA_DB_OK
+    ok_due_index = eq due_index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_i64_first_status = eq i64_first_status, SA_DB_OK
+    ok_i64_first_written = eq i64_first_written, 1
+    ok_i64_first_total = eq i64_first_total, 1
+    ok_i64_first_first_predicate = eq i64_first_first_predicate, 2
+    ok_i64_first_first_total = eq i64_first_first_total, 3
+    ok_i64_first_second_predicate = eq i64_first_second_predicate, 1
+    ok_i64_first_second_total = eq i64_first_second_total, 4
+    ok_i64_first_third_predicate = eq i64_first_third_predicate, 3
+    ok_i64_first_third_total = eq i64_first_third_total, 5
+    ok_i64_first_row0 = eq i64_first_row0, 1
+    ok_bool_first_status = eq bool_first_status, SA_DB_OK
+    ok_bool_first_written = eq bool_first_written, 1
+    ok_bool_first_total = eq bool_first_total, 1
+    ok_bool_first_first_predicate = eq bool_first_first_predicate, 3
+    ok_bool_first_first_total = eq bool_first_first_total, 1
+    ok_bool_first_second_predicate = eq bool_first_second_predicate, 1
+    ok_bool_first_second_total = eq bool_first_second_total, 4
+    ok_bool_first_third_predicate = eq bool_first_third_predicate, 2
+    ok_bool_first_third_total = eq bool_first_third_total, 6
+    ok_bool_first_row0 = eq bool_first_row0, 2
+    ok_u64_first_page_status = eq u64_first_page_status, SA_DB_OK
+    ok_u64_first_page_written = eq u64_first_page_written, 1
+    ok_u64_first_page_total = eq u64_first_page_total, 2
+    ok_u64_first_page_first_predicate = eq u64_first_page_first_predicate, 1
+    ok_u64_first_page_first_total = eq u64_first_page_first_total, 2
+    ok_u64_first_page_second_predicate = eq u64_first_page_second_predicate, 3
+    ok_u64_first_page_second_total = eq u64_first_page_second_total, 5
+    ok_u64_first_page_third_predicate = eq u64_first_page_third_predicate, 2
+    ok_u64_first_page_third_total = eq u64_first_page_third_total, 6
+    ok_u64_first_page_row0 = eq u64_first_page_row0, 4
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_insert0
+    ok03 = and ok02, ok_insert1
+    ok04 = and ok03, ok_insert2
+    ok05 = and ok04, ok_insert3
+    ok06 = and ok05, ok_insert4
+    ok07 = and ok06, ok_insert5
+    ok08 = and ok07, ok_status_index
+    ok09 = and ok08, ok_due_index
+    ok10 = and ok09, ok_open
+    ok11 = and ok10, ok_i64_first_status
+    ok12 = and ok11, ok_i64_first_written
+    ok13 = and ok12, ok_i64_first_total
+    ok14 = and ok13, ok_i64_first_first_predicate
+    ok15 = and ok14, ok_i64_first_first_total
+    ok16 = and ok15, ok_i64_first_second_predicate
+    ok17 = and ok16, ok_i64_first_second_total
+    ok18 = and ok17, ok_i64_first_third_predicate
+    ok19 = and ok18, ok_i64_first_third_total
+    ok20 = and ok19, ok_i64_first_row0
+    ok21 = and ok20, ok_bool_first_status
+    ok22 = and ok21, ok_bool_first_written
+    ok23 = and ok22, ok_bool_first_total
+    ok24 = and ok23, ok_bool_first_first_predicate
+    ok25 = and ok24, ok_bool_first_first_total
+    ok26 = and ok25, ok_bool_first_second_predicate
+    ok27 = and ok26, ok_bool_first_second_total
+    ok28 = and ok27, ok_bool_first_third_predicate
+    ok29 = and ok28, ok_bool_first_third_total
+    ok30 = and ok29, ok_bool_first_row0
+    ok31 = and ok30, ok_u64_first_page_status
+    ok32 = and ok31, ok_u64_first_page_written
+    ok33 = and ok32, ok_u64_first_page_total
+    ok34 = and ok33, ok_u64_first_page_first_predicate
+    ok35 = and ok34, ok_u64_first_page_first_total
+    ok36 = and ok35, ok_u64_first_page_second_predicate
+    ok37 = and ok36, ok_u64_first_page_second_total
+    ok38 = and ok37, ok_u64_first_page_third_predicate
+    ok39 = and ok38, ok_u64_first_page_third_total
+    ok40 = and ok39, ok_u64_first_page_row0
+    ok41 = and ok40, ok_close
+    ok = and ok41, ok_verify
+
+    !remove_status
+    !init_status
+    !insert0_status
+    !insert1_status
+    !insert2_status
+    !insert3_status
+    !insert4_status
+    !insert5_status
+    !status_index_status
+    !due_index_status
+    !open_status
+    !read_handle
+    !i64_first_status
+    !i64_first_written
+    !i64_first_total
+    !i64_first_first_predicate
+    !i64_first_first_total
+    !i64_first_second_predicate
+    !i64_first_second_total
+    !i64_first_third_predicate
+    !i64_first_third_total
+    !i64_first_row0
+    !bool_first_status
+    !bool_first_written
+    !bool_first_total
+    !bool_first_first_predicate
+    !bool_first_first_total
+    !bool_first_second_predicate
+    !bool_first_second_total
+    !bool_first_third_predicate
+    !bool_first_third_total
+    !bool_first_row0
+    !u64_first_page_status
+    !u64_first_page_written
+    !u64_first_page_total
+    !u64_first_page_first_predicate
+    !u64_first_page_first_total
+    !u64_first_page_second_predicate
+    !u64_first_page_second_total
+    !u64_first_page_third_predicate
+    !u64_first_page_third_total
+    !u64_first_page_row0
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_insert0
+    !ok_insert1
+    !ok_insert2
+    !ok_insert3
+    !ok_insert4
+    !ok_insert5
+    !ok_status_index
+    !ok_due_index
+    !ok_open
+    !ok_i64_first_status
+    !ok_i64_first_written
+    !ok_i64_first_total
+    !ok_i64_first_first_predicate
+    !ok_i64_first_first_total
+    !ok_i64_first_second_predicate
+    !ok_i64_first_second_total
+    !ok_i64_first_third_predicate
+    !ok_i64_first_third_total
+    !ok_i64_first_row0
+    !ok_bool_first_status
+    !ok_bool_first_written
+    !ok_bool_first_total
+    !ok_bool_first_first_predicate
+    !ok_bool_first_first_total
+    !ok_bool_first_second_predicate
+    !ok_bool_first_second_total
+    !ok_bool_first_third_predicate
+    !ok_bool_first_third_total
+    !ok_bool_first_row0
+    !ok_u64_first_page_status
+    !ok_u64_first_page_written
+    !ok_u64_first_page_total
+    !ok_u64_first_page_first_predicate
+    !ok_u64_first_page_first_total
+    !ok_u64_first_page_second_predicate
+    !ok_u64_first_page_second_total
+    !ok_u64_first_page_third_predicate
+    !ok_u64_first_page_third_total
+    !ok_u64_first_page_row0
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !row
+    !plan_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9017)
