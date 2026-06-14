@@ -761,6 +761,214 @@ pub export fn sa_db_update_row_i32_key(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_upsert_row_u8_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_update_row_u8_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_upsert_row_i8_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_update_row_i8_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_upsert_row_u16_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_update_row_u16_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_upsert_row_i16_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_update_row_i16_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_upsert_row_i64_key(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -1146,6 +1354,170 @@ pub export fn sa_db_tx_update_row_i32_key(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_tx_upsert_row_u8_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const result = table.writeTransactionUpsertRawRowU8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_u8_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowU8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_upsert_row_i8_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const result = table.writeTransactionUpsertRawRowI8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_i8_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i8,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowI8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_upsert_row_u16_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const result = table.writeTransactionUpsertRawRowU16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_u16_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowU16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_upsert_row_i16_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const result = table.writeTransactionUpsertRawRowI16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_i16_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i16,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowI16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_tx_upsert_row_i64_key(
     handle: ?*anyopaque,
     column_index: u64,
@@ -1323,6 +1695,66 @@ pub export fn sa_db_tx_delete_i32_key(
     defer tx_handle_mutex.unlock();
     const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteI32Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_delete_u8_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u8,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionDeleteU8Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_delete_i8_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i8,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionDeleteI8Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_delete_u16_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u16,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionDeleteU16Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_delete_i16_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i16,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionDeleteI16Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -2016,6 +2448,90 @@ pub export fn sa_db_delete_i32_key(
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
     const info = table.deleteI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_delete_u8_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u8,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.deleteU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_delete_i8_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i8,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.deleteI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_delete_u16_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u16,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.deleteU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_delete_i16_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i16,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.deleteI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -5403,6 +5919,246 @@ test "db SA ABI writes rows by u32 and i32 keys" {
         try std.testing.expectEqual(@as(u64, 0), found);
         try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
         try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "i32_write_adjustments".ptr, "i32_write_adjustments".len, &info));
+    }
+}
+
+test "db SA ABI writes rows by u8 i8 u16 and i16 keys" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    var info: SaDbTableInfo = undefined;
+
+    {
+        const schema_source =
+            \\#def MAX_ROWS = 8
+            \\#def COL_CHANNEL_ID_STRIDE = 1 // u8
+            \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+        ;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "u8_write_channels.sadb-schema".ptr, "u8_write_channels.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+        var channel_ids = [_]u8{ 1, 2, 3 };
+        var totals = [_]i64{ 1000, 2000, 3000 };
+        const cols = [_]SaDbColumnInput{
+            .{ .data = @ptrCast(&channel_ids), .len = @sizeOf(@TypeOf(channel_ids)) },
+            .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+        };
+        try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, channel_ids.len, &cols, cols.len, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_create_u8_index(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, 0, 1, &info));
+
+        var row: [9]u8 = undefined;
+        row[0] = 2;
+        std.mem.writeInt(i64, row[1..9], 2200, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_update_row_u8_key(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, 0, 2, &row, row.len, &info));
+
+        var inserted: u64 = 99;
+        row[0] = 4;
+        std.mem.writeInt(i64, row[1..9], 4000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_u8_key(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, 0, 4, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 1), inserted);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_delete_u8_key(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, 0, 3, &info));
+
+        var tx_handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, &tx_handle));
+        row[0] = 2;
+        std.mem.writeInt(i64, row[1..9], 2500, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_u8_key(tx_handle, 0, 2, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 0), inserted);
+        row[0] = 4;
+        std.mem.writeInt(i64, row[1..9], 4400, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_u8_key(tx_handle, 0, 4, &row, row.len, &info));
+        row[0] = 5;
+        std.mem.writeInt(i64, row[1..9], 5000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_u8_key(tx_handle, 0, 5, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_delete_u8_key(tx_handle, 0, 1, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+        try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "u8_write_channels".ptr, "u8_write_channels".len, &handle));
+        var found: u64 = 0;
+        var row_index: u64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_find_u8_handle(handle, 0, 2, &found, &row_index));
+        try std.testing.expectEqual(@as(u64, 1), found);
+        var total: i64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 1, row_index, &total));
+        try std.testing.expectEqual(@as(i64, 2500), total);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    }
+
+    {
+        const schema_source =
+            \\#def MAX_ROWS = 8
+            \\#def COL_ADJUSTMENT_STRIDE = 1 // i8
+            \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+        ;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "i8_write_adjustments.sadb-schema".ptr, "i8_write_adjustments.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+        var adjustments = [_]i8{ -5, 0, 10 };
+        var totals = [_]i64{ 1000, 2000, 3000 };
+        const cols = [_]SaDbColumnInput{
+            .{ .data = @ptrCast(&adjustments), .len = @sizeOf(@TypeOf(adjustments)) },
+            .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+        };
+        try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, adjustments.len, &cols, cols.len, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_create_i8_index(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, 0, 1, &info));
+
+        var row: [9]u8 = undefined;
+        row[0] = @bitCast(@as(i8, 0));
+        std.mem.writeInt(i64, row[1..9], 2100, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_update_row_i8_key(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, 0, 0, &row, row.len, &info));
+
+        var inserted: u64 = 99;
+        row[0] = @bitCast(@as(i8, -10));
+        std.mem.writeInt(i64, row[1..9], 900, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_i8_key(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, 0, -10, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 1), inserted);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_delete_i8_key(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, 0, 10, &info));
+
+        var tx_handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, &tx_handle));
+        row[0] = @bitCast(@as(i8, 0));
+        std.mem.writeInt(i64, row[1..9], 2500, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i8_key(tx_handle, 0, 0, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 0), inserted);
+        row[0] = @bitCast(@as(i8, -10));
+        std.mem.writeInt(i64, row[1..9], 1000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_i8_key(tx_handle, 0, -10, &row, row.len, &info));
+        row[0] = @bitCast(@as(i8, 20));
+        std.mem.writeInt(i64, row[1..9], 2000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i8_key(tx_handle, 0, 20, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_delete_i8_key(tx_handle, 0, -5, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+        try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "i8_write_adjustments".ptr, "i8_write_adjustments".len, &handle));
+        var found: u64 = 0;
+        var row_index: u64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_find_i8_handle(handle, 0, -10, &found, &row_index));
+        try std.testing.expectEqual(@as(u64, 1), found);
+        var total: i64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 1, row_index, &total));
+        try std.testing.expectEqual(@as(i64, 1000), total);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    }
+
+    {
+        const schema_source =
+            \\#def MAX_ROWS = 8
+            \\#def COL_CHANNEL_ID_STRIDE = 2 // u16
+            \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+        ;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "u16_write_channels.sadb-schema".ptr, "u16_write_channels.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+        var channel_ids = [_]u16{ 100, 200, 300 };
+        var totals = [_]i64{ 1000, 2000, 3000 };
+        const cols = [_]SaDbColumnInput{
+            .{ .data = @ptrCast(&channel_ids), .len = @sizeOf(@TypeOf(channel_ids)) },
+            .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+        };
+        try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, channel_ids.len, &cols, cols.len, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_create_u16_index(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, 0, 1, &info));
+
+        var row: [10]u8 = undefined;
+        std.mem.writeInt(u16, row[0..2], 200, .little);
+        std.mem.writeInt(i64, row[2..10], 2200, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_update_row_u16_key(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, 0, 200, &row, row.len, &info));
+
+        var inserted: u64 = 99;
+        std.mem.writeInt(u16, row[0..2], 400, .little);
+        std.mem.writeInt(i64, row[2..10], 4000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_u16_key(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, 0, 400, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 1), inserted);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_delete_u16_key(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, 0, 300, &info));
+
+        var tx_handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, &tx_handle));
+        std.mem.writeInt(u16, row[0..2], 200, .little);
+        std.mem.writeInt(i64, row[2..10], 2500, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_u16_key(tx_handle, 0, 200, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 0), inserted);
+        std.mem.writeInt(u16, row[0..2], 400, .little);
+        std.mem.writeInt(i64, row[2..10], 4400, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_u16_key(tx_handle, 0, 400, &row, row.len, &info));
+        std.mem.writeInt(u16, row[0..2], 500, .little);
+        std.mem.writeInt(i64, row[2..10], 5000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_u16_key(tx_handle, 0, 500, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_delete_u16_key(tx_handle, 0, 100, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+        try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "u16_write_channels".ptr, "u16_write_channels".len, &handle));
+        var found: u64 = 0;
+        var row_index: u64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_find_u16_handle(handle, 0, 500, &found, &row_index));
+        try std.testing.expectEqual(@as(u64, 1), found);
+        var total: i64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 1, row_index, &total));
+        try std.testing.expectEqual(@as(i64, 5000), total);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    }
+
+    {
+        const schema_source =
+            \\#def MAX_ROWS = 8
+            \\#def COL_ADJUSTMENT_STRIDE = 2 // i16
+            \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+        ;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "i16_write_adjustments.sadb-schema".ptr, "i16_write_adjustments.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+        var adjustments = [_]i16{ -100, 0, 100 };
+        var totals = [_]i64{ 1000, 2000, 3000 };
+        const cols = [_]SaDbColumnInput{
+            .{ .data = @ptrCast(&adjustments), .len = @sizeOf(@TypeOf(adjustments)) },
+            .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+        };
+        try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, adjustments.len, &cols, cols.len, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_create_i16_index(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, 0, 1, &info));
+
+        var row: [10]u8 = undefined;
+        std.mem.writeInt(i16, row[0..2], 0, .little);
+        std.mem.writeInt(i64, row[2..10], 2100, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_update_row_i16_key(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, 0, 0, &row, row.len, &info));
+
+        var inserted: u64 = 99;
+        std.mem.writeInt(i16, row[0..2], -200, .little);
+        std.mem.writeInt(i64, row[2..10], 900, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_i16_key(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, 0, -200, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 1), inserted);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_delete_i16_key(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, 0, 100, &info));
+
+        var tx_handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, &tx_handle));
+        std.mem.writeInt(i16, row[0..2], 0, .little);
+        std.mem.writeInt(i64, row[2..10], 2500, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i16_key(tx_handle, 0, 0, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(@as(u64, 0), inserted);
+        std.mem.writeInt(i16, row[0..2], -200, .little);
+        std.mem.writeInt(i64, row[2..10], 1000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_i16_key(tx_handle, 0, -200, &row, row.len, &info));
+        std.mem.writeInt(i16, row[0..2], 200, .little);
+        std.mem.writeInt(i64, row[2..10], 2000, .little);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i16_key(tx_handle, 0, 200, &row, row.len, &inserted, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_delete_i16_key(tx_handle, 0, -100, &info));
+        try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+        try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "i16_write_adjustments".ptr, "i16_write_adjustments".len, &handle));
+        var found: u64 = 0;
+        var row_index: u64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_find_i16_handle(handle, 0, -200, &found, &row_index));
+        try std.testing.expectEqual(@as(u64, 1), found);
+        var total: i64 = 0;
+        try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 1, row_index, &total));
+        try std.testing.expectEqual(@as(i64, 1000), total);
+        try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
     }
 }
 

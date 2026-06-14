@@ -25,6 +25,14 @@
 @extern sa_db_update_row_u32_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u32, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_upsert_row_i32_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i32, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_update_row_i32_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i32, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_upsert_row_u8_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u8, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_update_row_u8_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u8, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_upsert_row_i8_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i8, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_update_row_i8_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i8, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_upsert_row_u16_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u16, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_update_row_u16_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u16, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_upsert_row_i16_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i16, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_update_row_i16_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i16, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_upsert_row_i64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_update_row_i64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_upsert_row_u64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
@@ -41,6 +49,14 @@
 @extern sa_db_tx_update_row_u32_key(handle: ptr, column_index: u64, expected: u32, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_upsert_row_i32_key(handle: ptr, column_index: u64, expected: i32, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_update_row_i32_key(handle: ptr, column_index: u64, expected: i32, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_upsert_row_u8_key(handle: ptr, column_index: u64, expected: u8, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_tx_update_row_u8_key(handle: ptr, column_index: u64, expected: u8, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_upsert_row_i8_key(handle: ptr, column_index: u64, expected: i8, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_tx_update_row_i8_key(handle: ptr, column_index: u64, expected: i8, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_upsert_row_u16_key(handle: ptr, column_index: u64, expected: u16, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_tx_update_row_u16_key(handle: ptr, column_index: u64, expected: u16, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_upsert_row_i16_key(handle: ptr, column_index: u64, expected: i16, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_tx_update_row_i16_key(handle: ptr, column_index: u64, expected: i16, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_upsert_row_i64_key(handle: ptr, column_index: u64, expected: i64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_update_row_i64_key(handle: ptr, column_index: u64, expected: i64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_upsert_row_u64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
@@ -50,6 +66,10 @@
 @extern sa_db_tx_delete_u64_key(handle: ptr, column_index: u64, expected: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u32_key(handle: ptr, column_index: u64, expected: u32, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_i32_key(handle: ptr, column_index: u64, expected: i32, &out_info: ptr) -> u32
+@extern sa_db_tx_delete_u8_key(handle: ptr, column_index: u64, expected: u8, &out_info: ptr) -> u32
+@extern sa_db_tx_delete_i8_key(handle: ptr, column_index: u64, expected: i8, &out_info: ptr) -> u32
+@extern sa_db_tx_delete_u16_key(handle: ptr, column_index: u64, expected: u16, &out_info: ptr) -> u32
+@extern sa_db_tx_delete_i16_key(handle: ptr, column_index: u64, expected: i16, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_i64_key(handle: ptr, column_index: u64, expected: i64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u64_i64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: i64, &out_info: ptr) -> u32
@@ -81,6 +101,10 @@
 @extern sa_db_delete_u64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u64, &out_info: ptr) -> u32
 @extern sa_db_delete_u32_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u32, &out_info: ptr) -> u32
 @extern sa_db_delete_i32_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i32, &out_info: ptr) -> u32
+@extern sa_db_delete_u8_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u8, &out_info: ptr) -> u32
+@extern sa_db_delete_i8_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i8, &out_info: ptr) -> u32
+@extern sa_db_delete_u16_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u16, &out_info: ptr) -> u32
+@extern sa_db_delete_i16_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i16, &out_info: ptr) -> u32
 @extern sa_db_delete_i64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: i64, &out_info: ptr) -> u32
 @extern sa_db_delete_u64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: u64, &out_info: ptr) -> u32
 @extern sa_db_delete_u64_i64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: i64, &out_info: ptr) -> u32

@@ -1,0 +1,566 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"compact_row_write_smoke"
+@const SCHEMA_PATH = utf8:"compact_row_write_smoke.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 16\n#def COL_U8_STRIDE = 1 // u8\n#def COL_I8_STRIDE = 1 // i8\n#def COL_U16_STRIDE = 2 // u16\n#def COL_I16_STRIDE = 2 // i16\n#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 23
+#def SCHEMA_PATH_LEN = 35
+#def SCHEMA_LEN = 189
+#def ROWS = 3
+#def U8_BYTES = 3
+#def I8_BYTES = 3
+#def U16_BYTES = 6
+#def I16_BYTES = 6
+#def TOTAL_BYTES = 24
+#def ROW_BYTES = 14
+#def COLUMN_COUNT = 5
+#def COLUMNS_BYTES = 80
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    u8_col = alloc U8_BYTES
+    i8_col = alloc I8_BYTES
+    u16_col = alloc U16_BYTES
+    i16_col = alloc I16_BYTES
+    totals = alloc TOTAL_BYTES
+    row = alloc ROW_BYTES
+
+    store u8_col+0, 1 as u8
+    store u8_col+1, 2 as u8
+    store u8_col+2, 3 as u8
+    store i8_col+0, -1 as i8
+    store i8_col+1, 0 as i8
+    store i8_col+2, 1 as i8
+    store u16_col+0, 100 as u16
+    store u16_col+2, 200 as u16
+    store u16_col+4, 300 as u16
+    store i16_col+0, -100 as i16
+    store i16_col+2, 0 as i16
+    store i16_col+4, 100 as i16
+    store totals+0, 1000 as i64
+    store totals+8, 2000 as i64
+    store totals+16, 3000 as i64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, u8_col, U8_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, i8_col, I8_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, u16_col, U16_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, i16_col, I16_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, totals, TOTAL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U8_INDEX index_u8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+    EXPAND DB_CREATE_I8_INDEX index_i8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 1, info
+    EXPAND DB_CREATE_U16_INDEX index_u16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 1, info
+    EXPAND DB_CREATE_I16_INDEX index_i16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 1, info
+
+    store row+0, 2 as u8
+    store row+1, 0 as i8
+    store row+2, 200 as u16
+    store row+4, 0 as i16
+    store row+6, 2100 as i64
+    EXPAND DB_UPDATE_ROW_U8_KEY direct_update_u8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 2, row, ROW_BYTES, info
+
+    store row+0, 3 as u8
+    store row+1, 1 as i8
+    store row+2, 300 as u16
+    store row+4, 100 as i16
+    store row+6, 3100 as i64
+    EXPAND DB_UPDATE_ROW_I8_KEY direct_update_i8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 1, row, ROW_BYTES, info
+
+    store row+0, 1 as u8
+    store row+1, -1 as i8
+    store row+2, 100 as u16
+    store row+4, -100 as i16
+    store row+6, 1100 as i64
+    EXPAND DB_UPDATE_ROW_U16_KEY direct_update_u16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 100, row, ROW_BYTES, info
+
+    store row+0, 2 as u8
+    store row+1, 0 as i8
+    store row+2, 200 as u16
+    store row+4, 0 as i16
+    store row+6, 2200 as i64
+    EXPAND DB_UPDATE_ROW_I16_KEY direct_update_i16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 0, row, ROW_BYTES, info
+
+    store row+0, 1 as u8
+    store row+1, -1 as i8
+    store row+2, 100 as u16
+    store row+4, -100 as i16
+    store row+6, 1200 as i64
+    EXPAND DB_UPSERT_ROW_U8_KEY direct_upsert_u8_status, direct_upsert_u8_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, row, ROW_BYTES, info
+
+    store row+0, 4 as u8
+    store row+1, 4 as i8
+    store row+2, 400 as u16
+    store row+4, 400 as i16
+    store row+6, 4000 as i64
+    EXPAND DB_UPSERT_ROW_I8_KEY direct_upsert_i8_status, direct_upsert_i8_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 4, row, ROW_BYTES, info
+
+    store row+0, 5 as u8
+    store row+1, 5 as i8
+    store row+2, 500 as u16
+    store row+4, 500 as i16
+    store row+6, 5000 as i64
+    EXPAND DB_UPSERT_ROW_U16_KEY direct_upsert_u16_status, direct_upsert_u16_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 500, row, ROW_BYTES, info
+
+    store row+0, 6 as u8
+    store row+1, 6 as i8
+    store row+2, 600 as u16
+    store row+4, 600 as i16
+    store row+6, 6000 as i64
+    EXPAND DB_UPSERT_ROW_I16_KEY direct_upsert_i16_status, direct_upsert_i16_inserted, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 600, row, ROW_BYTES, info
+
+    EXPAND DB_DELETE_U8_KEY direct_delete_u8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 3, info
+    EXPAND DB_DELETE_I8_KEY direct_delete_i8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 4, info
+    EXPAND DB_DELETE_U16_KEY direct_delete_u16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 500, info
+    EXPAND DB_DELETE_I16_KEY direct_delete_i16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 600, info
+    EXPAND DB_INFO_ROW_COUNT direct_rows, info
+
+    EXPAND DB_TX_BEGIN tx_begin_status, tx, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 1 as u8
+    store row+1, -1 as i8
+    store row+2, 100 as u16
+    store row+4, -100 as i16
+    store row+6, 1300 as i64
+    EXPAND DB_TX_UPDATE_ROW_U8_KEY tx_update_u8_status, tx, 0, 1, row, ROW_BYTES, info
+
+    store row+0, 2 as u8
+    store row+1, 0 as i8
+    store row+2, 200 as u16
+    store row+4, 0 as i16
+    store row+6, 2300 as i64
+    EXPAND DB_TX_UPDATE_ROW_I8_KEY tx_update_i8_status, tx, 1, 0, row, ROW_BYTES, info
+
+    store row+0, 1 as u8
+    store row+1, -1 as i8
+    store row+2, 100 as u16
+    store row+4, -100 as i16
+    store row+6, 1400 as i64
+    EXPAND DB_TX_UPDATE_ROW_U16_KEY tx_update_u16_status, tx, 2, 100, row, ROW_BYTES, info
+
+    store row+0, 2 as u8
+    store row+1, 0 as i8
+    store row+2, 200 as u16
+    store row+4, 0 as i16
+    store row+6, 2400 as i64
+    EXPAND DB_TX_UPDATE_ROW_I16_KEY tx_update_i16_status, tx, 3, 0, row, ROW_BYTES, info
+
+    store row+0, 1 as u8
+    store row+1, -1 as i8
+    store row+2, 100 as u16
+    store row+4, -100 as i16
+    store row+6, 1500 as i64
+    EXPAND DB_TX_UPSERT_ROW_U8_KEY tx_upsert_u8_status, tx_upsert_u8_inserted, tx, 0, 1, row, ROW_BYTES, info
+
+    store row+0, 7 as u8
+    store row+1, 7 as i8
+    store row+2, 700 as u16
+    store row+4, 700 as i16
+    store row+6, 7000 as i64
+    EXPAND DB_TX_UPSERT_ROW_I8_KEY tx_upsert_i8_status, tx_upsert_i8_inserted, tx, 1, 7, row, ROW_BYTES, info
+
+    store row+0, 8 as u8
+    store row+1, 8 as i8
+    store row+2, 800 as u16
+    store row+4, 800 as i16
+    store row+6, 8000 as i64
+    EXPAND DB_TX_UPSERT_ROW_U16_KEY tx_upsert_u16_status, tx_upsert_u16_inserted, tx, 2, 800, row, ROW_BYTES, info
+
+    store row+0, 9 as u8
+    store row+1, 9 as i8
+    store row+2, 900 as u16
+    store row+4, 900 as i16
+    store row+6, 9000 as i64
+    EXPAND DB_TX_UPSERT_ROW_I16_KEY tx_upsert_i16_status, tx_upsert_i16_inserted, tx, 3, 900, row, ROW_BYTES, info
+
+    store row+0, 10 as u8
+    store row+1, 10 as i8
+    store row+2, 1000 as u16
+    store row+4, 1000 as i16
+    store row+6, 10000 as i64
+    EXPAND DB_TX_UPSERT_ROW_U8_KEY tx_upsert_u8_new_status, tx_upsert_u8_new_inserted, tx, 0, 10, row, ROW_BYTES, info
+
+    EXPAND DB_TX_DELETE_U8_KEY tx_delete_u8_status, tx, 0, 7, info
+    EXPAND DB_TX_DELETE_I8_KEY tx_delete_i8_status, tx, 1, 8, info
+    EXPAND DB_TX_DELETE_U16_KEY tx_delete_u16_status, tx, 2, 900, info
+    EXPAND DB_TX_DELETE_I16_KEY tx_delete_i16_status, tx, 3, 1000, info
+    EXPAND DB_TX_COMMIT tx_commit_status, tx, info
+    EXPAND DB_INFO_ROW_COUNT tx_rows, info
+
+    EXPAND DB_TX_BEGIN rollback_begin_status, rollback_tx, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 99 as u8
+    store row+1, 99 as i8
+    store row+2, 990 as u16
+    store row+4, 990 as i16
+    store row+6, 9900 as i64
+    EXPAND DB_TX_UPSERT_ROW_U8_KEY rollback_upsert_status, rollback_upsert_inserted, rollback_tx, 0, 99, row, ROW_BYTES, info
+    EXPAND DB_TX_ROLLBACK rollback_status, rollback_tx
+
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_FIND_U8_HANDLE find_u8_status, find_u8_found, find_u8_row, read_handle, 0, 1
+    EXPAND DB_GET_I64_HANDLE get_u8_total_status, u8_total, read_handle, 4, find_u8_row
+    EXPAND DB_FIND_I8_HANDLE find_i8_status, find_i8_found, find_i8_row, read_handle, 1, 0
+    EXPAND DB_GET_I64_HANDLE get_i8_total_status, i8_total, read_handle, 4, find_i8_row
+    EXPAND DB_FIND_U16_HANDLE find_deleted_u16_status, find_deleted_u16_found, find_deleted_u16_row, read_handle, 2, 700
+    EXPAND DB_FIND_I16_HANDLE find_deleted_i16_status, find_deleted_i16_found, find_deleted_i16_row, read_handle, 3, 1000
+    EXPAND DB_FIND_U8_HANDLE find_rollback_status, find_rollback_found, find_rollback_row, read_handle, 0, 99
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok01 = eq remove_status, SA_DB_OK
+    ok02 = eq init_status, SA_DB_OK
+    ok03 = eq ingest_status, SA_DB_OK
+    ok04 = eq index_u8_status, SA_DB_OK
+    ok05 = eq index_i8_status, SA_DB_OK
+    ok06 = eq index_u16_status, SA_DB_OK
+    ok07 = eq index_i16_status, SA_DB_OK
+    ok08 = eq direct_update_u8_status, SA_DB_OK
+    ok09 = eq direct_update_i8_status, SA_DB_OK
+    ok10 = eq direct_update_u16_status, SA_DB_OK
+    ok11 = eq direct_update_i16_status, SA_DB_OK
+    ok12 = eq direct_upsert_u8_status, SA_DB_OK
+    ok13 = eq direct_upsert_u8_inserted, 0
+    ok14 = eq direct_upsert_i8_status, SA_DB_OK
+    ok15 = eq direct_upsert_i8_inserted, 1
+    ok16 = eq direct_upsert_u16_status, SA_DB_OK
+    ok17 = eq direct_upsert_u16_inserted, 1
+    ok18 = eq direct_upsert_i16_status, SA_DB_OK
+    ok19 = eq direct_upsert_i16_inserted, 1
+    ok20 = eq direct_delete_u8_status, SA_DB_OK
+    ok21 = eq direct_delete_i8_status, SA_DB_OK
+    ok22 = eq direct_delete_u16_status, SA_DB_OK
+    ok23 = eq direct_delete_i16_status, SA_DB_OK
+    ok24 = eq direct_rows, 2
+    ok25 = eq tx_begin_status, SA_DB_OK
+    ok26 = eq tx_update_u8_status, SA_DB_OK
+    ok27 = eq tx_update_i8_status, SA_DB_OK
+    ok28 = eq tx_update_u16_status, SA_DB_OK
+    ok29 = eq tx_update_i16_status, SA_DB_OK
+    ok30 = eq tx_upsert_u8_status, SA_DB_OK
+    ok31 = eq tx_upsert_u8_inserted, 0
+    ok32 = eq tx_upsert_i8_status, SA_DB_OK
+    ok33 = eq tx_upsert_i8_inserted, 1
+    ok34 = eq tx_upsert_u16_status, SA_DB_OK
+    ok35 = eq tx_upsert_u16_inserted, 1
+    ok36 = eq tx_upsert_i16_status, SA_DB_OK
+    ok37 = eq tx_upsert_i16_inserted, 1
+    ok38 = eq tx_upsert_u8_new_status, SA_DB_OK
+    ok39 = eq tx_upsert_u8_new_inserted, 1
+    ok40 = eq tx_delete_u8_status, SA_DB_OK
+    ok41 = eq tx_delete_i8_status, SA_DB_OK
+    ok42 = eq tx_delete_u16_status, SA_DB_OK
+    ok43 = eq tx_delete_i16_status, SA_DB_OK
+    ok44 = eq tx_commit_status, SA_DB_OK
+    ok45 = eq tx_rows, 2
+    ok46 = eq rollback_begin_status, SA_DB_OK
+    ok47 = eq rollback_upsert_status, SA_DB_OK
+    ok48 = eq rollback_upsert_inserted, 1
+    ok49 = eq rollback_status, SA_DB_OK
+    ok50 = eq open_status, SA_DB_OK
+    ok51 = eq find_u8_status, SA_DB_OK
+    ok52 = eq find_u8_found, 1
+    ok53 = eq get_u8_total_status, SA_DB_OK
+    ok54 = eq u8_total, 1500
+    ok55 = eq find_i8_status, SA_DB_OK
+    ok56 = eq find_i8_found, 1
+    ok57 = eq get_i8_total_status, SA_DB_OK
+    ok58 = eq i8_total, 2400
+    ok59 = eq find_deleted_u16_status, SA_DB_OK
+    ok60 = eq find_deleted_u16_found, 0
+    ok61 = eq find_deleted_i16_status, SA_DB_OK
+    ok62 = eq find_deleted_i16_found, 0
+    ok63 = eq find_rollback_status, SA_DB_OK
+    ok64 = eq find_rollback_found, 0
+    ok65 = eq close_status, SA_DB_OK
+    ok66 = eq verify_status, SA_DB_OK
+
+    pass01 = and ok01, ok02
+    pass02 = and pass01, ok03
+    pass03 = and pass02, ok04
+    pass04 = and pass03, ok05
+    pass05 = and pass04, ok06
+    pass06 = and pass05, ok07
+    pass07 = and pass06, ok08
+    pass08 = and pass07, ok09
+    pass09 = and pass08, ok10
+    pass10 = and pass09, ok11
+    pass11 = and pass10, ok12
+    pass12 = and pass11, ok13
+    pass13 = and pass12, ok14
+    pass14 = and pass13, ok15
+    pass15 = and pass14, ok16
+    pass16 = and pass15, ok17
+    pass17 = and pass16, ok18
+    pass18 = and pass17, ok19
+    pass19 = and pass18, ok20
+    pass20 = and pass19, ok21
+    pass21 = and pass20, ok22
+    pass22 = and pass21, ok23
+    pass23 = and pass22, ok24
+    pass24 = and pass23, ok25
+    pass25 = and pass24, ok26
+    pass26 = and pass25, ok27
+    pass27 = and pass26, ok28
+    pass28 = and pass27, ok29
+    pass29 = and pass28, ok30
+    pass30 = and pass29, ok31
+    pass31 = and pass30, ok32
+    pass32 = and pass31, ok33
+    pass33 = and pass32, ok34
+    pass34 = and pass33, ok35
+    pass35 = and pass34, ok36
+    pass36 = and pass35, ok37
+    pass37 = and pass36, ok38
+    pass38 = and pass37, ok39
+    pass39 = and pass38, ok40
+    pass40 = and pass39, ok41
+    pass41 = and pass40, ok42
+    pass42 = and pass41, ok43
+    pass43 = and pass42, ok44
+    pass44 = and pass43, ok45
+    pass45 = and pass44, ok46
+    pass46 = and pass45, ok47
+    pass47 = and pass46, ok48
+    pass48 = and pass47, ok49
+    pass49 = and pass48, ok50
+    pass50 = and pass49, ok51
+    pass51 = and pass50, ok52
+    pass52 = and pass51, ok53
+    pass53 = and pass52, ok54
+    pass54 = and pass53, ok55
+    pass55 = and pass54, ok56
+    pass56 = and pass55, ok57
+    pass57 = and pass56, ok58
+    pass58 = and pass57, ok59
+    pass59 = and pass58, ok60
+    pass60 = and pass59, ok61
+    pass61 = and pass60, ok62
+    pass62 = and pass61, ok63
+    pass63 = and pass62, ok64
+    pass64 = and pass63, ok65
+    ok = and pass64, ok66
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !index_u8_status
+    !index_i8_status
+    !index_u16_status
+    !index_i16_status
+    !direct_update_u8_status
+    !direct_update_i8_status
+    !direct_update_u16_status
+    !direct_update_i16_status
+    !direct_upsert_u8_status
+    !direct_upsert_u8_inserted
+    !direct_upsert_i8_status
+    !direct_upsert_i8_inserted
+    !direct_upsert_u16_status
+    !direct_upsert_u16_inserted
+    !direct_upsert_i16_status
+    !direct_upsert_i16_inserted
+    !direct_delete_u8_status
+    !direct_delete_i8_status
+    !direct_delete_u16_status
+    !direct_delete_i16_status
+    !direct_rows
+    !tx_begin_status
+    !tx
+    !tx_update_u8_status
+    !tx_update_i8_status
+    !tx_update_u16_status
+    !tx_update_i16_status
+    !tx_upsert_u8_status
+    !tx_upsert_u8_inserted
+    !tx_upsert_i8_status
+    !tx_upsert_i8_inserted
+    !tx_upsert_u16_status
+    !tx_upsert_u16_inserted
+    !tx_upsert_i16_status
+    !tx_upsert_i16_inserted
+    !tx_upsert_u8_new_status
+    !tx_upsert_u8_new_inserted
+    !tx_delete_u8_status
+    !tx_delete_i8_status
+    !tx_delete_u16_status
+    !tx_delete_i16_status
+    !tx_commit_status
+    !tx_rows
+    !rollback_begin_status
+    !rollback_tx
+    !rollback_upsert_status
+    !rollback_upsert_inserted
+    !rollback_status
+    !open_status
+    !read_handle
+    !find_u8_status
+    !find_u8_found
+    !find_u8_row
+    !get_u8_total_status
+    !u8_total
+    !find_i8_status
+    !find_i8_found
+    !find_i8_row
+    !get_i8_total_status
+    !i8_total
+    !find_deleted_u16_status
+    !find_deleted_u16_found
+    !find_deleted_u16_row
+    !find_deleted_i16_status
+    !find_deleted_i16_found
+    !find_deleted_i16_row
+    !find_rollback_status
+    !find_rollback_found
+    !find_rollback_row
+    !close_status
+    !verify_status
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !ok45
+    !ok46
+    !ok47
+    !ok48
+    !ok49
+    !ok50
+    !ok51
+    !ok52
+    !ok53
+    !ok54
+    !ok55
+    !ok56
+    !ok57
+    !ok58
+    !ok59
+    !ok60
+    !ok61
+    !ok62
+    !ok63
+    !ok64
+    !ok65
+    !ok66
+    !pass01
+    !pass02
+    !pass03
+    !pass04
+    !pass05
+    !pass06
+    !pass07
+    !pass08
+    !pass09
+    !pass10
+    !pass11
+    !pass12
+    !pass13
+    !pass14
+    !pass15
+    !pass16
+    !pass17
+    !pass18
+    !pass19
+    !pass20
+    !pass21
+    !pass22
+    !pass23
+    !pass24
+    !pass25
+    !pass26
+    !pass27
+    !pass28
+    !pass29
+    !pass30
+    !pass31
+    !pass32
+    !pass33
+    !pass34
+    !pass35
+    !pass36
+    !pass37
+    !pass38
+    !pass39
+    !pass40
+    !pass41
+    !pass42
+    !pass43
+    !pass44
+    !pass45
+    !pass46
+    !pass47
+    !pass48
+    !pass49
+    !pass50
+    !pass51
+    !pass52
+    !pass53
+    !pass54
+    !pass55
+    !pass56
+    !pass57
+    !pass58
+    !pass59
+    !pass60
+    !pass61
+    !pass62
+    !pass63
+    !pass64
+    !u8_col
+    !i8_col
+    !u16_col
+    !i16_col
+    !totals
+    !row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9041)

@@ -48,6 +48,14 @@ Core native calls:
 - `sa_db_update_row_u32_key`
 - `sa_db_upsert_row_i32_key`
 - `sa_db_update_row_i32_key`
+- `sa_db_upsert_row_u8_key`
+- `sa_db_update_row_u8_key`
+- `sa_db_upsert_row_i8_key`
+- `sa_db_update_row_i8_key`
+- `sa_db_upsert_row_u16_key`
+- `sa_db_update_row_u16_key`
+- `sa_db_upsert_row_i16_key`
+- `sa_db_update_row_i16_key`
 - `sa_db_upsert_row_i64_key`
 - `sa_db_update_row_i64_key`
 - `sa_db_upsert_row_u64_pair_key`
@@ -67,6 +75,18 @@ Core native calls:
 - `sa_db_tx_upsert_row_i32_key`
 - `sa_db_tx_update_row_i32_key`
 - `sa_db_tx_delete_i32_key`
+- `sa_db_tx_upsert_row_u8_key`
+- `sa_db_tx_update_row_u8_key`
+- `sa_db_tx_delete_u8_key`
+- `sa_db_tx_upsert_row_i8_key`
+- `sa_db_tx_update_row_i8_key`
+- `sa_db_tx_delete_i8_key`
+- `sa_db_tx_upsert_row_u16_key`
+- `sa_db_tx_update_row_u16_key`
+- `sa_db_tx_delete_u16_key`
+- `sa_db_tx_upsert_row_i16_key`
+- `sa_db_tx_update_row_i16_key`
+- `sa_db_tx_delete_i16_key`
 - `sa_db_tx_upsert_row_i64_key`
 - `sa_db_tx_update_row_i64_key`
 - `sa_db_tx_delete_i64_key`
@@ -109,6 +129,10 @@ Core native calls:
 - `sa_db_delete_u64_key`
 - `sa_db_delete_u32_key`
 - `sa_db_delete_i32_key`
+- `sa_db_delete_u8_key`
+- `sa_db_delete_i8_key`
+- `sa_db_delete_u16_key`
+- `sa_db_delete_i16_key`
 - `sa_db_delete_i64_key`
 - `sa_db_delete_u64_pair_key`
 - `sa_db_delete_u64_i64_pair_key`
@@ -288,6 +312,10 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`,
 `DB_UPSERT_ROW_U32_KEY`, `DB_UPDATE_ROW_U32_KEY`,
 `DB_UPSERT_ROW_I32_KEY`, `DB_UPDATE_ROW_I32_KEY`,
+`DB_UPSERT_ROW_U8_KEY`, `DB_UPDATE_ROW_U8_KEY`,
+`DB_UPSERT_ROW_I8_KEY`, `DB_UPDATE_ROW_I8_KEY`,
+`DB_UPSERT_ROW_U16_KEY`, `DB_UPDATE_ROW_U16_KEY`,
+`DB_UPSERT_ROW_I16_KEY`, `DB_UPDATE_ROW_I16_KEY`,
 `DB_UPSERT_ROW_I64_KEY`, `DB_UPDATE_ROW_I64_KEY`,
 `DB_UPSERT_ROW_U64_PAIR_KEY`, `DB_UPDATE_ROW_U64_PAIR_KEY`,
 `DB_UPSERT_ROW_U64_I64_PAIR_KEY`, `DB_UPDATE_ROW_U64_I64_PAIR_KEY`,
@@ -296,6 +324,10 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`,
 `DB_TX_UPSERT_ROW_U32_KEY`, `DB_TX_UPDATE_ROW_U32_KEY`, `DB_TX_DELETE_U32_KEY`,
 `DB_TX_UPSERT_ROW_I32_KEY`, `DB_TX_UPDATE_ROW_I32_KEY`, `DB_TX_DELETE_I32_KEY`,
+`DB_TX_UPSERT_ROW_U8_KEY`, `DB_TX_UPDATE_ROW_U8_KEY`, `DB_TX_DELETE_U8_KEY`,
+`DB_TX_UPSERT_ROW_I8_KEY`, `DB_TX_UPDATE_ROW_I8_KEY`, `DB_TX_DELETE_I8_KEY`,
+`DB_TX_UPSERT_ROW_U16_KEY`, `DB_TX_UPDATE_ROW_U16_KEY`, `DB_TX_DELETE_U16_KEY`,
+`DB_TX_UPSERT_ROW_I16_KEY`, `DB_TX_UPDATE_ROW_I16_KEY`, `DB_TX_DELETE_I16_KEY`,
 `DB_TX_UPSERT_ROW_I64_KEY`, `DB_TX_UPDATE_ROW_I64_KEY`, `DB_TX_DELETE_I64_KEY`,
 `DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`,
 `DB_TX_DELETE_U64_PAIR_KEY`, `DB_TX_UPSERT_ROW_U64_I64_PAIR_KEY`,
@@ -315,6 +347,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FILTER_BLOB_CONTAINS_HANDLE`, `DB_FILTER_BLOB_TOKEN_HANDLE`,
 `DB_FILTER_BLOB_PREFIX_HANDLE`,
 `DB_DELETE_U64_KEY`, `DB_DELETE_U32_KEY`, `DB_DELETE_I32_KEY`,
+`DB_DELETE_U8_KEY`, `DB_DELETE_I8_KEY`, `DB_DELETE_U16_KEY`, `DB_DELETE_I16_KEY`,
 `DB_DELETE_I64_KEY`, `DB_DELETE_U64_PAIR_KEY`,
 `DB_DELETE_U64_I64_PAIR_KEY`,
 `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
@@ -673,7 +706,11 @@ returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_DICT_INTERN`, `DB_TX_BLOB_P
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, and
 `DB_TX_DELETE_U64_KEY`, compact-key forms `DB_TX_UPSERT_ROW_U32_KEY`,
 `DB_TX_UPDATE_ROW_U32_KEY`, `DB_TX_DELETE_U32_KEY`, `DB_TX_UPSERT_ROW_I32_KEY`,
-`DB_TX_UPDATE_ROW_I32_KEY`, and `DB_TX_DELETE_I32_KEY`, the signed-key forms `DB_TX_UPSERT_ROW_I64_KEY`,
+`DB_TX_UPDATE_ROW_I32_KEY`, `DB_TX_DELETE_I32_KEY`, `DB_TX_UPSERT_ROW_U8_KEY`,
+`DB_TX_UPDATE_ROW_U8_KEY`, `DB_TX_DELETE_U8_KEY`, `DB_TX_UPSERT_ROW_I8_KEY`,
+`DB_TX_UPDATE_ROW_I8_KEY`, `DB_TX_DELETE_I8_KEY`, `DB_TX_UPSERT_ROW_U16_KEY`,
+`DB_TX_UPDATE_ROW_U16_KEY`, `DB_TX_DELETE_U16_KEY`, `DB_TX_UPSERT_ROW_I16_KEY`,
+`DB_TX_UPDATE_ROW_I16_KEY`, and `DB_TX_DELETE_I16_KEY`, the signed-key forms `DB_TX_UPSERT_ROW_I64_KEY`,
 `DB_TX_UPDATE_ROW_I64_KEY`, and `DB_TX_DELETE_I64_KEY`, plus the composite-key forms
 `DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`, and
 `DB_TX_DELETE_U64_PAIR_KEY`, and the signed-second-key forms
@@ -708,13 +745,16 @@ signed business keys. Existing keys are replaced with `out_inserted=0`, missing
 keys are appended with `out_inserted=1`, and the row's encoded `i64` key must
 match the expected key argument.
 
-`sa_db_upsert_row_u32_key` / `DB_UPSERT_ROW_U32_KEY` and
-`sa_db_upsert_row_i32_key` / `DB_UPSERT_ROW_I32_KEY` provide the same strict
-single-key row-write contract for compact integer keys. Use `u32` for ERP
-status, channel, warehouse, or category IDs that do not need 64 bits, and `i32`
-for compact signed adjustments or sequence fields. The key column must have a
-unique `u32` or `i32` index, the row-encoded key must equal `expected`, and the
-direct and transaction variants preserve the same `out_inserted` semantics.
+`sa_db_upsert_row_u8_key`, `sa_db_upsert_row_i8_key`,
+`sa_db_upsert_row_u16_key`, `sa_db_upsert_row_i16_key`,
+`sa_db_upsert_row_u32_key`, and `sa_db_upsert_row_i32_key`, plus the matching
+`DB_UPSERT_ROW_*_KEY` macros, provide the same strict single-key row-write
+contract for compact integer keys. Use unsigned compact keys for ERP status,
+channel, warehouse, location, line-number, or category IDs that do not need 64
+bits, and signed compact keys for adjustment, priority, or small sequence
+fields. The key column must have a unique index of the same compact type, the
+row-encoded key must equal `expected`, and the direct and transaction variants
+preserve the same `out_inserted` semantics.
 
 `sa_db_upsert_row_u64_pair_key` / `DB_UPSERT_ROW_U64_PAIR_KEY` applies the same
 strict row-write contract to a unique `u64_pair` index. The row's two key
@@ -773,10 +813,10 @@ advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
 `sa_db_tx_delete_i64_key` / `DB_TX_DELETE_I64_KEY` provide the same behavior for
 unique signed `i64` keys.
 
-`sa_db_delete_u32_key` / `DB_DELETE_U32_KEY` and
-`sa_db_delete_i32_key` / `DB_DELETE_I32_KEY`, plus their transaction variants,
-delete one row by a unique compact integer key and return `SA_DB_ERR_NOT_FOUND`
-when absent.
+`sa_db_delete_u8_key`, `sa_db_delete_i8_key`, `sa_db_delete_u16_key`,
+`sa_db_delete_i16_key`, `sa_db_delete_u32_key`, and `sa_db_delete_i32_key`, plus
+their `DB_DELETE_*` and transaction variants, delete one row by a unique compact
+integer key and return `SA_DB_ERR_NOT_FOUND` when absent.
 
 `sa_db_delete_u64_pair_key` / `DB_DELETE_U64_PAIR_KEY` deletes one row by a
 unique `(u64, u64)` tuple. `sa_db_tx_delete_u64_pair_key` /
@@ -858,7 +898,7 @@ benchmarks. The required baseline is:
   text predicates.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert/update/delete by unique `u64`,
-  `u32`, `i32`, or `i64` key, unique `(u64, u64)` tuple, or unique `(u64, i64)`
+  `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, or `i64` key, unique `(u64, u64)` tuple, or unique `(u64, i64)`
   tuple, range query handles, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
   prefix, and contains filters plus fixed-first-key `u64_pair` and
@@ -929,6 +969,9 @@ sa build-exe db_i64_key_write_smoke.sa -o db_i64_key_write_smoke.out --no-increm
 
 sa build-exe db_u32_i32_key_write_smoke.sa -o db_u32_i32_key_write_smoke.out --no-incremental
 ./db_u32_i32_key_write_smoke.out
+
+sa build-exe db_u8_i8_u16_i16_key_write_smoke.sa -o db_u8_i8_u16_i16_key_write_smoke.out --no-incremental
+./db_u8_i8_u16_i16_key_write_smoke.out
 
 sa build-exe db_candidate_filter_smoke.sa -o db_candidate_filter_smoke.out --no-incremental
 ./db_candidate_filter_smoke.out
