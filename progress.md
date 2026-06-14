@@ -29,6 +29,7 @@
 
 - `zig build test` passes in `/home/vscode/projects/sa_plugins/sa_plugin_db`.
 - `zig build` passes and produces `zig-out/lib/libdb.so` for the `linux-x86_64` artifact path in `sap.json`.
+- `sa build-exe benchmark_test/db_interface_smoke.sa -o benchmark_test/db_interface_smoke.out --no-incremental` plus the resulting smoke binary pass and cover `DB_PROJECT_ROWS_HANDLE` for both populated projected pages and empty projected pages (`written_rows=0`, `required_bytes=0`) through `db.sal`.
 - `sa build-exe benchmark_test/db_update_row_smoke.sa -o benchmark_test/db_update_row_smoke.out --no-incremental` plus the resulting smoke binary pass and cover strict row update, transaction row update, and missing-key `SA_DB_ERR_NOT_FOUND` behavior through `db.sal`.
 - `sa build-exe benchmark_test/db_i64_key_write_smoke.sa -o benchmark_test/db_i64_key_write_smoke.out --no-incremental` plus the resulting smoke binary pass and cover direct and transaction upsert/update/delete by unique signed `i64` key through `db.sal`, including negative keys and rollback invisibility.
 - `sa build-exe benchmark_test/db_u32_i32_key_write_smoke.sa -o benchmark_test/db_u32_i32_key_write_smoke.out --no-incremental` plus the resulting smoke binary pass and cover direct and transaction upsert/update/delete by unique compact `u32` and `i32` keys through `db.sal`, including signed compact keys and rollback invisibility.

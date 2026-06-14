@@ -715,7 +715,9 @@ Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
 column order. The call returns `written_rows` and `required_bytes`; a too-small
-output buffer returns `SA_DB_ERR_CURSOR_OVERFLOW` with `required_bytes` set.
+output buffer returns `SA_DB_ERR_CURSOR_OVERFLOW` with `required_bytes` set. An
+empty input row list is valid and returns `written_rows=0` and
+`required_bytes=0`, so callers can keep one projection path for empty ERP pages.
 
 This makes repeated serial and concurrent reads fast because they no longer
 reparse metadata or reread column files for every query. A handle remains a

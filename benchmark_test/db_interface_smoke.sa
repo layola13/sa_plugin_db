@@ -150,6 +150,7 @@ L_ENTRY:
     project_points0 = load projected_rows+8 as u64
     project_id1 = load projected_rows+16 as u64
     project_points1 = load projected_rows+24 as u64
+    EXPAND DB_PROJECT_ROWS_HANDLE empty_project_status, empty_project_written, empty_project_required, projected_rows, 0, read_handle, range_rows, 0, project_columns, PROJECT_COLUMNS
     EXPAND DB_FIND_U64_PAIR_HANDLE pair_find_status, pair_found, pair_found_row, read_handle, 1, 2, 1, paused_status_id
     EXPAND DB_GET_U64_HANDLE pair_get_status, pair_member_id, read_handle, 0, pair_found_row
     EXPAND DB_RANGE_U64_PAIR_HANDLE pair_range_status, pair_range_written, pair_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 1, active_status_id, paused_status_id, 0, 2
@@ -278,6 +279,9 @@ L_ENTRY:
     ok_project_points0 = eq project_points0, 30
     ok_project_id1 = eq project_id1, 4
     ok_project_points1 = eq project_points1, 40
+    ok_empty_project_status = eq empty_project_status, SA_DB_OK
+    ok_empty_project_written = eq empty_project_written, 0
+    ok_empty_project_required = eq empty_project_required, 0
     ok_pair_find_status = eq pair_find_status, SA_DB_OK
     ok_pair_found = eq pair_found, 1
     ok_pair_found_row = eq pair_found_row, 2
@@ -427,6 +431,9 @@ L_ENTRY:
     ok13m = and ok13l, ok_project_points0
     ok13n = and ok13m, ok_project_id1
     ok13o = and ok13n, ok_project_points1
+    ok13o1 = and ok13o, ok_empty_project_status
+    ok13o2 = and ok13o1, ok_empty_project_written
+    ok13o3 = and ok13o2, ok_empty_project_required
     ok_pair01 = and ok_pair_find_status, ok_pair_found
     ok_pair02 = and ok_pair01, ok_pair_found_row
     ok_pair03 = and ok_pair02, ok_pair_get_status
@@ -436,7 +443,7 @@ L_ENTRY:
     ok_pair07 = and ok_pair06, ok_pair_range_total
     ok_pair08 = and ok_pair07, ok_pair_range_row0
     ok_pair09 = and ok_pair08, ok_pair_range_row1
-    ok13o_pair = and ok13o, ok_pair09
+    ok13o_pair = and ok13o3, ok_pair09
     ok13p = and ok13o_pair, ok_balance_range_status
     ok13q = and ok13p, ok_balance_range_written
     ok13r = and ok13q, ok_balance_range_total
@@ -579,6 +586,9 @@ L_ENTRY:
     !project_points0
     !project_id1
     !project_points1
+    !empty_project_status
+    !empty_project_written
+    !empty_project_required
     !pair_find_status
     !pair_found
     !pair_found_row
@@ -731,6 +741,9 @@ L_ENTRY:
     !ok_project_points0
     !ok_project_id1
     !ok_project_points1
+    !ok_empty_project_status
+    !ok_empty_project_written
+    !ok_empty_project_required
     !ok_pair_find_status
     !ok_pair_found
     !ok_pair_found_row
@@ -880,6 +893,9 @@ L_ENTRY:
     !ok13m
     !ok13n
     !ok13o
+    !ok13o1
+    !ok13o2
+    !ok13o3
     !ok_pair01
     !ok_pair02
     !ok_pair03

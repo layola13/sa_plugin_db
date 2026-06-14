@@ -5750,7 +5750,7 @@ pub export fn sa_db_project_rows_handle(
     out_written_rows: ?*u64,
     out_required_bytes: ?*u64,
 ) u32 {
-    const row_indices = inputU64s(row_indices_ptr, row_indices_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_indices = inputU64sAllowEmpty(row_indices_ptr, row_indices_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const column_indices = inputU64s(column_indices_ptr, column_indices_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const written_slot = out_written_rows orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const required_slot = out_required_bytes orelse return SA_DB_ERR_INVALID_ARGUMENT;
@@ -5764,7 +5764,7 @@ pub export fn sa_db_project_rows_handle(
     required_slot.* = required_bytes;
     if (required_bytes > out_bytes_len) return SA_DB_ERR_CURSOR_OVERFLOW;
 
-    const out_bytes = outputBytes(out_bytes_ptr, out_bytes_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_bytes = outputBytesAllowEmpty(out_bytes_ptr, out_bytes_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.snapshotProjectRows(snapshot, row_indices, column_indices, out_bytes) catch |err| return tableStatus(err);
     written_slot.* = result.written_rows;
     required_slot.* = result.required_bytes;
@@ -8788,6 +8788,11 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(SA_DB_ERR_CURSOR_OVERFLOW, sa_db_project_rows_handle(handle, &range_rows, range_written, &project_columns, project_columns.len, &too_small_projected_rows, too_small_projected_rows.len, &projected_written, &projected_required));
     try std.testing.expectEqual(@as(u64, 0), projected_written);
     try std.testing.expectEqual(@as(u64, 32), projected_required);
+    projected_written = 99;
+    projected_required = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_project_rows_handle(handle, null, 0, &project_columns, project_columns.len, null, 0, &projected_written, &projected_required));
+    try std.testing.expectEqual(@as(u64, 0), projected_written);
+    try std.testing.expectEqual(@as(u64, 0), projected_required);
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_range_u64_handle(handle, 1, 10, 50, 0, 2, &range_rows, range_rows.len, &range_written, &range_total));
     var found: u64 = 0;
     var row_index: u64 = 0;
