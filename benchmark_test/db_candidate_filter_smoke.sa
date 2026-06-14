@@ -31,6 +31,7 @@ L_ENTRY:
     posted_us = alloc I64_COL_BYTES
     candidate_rows = alloc ROWS_BYTES
     status_rows = alloc ROWS_BYTES
+    date_rows = alloc ROWS_BYTES
     final_rows = alloc ROWS_BYTES
 
     store customer_ids+0, 7 as u64
@@ -90,17 +91,24 @@ L_ENTRY:
     EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
 
     EXPAND DB_RANGE_U64_I64_PAIR_HANDLE candidate_status, candidate_written, candidate_total, candidate_rows, ROWS_CAP, read_handle, 0, 1, 7, -5, 25, 0, ROWS_CAP
-    EXPAND DB_FILTER_ROWS_DATE_RANGE_HANDLE date_filter_status, date_written, date_total, final_rows, ROWS_CAP, read_handle, 1, candidate_rows, candidate_written, 1970, 1, 1, 1970, 1, 21, 0, ROWS_CAP
-    date_row0 = load final_rows+0 as u64
-    date_row1 = load final_rows+8 as u64
-    date_row2 = load final_rows+16 as u64
+    EXPAND DB_FILTER_ROWS_DATE_RANGE_HANDLE date_filter_status, date_written, date_total, date_rows, ROWS_CAP, read_handle, 1, candidate_rows, candidate_written, 1970, 1, 1, 1970, 1, 21, 0, ROWS_CAP
+    date_row0 = load date_rows+0 as u64
+    date_row1 = load date_rows+8 as u64
+    date_row2 = load date_rows+16 as u64
     EXPAND DB_FILTER_ROWS_U64_RANGE_HANDLE status_filter_status, status_written, status_total, status_rows, ROWS_CAP, read_handle, 2, candidate_rows, candidate_written, 2, 2, 0, ROWS_CAP
     status_row0 = load status_rows+0 as u64
     status_row1 = load status_rows+8 as u64
     status_row2 = load status_rows+16 as u64
-    EXPAND DB_INTERSECT_ROWS_HANDLE intersect_status, intersect_written, intersect_total, final_rows, ROWS_CAP, read_handle, status_rows, status_written, final_rows, date_written, 0, ROWS_CAP
+    EXPAND DB_INTERSECT_ROWS_HANDLE intersect_status, intersect_written, intersect_total, final_rows, ROWS_CAP, read_handle, status_rows, status_written, date_rows, date_written, 0, ROWS_CAP
     intersect_row0 = load final_rows+0 as u64
     intersect_row1 = load final_rows+8 as u64
+    EXPAND DB_UNION_ROWS_HANDLE row_union_status, row_union_written, row_union_total, final_rows, ROWS_CAP, read_handle, status_rows, status_written, date_rows, date_written, 0, ROWS_CAP
+    row_union_row0 = load final_rows+0 as u64
+    row_union_row1 = load final_rows+8 as u64
+    row_union_row2 = load final_rows+16 as u64
+    row_union_row3 = load final_rows+24 as u64
+    EXPAND DB_EXCEPT_ROWS_HANDLE row_except_status, row_except_written, row_except_total, final_rows, ROWS_CAP, read_handle, status_rows, status_written, date_rows, date_written, 0, ROWS_CAP
+    row_except_row0 = load final_rows+0 as u64
     EXPAND DB_STATS_ROWS_U64_HANDLE status_stats_status, status_stats_count, status_stats_sum, status_stats_min, status_stats_max, read_handle, 2, status_rows, status_written
     EXPAND DB_STATS_ROWS_I64_HANDLE amount_stats_status, amount_stats_count, amount_stats_sum, amount_stats_min, amount_stats_max, read_handle, 4, status_rows, status_written
     EXPAND DB_SORT_ROWS_U64_HANDLE status_sort_status, status_sort_written, status_sort_total, final_rows, ROWS_CAP, read_handle, 2, candidate_rows, candidate_written, 1, 0, ROWS_CAP
@@ -160,6 +168,17 @@ L_ENTRY:
     ok_intersect_total = eq intersect_total, 2
     ok_intersect_row0 = eq intersect_row0, 1
     ok_intersect_row1 = eq intersect_row1, 2
+    ok_row_union_status = eq row_union_status, SA_DB_OK
+    ok_row_union_written = eq row_union_written, 4
+    ok_row_union_total = eq row_union_total, 4
+    ok_row_union_row0 = eq row_union_row0, 1
+    ok_row_union_row1 = eq row_union_row1, 2
+    ok_row_union_row2 = eq row_union_row2, 5
+    ok_row_union_row3 = eq row_union_row3, 4
+    ok_row_except_status = eq row_except_status, SA_DB_OK
+    ok_row_except_written = eq row_except_written, 1
+    ok_row_except_total = eq row_except_total, 1
+    ok_row_except_row0 = eq row_except_row0, 5
     ok_status_stats_status = eq status_stats_status, SA_DB_OK
     ok_status_stats_count = eq status_stats_count, 3
     ok_status_stats_sum = eq status_stats_sum, 6
@@ -243,7 +262,18 @@ L_ENTRY:
     ok_intersect03 = and ok_intersect02, ok_intersect_total
     ok_intersect04 = and ok_intersect03, ok_intersect_row0
     ok_intersect05 = and ok_intersect04, ok_intersect_row1
-    ok20 = and ok_intersect05, ok_status_stats_status
+    ok_union01 = and ok_intersect05, ok_row_union_status
+    ok_union02 = and ok_union01, ok_row_union_written
+    ok_union03 = and ok_union02, ok_row_union_total
+    ok_union04 = and ok_union03, ok_row_union_row0
+    ok_union05 = and ok_union04, ok_row_union_row1
+    ok_union06 = and ok_union05, ok_row_union_row2
+    ok_union07 = and ok_union06, ok_row_union_row3
+    ok_except01 = and ok_union07, ok_row_except_status
+    ok_except02 = and ok_except01, ok_row_except_written
+    ok_except03 = and ok_except02, ok_row_except_total
+    ok_except04 = and ok_except03, ok_row_except_row0
+    ok20 = and ok_except04, ok_status_stats_status
     ok21 = and ok20, ok_status_stats_count
     ok22 = and ok21, ok_status_stats_sum
     ok23 = and ok22, ok_status_stats_min
@@ -328,6 +358,17 @@ L_ENTRY:
     !intersect_total
     !intersect_row0
     !intersect_row1
+    !row_union_status
+    !row_union_written
+    !row_union_total
+    !row_union_row0
+    !row_union_row1
+    !row_union_row2
+    !row_union_row3
+    !row_except_status
+    !row_except_written
+    !row_except_total
+    !row_except_row0
     !status_stats_status
     !status_stats_count
     !status_stats_sum
@@ -411,6 +452,17 @@ L_ENTRY:
     !ok_intersect_total
     !ok_intersect_row0
     !ok_intersect_row1
+    !ok_row_union_status
+    !ok_row_union_written
+    !ok_row_union_total
+    !ok_row_union_row0
+    !ok_row_union_row1
+    !ok_row_union_row2
+    !ok_row_union_row3
+    !ok_row_except_status
+    !ok_row_except_written
+    !ok_row_except_total
+    !ok_row_except_row0
     !ok_status_stats_status
     !ok_status_stats_count
     !ok_status_stats_sum
@@ -503,6 +555,17 @@ L_ENTRY:
     !ok_intersect03
     !ok_intersect04
     !ok_intersect05
+    !ok_union01
+    !ok_union02
+    !ok_union03
+    !ok_union04
+    !ok_union05
+    !ok_union06
+    !ok_union07
+    !ok_except01
+    !ok_except02
+    !ok_except03
+    !ok_except04
     !ok_sort01
     !ok_sort02
     !ok_sort03
@@ -559,6 +622,7 @@ L_ENTRY:
     !posted_us
     !candidate_rows
     !status_rows
+    !date_rows
     !final_rows
     br ok -> L_OK, L_FAIL
 

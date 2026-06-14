@@ -51,7 +51,7 @@
 The current development API exposes both command-level plugin capability and a
 low-level SA-facing ABI. `sap.json` publishes `db.sai` and `db.sal`, and SA
 programs should import those files for fixed-width row writes, read-handle
-queries, candidate row filtering/sorting/intersection, dictionaries, blob stores,
+queries, candidate row filtering/sorting/intersection/union/exclusion, dictionaries, blob stores,
 and table maintenance calls.
 
 This API is still allowed to break during `0.1.x` development, but old direct

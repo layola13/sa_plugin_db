@@ -6747,6 +6747,15 @@ fn sortedRowsContain(rows: []const u64, needle: u64) bool {
     return lo < rows.len and rows[lo] == needle;
 }
 
+fn appendPagedRow(row: u64, offset: u64, limit: u64, out_rows: []u64, total: *u64, written: *u64) TableError!void {
+    const out_capacity: u64 = @intCast(out_rows.len);
+    if (total.* >= offset and limit != 0 and written.* < limit and written.* < out_capacity) {
+        out_rows[@intCast(written.*)] = row;
+        written.* += 1;
+    }
+    total.* = std.math.add(u64, total.*, 1) catch return TableError.CursorOverflow;
+}
+
 pub fn snapshotIntersectRows(
     allocator: std.mem.Allocator,
     snapshot: *const ReadSnapshot,
@@ -6775,6 +6784,78 @@ pub fn snapshotIntersectRows(
             }
             total = std.math.add(u64, total, 1) catch return TableError.CursorOverflow;
         }
+    }
+    return .{ .written = written, .total = total };
+}
+
+pub fn snapshotUnionRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    left_rows: []const u64,
+    right_rows: []const u64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try validateSnapshotRows(snapshot, left_rows);
+    try validateSnapshotRows(snapshot, right_rows);
+
+    const left_copy = try allocator.dupe(u64, left_rows);
+    defer allocator.free(left_copy);
+    const right_copy = try allocator.dupe(u64, right_rows);
+    defer allocator.free(right_copy);
+
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+
+    var total: u64 = 0;
+    var written: u64 = 0;
+    for (left_copy) |row| {
+        const entry = try seen.getOrPut(row);
+        if (entry.found_existing) continue;
+        try appendPagedRow(row, offset, limit, out_rows, &total, &written);
+    }
+    for (right_copy) |row| {
+        const entry = try seen.getOrPut(row);
+        if (entry.found_existing) continue;
+        try appendPagedRow(row, offset, limit, out_rows, &total, &written);
+    }
+    return .{ .written = written, .total = total };
+}
+
+pub fn snapshotExceptRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    left_rows: []const u64,
+    right_rows: []const u64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try validateSnapshotRows(snapshot, left_rows);
+    try validateSnapshotRows(snapshot, right_rows);
+
+    const left_copy = try allocator.dupe(u64, left_rows);
+    defer allocator.free(left_copy);
+    const right_copy = try allocator.dupe(u64, right_rows);
+    defer allocator.free(right_copy);
+
+    var excluded = std.AutoHashMap(u64, void).init(allocator);
+    defer excluded.deinit();
+    for (right_copy) |row| {
+        try excluded.put(row, {});
+    }
+
+    var emitted = std.AutoHashMap(u64, void).init(allocator);
+    defer emitted.deinit();
+
+    var total: u64 = 0;
+    var written: u64 = 0;
+    for (left_copy) |row| {
+        if (excluded.contains(row)) continue;
+        const entry = try emitted.getOrPut(row);
+        if (entry.found_existing) continue;
+        try appendPagedRow(row, offset, limit, out_rows, &total, &written);
     }
     return .{ .written = written, .total = total };
 }
@@ -10816,8 +10897,38 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 1), intersect_page.written);
     try std.testing.expectEqual(@as(u64, 2), filtered_rows[0]);
 
+    const union_result = try snapshotUnionRows(std.testing.allocator, snapshot, candidate_rows[0..status_len], date_candidate_rows[0..date_candidate_len], 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 4), union_result.total);
+    try std.testing.expectEqual(@as(u64, 4), union_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[2]);
+    try std.testing.expectEqual(@as(u64, 4), filtered_rows[3]);
+
+    const union_page = try snapshotUnionRows(std.testing.allocator, snapshot, candidate_rows[0..status_len], date_candidate_rows[0..date_candidate_len], 2, 2, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 4), union_page.total);
+    try std.testing.expectEqual(@as(u64, 2), union_page.written);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 4), filtered_rows[1]);
+
+    const except_result = try snapshotExceptRows(std.testing.allocator, snapshot, candidate_rows[0..status_len], date_candidate_rows[0..date_candidate_len], 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 1), except_result.total);
+    try std.testing.expectEqual(@as(u64, 1), except_result.written);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[0]);
+
+    var duplicate_left_rows = [_]u64{ 1, 1, 2 };
+    var duplicate_right_rows = [_]u64{ 2, 4, 4 };
+    const union_dedup = try snapshotUnionRows(std.testing.allocator, snapshot, &duplicate_left_rows, &duplicate_right_rows, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), union_dedup.total);
+    try std.testing.expectEqual(@as(u64, 3), union_dedup.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 4), filtered_rows[2]);
+
     const invalid_intersect_rows = [_]u64{999};
     try std.testing.expectError(TableError.InvalidFormat, snapshotIntersectRows(std.testing.allocator, snapshot, &invalid_intersect_rows, date_candidate_rows[0..date_candidate_len], 0, filtered_rows.len, &filtered_rows));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotUnionRows(std.testing.allocator, snapshot, &invalid_intersect_rows, date_candidate_rows[0..date_candidate_len], 0, filtered_rows.len, &filtered_rows));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotExceptRows(std.testing.allocator, snapshot, candidate_rows[0..status_len], &invalid_intersect_rows, 0, filtered_rows.len, &filtered_rows));
 
     const status_stats = try snapshotStatsRowsU64(snapshot, 2, candidate_rows[0..status_len]);
     try std.testing.expectEqual(@as(u64, 3), status_stats.count);
