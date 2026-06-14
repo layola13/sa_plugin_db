@@ -11068,6 +11068,118 @@ pub fn snapshotPlanI64I64RangeRows(
     };
 }
 
+pub fn snapshotPlanU64BlobEqRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    u64_column_index: usize,
+    u64_min_value: u64,
+    u64_max_value: u64,
+    blob_column_index: usize,
+    store_name: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!PlanRowsResult {
+    var empty_rows: [0]u64 = .{};
+    const range_count = try snapshotRangeU64Rows(snapshot, u64_column_index, u64_min_value, u64_max_value, 0, 0, &empty_rows);
+    const blob_count = try snapshotFilterBlobEqRows(allocator, snapshot, blob_column_index, store_name, needle, 0, 0, &empty_rows);
+    const range_first = range_count.total <= blob_count.total;
+    const first_predicate: u64 = if (range_first) 1 else 2;
+    const first_total = if (range_first) range_count.total else blob_count.total;
+    const second_total = if (range_first) blob_count.total else range_count.total;
+    if (first_total == 0 or second_total == 0) {
+        return .{ .written = 0, .total = 0, .first_predicate = first_predicate, .first_total = first_total, .second_total = second_total };
+    }
+    if (first_total > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+
+    const candidate_rows = try allocator.alloc(u64, @intCast(first_total));
+    defer allocator.free(candidate_rows);
+
+    if (range_first) {
+        const initial = try snapshotRangeU64Rows(snapshot, u64_column_index, u64_min_value, u64_max_value, 0, first_total, candidate_rows);
+        if (initial.total != first_total or initial.written != first_total) return TableError.VerifyFailed;
+    } else {
+        const initial = try snapshotFilterBlobEqRows(allocator, snapshot, blob_column_index, store_name, needle, 0, first_total, candidate_rows);
+        if (initial.total != first_total or initial.written != first_total) return TableError.VerifyFailed;
+    }
+
+    var filtered_written: u64 = 0;
+    var filtered_total: u64 = 0;
+    if (range_first) {
+        const filtered = try snapshotFilterRowsBlobEq(allocator, snapshot, blob_column_index, candidate_rows, store_name, needle, offset, limit, out_rows);
+        filtered_written = filtered.written;
+        filtered_total = filtered.total;
+    } else {
+        const filtered = try snapshotFilterRowsU64Range(snapshot, u64_column_index, candidate_rows, u64_min_value, u64_max_value, offset, limit, out_rows);
+        filtered_written = filtered.written;
+        filtered_total = filtered.total;
+    }
+    return .{
+        .written = filtered_written,
+        .total = filtered_total,
+        .first_predicate = first_predicate,
+        .first_total = first_total,
+        .second_total = second_total,
+    };
+}
+
+pub fn snapshotPlanI64BlobEqRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    i64_column_index: usize,
+    i64_min_value: i64,
+    i64_max_value: i64,
+    blob_column_index: usize,
+    store_name: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!PlanRowsResult {
+    var empty_rows: [0]u64 = .{};
+    const range_count = try snapshotRangeI64Rows(snapshot, i64_column_index, i64_min_value, i64_max_value, 0, 0, &empty_rows);
+    const blob_count = try snapshotFilterBlobEqRows(allocator, snapshot, blob_column_index, store_name, needle, 0, 0, &empty_rows);
+    const range_first = range_count.total <= blob_count.total;
+    const first_predicate: u64 = if (range_first) 1 else 2;
+    const first_total = if (range_first) range_count.total else blob_count.total;
+    const second_total = if (range_first) blob_count.total else range_count.total;
+    if (first_total == 0 or second_total == 0) {
+        return .{ .written = 0, .total = 0, .first_predicate = first_predicate, .first_total = first_total, .second_total = second_total };
+    }
+    if (first_total > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+
+    const candidate_rows = try allocator.alloc(u64, @intCast(first_total));
+    defer allocator.free(candidate_rows);
+
+    if (range_first) {
+        const initial = try snapshotRangeI64Rows(snapshot, i64_column_index, i64_min_value, i64_max_value, 0, first_total, candidate_rows);
+        if (initial.total != first_total or initial.written != first_total) return TableError.VerifyFailed;
+    } else {
+        const initial = try snapshotFilterBlobEqRows(allocator, snapshot, blob_column_index, store_name, needle, 0, first_total, candidate_rows);
+        if (initial.total != first_total or initial.written != first_total) return TableError.VerifyFailed;
+    }
+
+    var filtered_written: u64 = 0;
+    var filtered_total: u64 = 0;
+    if (range_first) {
+        const filtered = try snapshotFilterRowsBlobEq(allocator, snapshot, blob_column_index, candidate_rows, store_name, needle, offset, limit, out_rows);
+        filtered_written = filtered.written;
+        filtered_total = filtered.total;
+    } else {
+        const filtered = try snapshotFilterRowsI64Range(snapshot, i64_column_index, candidate_rows, i64_min_value, i64_max_value, offset, limit, out_rows);
+        filtered_written = filtered.written;
+        filtered_total = filtered.total;
+    }
+    return .{
+        .written = filtered_written,
+        .total = filtered_total,
+        .first_predicate = first_predicate,
+        .first_total = first_total,
+        .second_total = second_total,
+    };
+}
+
 pub fn snapshotFilterRowsU32Range(
     snapshot: *const ReadSnapshot,
     column_index: usize,
@@ -13647,7 +13759,12 @@ test "table filters candidate rows for ERP composite predicates" {
         \\#def COL_SIGNED_FLAG_STRIDE = 1 // i8
         \\#def COL_WAREHOUSE_ID_STRIDE = 2 // u16
         \\#def COL_QTY_DELTA_STRIDE = 2 // i16
+        \\#def COL_DOC_TYPE_STRIDE = 8 // blob_handle
     );
+
+    const invoice_doc = try putBlobValue(std.testing.allocator, ".", table_name, "doc_type", "invoice");
+    const order_doc = try putBlobValue(std.testing.allocator, ".", table_name, "doc_type", "order");
+    const credit_doc = try putBlobValue(std.testing.allocator, ".", table_name, "doc_type", "credit");
 
     var customer_ids = [_]u64{ 7, 7, 7, 8, 7, 7 };
     var order_days = [_]i64{ -5, 0, 10, -3, 20, 25 };
@@ -13660,6 +13777,7 @@ test "table filters candidate rows for ERP composite predicates" {
     var signed_flags = [_]i8{ -1, 0, 1, 0, -1, 1 };
     var warehouse_ids = [_]u16{ 100, 200, 200, 300, 100, 200 };
     var qty_deltas = [_]i16{ -5, 10, 20, 30, -15, 40 };
+    var doc_type_ids = [_]u64{ invoice_doc.id, order_doc.id, invoice_doc.id, order_doc.id, credit_doc.id, invoice_doc.id };
     const columns = [_]RawColumnBytes{
         .{ .bytes = std.mem.sliceAsBytes(customer_ids[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(order_days[0..]) },
@@ -13672,6 +13790,7 @@ test "table filters candidate rows for ERP composite predicates" {
         .{ .bytes = std.mem.sliceAsBytes(signed_flags[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(warehouse_ids[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(qty_deltas[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(doc_type_ids[0..]) },
     };
     _ = try ingestRawColumns(std.testing.allocator, ".", table_name, customer_ids.len, &columns);
     _ = try createU64I64PairIndex(std.testing.allocator, ".", table_name, 0, 1, true);
@@ -13679,6 +13798,7 @@ test "table filters candidate rows for ERP composite predicates" {
     _ = try createU64Index(std.testing.allocator, ".", table_name, 2, false);
     _ = try createI64Index(std.testing.allocator, ".", table_name, 1, false);
     _ = try createI64Index(std.testing.allocator, ".", table_name, 4, false);
+    _ = try createBlobEqIndex(std.testing.allocator, ".", table_name, 11, "doc_type", false);
 
     const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
     defer snapshot.destroy();
@@ -13933,6 +14053,44 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 2), planned_i64_i64.written);
     try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
     try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+
+    const planned_status_order = try snapshotPlanU64BlobEqRows(std.testing.allocator, snapshot, 2, 2, 2, 11, "doc_type", "order", 0, planned_rows.len, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 2), planned_status_order.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), planned_status_order.first_total);
+    try std.testing.expectEqual(@as(u64, 4), planned_status_order.second_total);
+    try std.testing.expectEqual(@as(u64, 2), planned_status_order.total);
+    try std.testing.expectEqual(@as(u64, 2), planned_status_order.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), planned_rows[1]);
+
+    const planned_status_order_page = try snapshotPlanU64BlobEqRows(std.testing.allocator, snapshot, 2, 2, 2, 11, "doc_type", "order", 1, 1, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 2), planned_status_order_page.total);
+    try std.testing.expectEqual(@as(u64, 1), planned_status_order_page.written);
+    try std.testing.expectEqual(@as(u64, 3), planned_rows[0]);
+
+    const planned_status_invoice = try snapshotPlanU64BlobEqRows(std.testing.allocator, snapshot, 2, 1, 1, 11, "doc_type", "invoice", 0, planned_rows.len, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 1), planned_status_invoice.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), planned_status_invoice.first_total);
+    try std.testing.expectEqual(@as(u64, 3), planned_status_invoice.second_total);
+    try std.testing.expectEqual(@as(u64, 1), planned_status_invoice.total);
+    try std.testing.expectEqual(@as(u64, 1), planned_status_invoice.written);
+    try std.testing.expectEqual(@as(u64, 0), planned_rows[0]);
+
+    const planned_due_order = try snapshotPlanI64BlobEqRows(std.testing.allocator, snapshot, 1, 0, 20, 11, "doc_type", "order", 0, planned_rows.len, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 2), planned_due_order.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), planned_due_order.first_total);
+    try std.testing.expectEqual(@as(u64, 3), planned_due_order.second_total);
+    try std.testing.expectEqual(@as(u64, 1), planned_due_order.total);
+    try std.testing.expectEqual(@as(u64, 1), planned_due_order.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+
+    const planned_due_invoice = try snapshotPlanI64BlobEqRows(std.testing.allocator, snapshot, 1, 20, 25, 11, "doc_type", "invoice", 0, planned_rows.len, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 1), planned_due_invoice.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), planned_due_invoice.first_total);
+    try std.testing.expectEqual(@as(u64, 3), planned_due_invoice.second_total);
+    try std.testing.expectEqual(@as(u64, 1), planned_due_invoice.total);
+    try std.testing.expectEqual(@as(u64, 1), planned_due_invoice.written);
+    try std.testing.expectEqual(@as(u64, 5), planned_rows[0]);
 
     const posted_result = try snapshotFilterRowsBool(snapshot, 3, candidate_rows[0..status_len], true, 0, filtered_rows.len, &filtered_rows);
     try std.testing.expectEqual(@as(u64, 2), posted_result.total);

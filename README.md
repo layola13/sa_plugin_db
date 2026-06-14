@@ -310,6 +310,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_ROWS_U64_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_PLAN_U64_I64_RANGES_HANDLE`,
 `DB_PLAN_U64_U64_RANGES_HANDLE`, `DB_PLAN_I64_I64_RANGES_HANDLE`,
+`DB_PLAN_U64_BLOB_EQ_HANDLE`, `DB_PLAN_I64_BLOB_EQ_HANDLE`,
 `DB_FILTER_ROWS_U32_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I32_RANGE_HANDLE`, `DB_FILTER_ROWS_U8_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I8_RANGE_HANDLE`, `DB_FILTER_ROWS_U16_RANGE_HANDLE`,
@@ -637,15 +638,18 @@ building block rather than a SQL optimizer. For common two-predicate ERP range
 shapes, `sa_db_plan_u64_i64_ranges_handle` /
 `DB_PLAN_U64_I64_RANGES_HANDLE`, `sa_db_plan_u64_u64_ranges_handle` /
 `DB_PLAN_U64_U64_RANGES_HANDLE`, and `sa_db_plan_i64_i64_ranges_handle` /
-`DB_PLAN_I64_I64_RANGES_HANDLE` estimate both indexed predicates, scan the
-smaller side first, filter the second predicate inside the plugin, and return
+`DB_PLAN_I64_I64_RANGES_HANDLE`, `sa_db_plan_u64_blob_eq_handle` /
+`DB_PLAN_U64_BLOB_EQ_HANDLE`, and `sa_db_plan_i64_blob_eq_handle` /
+`DB_PLAN_I64_BLOB_EQ_HANDLE` estimate both indexed predicates, scan the smaller
+side first, filter the second predicate inside the plugin, and return
 `SaDbPlanInfo` (`written`, `total`, `first_predicate`, `first_total`,
 `second_total`) so callers can audit which side was chosen. `first_predicate` is
 `1` for the first predicate argument and `2` for the second predicate argument;
 ties choose the first side for stable behavior. These cover dictionary/status
-codes plus amount/date ranges, two dictionary/status predicates, and two signed
-amount/date/timestamp ranges. Broader shapes still use the explicit building
-blocks above.
+codes plus amount/date ranges, two dictionary/status predicates, two signed
+amount/date/timestamp ranges, and numeric range plus exact text/blob business
+keys such as status/doc-type or due-date/business-code. Broader shapes still use
+the explicit building blocks above.
 `sa_db_filter_rows_blob_eq_handle` / `DB_FILTER_ROWS_BLOB_EQ_HANDLE`,
 `sa_db_filter_rows_blob_contains_handle` / `DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE`,
 `sa_db_filter_rows_blob_token_handle` / `DB_FILTER_ROWS_BLOB_TOKEN_HANDLE`, and
@@ -989,9 +993,9 @@ benchmarks. The required baseline is:
   float, bool, or text/blob predicates for multi-condition list pages, row-list
   intersection/union/exclusion compose independently indexed result sets for
   AND/OR/not-in filters, the first two-predicate range planners choose the
-  smaller indexed side automatically for `u64+i64`, `u64+u64`, and `i64+i64`
-  shapes, and candidate row sorting covers integer and finite float list
-  ordering. The first ERP workflow
+  smaller indexed side automatically for `u64+i64`, `u64+u64`, `i64+i64`,
+  `u64+blob_eq`, and `i64+blob_eq` shapes, and candidate row sorting covers
+  integer and finite float list ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
   same composite ERP filters; next is broader index planning.
@@ -1074,6 +1078,9 @@ sa build-exe db_candidate_filter_smoke.sa -o db_candidate_filter_smoke.out --no-
 
 sa build-exe db_planner_smoke.sa -o db_planner_smoke.out --no-incremental
 ./db_planner_smoke.out
+
+sa build-exe db_blob_planner_smoke.sa -o db_blob_planner_smoke.out --no-incremental
+./db_blob_planner_smoke.out
 
 sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 ./db_tx_smoke.out

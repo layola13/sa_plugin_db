@@ -1290,6 +1290,14 @@
     %out_status = call @sa_db_plan_i64_i64_ranges_handle(%handle, %first_column_index, %first_min_value, %first_max_value, %second_column_index, %second_min_value, %second_max_value, %offset, %limit, &%out_rows, %out_rows_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_PLAN_U64_BLOB_EQ_HANDLE %out_status, %out_rows, %out_rows_len, %out_info, %handle, %u64_column_index, %u64_min_value, %u64_max_value, %blob_column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
+    %out_status = call @sa_db_plan_u64_blob_eq_handle(%handle, %u64_column_index, %u64_min_value, %u64_max_value, %blob_column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_PLAN_I64_BLOB_EQ_HANDLE %out_status, %out_rows, %out_rows_len, %out_info, %handle, %i64_column_index, %i64_min_value, %i64_max_value, %blob_column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
+    %out_status = call @sa_db_plan_i64_blob_eq_handle(%handle, %i64_column_index, %i64_min_value, %i64_max_value, %blob_column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_F32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
     __db_handle_filter_rows_f32_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_f32_total_slot_%out_total = stack_alloc 8
