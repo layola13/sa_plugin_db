@@ -46,6 +46,7 @@ Core native calls:
 - `sa_db_update_row_u64_key`
 - `sa_db_tx_begin`
 - `sa_db_tx_insert_row`
+- `sa_db_tx_dict_intern`
 - `sa_db_tx_blob_put`
 - `sa_db_tx_upsert_row_u64_key`
 - `sa_db_tx_update_row_u64_key`
@@ -255,7 +256,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
-`DB_TX_BLOB_PUT`,
+`DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
@@ -353,6 +354,11 @@ advancing the table epoch. `sa_db_dict_lookup` finds an existing ID,
 `sa_db_dict_value_copy` copies the stored bytes into the caller buffer. ERP rows
 store the returned ID in a normal `u64` column, so status/category/type fields can
 reuse the existing `u64` indexes, range reads, projections, and row APIs.
+`sa_db_tx_dict_intern` / `DB_TX_DICT_INTERN` is the transaction-scoped form for
+interning dictionary values inside the same single-table transaction as row
+inserts, updates, deletes, or blob writes. A transaction-created value is not
+visible to direct lookups or read handles until commit, and rollback leaves the
+active dictionary unchanged.
 For read-heavy ERP list rendering, prefer the read-handle variants
 `sa_db_dict_lookup_handle`, `sa_db_dict_value_len_handle`, and
 `sa_db_dict_value_copy_handle` after `sa_db_open_read_table`; the dictionary bytes
@@ -617,14 +623,15 @@ column ingest path, so the write advances the table epoch and rebuilds any
 persisted `u64` indexes.
 
 `sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
-returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_BLOB_PUT`,
+returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, and
 `DB_TX_DELETE_U64_KEY` mutate a transaction
 image; no new table epoch or manifest is published until `sa_db_tx_commit` /
-`DB_TX_COMMIT`. Commit writes changed row segments when needed, versioned blob
-artifacts referenced by the transaction metadata, rebuilds all persisted indexes,
-then advances the active manifest once. Blob-only transactions are valid and
-advance the epoch without rewriting row segments. A pending/commit marker pair
+`DB_TX_COMMIT`. Commit writes changed row segments when needed, versioned
+dictionary/blob artifacts referenced by the transaction metadata, rebuilds all
+persisted indexes, then advances the active manifest once. Dictionary-only and
+blob-only transactions are valid and advance the epoch without rewriting row
+segments. A pending/commit marker pair
 lets `recover` distinguish incomplete transaction metadata from committed
 metadata whose manifest update was interrupted. If commit fails, for example
 because a batch introduces duplicate keys for a unique index, the previous active
@@ -656,13 +663,16 @@ delete rewrites the remaining rows into a new column segment, rebuilds indexes,
 advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
 
 `sa_db_dict_intern` / `DB_DICT_INTERN` provides the first string data-model layer
-for ERP fields with small repeated value sets. The dictionary itself is a
-versioned table artifact, so snapshot, restore, verify, recover, lock, unlock,
-and table removal handle it with the same consistency rules as columns and
-indexes. It is not a general varchar/blob store; it is intentionally optimized
-for stable labels that can be represented as integer IDs in fixed-width rows.
-Read handles expose dictionary lookup and ID-to-bytes helpers directly, which is
-the recommended path for decoding list rows back to labels inside one snapshot.
+for ERP fields with small repeated value sets. `sa_db_tx_dict_intern` /
+`DB_TX_DICT_INTERN` provides the same dictionary ID allocation inside a
+single-table transaction, so a new status/category label and the rows that refer
+to it commit or roll back together. The dictionary itself is a versioned table
+artifact, so snapshot, restore, verify, recover, lock, unlock, and table removal
+handle it with the same consistency rules as columns and indexes. It is not a
+general varchar/blob store; it is intentionally optimized for stable labels that
+can be represented as integer IDs in fixed-width rows. Read handles expose
+dictionary lookup and ID-to-bytes helpers directly, which is the recommended path
+for decoding list rows back to labels inside one snapshot.
 
 `sa_db_blob_put` / `DB_BLOB_PUT` is the general variable-width layer for ERP text
 and small/medium binary fields. Rows store a normal 8-byte `blob_handle` value,
@@ -791,6 +801,9 @@ sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 
 sa build-exe db_tx_blob_smoke.sa -o db_tx_blob_smoke.out --no-incremental
 ./db_tx_blob_smoke.out
+
+sa build-exe db_tx_dict_smoke.sa -o db_tx_dict_smoke.out --no-incremental
+./db_tx_dict_smoke.out
 
 sa build-exe db_blob_token_smoke.sa -o db_blob_token_smoke.out --no-incremental
 ./db_blob_token_smoke.out

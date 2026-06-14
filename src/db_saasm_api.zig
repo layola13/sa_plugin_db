@@ -698,6 +698,34 @@ pub export fn sa_db_tx_insert_row(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_tx_dict_intern(
+    handle: ?*anyopaque,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_id: ?*u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    id_slot.* = 0;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    const result = table.writeTransactionInternStringDict(std.heap.page_allocator, tx, dict_name, value) catch |err| return tableStatus(err);
+    id_slot.* = result.id;
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
 pub export fn sa_db_tx_blob_put(
     handle: ?*anyopaque,
     store_ptr: ?[*]const u8,
@@ -5162,6 +5190,83 @@ test "db SA ABI commits and rolls back transaction blob handles" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
     try std.testing.expectEqual(@as(u64, 1), info.row_count);
     try std.testing.expectEqual(@as(u64, 3), info.epoch);
+}
+
+test "db SA ABI commits and rolls back transaction dictionaries" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "tx_dict_abi";
+    const dict_name = "status";
+    const active = "active";
+    const paused = "paused";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_dict_abi.sadb-schema".ptr, "tx_dict_abi.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_index(root.ptr, root.len, table_name.ptr, table_name.len, 0, 1, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    var active_id: u64 = 0;
+    var inserted: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_dict_intern(tx_handle, dict_name.ptr, dict_name.len, active.ptr, active.len, &active_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), active_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_dict_intern(tx_handle, dict_name.ptr, dict_name.len, active.ptr, active.len, &active_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), active_id);
+    try std.testing.expectEqual(@as(u64, 0), inserted);
+
+    var found: u64 = 99;
+    var lookup_id: u64 = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup(root.ptr, root.len, table_name.ptr, table_name.len, dict_name.ptr, dict_name.len, active.ptr, active.len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(@as(u64, 0), lookup_id);
+
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 1, .little);
+    std.mem.writeInt(u64, row[8..16], active_id, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_insert_row(tx_handle, &row, row.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 1), info.row_count);
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup(root.ptr, root.len, table_name.ptr, table_name.len, dict_name.ptr, dict_name.len, active.ptr, active.len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 1), lookup_id);
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &read_handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup_handle(read_handle, dict_name.ptr, dict_name.len, active.ptr, active.len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 1), lookup_id);
+    var fetched_row: [16]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u64_key_handle(read_handle, 0, 1, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    var paused_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_dict_intern(tx_handle, dict_name.ptr, dict_name.len, paused.ptr, paused.len, &paused_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 2), paused_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(tx_handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup(root.ptr, root.len, table_name.ptr, table_name.len, dict_name.ptr, dict_name.len, paused.ptr, paused.len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(@as(u64, 0), lookup_id);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
+    try std.testing.expectEqual(@as(u64, 1), info.row_count);
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
 }
 
 test "db SA ABI creates and queries blob token indexes" {

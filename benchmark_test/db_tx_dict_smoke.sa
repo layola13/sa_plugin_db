@@ -1,0 +1,264 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"tx_dict_members"
+@const SCHEMA_PATH = utf8:"tx_dict_members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 4\n#def COL_ID_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n"
+@const DICT_STATUS = utf8:"status"
+@const STATUS_ACTIVE = utf8:"active"
+@const STATUS_PAUSED = utf8:"paused"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 15
+#def SCHEMA_PATH_LEN = 27
+#def SCHEMA_LEN = 82
+#def DICT_STATUS_LEN = 6
+#def STATUS_ACTIVE_LEN = 6
+#def STATUS_PAUSED_LEN = 6
+#def ROW_BYTES = 16
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+    fetched = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+
+    EXPAND DB_TX_BEGIN tx1_begin_status, tx1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_TX_DICT_INTERN tx1_active_status, active_id, active_inserted, tx1, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN, info
+    EXPAND DB_TX_DICT_INTERN tx1_active_again_status, active_again_id, active_again_inserted, tx1, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN, info
+    EXPAND DB_DICT_LOOKUP pre_lookup_status, pre_found, pre_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN
+    store row+0, 1 as u64
+    store row+8, active_id as u64
+    EXPAND DB_TX_INSERT_ROW tx1_insert_status, tx1, row, ROW_BYTES, info
+    EXPAND DB_TX_COMMIT tx1_commit_status, tx1, info
+    EXPAND DB_INFO_ROW_COUNT tx1_rows, info
+    EXPAND DB_INFO_EPOCH tx1_epoch, info
+    EXPAND DB_DICT_LOOKUP post_lookup_status, post_found, post_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN
+
+    EXPAND DB_OPEN_READ_TABLE open_status, read1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_DICT_LOOKUP_HANDLE handle_lookup_status, handle_found, handle_id, read1, DICT_STATUS, DICT_STATUS_LEN, STATUS_ACTIVE, STATUS_ACTIVE_LEN
+    EXPAND DB_GET_ROW_U64_KEY_HANDLE get_row_status, read1, 0, 1, fetched, ROW_BYTES
+    fetched_id = load fetched+0 as u64
+    fetched_status = load fetched+8 as u64
+    EXPAND DB_CLOSE_READ_TABLE close_status, read1
+
+    EXPAND DB_TX_BEGIN tx2_begin_status, tx2, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_TX_DICT_INTERN tx2_paused_status, paused_id, paused_inserted, tx2, DICT_STATUS, DICT_STATUS_LEN, STATUS_PAUSED, STATUS_PAUSED_LEN, info
+    EXPAND DB_TX_ROLLBACK tx2_rollback_status, tx2
+    EXPAND DB_DICT_LOOKUP paused_lookup_status, paused_found, paused_lookup_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, DICT_STATUS, DICT_STATUS_LEN, STATUS_PAUSED, STATUS_PAUSED_LEN
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_ROW_COUNT verify_rows, info
+    EXPAND DB_INFO_EPOCH verify_epoch, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_create_index = eq create_index_status, SA_DB_OK
+    ok_tx1_begin = eq tx1_begin_status, SA_DB_OK
+    ok_tx1_active_status = eq tx1_active_status, SA_DB_OK
+    ok_active_id = eq active_id, 1
+    ok_active_inserted = eq active_inserted, 1
+    ok_tx1_active_again_status = eq tx1_active_again_status, SA_DB_OK
+    ok_active_again_id = eq active_again_id, 1
+    ok_active_again_inserted = eq active_again_inserted, 0
+    ok_pre_lookup_status = eq pre_lookup_status, SA_DB_OK
+    ok_pre_found = eq pre_found, 0
+    ok_pre_id = eq pre_id, 0
+    ok_tx1_insert = eq tx1_insert_status, SA_DB_OK
+    ok_tx1_commit = eq tx1_commit_status, SA_DB_OK
+    ok_tx1_rows = eq tx1_rows, 1
+    ok_tx1_epoch = eq tx1_epoch, 2
+    ok_post_lookup_status = eq post_lookup_status, SA_DB_OK
+    ok_post_found = eq post_found, 1
+    ok_post_id = eq post_id, active_id
+    ok_open = eq open_status, SA_DB_OK
+    ok_handle_lookup_status = eq handle_lookup_status, SA_DB_OK
+    ok_handle_found = eq handle_found, 1
+    ok_handle_id = eq handle_id, active_id
+    ok_get_row = eq get_row_status, SA_DB_OK
+    ok_fetched_id = eq fetched_id, 1
+    ok_fetched_status = eq fetched_status, active_id
+    ok_close = eq close_status, SA_DB_OK
+    ok_tx2_begin = eq tx2_begin_status, SA_DB_OK
+    ok_tx2_paused_status = eq tx2_paused_status, SA_DB_OK
+    ok_paused_id = eq paused_id, 2
+    ok_paused_inserted = eq paused_inserted, 1
+    ok_tx2_rollback = eq tx2_rollback_status, SA_DB_OK
+    ok_paused_lookup_status = eq paused_lookup_status, SA_DB_OK
+    ok_paused_found = eq paused_found, 0
+    ok_paused_lookup_id = eq paused_lookup_id, 0
+    ok_verify = eq verify_status, SA_DB_OK
+    ok_verify_rows = eq verify_rows, 1
+    ok_verify_epoch = eq verify_epoch, 2
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_create_index
+    ok03 = and ok02, ok_tx1_begin
+    ok04 = and ok03, ok_tx1_active_status
+    ok05 = and ok04, ok_active_id
+    ok06 = and ok05, ok_active_inserted
+    ok07 = and ok06, ok_tx1_active_again_status
+    ok08 = and ok07, ok_active_again_id
+    ok09 = and ok08, ok_active_again_inserted
+    ok10 = and ok09, ok_pre_lookup_status
+    ok11 = and ok10, ok_pre_found
+    ok12 = and ok11, ok_pre_id
+    ok13 = and ok12, ok_tx1_insert
+    ok14 = and ok13, ok_tx1_commit
+    ok15 = and ok14, ok_tx1_rows
+    ok16 = and ok15, ok_tx1_epoch
+    ok17 = and ok16, ok_post_lookup_status
+    ok18 = and ok17, ok_post_found
+    ok19 = and ok18, ok_post_id
+    ok20 = and ok19, ok_open
+    ok21 = and ok20, ok_handle_lookup_status
+    ok22 = and ok21, ok_handle_found
+    ok23 = and ok22, ok_handle_id
+    ok24 = and ok23, ok_get_row
+    ok25 = and ok24, ok_fetched_id
+    ok26 = and ok25, ok_fetched_status
+    ok27 = and ok26, ok_close
+    ok28 = and ok27, ok_tx2_begin
+    ok29 = and ok28, ok_tx2_paused_status
+    ok30 = and ok29, ok_paused_id
+    ok31 = and ok30, ok_paused_inserted
+    ok32 = and ok31, ok_tx2_rollback
+    ok33 = and ok32, ok_paused_lookup_status
+    ok34 = and ok33, ok_paused_found
+    ok35 = and ok34, ok_paused_lookup_id
+    ok36 = and ok35, ok_verify
+    ok37 = and ok36, ok_verify_rows
+    ok = and ok37, ok_verify_epoch
+
+    !remove_status
+    !init_status
+    !create_index_status
+    !tx1_begin_status
+    !tx1
+    !tx1_active_status
+    !active_id
+    !active_inserted
+    !tx1_active_again_status
+    !active_again_id
+    !active_again_inserted
+    !pre_lookup_status
+    !pre_found
+    !pre_id
+    !tx1_insert_status
+    !tx1_commit_status
+    !tx1_rows
+    !tx1_epoch
+    !post_lookup_status
+    !post_found
+    !post_id
+    !open_status
+    !read1
+    !handle_lookup_status
+    !handle_found
+    !handle_id
+    !get_row_status
+    !fetched_id
+    !fetched_status
+    !close_status
+    !tx2_begin_status
+    !tx2
+    !tx2_paused_status
+    !paused_id
+    !paused_inserted
+    !tx2_rollback_status
+    !paused_lookup_status
+    !paused_found
+    !paused_lookup_id
+    !verify_status
+    !verify_rows
+    !verify_epoch
+    !ok_remove
+    !ok_init
+    !ok_create_index
+    !ok_tx1_begin
+    !ok_tx1_active_status
+    !ok_active_id
+    !ok_active_inserted
+    !ok_tx1_active_again_status
+    !ok_active_again_id
+    !ok_active_again_inserted
+    !ok_pre_lookup_status
+    !ok_pre_found
+    !ok_pre_id
+    !ok_tx1_insert
+    !ok_tx1_commit
+    !ok_tx1_rows
+    !ok_tx1_epoch
+    !ok_post_lookup_status
+    !ok_post_found
+    !ok_post_id
+    !ok_open
+    !ok_handle_lookup_status
+    !ok_handle_found
+    !ok_handle_id
+    !ok_get_row
+    !ok_fetched_id
+    !ok_fetched_status
+    !ok_close
+    !ok_tx2_begin
+    !ok_tx2_paused_status
+    !ok_paused_id
+    !ok_paused_inserted
+    !ok_tx2_rollback
+    !ok_paused_lookup_status
+    !ok_paused_found
+    !ok_paused_lookup_id
+    !ok_verify
+    !ok_verify_rows
+    !ok_verify_epoch
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !ok36
+    !ok37
+    !row
+    !fetched
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9007)

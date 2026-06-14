@@ -3062,6 +3062,49 @@ pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, 
     return tableInfo(tx.meta);
 }
 
+pub fn writeTransactionInternStringDict(
+    allocator: std.mem.Allocator,
+    tx: *WriteTransaction,
+    dict_name: []const u8,
+    value: []const u8,
+) TableError!DictInternResult {
+    try validateDictName(dict_name);
+    try validateDictValue(value);
+
+    var old_bytes: []u8 = &.{};
+    var old_count: u64 = 0;
+    var has_old = false;
+    if (findDictMetaIndex(tx.meta, dict_name)) |idx| {
+        old_bytes = try readDictBytes(allocator, tx.root_dir, tx.meta.dicts[idx]);
+        has_old = true;
+        old_count = try dictEntryCount(old_bytes);
+        if (try dictFindValueId(old_bytes, value)) |id| {
+            allocator.free(old_bytes);
+            return .{ .info = tableInfo(tx.meta), .id = id, .inserted = false };
+        }
+    }
+    defer if (has_old) allocator.free(old_bytes);
+
+    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const new_bytes = try buildDictBytesWithValue(allocator, old_bytes, old_count, value);
+    defer allocator.free(new_bytes);
+
+    const target_epoch = std.math.add(u64, tx.meta.epoch, 1) catch return TableError.CursorOverflow;
+    const basename = try dictFileName(allocator, tx.table_name, dict_name, target_epoch);
+    defer allocator.free(basename);
+    const path = try activePath(allocator, tx.root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
+
+    const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
+    var consumed = false;
+    errdefer if (!consumed) freeDictMeta(allocator, new_meta);
+    try putDictMeta(allocator, &tx.meta, new_meta);
+    consumed = true;
+    tx.dirty = true;
+    return .{ .info = tableInfo(tx.meta), .id = new_count, .inserted = true };
+}
+
 pub fn writeTransactionPutBlobValue(
     allocator: std.mem.Allocator,
     tx: *WriteTransaction,
@@ -11411,6 +11454,71 @@ test "table write transaction commits blob handles with rows atomically" {
 
     const verified = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(@as(u64, 3), verified.epoch);
+    try std.testing.expectEqual(@as(u64, 1), verified.row_count);
+}
+
+test "table write transaction interns dictionaries with rows atomically" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "tx_dict_members";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "tx_dict_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    var tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    const active = try writeTransactionInternStringDict(std.testing.allocator, tx, "status", "active");
+    try std.testing.expectEqual(@as(u64, 1), active.id);
+    try std.testing.expect(active.inserted);
+    const active_again = try writeTransactionInternStringDict(std.testing.allocator, tx, "status", "active");
+    try std.testing.expectEqual(@as(u64, 1), active_again.id);
+    try std.testing.expect(!active_again.inserted);
+
+    const not_visible_before_commit = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    try std.testing.expect(!not_visible_before_commit.found);
+
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, 1);
+    writeU64LE(&row, 8, active.id);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 1), committed.row_count);
+    try std.testing.expectEqual(@as(u64, 2), committed.epoch);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+    const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    try std.testing.expect(visible.found);
+    try std.testing.expectEqual(@as(u64, 1), visible.id);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        const found = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(found.found);
+        try std.testing.expectEqual(@as(u64, 1), try snapshotGetU64(snapshot, 1, found.row_index));
+        const status_lookup = try snapshotDictLookup(snapshot, "status", "active");
+        try std.testing.expect(status_lookup.found);
+        try std.testing.expectEqual(@as(u64, 1), status_lookup.id);
+    }
+
+    tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    const paused = try writeTransactionInternStringDict(std.testing.allocator, tx, "status", "paused");
+    try std.testing.expectEqual(@as(u64, 2), paused.id);
+    try std.testing.expect(paused.inserted);
+    destroyWriteTransaction(std.testing.allocator, tx);
+    const rolled_back = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "paused");
+    try std.testing.expect(!rolled_back.found);
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.epoch);
     try std.testing.expectEqual(@as(u64, 1), verified.row_count);
 }
 
