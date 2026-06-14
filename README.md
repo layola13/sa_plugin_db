@@ -152,6 +152,8 @@ Read-handle query calls:
 - `sa_db_filter_bool_handle`
 - `sa_db_filter_rows_u64_range_handle`
 - `sa_db_filter_rows_i64_range_handle`
+- `sa_db_filter_rows_f32_range_handle`
+- `sa_db_filter_rows_f64_range_handle`
 - `sa_db_filter_rows_u32_range_handle`
 - `sa_db_filter_rows_i32_range_handle`
 - `sa_db_filter_rows_u8_range_handle`
@@ -165,6 +167,8 @@ Read-handle query calls:
 - `sa_db_filter_rows_bool_handle`
 - `sa_db_sort_rows_u64_handle`
 - `sa_db_sort_rows_i64_handle`
+- `sa_db_sort_rows_f32_handle`
+- `sa_db_sort_rows_f64_handle`
 - `sa_db_sort_rows_u32_handle`
 - `sa_db_sort_rows_i32_handle`
 - `sa_db_sort_rows_u8_handle`
@@ -458,7 +462,9 @@ encoding.
 Candidate row filters are the first explicit composition layer above these
 indexes. `sa_db_filter_rows_u64_range_handle` /
 `DB_FILTER_ROWS_U64_RANGE_HANDLE`, `sa_db_filter_rows_i64_range_handle` /
-`DB_FILTER_ROWS_I64_RANGE_HANDLE`, compact integer variants
+`DB_FILTER_ROWS_I64_RANGE_HANDLE`, finite float variants
+`sa_db_filter_rows_f32_range_handle` / `DB_FILTER_ROWS_F32_RANGE_HANDLE` and
+`sa_db_filter_rows_f64_range_handle` / `DB_FILTER_ROWS_F64_RANGE_HANDLE`, compact integer variants
 `sa_db_filter_rows_u32_range_handle`, `sa_db_filter_rows_i32_range_handle`,
 `sa_db_filter_rows_u8_range_handle`, `sa_db_filter_rows_i8_range_handle`,
 `sa_db_filter_rows_u16_range_handle`, and
@@ -476,8 +482,8 @@ predicate, and return the same `offset`/`limit`/`total` pagination contract.
 Decimal/date/timestamp wrappers validate and encode the logical ERP values before
 using the signed integer scan path. SA callers can therefore run an indexed
 customer/date or blob/text query first, then narrow the candidate rows by status,
-compact warehouse/category/priority codes, amount/date/timestamp range, or
-posted/active bool without materializing full rows in SA code. This is a planner
+compact warehouse/category/priority codes, amount/date/timestamp range, finite
+measurement/rate/weight ranges, or posted/active bool without materializing full rows in SA code. This is a planner
 building block rather than a SQL optimizer: callers still choose the first
 selective index explicitly.
 `sa_db_stats_rows_u64_handle` / `DB_STATS_ROWS_U64_HANDLE` and
@@ -486,7 +492,9 @@ candidate row list and return `count`, `sum`, `min`, and `max` in one snapshot
 pass. Use the signed variant for scaled decimal amounts, date/timestamp extrema,
 and signed ERP adjustment totals; an empty candidate list returns zeroed stats.
 `sa_db_sort_rows_u64_handle` / `DB_SORT_ROWS_U64_HANDLE`,
-`sa_db_sort_rows_i64_handle` / `DB_SORT_ROWS_I64_HANDLE`, and compact integer
+`sa_db_sort_rows_i64_handle` / `DB_SORT_ROWS_I64_HANDLE`, finite float variants
+`sa_db_sort_rows_f32_handle` / `DB_SORT_ROWS_F32_HANDLE` and
+`sa_db_sort_rows_f64_handle` / `DB_SORT_ROWS_F64_HANDLE`, and compact integer
 variants `sa_db_sort_rows_u32_handle`, `sa_db_sort_rows_i32_handle`,
 `sa_db_sort_rows_u8_handle`, `sa_db_sort_rows_i8_handle`,
 `sa_db_sort_rows_u16_handle`, and `sa_db_sort_rows_i16_handle` with matching
@@ -496,6 +504,8 @@ column, validate that every candidate row is in range, and return a stable
 list pages stay deterministic after applying filters. Use the signed variants
 for scaled decimal amounts, dates, timestamps, signed adjustment fields, and
 compact signed business codes.
+Use the float variants for finite measurement, rate, discount, weight, and
+dimension columns; NaN and infinity are rejected with `SA_DB_ERR_INVALID_FORMAT`.
 Use `sa_db_project_rows_handle` / `DB_PROJECT_ROWS_HANDLE` when a list page only
 needs selected columns. The output is packed row-major: for each row index in
 the input order, bytes for each requested column are appended in the requested
@@ -671,8 +681,9 @@ benchmarks. The required baseline is:
   prefix, and contains filters plus fixed-first-key `u64_pair` and
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
   customer/date, status/due-date, and product/posting-date shapes. Candidate row
-  filters now compose an existing row-id list with additional `u64`, `i64`, or
-  bool predicates for multi-condition list pages. The first ERP workflow
+  filters now compose an existing row-id list with additional integer, finite
+  float, or bool predicates for multi-condition list pages, and candidate row
+  sorting covers integer and finite float list ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
   same composite ERP filters; next is broader index planning.

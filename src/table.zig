@@ -6682,6 +6682,18 @@ fn snapshotI16AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_inde
     return readI16LE(located.bytes, byte_offset);
 }
 
+fn snapshotF32AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!f32 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 4);
+    const byte_offset: usize = @intCast(located.local_row * 4);
+    return try finiteF32(readF32LE(located.bytes, byte_offset));
+}
+
+fn snapshotF64AtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!f64 {
+    const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, 8);
+    const byte_offset: usize = @intCast(located.local_row * 8);
+    return try finiteF64(readF64LE(located.bytes, byte_offset));
+}
+
 fn snapshotBoolAtRow(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!bool {
     const column = snapshot.columns[column_index];
     const located = try snapshotColumnBytesForRow(snapshot, column_index, row_index, column.stride);
@@ -6804,6 +6816,30 @@ const FilterRowsI16RangeContext = struct {
 
 fn matchesRowsI16Range(context: FilterRowsI16RangeContext, row: u64) TableError!bool {
     const value = try snapshotI16AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsF32RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: f32,
+    max_value: f32,
+};
+
+fn matchesRowsF32Range(context: FilterRowsF32RangeContext, row: u64) TableError!bool {
+    const value = try snapshotF32AtRow(context.snapshot, context.column_index, row);
+    return value >= context.min_value and value <= context.max_value;
+}
+
+const FilterRowsF64RangeContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: f64,
+    max_value: f64,
+};
+
+fn matchesRowsF64Range(context: FilterRowsF64RangeContext, row: u64) TableError!bool {
+    const value = try snapshotF64AtRow(context.snapshot, context.column_index, row);
     return value >= context.min_value and value <= context.max_value;
 }
 
@@ -8570,6 +8606,50 @@ pub fn snapshotFilterRowsI16Range(
     }, matchesRowsI16Range);
 }
 
+pub fn snapshotFilterRowsF32Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: f32,
+    max_value: f32,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotF32Column(snapshot, column_index);
+    const normalized_min = try finiteF32(min_value);
+    const normalized_max = try finiteF32(max_value);
+    if (normalized_min > normalized_max) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsF32RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = normalized_min,
+        .max_value = normalized_max,
+    }, matchesRowsF32Range);
+}
+
+pub fn snapshotFilterRowsF64Range(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: f64,
+    max_value: f64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotF64Column(snapshot, column_index);
+    const normalized_min = try finiteF64(min_value);
+    const normalized_max = try finiteF64(max_value);
+    if (normalized_min > normalized_max) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsF64RangeContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = normalized_min,
+        .max_value = normalized_max,
+    }, matchesRowsF64Range);
+}
+
 pub fn snapshotFilterRowsBool(
     snapshot: *const ReadSnapshot,
     column_index: usize,
@@ -8697,6 +8777,34 @@ pub fn snapshotSortRowsI16(
 ) TableError!U64RangeResult {
     try ensureSnapshotI16Column(snapshot, column_index);
     return try snapshotSortRowsBy(i16, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotI16AtRow);
+}
+
+pub fn snapshotSortRowsF32(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotF32Column(snapshot, column_index);
+    return try snapshotSortRowsBy(f32, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotF32AtRow);
+}
+
+pub fn snapshotSortRowsF64(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    descending: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotF64Column(snapshot, column_index);
+    return try snapshotSortRowsBy(f64, allocator, snapshot, column_index, in_rows, descending, offset, limit, out_rows, snapshotF64AtRow);
 }
 
 pub fn snapshotGetU64(snapshot: *const ReadSnapshot, column_index: usize, row_index: u64) TableError!u64 {
@@ -11474,8 +11582,52 @@ test "table persistent f32 and f64 indexes use finite float ordering" {
     try std.testing.expectApproxEqAbs(@as(f64, -3.25), try snapshotMinF64(snapshot, 2), 0.0000001);
     try std.testing.expectApproxEqAbs(@as(f64, 100.125), try snapshotMaxF64(snapshot, 2), 0.0000001);
 
+    var f32_candidate_rows = [_]u64{ 2, 3, 0, 1, 4 };
+    var f32_filtered_rows = [_]u64{ 99, 99, 99 };
+    const f32_filter = try snapshotFilterRowsF32Range(snapshot, 1, &f32_candidate_rows, -0.0, 1.5, 0, f32_filtered_rows.len, &f32_filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), f32_filter.total);
+    try std.testing.expectEqual(@as(u64, 3), f32_filter.written);
+    try std.testing.expectEqual(@as(u64, 2), f32_filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), f32_filtered_rows[1]);
+    try std.testing.expectEqual(@as(u64, 0), f32_filtered_rows[2]);
+
+    var f64_candidate_rows = [_]u64{ 1, 2, 3, 0, 4 };
+    var f64_filtered_rows = [_]u64{ 99, 99 };
+    const f64_filter = try snapshotFilterRowsF64Range(snapshot, 2, &f64_candidate_rows, 2.0, 10.5, 1, f64_filtered_rows.len, &f64_filtered_rows);
+    try std.testing.expectEqual(@as(u64, 3), f64_filter.total);
+    try std.testing.expectEqual(@as(u64, 2), f64_filter.written);
+    try std.testing.expectEqual(@as(u64, 3), f64_filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 0), f64_filtered_rows[1]);
+
+    var all_rows = [_]u64{ 0, 1, 2, 3, 4 };
+    var sorted_rows = [_]u64{ 99, 99, 99, 99, 99 };
+    const f32_sort = try snapshotSortRowsF32(std.testing.allocator, snapshot, 1, &all_rows, true, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), f32_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), f32_sort.written);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 3), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[4]);
+
+    const f64_sort = try snapshotSortRowsF64(std.testing.allocator, snapshot, 2, &all_rows, false, 0, sorted_rows.len, &sorted_rows);
+    try std.testing.expectEqual(@as(u64, 5), f64_sort.total);
+    try std.testing.expectEqual(@as(u64, 5), f64_sort.written);
+    try std.testing.expectEqual(@as(u64, 1), sorted_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), sorted_rows[1]);
+    try std.testing.expectEqual(@as(u64, 3), sorted_rows[2]);
+    try std.testing.expectEqual(@as(u64, 0), sorted_rows[3]);
+    try std.testing.expectEqual(@as(u64, 4), sorted_rows[4]);
+
+    const empty_float_filter = try snapshotFilterRowsF64Range(snapshot, 2, &all_rows, 10.5, 2.0, 0, f64_filtered_rows.len, &f64_filtered_rows);
+    try std.testing.expectEqual(@as(u64, 0), empty_float_filter.total);
+    try std.testing.expectEqual(@as(u64, 0), empty_float_filter.written);
+
     try std.testing.expectError(TableError.InvalidFormat, snapshotCountF32Cmp(snapshot, 1, .eq, std.math.inf(f32)));
     try std.testing.expectError(TableError.InvalidFormat, snapshotFindF64(snapshot, 2, std.math.nan(f64)));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsF32Range(snapshot, 1, &all_rows, std.math.inf(f32), 1.0, 0, f32_filtered_rows.len, &f32_filtered_rows));
+    const invalid_rows = [_]u64{999};
+    try std.testing.expectError(TableError.InvalidFormat, snapshotSortRowsF64(std.testing.allocator, snapshot, 2, &invalid_rows, true, 0, sorted_rows.len, &sorted_rows));
 }
 
 test "table delete u64 key can empty a table" {

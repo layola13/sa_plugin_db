@@ -955,6 +955,22 @@
     %out_total = load __db_handle_filter_rows_i64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_ROWS_F32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_f32_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_f32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_f32_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_f32_written_slot_%out_written, &__db_handle_filter_rows_f32_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_f32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_f32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_F64_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
+    __db_handle_filter_rows_f64_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_f64_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_f64_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_f64_written_slot_%out_written, &__db_handle_filter_rows_f64_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_f64_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_f64_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_U32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
     __db_handle_filter_rows_u32_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_u32_total_slot_%out_total = stack_alloc 8
@@ -1057,6 +1073,22 @@
     %out_status = call @sa_db_sort_rows_i64_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_i64_written_slot_%out_written, &__db_handle_sort_rows_i64_total_slot_%out_total)
     %out_written = load __db_handle_sort_rows_i64_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_sort_rows_i64_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_F32_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_f32_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_f32_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_f32_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_f32_written_slot_%out_written, &__db_handle_sort_rows_f32_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_f32_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_f32_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_SORT_ROWS_F64_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
+    __db_handle_sort_rows_f64_written_slot_%out_written = stack_alloc 8
+    __db_handle_sort_rows_f64_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_sort_rows_f64_handle(%handle, %column_index, &%in_rows, %in_rows_len, %descending, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_sort_rows_f64_written_slot_%out_written, &__db_handle_sort_rows_f64_total_slot_%out_total)
+    %out_written = load __db_handle_sort_rows_f64_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_sort_rows_f64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_SORT_ROWS_U32_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
