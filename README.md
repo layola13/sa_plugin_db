@@ -62,6 +62,8 @@ Core native calls:
 - `sa_db_update_row_u64_pair_key`
 - `sa_db_upsert_row_u64_i64_pair_key`
 - `sa_db_update_row_u64_i64_pair_key`
+- `sa_db_upsert_row_blob_eq_key`
+- `sa_db_update_row_blob_eq_key`
 - `sa_db_tx_begin`
 - `sa_db_tx_insert_row`
 - `sa_db_tx_dict_intern`
@@ -96,6 +98,9 @@ Core native calls:
 - `sa_db_tx_upsert_row_u64_i64_pair_key`
 - `sa_db_tx_update_row_u64_i64_pair_key`
 - `sa_db_tx_delete_u64_i64_pair_key`
+- `sa_db_tx_upsert_row_blob_eq_key`
+- `sa_db_tx_update_row_blob_eq_key`
+- `sa_db_tx_delete_blob_eq_key`
 - `sa_db_tx_commit`
 - `sa_db_tx_rollback`
 - `sa_db_create_u64_index`
@@ -136,6 +141,7 @@ Core native calls:
 - `sa_db_delete_i64_key`
 - `sa_db_delete_u64_pair_key`
 - `sa_db_delete_u64_i64_pair_key`
+- `sa_db_delete_blob_eq_key`
 - `sa_db_snapshot`
 - `sa_db_restore`
 - `sa_db_recover`
@@ -485,7 +491,13 @@ filtering falls back to the previous snapshot scan. When the exact index is
 unique, `sa_db_get_row_blob_eq_key_handle` / `DB_GET_ROW_BLOB_EQ_KEY_HANDLE`
 fetches the full fixed-width row for one exact text/blob value, which covers ERP
 lookups by document number, customer/vendor code, SKU, or external ID stored in a
-`blob_handle` column. `sa_db_create_blob_token_index`
+`blob_handle` column. The matching write path is
+`sa_db_upsert_row_blob_eq_key` / `DB_UPSERT_ROW_BLOB_EQ_KEY`,
+`sa_db_update_row_blob_eq_key` / `DB_UPDATE_ROW_BLOB_EQ_KEY`, and
+`sa_db_delete_blob_eq_key` / `DB_DELETE_BLOB_EQ_KEY`, plus transaction variants.
+Those calls require the row's `blob_handle` to reference bytes equal to the key
+argument and still confirm indexed hash candidates against real blob bytes.
+`sa_db_create_blob_token_index`
 / `DB_CREATE_BLOB_TOKEN_INDEX` builds a persisted token index for ASCII
 letters/digits/underscore tokens. `sa_db_filter_blob_token_handle` /
 `DB_FILTER_BLOB_TOKEN_HANDLE` is case-insensitive, returns only rows whose blob
@@ -744,7 +756,9 @@ returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_DICT_INTERN`, `DB_TX_BLOB_P
 `DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`, and
 `DB_TX_DELETE_U64_PAIR_KEY`, and the signed-second-key forms
 `DB_TX_UPSERT_ROW_U64_I64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_I64_PAIR_KEY`, and
-`DB_TX_DELETE_U64_I64_PAIR_KEY`, mutate a transaction image; no new table epoch or
+`DB_TX_DELETE_U64_I64_PAIR_KEY`, plus unique text/blob-key forms
+`DB_TX_UPSERT_ROW_BLOB_EQ_KEY`, `DB_TX_UPDATE_ROW_BLOB_EQ_KEY`, and
+`DB_TX_DELETE_BLOB_EQ_KEY`, mutate a transaction image; no new table epoch or
 manifest is published until `sa_db_tx_commit` / `DB_TX_COMMIT`. Commit writes
 changed row segments when needed, versioned dictionary/blob artifacts referenced by the transaction metadata, rebuilds all
 persisted indexes, then advances the active manifest once. Dictionary-only and
@@ -804,6 +818,16 @@ This is the ERP composite-key path for signed second keys such as
 `out_inserted=0`, missing tuples are appended with `out_inserted=1`, and signed
 ordering remains available for list/range reads after the write.
 
+`sa_db_upsert_row_blob_eq_key` / `DB_UPSERT_ROW_BLOB_EQ_KEY` applies the same
+strict row-write contract to a unique `blob_eq` index over one `blob_handle`
+column and one named store. This is the ERP text/blob business-key path for
+customer/vendor codes, SKU strings, document numbers, or external IDs. The row's
+`blob_handle` must point at bytes equal to the key argument; existing keys are
+replaced with `out_inserted=0`, missing keys are appended with `out_inserted=1`,
+and all candidates are confirmed by real bytes so hash collisions cannot select
+the wrong row. `sa_db_tx_upsert_row_blob_eq_key` /
+`DB_TX_UPSERT_ROW_BLOB_EQ_KEY` provides the transaction-image variant.
+
 `sa_db_update_row_u64_key` / `DB_UPDATE_ROW_U64_KEY` is the strict update form
 for ERP screens that must not accidentally insert a new customer, order, item,
 or ledger row. It has the same fixed-width row layout and unique-key requirement
@@ -832,6 +856,13 @@ screens can modify multiple child rows and commit or roll them back together.
 `sa_db_tx_update_row_u64_i64_pair_key` /
 `DB_TX_UPDATE_ROW_U64_I64_PAIR_KEY` provides the transaction-image variant.
 
+`sa_db_update_row_blob_eq_key` / `DB_UPDATE_ROW_BLOB_EQ_KEY` is the strict
+no-insert update form for unique text/blob business keys. It returns
+`SA_DB_ERR_NOT_FOUND` when the exact bytes are absent and
+`SA_DB_ERR_INVALID_FORMAT` when the supplied row's `blob_handle` does not decode
+to the same key bytes. `sa_db_tx_update_row_blob_eq_key` /
+`DB_TX_UPDATE_ROW_BLOB_EQ_KEY` provides the transaction-image variant.
+
 `sa_db_delete_u64_key` / `DB_DELETE_U64_KEY` deletes one row by a unique `u64`
 key. The target column must already have a unique `u64` index, so the operation
 has primary-key semantics instead of deleting an arbitrary non-unique match. The
@@ -857,6 +888,11 @@ without scanning the whole child table.
 a unique `(u64, i64)` tuple. `sa_db_tx_delete_u64_i64_pair_key` /
 `DB_TX_DELETE_U64_I64_PAIR_KEY` provides the same behavior inside a write
 transaction for signed date/timestamp/amount second-key shapes.
+
+`sa_db_delete_blob_eq_key` / `DB_DELETE_BLOB_EQ_KEY` deletes one row by a unique
+text/blob business key and returns `SA_DB_ERR_NOT_FOUND` when the exact bytes are
+absent. `sa_db_tx_delete_blob_eq_key` / `DB_TX_DELETE_BLOB_EQ_KEY` provides the
+same behavior inside a write transaction.
 
 `sa_db_dict_intern` / `DB_DICT_INTERN` provides the first string data-model layer
 for ERP fields with small repeated value sets. `sa_db_tx_dict_intern` /
@@ -927,8 +963,8 @@ benchmarks. The required baseline is:
   text predicates.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index, unique typed integer key, unique composite key, or unique
-  `blob_eq` text/blob key. Upsert/update/delete by unique `u64`, `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, or `i64` key, unique `(u64, u64)` tuple, or unique `(u64, i64)`
-  tuple, range query handles, and single-table batch transactions exist now. Projected
+  `blob_eq` text/blob key. Upsert/update/delete by unique `u64`, `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, or `i64` key, unique `(u64, u64)` tuple, unique `(u64, i64)`
+  tuple, or unique `blob_eq` text/blob key, range query handles, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
   prefix, and contains filters plus fixed-first-key `u64_pair` and
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
@@ -1010,6 +1046,9 @@ sa build-exe db_pair_key_get_row_smoke.sa -o db_pair_key_get_row_smoke.out --no-
 
 sa build-exe db_blob_key_get_row_smoke.sa -o db_blob_key_get_row_smoke.out --no-incremental
 ./db_blob_key_get_row_smoke.out
+
+sa build-exe db_blob_key_write_smoke.sa -o db_blob_key_write_smoke.out --no-incremental
+./db_blob_key_write_smoke.out
 
 sa build-exe db_candidate_filter_smoke.sa -o db_candidate_filter_smoke.out --no-incremental
 ./db_candidate_filter_smoke.out

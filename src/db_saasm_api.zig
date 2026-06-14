@@ -1139,6 +1139,69 @@ pub export fn sa_db_update_row_u64_i64_pair_key(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_upsert_row_blob_eq_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_update_row_blob_eq_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_tx_begin(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -1653,6 +1716,57 @@ pub export fn sa_db_tx_update_row_u64_i64_pair_key(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_tx_upsert_row_blob_eq_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const result = table.writeTransactionUpsertRawRowBlobEqKey(std.heap.page_allocator, tx, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_blob_eq_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowBlobEqKey(std.heap.page_allocator, tx, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_tx_delete_u64_key(
     handle: ?*anyopaque,
     column_index: u64,
@@ -1806,6 +1920,26 @@ pub export fn sa_db_tx_delete_u64_i64_pair_key(
     defer tx_handle_mutex.unlock();
     const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU64I64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_delete_blob_eq_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionDeleteBlobEqKey(std.heap.page_allocator, tx, @intCast(column_index), store_name, value) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -2601,6 +2735,32 @@ pub export fn sa_db_delete_u64_i64_pair_key(
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
     const info = table.deleteU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_delete_blob_eq_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.deleteBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -6451,6 +6611,138 @@ test "db SA ABI gets rows by unique blob eq key" {
     try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, missing_code.ptr, missing_code.len, &fetched_row, fetched_row.len));
     var short_row: [23]u8 = undefined;
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &short_row, short_row.len));
+}
+
+test "db SA ABI writes rows by unique blob eq keys" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "blob_key_write_abi";
+    const store_name = "codes";
+    const code_a = "CUST-001";
+    const code_b = "CUST-002";
+    const code_c = "CUST-003";
+    const code_d = "CUST-004";
+    const code_e = "CUST-005";
+    const code_f = "CUST-006";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_CODE_STRIDE = 8 // blob_handle
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "blob_key_write_abi.sadb-schema".ptr, "blob_key_write_abi.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var code_a_id: u64 = 0;
+    var code_b_id: u64 = 0;
+    var code_c_id: u64 = 0;
+    var code_d_id: u64 = 0;
+    var code_e_id: u64 = 0;
+    var code_f_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, code_a.ptr, code_a.len, &code_a_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &code_b_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, code_c.ptr, code_c.len, &code_c_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, code_e.ptr, code_e.len, &code_e_id, &info));
+
+    var row: [24]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 1, .little);
+    std.mem.writeInt(u64, row[8..16], code_a_id, .little);
+    std.mem.writeInt(u64, row[16..24], 100, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], code_b_id, .little);
+    std.mem.writeInt(u64, row[16..24], 200, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_blob_eq_index(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, 1, &info));
+
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], code_b_id, .little);
+    std.mem.writeInt(u64, row[16..24], 250, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_update_row_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &row, row.len, &info));
+
+    std.mem.writeInt(u64, row[0..8], 3, .little);
+    std.mem.writeInt(u64, row[8..16], code_c_id, .little);
+    std.mem.writeInt(u64, row[16..24], 300, .little);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_update_row_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_c.ptr, code_c.len, &row, row.len, &info));
+
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], code_a_id, .little);
+    std.mem.writeInt(u64, row[16..24], 251, .little);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_update_row_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &row, row.len, &info));
+
+    var inserted: u64 = 99;
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], code_b_id, .little);
+    std.mem.writeInt(u64, row[16..24], 260, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 0), inserted);
+
+    std.mem.writeInt(u64, row[0..8], 3, .little);
+    std.mem.writeInt(u64, row[8..16], code_c_id, .little);
+    std.mem.writeInt(u64, row[16..24], 300, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_c.ptr, code_c.len, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_delete_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_a.ptr, code_a.len, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_delete_blob_eq_key(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, code_a.ptr, code_a.len, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], code_b_id, .little);
+    std.mem.writeInt(u64, row[16..24], 270, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_blob_eq_key(tx_handle, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 0), inserted);
+    std.mem.writeInt(u64, row[0..8], 5, .little);
+    std.mem.writeInt(u64, row[8..16], code_e_id, .little);
+    std.mem.writeInt(u64, row[16..24], 500, .little);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_tx_update_row_blob_eq_key(tx_handle, 1, store_name.ptr, store_name.len, code_e.ptr, code_e.len, &row, row.len, &info));
+    std.mem.writeInt(u64, row[0..8], 3, .little);
+    std.mem.writeInt(u64, row[8..16], code_c_id, .little);
+    std.mem.writeInt(u64, row[16..24], 330, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_blob_eq_key(tx_handle, 1, store_name.ptr, store_name.len, code_c.ptr, code_c.len, &row, row.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_blob_put(tx_handle, store_name.ptr, store_name.len, code_d.ptr, code_d.len, &code_d_id, &info));
+    std.mem.writeInt(u64, row[0..8], 4, .little);
+    std.mem.writeInt(u64, row[8..16], code_d_id, .little);
+    std.mem.writeInt(u64, row[16..24], 400, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_blob_eq_key(tx_handle, 1, store_name.ptr, store_name.len, code_d.ptr, code_d.len, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_delete_blob_eq_key(tx_handle, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, table_name.ptr, table_name.len, &tx_handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_blob_put(tx_handle, store_name.ptr, store_name.len, code_f.ptr, code_f.len, &code_f_id, &info));
+    std.mem.writeInt(u64, row[0..8], 6, .little);
+    std.mem.writeInt(u64, row[8..16], code_f_id, .little);
+    std.mem.writeInt(u64, row[16..24], 600, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_blob_eq_key(tx_handle, 1, store_name.ptr, store_name.len, code_f.ptr, code_f.len, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(tx_handle));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &handle));
+    var fetched_row: [24]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_c.ptr, code_c.len, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(code_c_id, std.mem.readInt(u64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 330), std.mem.readInt(u64, fetched_row[16..24], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_d.ptr, code_d.len, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(code_d_id, std.mem.readInt(u64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 400), std.mem.readInt(u64, fetched_row[16..24], .little));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_a.ptr, code_a.len, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_f.ptr, code_f.len, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
 }
 
 test "db SA ABI writes rows by u64 pair keys" {

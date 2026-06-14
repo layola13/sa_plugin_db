@@ -2864,6 +2864,32 @@ fn rowU64I64PairKeyValue(meta: TableMeta, column_index: usize, column_index2: us
     };
 }
 
+fn rowBlobHandleKeyValue(meta: TableMeta, column_index: usize, row_bytes: []const u8) TableError!u64 {
+    try ensureBlobHandleColumn(meta, column_index);
+    if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
+    const offset = try rowColumnOffset(meta, column_index);
+    return readU64LE(row_bytes, offset);
+}
+
+fn ensureRowBlobEqKeyValue(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    store_name: []const u8,
+    value: []const u8,
+    row_bytes: []const u8,
+) TableError!void {
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(value);
+    const blob_id = try rowBlobHandleKeyValue(meta, column_index, row_bytes);
+    const blob_idx = findBlobStoreMetaIndex(meta, store_name) orelse return TableError.InvalidFormat;
+    const blob_bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[blob_idx]);
+    defer allocator.free(blob_bytes);
+    const actual = (try blobValueSliceById(blob_bytes, blob_id)) orelse return TableError.InvalidFormat;
+    if (!std.mem.eql(u8, actual, value)) return TableError.InvalidFormat;
+}
+
 fn splitRawRowColumns(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]RawColumnBytes {
     if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
     const columns = try allocator.alloc(RawColumnBytes, meta.columns.len);
@@ -3065,6 +3091,21 @@ fn hasUniqueU64I64PairIndex(meta: TableMeta, column_index: usize, column_index2:
     return false;
 }
 
+fn hasUniqueBlobEqIndex(meta: TableMeta, column_index: usize, store_name: []const u8) bool {
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.unique and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null and
+            index.store_name != null and
+            std.mem.eql(u8, index.store_name.?, store_name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn validateTransactionBuffers(tx: *const WriteTransaction) TableError!void {
     if (tx.buffers.len != tx.meta.columns.len) return TableError.InvalidFormat;
     for (tx.meta.columns, 0..) |column, col_idx| {
@@ -3219,6 +3260,31 @@ fn txFindU64I64PairKeyRow(tx: *const WriteTransaction, column_index: usize, colu
         const offset_u64 = std.math.mul(u64, row, 8) catch return TableError.CursorOverflow;
         const offset: usize = @intCast(offset_u64);
         if (readU64LE(bytes1, offset) == key1 and readI64LE(bytes2, offset) == key2) return .{ .found = true, .row_index = row };
+    }
+    return .{ .found = false, .row_index = 0 };
+}
+
+fn txFindBlobEqKeyRow(allocator: std.mem.Allocator, tx: *const WriteTransaction, column_index: usize, store_name: []const u8, value: []const u8) TableError!U64FindResult {
+    try ensureBlobHandleColumn(tx.meta, column_index);
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(value);
+    if (!hasUniqueBlobEqIndex(tx.meta, column_index, store_name)) return TableError.InvalidFormat;
+    try validateTransactionBuffers(tx);
+
+    const blob_idx = findBlobStoreMetaIndex(tx.meta, store_name) orelse return .{ .found = false, .row_index = 0 };
+    const blob_bytes = try readBlobStoreBytes(allocator, tx.root_dir, tx.meta.blobs[blob_idx]);
+    defer allocator.free(blob_bytes);
+    const refs = try buildBlobValueRefs(allocator, blob_bytes);
+    defer allocator.free(refs);
+
+    const bytes = tx.buffers[column_index].items;
+    var row: u64 = 0;
+    while (row < tx.meta.row_count) : (row += 1) {
+        const offset_u64 = std.math.mul(u64, row, 8) catch return TableError.CursorOverflow;
+        const offset: usize = @intCast(offset_u64);
+        const blob_id = readU64LE(bytes, offset);
+        const value_ref = blobRefForId(refs, blob_id) orelse continue;
+        if (std.mem.eql(u8, value_ref.value, value)) return .{ .found = true, .row_index = row };
     }
     return .{ .found = false, .row_index = 0 };
 }
@@ -3489,6 +3555,17 @@ pub fn writeTransactionUpsertRawRowU64I64PairKey(tx: *WriteTransaction, column_i
     return .{ .info = tableInfo(tx.meta), .inserted = true };
 }
 
+pub fn writeTransactionUpsertRawRowBlobEqKey(allocator: std.mem.Allocator, tx: *WriteTransaction, column_index: usize, store_name: []const u8, value: []const u8, row_bytes: []const u8) TableError!UpsertResult {
+    try ensureRowBlobEqKeyValue(allocator, tx.root_dir, tx.meta, column_index, store_name, value, row_bytes);
+    const found = try txFindBlobEqKeyRow(allocator, tx, column_index, store_name, value);
+    if (found.found) {
+        try txReplaceRawRow(tx, found.row_index, row_bytes);
+        return .{ .info = tableInfo(tx.meta), .inserted = false };
+    }
+    try txAppendRawRow(tx, row_bytes);
+    return .{ .info = tableInfo(tx.meta), .inserted = true };
+}
+
 pub fn writeTransactionUpdateRawRowU64Key(tx: *WriteTransaction, column_index: usize, expected: u64, row_bytes: []const u8) TableError!TableInfo {
     const key_value = try rowU64KeyValue(tx.meta, column_index, row_bytes);
     if (key_value != expected) return TableError.InvalidFormat;
@@ -3579,6 +3656,14 @@ pub fn writeTransactionUpdateRawRowU64I64PairKey(tx: *WriteTransaction, column_i
     return tableInfo(tx.meta);
 }
 
+pub fn writeTransactionUpdateRawRowBlobEqKey(allocator: std.mem.Allocator, tx: *WriteTransaction, column_index: usize, store_name: []const u8, value: []const u8, row_bytes: []const u8) TableError!TableInfo {
+    try ensureRowBlobEqKeyValue(allocator, tx.root_dir, tx.meta, column_index, store_name, value, row_bytes);
+    const found = try txFindBlobEqKeyRow(allocator, tx, column_index, store_name, value);
+    if (!found.found) return TableError.NotFound;
+    try txReplaceRawRow(tx, found.row_index, row_bytes);
+    return tableInfo(tx.meta);
+}
+
 pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, expected: u64) TableError!TableInfo {
     const found = try txFindU64KeyRow(tx, column_index, expected);
     if (!found.found) return TableError.NotFound;
@@ -3644,6 +3729,13 @@ pub fn writeTransactionDeleteU64PairKey(tx: *WriteTransaction, column_index: usi
 
 pub fn writeTransactionDeleteU64I64PairKey(tx: *WriteTransaction, column_index: usize, column_index2: usize, key1: u64, key2: i64) TableError!TableInfo {
     const found = try txFindU64I64PairKeyRow(tx, column_index, column_index2, key1, key2);
+    if (!found.found) return TableError.NotFound;
+    try txDeleteRow(tx, found.row_index);
+    return tableInfo(tx.meta);
+}
+
+pub fn writeTransactionDeleteBlobEqKey(allocator: std.mem.Allocator, tx: *WriteTransaction, column_index: usize, store_name: []const u8, value: []const u8) TableError!TableInfo {
+    const found = try txFindBlobEqKeyRow(allocator, tx, column_index, store_name, value);
     if (!found.found) return TableError.NotFound;
     try txDeleteRow(tx, found.row_index);
     return tableInfo(tx.meta);
@@ -8595,6 +8687,97 @@ fn findUniqueU64I64PairKeyRow(
     }, key1, sortableI64Key(key2));
 }
 
+fn blobHandleAtRowFromMeta(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta, column_index: usize, row_index: u64) TableError!u64 {
+    try ensureBlobHandleColumn(meta, column_index);
+    if (row_index >= meta.row_count) return TableError.VerifyFailed;
+
+    var row_base: u64 = 0;
+    for (meta.segments) |segment| {
+        const segment_end = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+        if (row_index < segment_end) {
+            const local_row = row_index - row_base;
+            const file_meta = segment.files[column_index];
+            const path = try activePath(allocator, root_dir, file_meta.path);
+            defer allocator.free(path);
+            const bytes = try readFileAlloc(allocator, path, 1 << 30);
+            defer allocator.free(bytes);
+            const expected_len = try expectedColumnBytes(segment.rows, 8);
+            if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+            const byte_offset_u64 = std.math.mul(u64, local_row, 8) catch return TableError.CursorOverflow;
+            if (byte_offset_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+            return readU64LE(bytes, @intCast(byte_offset_u64));
+        }
+        row_base = segment_end;
+    }
+    return TableError.VerifyFailed;
+}
+
+fn findUniqueBlobEqKeyRow(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    store_name: []const u8,
+    value: []const u8,
+) TableError!U64FindResult {
+    try ensureBlobHandleColumn(meta, column_index);
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(value);
+    var selected: ?IndexMeta = null;
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.unique and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null and
+            index.store_name != null and
+            std.mem.eql(u8, index.store_name.?, store_name))
+        {
+            selected = index;
+            break;
+        }
+    }
+    const index = selected orelse return TableError.InvalidFormat;
+    if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+
+    const blob_idx = findBlobStoreMetaIndex(meta, store_name) orelse return .{ .found = false, .row_index = 0 };
+    const blob_bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[blob_idx]);
+    defer allocator.free(blob_bytes);
+    const refs = try buildBlobValueRefs(allocator, blob_bytes);
+    defer allocator.free(refs);
+
+    const path = try activePath(allocator, root_dir, index.path);
+    defer allocator.free(path);
+    const bytes = try readFileAlloc(allocator, path, 1 << 30);
+    defer allocator.free(bytes);
+    if (bytes.len != index.bytes) return TableError.VerifyFailed;
+    const actual_hash = hashBytes(bytes);
+    const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
+    if (!std.mem.eql(u8, actual_hex[0..], index.sha256)) return TableError.VerifyFailed;
+    try validateIndexBytesShape(bytes, meta.row_count, true);
+
+    const key = blobValueHash(value);
+    const read_index = ReadIndexSnapshot{
+        .kind = BLOB_EQ_INDEX_KIND,
+        .column_index = @intCast(column_index),
+        .unique = true,
+        .entries = bytes,
+    };
+    const start = lowerBoundU64Index(read_index, key);
+    const end = upperBoundU64Index(read_index, key);
+    var matched_row: ?u64 = null;
+    var i = start;
+    while (i < end) : (i += 1) {
+        const row = readIndexRow(bytes, i);
+        const blob_id = try blobHandleAtRowFromMeta(allocator, root_dir, meta, column_index, row);
+        const value_ref = blobRefForId(refs, blob_id) orelse continue;
+        if (!std.mem.eql(u8, value_ref.value, value)) continue;
+        if (matched_row != null) return TableError.VerifyFailed;
+        matched_row = row;
+    }
+    if (matched_row) |row| return .{ .found = true, .row_index = row };
+    return .{ .found = false, .row_index = 0 };
+}
+
 fn buildColumnBuffersWithoutRow(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -8960,6 +9143,25 @@ pub fn deleteU64I64PairKey(
     return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
 }
 
+pub fn deleteBlobEqKey(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    store_name: []const u8,
+    value: []const u8,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
+    if (!found.found) return TableError.NotFound;
+    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+}
+
 pub fn updateRawRowU64Key(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -9180,6 +9382,28 @@ pub fn updateRawRowU64I64PairKey(
     if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
 
     const found = try findUniqueU64I64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
+    if (!found.found) return TableError.NotFound;
+    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+}
+
+pub fn updateRawRowBlobEqKey(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    store_name: []const u8,
+    value: []const u8,
+    row_bytes: []const u8,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    try ensureRowBlobEqKeyValue(allocator, root_dir, owned, column_index, store_name, value, row_bytes);
+
+    const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
     if (!found.found) return TableError.NotFound;
     return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
 }
@@ -9539,6 +9763,43 @@ pub fn upsertRawRowU64I64PairKey(
     if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
 
     const found = try findUniqueU64I64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
+    if (found.found) {
+        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+        return .{ .info = info, .inserted = false };
+    }
+
+    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
+    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
+    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
+    defer {
+        for (buffers) |*buf| buf.deinit();
+        allocator.free(buffers);
+    }
+
+    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
+    try rebuildIndexes(allocator, root_dir, &owned);
+    try writeMeta(allocator, root_dir, table_name, owned);
+    return .{ .info = tableInfo(owned), .inserted = true };
+}
+
+pub fn upsertRawRowBlobEqKey(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    store_name: []const u8,
+    value: []const u8,
+    row_bytes: []const u8,
+) TableError!UpsertResult {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    try ensureRowBlobEqKeyValue(allocator, root_dir, owned, column_index, store_name, value, row_bytes);
+
+    const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
     if (found.found) {
         const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
         return .{ .info = info, .inserted = false };
