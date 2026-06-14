@@ -181,6 +181,8 @@ Read-handle query calls:
 - `sa_db_stats_rows_i64_handle`
 - `sa_db_group_sum_i64_by_u64_handle`
 - `sa_db_group_rows_sum_i64_by_u64_handle`
+- `sa_db_group_sum_i64_by_u64_sorted_handle`
+- `sa_db_group_rows_sum_i64_by_u64_sorted_handle`
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
 - `sa_db_count_i64_cmp_handle`
@@ -302,6 +304,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
 `DB_SUM_I64_HANDLE`, `DB_STATS_ROWS_U64_HANDLE`, `DB_STATS_ROWS_I64_HANDLE`,
 `DB_GROUP_SUM_I64_BY_U64_HANDLE`, `DB_GROUP_ROWS_SUM_I64_BY_U64_HANDLE`,
+`DB_GROUP_SUM_I64_BY_U64_SORTED_HANDLE`, `DB_GROUP_ROWS_SUM_I64_BY_U64_SORTED_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
 `DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_U8_CMP_HANDLE`, `DB_COUNT_I8_CMP_HANDLE`,
 `DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_F32_CMP_HANDLE`,
@@ -708,6 +711,13 @@ group key, row count, and signed sum in caller-provided arrays. Use the rows
 variant after indexed filters or planners to build ERP totals such as amount by
 customer, warehouse, status, or account without copying candidate rows back into
 SA code.
+The sorted variants, `sa_db_group_sum_i64_by_u64_sorted_handle` /
+`DB_GROUP_SUM_I64_BY_U64_SORTED_HANDLE` and
+`sa_db_group_rows_sum_i64_by_u64_sorted_handle` /
+`DB_GROUP_ROWS_SUM_I64_BY_U64_SORTED_HANDLE`, return the same group columns after
+sorting pages by `sort_by` (`0=key`, `1=count`, `2=sum`) and `descending` (`0/1`).
+Groups with equal sort values keep first-seen order, so Top N customer,
+warehouse, status, or account reports page deterministically.
 `sa_db_sort_rows_u64_handle` / `DB_SORT_ROWS_U64_HANDLE`,
 `sa_db_sort_rows_i64_handle` / `DB_SORT_ROWS_I64_HANDLE`, finite float variants
 `sa_db_sort_rows_f32_handle` / `DB_SORT_ROWS_F32_HANDLE` and

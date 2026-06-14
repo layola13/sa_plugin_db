@@ -72,6 +72,22 @@ L_ENTRY:
     candidate_count1 = load group_counts+8 as u64
     candidate_sum1 = load group_sums+8 as i64
 
+    EXPAND DB_GROUP_SUM_I64_BY_U64_SORTED_HANDLE sorted_status, sorted_written, sorted_total, group_keys, group_counts, group_sums, GROUP_CAP, read_handle, 0, 1, 2, 1, 0, 2
+    sorted_key0 = load group_keys+0 as u64
+    sorted_count0 = load group_counts+0 as u64
+    sorted_sum0 = load group_sums+0 as i64
+    sorted_key1 = load group_keys+8 as u64
+    sorted_count1 = load group_counts+8 as u64
+    sorted_sum1 = load group_sums+8 as i64
+
+    EXPAND DB_GROUP_ROWS_SUM_I64_BY_U64_SORTED_HANDLE sorted_candidate_status, sorted_candidate_written, sorted_candidate_total, group_keys, group_counts, group_sums, GROUP_CAP, read_handle, 0, 1, candidate_rows, CANDIDATE_ROWS, 2, 0, 0, GROUP_CAP
+    sorted_candidate_key0 = load group_keys+0 as u64
+    sorted_candidate_count0 = load group_counts+0 as u64
+    sorted_candidate_sum0 = load group_sums+0 as i64
+    sorted_candidate_key1 = load group_keys+8 as u64
+    sorted_candidate_count1 = load group_counts+8 as u64
+    sorted_candidate_sum1 = load group_sums+8 as i64
+
     EXPAND DB_GROUP_ROWS_SUM_I64_BY_U64_HANDLE empty_status, empty_written, empty_total, group_keys, group_counts, group_sums, 0, read_handle, 0, 1, candidate_rows, 0, 0, 0
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
     EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
@@ -111,6 +127,24 @@ L_ENTRY:
     ok_candidate_key1 = eq candidate_key1, 1
     ok_candidate_count1 = eq candidate_count1, 1
     ok_candidate_sum1 = eq candidate_sum1, 20
+    ok_sorted_status = eq sorted_status, SA_DB_OK
+    ok_sorted_written = eq sorted_written, 2
+    ok_sorted_total = eq sorted_total, 3
+    ok_sorted_key0 = eq sorted_key0, 1
+    ok_sorted_count0 = eq sorted_count0, 2
+    ok_sorted_sum0 = eq sorted_sum0, 30
+    ok_sorted_key1 = eq sorted_key1, 2
+    ok_sorted_count1 = eq sorted_count1, 2
+    ok_sorted_sum1 = eq sorted_sum1, 10
+    ok_sorted_candidate_status = eq sorted_candidate_status, SA_DB_OK
+    ok_sorted_candidate_written = eq sorted_candidate_written, 2
+    ok_sorted_candidate_total = eq sorted_candidate_total, 2
+    ok_sorted_candidate_key0 = eq sorted_candidate_key0, 2
+    ok_sorted_candidate_count0 = eq sorted_candidate_count0, 2
+    ok_sorted_candidate_sum0 = eq sorted_candidate_sum0, 10
+    ok_sorted_candidate_key1 = eq sorted_candidate_key1, 1
+    ok_sorted_candidate_count1 = eq sorted_candidate_count1, 1
+    ok_sorted_candidate_sum1 = eq sorted_candidate_sum1, 20
     ok_empty_status = eq empty_status, SA_DB_OK
     ok_empty_written = eq empty_written, 0
     ok_empty_total = eq empty_total, 0
@@ -151,11 +185,29 @@ L_ENTRY:
     ok32 = and ok31, ok_candidate_key1
     ok33 = and ok32, ok_candidate_count1
     ok34 = and ok33, ok_candidate_sum1
-    ok35 = and ok34, ok_empty_status
-    ok36 = and ok35, ok_empty_written
-    ok37 = and ok36, ok_empty_total
-    ok38 = and ok37, ok_close
-    ok = and ok38, ok_verify
+    ok35 = and ok34, ok_sorted_status
+    ok36 = and ok35, ok_sorted_written
+    ok37 = and ok36, ok_sorted_total
+    ok38 = and ok37, ok_sorted_key0
+    ok39 = and ok38, ok_sorted_count0
+    ok40 = and ok39, ok_sorted_sum0
+    ok41 = and ok40, ok_sorted_key1
+    ok42 = and ok41, ok_sorted_count1
+    ok43 = and ok42, ok_sorted_sum1
+    ok44 = and ok43, ok_sorted_candidate_status
+    ok45 = and ok44, ok_sorted_candidate_written
+    ok46 = and ok45, ok_sorted_candidate_total
+    ok47 = and ok46, ok_sorted_candidate_key0
+    ok48 = and ok47, ok_sorted_candidate_count0
+    ok49 = and ok48, ok_sorted_candidate_sum0
+    ok50 = and ok49, ok_sorted_candidate_key1
+    ok51 = and ok50, ok_sorted_candidate_count1
+    ok52 = and ok51, ok_sorted_candidate_sum1
+    ok53 = and ok52, ok_empty_status
+    ok54 = and ok53, ok_empty_written
+    ok55 = and ok54, ok_empty_total
+    ok56 = and ok55, ok_close
+    ok = and ok56, ok_verify
 
     !remove_status
     !init_status
@@ -193,6 +245,24 @@ L_ENTRY:
     !candidate_key1
     !candidate_count1
     !candidate_sum1
+    !sorted_status
+    !sorted_written
+    !sorted_total
+    !sorted_key0
+    !sorted_count0
+    !sorted_sum0
+    !sorted_key1
+    !sorted_count1
+    !sorted_sum1
+    !sorted_candidate_status
+    !sorted_candidate_written
+    !sorted_candidate_total
+    !sorted_candidate_key0
+    !sorted_candidate_count0
+    !sorted_candidate_sum0
+    !sorted_candidate_key1
+    !sorted_candidate_count1
+    !sorted_candidate_sum1
     !empty_status
     !empty_written
     !empty_total
@@ -233,6 +303,24 @@ L_ENTRY:
     !ok_candidate_key1
     !ok_candidate_count1
     !ok_candidate_sum1
+    !ok_sorted_status
+    !ok_sorted_written
+    !ok_sorted_total
+    !ok_sorted_key0
+    !ok_sorted_count0
+    !ok_sorted_sum0
+    !ok_sorted_key1
+    !ok_sorted_count1
+    !ok_sorted_sum1
+    !ok_sorted_candidate_status
+    !ok_sorted_candidate_written
+    !ok_sorted_candidate_total
+    !ok_sorted_candidate_key0
+    !ok_sorted_candidate_count0
+    !ok_sorted_candidate_sum0
+    !ok_sorted_candidate_key1
+    !ok_sorted_candidate_count1
+    !ok_sorted_candidate_sum1
     !ok_empty_status
     !ok_empty_written
     !ok_empty_total
@@ -276,6 +364,24 @@ L_ENTRY:
     !ok36
     !ok37
     !ok38
+    !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !ok45
+    !ok46
+    !ok47
+    !ok48
+    !ok49
+    !ok50
+    !ok51
+    !ok52
+    !ok53
+    !ok54
+    !ok55
+    !ok56
     !row
     !group_keys
     !group_counts

@@ -926,6 +926,22 @@
     %out_total = load __db_group_rows_sum_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_GROUP_SUM_I64_BY_U64_SORTED_HANDLE %out_status, %out_written, %out_total, %out_keys, %out_counts, %out_sums, %out_len, %handle, %group_column_index, %sum_column_index, %sort_by, %descending, %offset, %limit
+    __db_group_sum_sorted_written_slot_%out_written = stack_alloc 8
+    __db_group_sum_sorted_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_group_sum_i64_by_u64_sorted_handle(%handle, %group_column_index, %sum_column_index, %sort_by, %descending, %offset, %limit, &%out_keys, &%out_counts, &%out_sums, %out_len, &__db_group_sum_sorted_written_slot_%out_written, &__db_group_sum_sorted_total_slot_%out_total)
+    %out_written = load __db_group_sum_sorted_written_slot_%out_written+0 as u64
+    %out_total = load __db_group_sum_sorted_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_GROUP_ROWS_SUM_I64_BY_U64_SORTED_HANDLE %out_status, %out_written, %out_total, %out_keys, %out_counts, %out_sums, %out_len, %handle, %group_column_index, %sum_column_index, %in_rows, %in_rows_len, %sort_by, %descending, %offset, %limit
+    __db_group_rows_sum_sorted_written_slot_%out_written = stack_alloc 8
+    __db_group_rows_sum_sorted_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_group_rows_sum_i64_by_u64_sorted_handle(%handle, %group_column_index, %sum_column_index, &%in_rows, %in_rows_len, %sort_by, %descending, %offset, %limit, &%out_keys, &%out_counts, &%out_sums, %out_len, &__db_group_rows_sum_sorted_written_slot_%out_written, &__db_group_rows_sum_sorted_total_slot_%out_total)
+    %out_written = load __db_group_rows_sum_sorted_written_slot_%out_written+0 as u64
+    %out_total = load __db_group_rows_sum_sorted_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_COUNT_U64_EQ_HANDLE %out_status, %out_count, %handle, %column_index, %expected
     __db_handle_count_slot_%out_count = stack_alloc 8
     %out_status = call @sa_db_count_u64_eq_handle(%handle, %column_index, %expected, &__db_handle_count_slot_%out_count)

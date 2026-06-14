@@ -321,6 +321,15 @@ fn boolFromAbi(value: u32) ?bool {
     };
 }
 
+fn groupSortByFromAbi(value: u32) ?table.GroupSortBy {
+    return switch (value) {
+        0 => .key,
+        1 => .count,
+        2 => .sum,
+        else => null,
+    };
+}
+
 fn decimalScaleFactor(scale: u32) ?u64 {
     if (scale > DECIMAL_MAX_SCALE) return null;
     var factor: u64 = 1;
@@ -3537,6 +3546,81 @@ pub export fn sa_db_group_rows_sum_i64_by_u64_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotGroupRowsSumI64ByU64(gpa.allocator(), snapshot, @intCast(group_column_index), @intCast(sum_column_index), in_rows, offset, limit, out_keys, out_counts, out_sums) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_group_sum_i64_by_u64_sorted_handle(
+    handle: ?*anyopaque,
+    group_column_index: u64,
+    sum_column_index: u64,
+    sort_by: u32,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_keys_ptr: ?[*]u64,
+    out_counts_ptr: ?[*]u64,
+    out_sums_ptr: ?[*]i64,
+    out_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const out_keys = outputU64sAllowEmpty(out_keys_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_counts = outputU64sAllowEmpty(out_counts_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_sums = outputI64sAllowEmpty(out_sums_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const group_sort_by = groupSortByFromAbi(sort_by) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotGroupSumI64ByU64Sorted(gpa.allocator(), snapshot, @intCast(group_column_index), @intCast(sum_column_index), group_sort_by, sort_descending, offset, limit, out_keys, out_counts, out_sums) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_group_rows_sum_i64_by_u64_sorted_handle(
+    handle: ?*anyopaque,
+    group_column_index: u64,
+    sum_column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    sort_by: u32,
+    descending: u32,
+    offset: u64,
+    limit: u64,
+    out_keys_ptr: ?[*]u64,
+    out_counts_ptr: ?[*]u64,
+    out_sums_ptr: ?[*]i64,
+    out_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_keys = outputU64sAllowEmpty(out_keys_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_counts = outputU64sAllowEmpty(out_counts_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_sums = outputI64sAllowEmpty(out_sums_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const group_sort_by = groupSortByFromAbi(sort_by) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotGroupRowsSumI64ByU64Sorted(gpa.allocator(), snapshot, @intCast(group_column_index), @intCast(sum_column_index), in_rows, group_sort_by, sort_descending, offset, limit, out_keys, out_counts, out_sums) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
@@ -8496,8 +8580,47 @@ test "db SA ABI groups signed sums by u64 keys" {
     try std.testing.expectEqual(@as(u64, 2), counts[0]);
     try std.testing.expectEqual(@as(i64, 10), sums[0]);
 
+    keys = .{ 99, 99, 99 };
+    counts = .{ 99, 99, 99 };
+    sums = .{ 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_sum_i64_by_u64_sorted_handle(handle, 0, 1, 2, 1, 0, 2, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), keys[0]);
+    try std.testing.expectEqual(@as(u64, 2), counts[0]);
+    try std.testing.expectEqual(@as(i64, 30), sums[0]);
+    try std.testing.expectEqual(@as(u64, 2), keys[1]);
+    try std.testing.expectEqual(@as(u64, 2), counts[1]);
+    try std.testing.expectEqual(@as(i64, 10), sums[1]);
+
+    keys = .{ 99, 99, 99 };
+    counts = .{ 99, 99, 99 };
+    sums = .{ 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_sum_i64_by_u64_sorted_handle(handle, 0, 1, 0, 1, 0, 2, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 3), keys[0]);
+    try std.testing.expectEqual(@as(u64, 1), counts[0]);
+    try std.testing.expectEqual(@as(i64, 7), sums[0]);
+    try std.testing.expectEqual(@as(u64, 2), keys[1]);
+    try std.testing.expectEqual(@as(u64, 2), counts[1]);
+    try std.testing.expectEqual(@as(i64, 10), sums[1]);
+
     const candidate_rows = [_]u64{ 1, 2, 4 };
     try std.testing.expectEqual(SA_DB_OK, sa_db_group_rows_sum_i64_by_u64_handle(handle, 0, 1, &candidate_rows, candidate_rows.len, 0, keys.len, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 2), keys[0]);
+    try std.testing.expectEqual(@as(u64, 2), counts[0]);
+    try std.testing.expectEqual(@as(i64, 10), sums[0]);
+    try std.testing.expectEqual(@as(u64, 1), keys[1]);
+    try std.testing.expectEqual(@as(u64, 1), counts[1]);
+    try std.testing.expectEqual(@as(i64, 20), sums[1]);
+
+    keys = .{ 99, 99, 99 };
+    counts = .{ 99, 99, 99 };
+    sums = .{ 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_rows_sum_i64_by_u64_sorted_handle(handle, 0, 1, &candidate_rows, candidate_rows.len, 2, 0, 0, keys.len, &keys, &counts, &sums, keys.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);
     try std.testing.expectEqual(@as(u64, 2), written);
     try std.testing.expectEqual(@as(u64, 2), keys[0]);
@@ -8510,6 +8633,12 @@ test "db SA ABI groups signed sums by u64 keys" {
     written = 99;
     total = 99;
     try std.testing.expectEqual(SA_DB_OK, sa_db_group_rows_sum_i64_by_u64_handle(handle, 0, 1, null, 0, 0, 0, null, null, null, 0, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    written = 99;
+    total = 99;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_group_sum_i64_by_u64_sorted_handle(handle, 0, 1, 99, 0, 0, keys.len, &keys, &counts, &sums, keys.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 0), written);
     try std.testing.expectEqual(@as(u64, 0), total);
 

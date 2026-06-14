@@ -59,7 +59,7 @@ zig cc -O1 sqlite_erp_workflow_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.
 
 说明：`libsa_std.a` 当前仍导出 `sqlite3_prepare/sqlite3_step/sqlite3_finalize` stub，会覆盖系统 SQLite 同名符号。SQLite 对照使用重命名后的本地 std archive；当前 archive 已包含 pthread host 符号，不需要再显式编入 `sa_pthread_host.c`。
 
-db 插件旧的 direct query ABI 已删除；SA-facing 查询接口现在只开放 read-handle API：`sa_db_open_read_table`、`sa_db_close_read_table`、`sa_db_sum_u64_handle`、`sa_db_sum_i64_handle`、`sa_db_group_sum_i64_by_u64_handle`、`sa_db_group_rows_sum_i64_by_u64_handle`、`sa_db_count_u64_eq_handle`、`sa_db_count_u64_cmp_handle`、`sa_db_min_u64_handle`、`sa_db_max_u64_handle`。
+db 插件旧的 direct query ABI 已删除；SA-facing 查询接口现在只开放 read-handle API：`sa_db_open_read_table`、`sa_db_close_read_table`、`sa_db_sum_u64_handle`、`sa_db_sum_i64_handle`、`sa_db_group_sum_i64_by_u64_handle`、`sa_db_group_rows_sum_i64_by_u64_handle`、`sa_db_group_sum_i64_by_u64_sorted_handle`、`sa_db_group_rows_sum_i64_by_u64_sorted_handle`、`sa_db_count_u64_eq_handle`、`sa_db_count_u64_cmp_handle`、`sa_db_min_u64_handle`、`sa_db_max_u64_handle`。
 
 ## 单线程结果
 

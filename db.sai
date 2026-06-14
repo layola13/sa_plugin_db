@@ -146,6 +146,8 @@
 @extern sa_db_stats_rows_i64_handle(handle: ptr, column_index: u64, &in_rows: ptr, in_rows_len: u64, &out_count: ptr, &out_sum: ptr, &out_min: ptr, &out_max: ptr) -> u32
 @extern sa_db_group_sum_i64_by_u64_handle(handle: ptr, group_column_index: u64, sum_column_index: u64, offset: u64, limit: u64, &out_keys: ptr, &out_counts: ptr, &out_sums: ptr, out_len: u64, &out_written: ptr, &out_total: ptr) -> u32
 @extern sa_db_group_rows_sum_i64_by_u64_handle(handle: ptr, group_column_index: u64, sum_column_index: u64, &in_rows: ptr, in_rows_len: u64, offset: u64, limit: u64, &out_keys: ptr, &out_counts: ptr, &out_sums: ptr, out_len: u64, &out_written: ptr, &out_total: ptr) -> u32
+@extern sa_db_group_sum_i64_by_u64_sorted_handle(handle: ptr, group_column_index: u64, sum_column_index: u64, sort_by: u32, descending: u32, offset: u64, limit: u64, &out_keys: ptr, &out_counts: ptr, &out_sums: ptr, out_len: u64, &out_written: ptr, &out_total: ptr) -> u32
+@extern sa_db_group_rows_sum_i64_by_u64_sorted_handle(handle: ptr, group_column_index: u64, sum_column_index: u64, &in_rows: ptr, in_rows_len: u64, sort_by: u32, descending: u32, offset: u64, limit: u64, &out_keys: ptr, &out_counts: ptr, &out_sums: ptr, out_len: u64, &out_written: ptr, &out_total: ptr) -> u32
 @extern sa_db_count_u64_eq_handle(handle: ptr, column_index: u64, expected: u64, &out_count: ptr) -> u32
 @extern sa_db_count_u64_cmp_handle(handle: ptr, column_index: u64, op: u32, expected: u64, &out_count: ptr) -> u32
 @extern sa_db_count_i64_cmp_handle(handle: ptr, column_index: u64, op: u32, expected: i64, &out_count: ptr) -> u32
