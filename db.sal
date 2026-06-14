@@ -880,6 +880,12 @@
     %out_sum = load __db_handle_sum_slot_%out_sum+0 as u64
 [END_MACRO]
 
+[MACRO] DB_SUM_I64_HANDLE %out_status, %out_sum, %handle, %column_index
+    __db_handle_sum_i64_slot_%out_sum = stack_alloc 8
+    %out_status = call @sa_db_sum_i64_handle(%handle, %column_index, &__db_handle_sum_i64_slot_%out_sum)
+    %out_sum = load __db_handle_sum_i64_slot_%out_sum+0 as i64
+[END_MACRO]
+
 [MACRO] DB_STATS_ROWS_U64_HANDLE %out_status, %out_count, %out_sum, %out_min, %out_max, %handle, %column_index, %in_rows, %in_rows_len
     __db_handle_stats_rows_u64_count_slot_%out_count = stack_alloc 8
     __db_handle_stats_rows_u64_sum_slot_%out_sum = stack_alloc 8

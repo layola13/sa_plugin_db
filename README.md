@@ -176,6 +176,7 @@ Read-handle query calls:
 - `sa_db_column_info_handle`
 - `sa_db_column_logical_info_handle`
 - `sa_db_sum_u64_handle`
+- `sa_db_sum_i64_handle`
 - `sa_db_stats_rows_u64_handle`
 - `sa_db_stats_rows_i64_handle`
 - `sa_db_count_u64_eq_handle`
@@ -297,7 +298,7 @@ Removed calls:
 
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
-`DB_STATS_ROWS_U64_HANDLE`, `DB_STATS_ROWS_I64_HANDLE`,
+`DB_SUM_I64_HANDLE`, `DB_STATS_ROWS_U64_HANDLE`, `DB_STATS_ROWS_I64_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
 `DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_U8_CMP_HANDLE`, `DB_COUNT_I8_CMP_HANDLE`,
 `DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_F32_CMP_HANDLE`,

@@ -160,6 +160,7 @@ L_ENTRY:
     balance_range_row0 = load balance_range_rows+0 as u64
     balance_range_row1 = load balance_range_rows+8 as u64
     balance_range_row2 = load balance_range_rows+16 as u64
+    EXPAND DB_SUM_I64_HANDLE balance_sum_status, balance_sum, read_handle, 4
     EXPAND DB_COUNT_I64_CMP_HANDLE balance_count_status, balance_nonnegative_count, read_handle, 4, SA_DB_CMP_GE, 0
     EXPAND DB_FIND_I64_HANDLE balance_find_status, balance_found, balance_found_row, read_handle, 4, -25
     EXPAND DB_GET_I64_HANDLE balance_get_status, balance_value, read_handle, 4, balance_found_row
@@ -298,6 +299,8 @@ L_ENTRY:
     ok_balance_range_row0 = eq balance_range_row0, 5
     ok_balance_range_row1 = eq balance_range_row1, 3
     ok_balance_range_row2 = eq balance_range_row2, 1
+    ok_balance_sum_status = eq balance_sum_status, SA_DB_OK
+    ok_balance_sum = eq balance_sum, 0
     ok_balance_count_status = eq balance_count_status, SA_DB_OK
     ok_balance_nonnegative_count = eq balance_nonnegative_count, 3
     ok_balance_find_status = eq balance_find_status, SA_DB_OK
@@ -450,7 +453,9 @@ L_ENTRY:
     ok13s = and ok13r, ok_balance_range_row0
     ok13t = and ok13s, ok_balance_range_row1
     ok13u = and ok13t, ok_balance_range_row2
-    ok13v = and ok13u, ok_balance_count_status
+    ok13u1 = and ok13u, ok_balance_sum_status
+    ok13u2 = and ok13u1, ok_balance_sum
+    ok13v = and ok13u2, ok_balance_count_status
     ok13w = and ok13v, ok_balance_nonnegative_count
     ok13x = and ok13w, ok_balance_find_status
     ok13y = and ok13x, ok_balance_found
@@ -605,6 +610,8 @@ L_ENTRY:
     !balance_range_row0
     !balance_range_row1
     !balance_range_row2
+    !balance_sum_status
+    !balance_sum
     !balance_count_status
     !balance_nonnegative_count
     !balance_find_status
@@ -760,6 +767,8 @@ L_ENTRY:
     !ok_balance_range_row0
     !ok_balance_range_row1
     !ok_balance_range_row2
+    !ok_balance_sum_status
+    !ok_balance_sum
     !ok_balance_count_status
     !ok_balance_nonnegative_count
     !ok_balance_find_status
@@ -912,6 +921,8 @@ L_ENTRY:
     !ok13s
     !ok13t
     !ok13u
+    !ok13u1
+    !ok13u2
     !ok13v
     !ok13w
     !ok13x

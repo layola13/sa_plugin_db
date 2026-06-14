@@ -3387,6 +3387,16 @@ pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_s
     return SA_DB_OK;
 }
 
+pub export fn sa_db_sum_i64_handle(handle: ?*anyopaque, column_index: u64, out_sum: ?*i64) u32 {
+    const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const sum = table.snapshotSumI64(snapshot, @intCast(column_index)) catch |err| return tableStatus(err);
+    sum_slot.* = sum;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_stats_rows_u64_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -8308,6 +8318,41 @@ test "db SA ABI filters and sorts float candidate rows" {
     try std.testing.expectEqual(@as(u64, 0), total);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+}
+
+test "db SA ABI sums signed i64 columns" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "signed_amounts";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_AMOUNT_STRIDE = 8 // i64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "signed_amounts.sadb-schema".ptr, "signed_amounts.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var amounts: [24]u8 = undefined;
+    std.mem.writeInt(i64, amounts[0..8], -100, .little);
+    std.mem.writeInt(i64, amounts[8..16], 0, .little);
+    std.mem.writeInt(i64, amounts[16..24], 150, .little);
+    const cols = [_]SaDbColumnInput{.{ .data = @ptrCast(&amounts), .len = amounts.len }};
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, table_name.ptr, table_name.len, 3, &cols, cols.len, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &handle));
+    var sum: i64 = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_i64_handle(handle, 0, &sum));
+    try std.testing.expectEqual(@as(i64, 50), sum);
+    var wrong_sum: u64 = 99;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_sum_u64_handle(handle, 0, &wrong_sum));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_sum_i64_handle(handle, 0, &sum));
 }
 
 test "db SA ABI commits and rolls back write transactions" {

@@ -9854,6 +9854,22 @@ pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableE
     return sum;
 }
 
+pub fn snapshotSumI64(snapshot: *const ReadSnapshot, column_index: usize) TableError!i64 {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    var sum: i64 = 0;
+    for (snapshot.segments) |segment| {
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        var i: u64 = 0;
+        while (i < segment.rows) : (i += 1) {
+            const byte_offset: usize = @intCast(i * 8);
+            sum = std.math.add(i64, sum, readI64LE(bytes, byte_offset)) catch return TableError.CursorOverflow;
+        }
+    }
+    return sum;
+}
+
 pub fn snapshotStatsRowsU64(snapshot: *const ReadSnapshot, column_index: usize, row_indices: []const u64) TableError!U64RowsStats {
     try ensureSnapshotU64Column(snapshot, column_index);
     var stats = U64RowsStats{ .count = 0, .sum = 0, .min = 0, .max = 0 };
