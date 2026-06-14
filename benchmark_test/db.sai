@@ -23,6 +23,8 @@
 @extern sa_db_update_row_u64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_upsert_row_u64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_update_row_u64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: u64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_upsert_row_u64_i64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: i64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_update_row_u64_i64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: i64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_begin(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_handle: ptr) -> u32
 @extern sa_db_tx_insert_row(handle: ptr, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_dict_intern(handle: ptr, &dict_name: ptr, dict_name_len: u64, &value: ptr, value_len: u64, &out_id: ptr, &out_inserted: ptr, &out_info: ptr) -> u32
@@ -31,8 +33,11 @@
 @extern sa_db_tx_update_row_u64_key(handle: ptr, column_index: u64, expected: u64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_upsert_row_u64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_update_row_u64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_upsert_row_u64_i64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: i64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
+@extern sa_db_tx_update_row_u64_i64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: i64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u64_key(handle: ptr, column_index: u64, expected: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_delete_u64_i64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: i64, &out_info: ptr) -> u32
 @extern sa_db_tx_commit(handle: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_rollback(handle: ptr) -> u32
 @extern sa_db_create_u64_index(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, unique: u32, &out_info: ptr) -> u32
@@ -60,6 +65,7 @@
 @extern sa_db_blob_value_copy(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &store_name: ptr, store_name_len: u64, id: u64, &out_buf: ptr, out_buf_len: u64, &out_found: ptr, &out_written: ptr) -> u32
 @extern sa_db_delete_u64_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, expected: u64, &out_info: ptr) -> u32
 @extern sa_db_delete_u64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: u64, &out_info: ptr) -> u32
+@extern sa_db_delete_u64_i64_pair_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, column_index2: u64, key1: u64, key2: i64, &out_info: ptr) -> u32
 @extern sa_db_snapshot(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
 @extern sa_db_restore(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, epoch: u64, &out_info: ptr) -> u32
 @extern sa_db_recover(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_info: ptr) -> u32
