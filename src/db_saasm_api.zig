@@ -4910,6 +4910,72 @@ pub export fn sa_db_plan_u64_i64_i64_ranges_handle(
     return fillPlan3Info(out_info, result);
 }
 
+pub export fn sa_db_plan_u64_date_decimal_i64_handle(
+    handle: ?*anyopaque,
+    u64_column_index: u64,
+    u64_min_value: u64,
+    u64_max_value: u64,
+    date_column_index: u64,
+    min_year: i64,
+    min_month: u32,
+    min_day: u32,
+    max_year: i64,
+    max_month: u32,
+    max_day: u32,
+    decimal_column_index: u64,
+    scale: u32,
+    min_negative: u32,
+    min_whole: u64,
+    min_fraction: u64,
+    max_negative: u32,
+    max_whole: u64,
+    max_fraction: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_info: ?*SaDbPlan3Info,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    info_slot.* = .{
+        .written = 0,
+        .total = 0,
+        .first_predicate = 0,
+        .first_total = 0,
+        .second_predicate = 0,
+        .second_total = 0,
+        .third_predicate = 0,
+        .third_total = 0,
+    };
+
+    const min_date = daysFromCivil(min_year, min_month, min_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const max_date = daysFromCivil(max_year, max_month, max_day) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    var min_amount: i64 = 0;
+    var max_amount: i64 = 0;
+    var status = sa_db_decimal_from_parts(min_negative, min_whole, min_fraction, scale, &min_amount);
+    if (status != SA_DB_OK) return status;
+    status = sa_db_decimal_from_parts(max_negative, max_whole, max_fraction, scale, &max_amount);
+    if (status != SA_DB_OK) return status;
+
+    return sa_db_plan_u64_i64_i64_ranges_handle(
+        handle,
+        u64_column_index,
+        u64_min_value,
+        u64_max_value,
+        date_column_index,
+        min_date,
+        max_date,
+        decimal_column_index,
+        min_amount,
+        max_amount,
+        offset,
+        limit,
+        out_rows_ptr,
+        out_rows_len,
+        info_slot,
+    );
+}
+
 pub export fn sa_db_filter_rows_f32_range_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -8068,6 +8134,45 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
     try std.testing.expectEqual(@as(u64, 1), plan3_info.written);
     try std.testing.expectEqual(@as(u64, 4), planned_rows[0]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_date_decimal_i64_handle(handle, 2, 2, 2, 1, 1969, 12, 27, 1970, 1, 26, 4, 2, 0, 15, 0, 0, 35, 0, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.first_total);
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.second_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.second_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.third_predicate);
+    try std.testing.expectEqual(@as(u64, 6), plan3_info.third_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_date_decimal_i64_handle(handle, 2, 2, 2, 1, 1970, 1, 1, 1970, 1, 21, 4, 2, 0, 15, 0, 0, 55, 0, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.first_total);
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.second_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.second_total);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.third_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.third_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+
+    plan3_info = .{
+        .written = 99,
+        .total = 99,
+        .first_predicate = 99,
+        .first_total = 99,
+        .second_predicate = 99,
+        .second_total = 99,
+        .third_predicate = 99,
+        .third_total = 99,
+    };
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_plan_u64_date_decimal_i64_handle(handle, 2, 2, 2, 1, 2023, 2, 29, 2024, 2, 29, 4, 2, 0, 15, 0, 0, 55, 0, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 0), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 0), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 0), plan3_info.first_predicate);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_decimal_i64_range_handle(handle, 4, &rows, 3, 2, 0, 15, 0, 0, 55, 0, 0, filtered.len, &filtered, filtered.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);

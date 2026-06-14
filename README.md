@@ -223,6 +223,7 @@ Read-handle query calls:
 - `sa_db_plan_u64_i64_blob_eq_handle`
 - `sa_db_plan_u64_i64_bool_handle`
 - `sa_db_plan_u64_i64_i64_ranges_handle`
+- `sa_db_plan_u64_date_decimal_i64_handle`
 - `sa_db_filter_rows_f32_range_handle`
 - `sa_db_filter_rows_f64_range_handle`
 - `sa_db_filter_rows_u32_range_handle`
