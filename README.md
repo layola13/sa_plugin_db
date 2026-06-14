@@ -179,6 +179,8 @@ Read-handle query calls:
 - `sa_db_sum_i64_handle`
 - `sa_db_stats_rows_u64_handle`
 - `sa_db_stats_rows_i64_handle`
+- `sa_db_group_sum_i64_by_u64_handle`
+- `sa_db_group_rows_sum_i64_by_u64_handle`
 - `sa_db_count_u64_eq_handle`
 - `sa_db_count_u64_cmp_handle`
 - `sa_db_count_i64_cmp_handle`
@@ -299,6 +301,7 @@ Removed calls:
 The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SNAPSHOT_INFO_HANDLE`, `DB_COLUMN_INFO_HANDLE`, `DB_SUM_U64_HANDLE`,
 `DB_SUM_I64_HANDLE`, `DB_STATS_ROWS_U64_HANDLE`, `DB_STATS_ROWS_I64_HANDLE`,
+`DB_GROUP_SUM_I64_BY_U64_HANDLE`, `DB_GROUP_ROWS_SUM_I64_BY_U64_HANDLE`,
 `DB_COUNT_U64_CMP_HANDLE`, `DB_COUNT_I64_CMP_HANDLE`, `DB_COUNT_U32_CMP_HANDLE`,
 `DB_COUNT_I32_CMP_HANDLE`, `DB_COUNT_U8_CMP_HANDLE`, `DB_COUNT_I8_CMP_HANDLE`,
 `DB_COUNT_U16_CMP_HANDLE`, `DB_COUNT_I16_CMP_HANDLE`, `DB_COUNT_F32_CMP_HANDLE`,
@@ -697,6 +700,14 @@ without pulling row ids back into SA code.
 candidate row list and return `count`, `sum`, `min`, and `max` in one snapshot
 pass. Use the signed variant for scaled decimal amounts, date/timestamp extrema,
 and signed ERP adjustment totals; an empty candidate list returns zeroed stats.
+`sa_db_group_sum_i64_by_u64_handle` / `DB_GROUP_SUM_I64_BY_U64_HANDLE` and
+`sa_db_group_rows_sum_i64_by_u64_handle` /
+`DB_GROUP_ROWS_SUM_I64_BY_U64_HANDLE` return stable first-seen group pages for a
+`u64` business key plus signed `i64` amount column. Each output slot contains the
+group key, row count, and signed sum in caller-provided arrays. Use the rows
+variant after indexed filters or planners to build ERP totals such as amount by
+customer, warehouse, status, or account without copying candidate rows back into
+SA code.
 `sa_db_sort_rows_u64_handle` / `DB_SORT_ROWS_U64_HANDLE`,
 `sa_db_sort_rows_i64_handle` / `DB_SORT_ROWS_I64_HANDLE`, finite float variants
 `sa_db_sort_rows_f32_handle` / `DB_SORT_ROWS_F32_HANDLE` and

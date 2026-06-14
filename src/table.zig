@@ -309,6 +309,12 @@ pub const U64RangeResult = struct {
     total: u64,
 };
 
+const U64I64GroupAccumulator = struct {
+    key: u64,
+    count: u64,
+    sum: i64,
+};
+
 pub const PlanRowsResult = struct {
     written: u64,
     total: u64,
@@ -9904,6 +9910,110 @@ pub fn snapshotStatsRowsI64(snapshot: *const ReadSnapshot, column_index: usize, 
         stats.count = std.math.add(u64, stats.count, 1) catch return TableError.CursorOverflow;
     }
     return stats;
+}
+
+fn addU64I64Group(
+    groups: *std.ArrayList(U64I64GroupAccumulator),
+    group_index: *std.AutoHashMap(u64, usize),
+    key: u64,
+    amount: i64,
+) TableError!void {
+    const entry = group_index.getOrPut(key) catch return TableError.OutOfMemory;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = groups.items.len;
+        groups.append(.{ .key = key, .count = 0, .sum = 0 }) catch return TableError.OutOfMemory;
+    }
+    const idx = entry.value_ptr.*;
+    groups.items[idx].count = std.math.add(u64, groups.items[idx].count, 1) catch return TableError.CursorOverflow;
+    groups.items[idx].sum = std.math.add(i64, groups.items[idx].sum, amount) catch return TableError.CursorOverflow;
+}
+
+fn copyU64I64GroupPage(
+    groups: []const U64I64GroupAccumulator,
+    offset: u64,
+    limit: u64,
+    out_keys: []u64,
+    out_counts: []u64,
+    out_sums: []i64,
+) U64RangeResult {
+    const out_capacity: u64 = @min(@as(u64, @intCast(out_keys.len)), @min(@as(u64, @intCast(out_counts.len)), @as(u64, @intCast(out_sums.len))));
+    var written: u64 = 0;
+    for (groups, 0..) |group, idx| {
+        const total: u64 = @intCast(idx);
+        if (total >= offset and limit != 0 and written < limit and written < out_capacity) {
+            const out_idx: usize = @intCast(written);
+            out_keys[out_idx] = group.key;
+            out_counts[out_idx] = group.count;
+            out_sums[out_idx] = group.sum;
+            written += 1;
+        }
+    }
+    return .{ .written = written, .total = @intCast(groups.len) };
+}
+
+pub fn snapshotGroupSumI64ByU64(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    group_column_index: usize,
+    sum_column_index: usize,
+    offset: u64,
+    limit: u64,
+    out_keys: []u64,
+    out_counts: []u64,
+    out_sums: []i64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU64Column(snapshot, group_column_index);
+    try ensureSnapshotI64Column(snapshot, sum_column_index);
+
+    var groups = std.ArrayList(U64I64GroupAccumulator).init(allocator);
+    defer groups.deinit();
+    var group_index = std.AutoHashMap(u64, usize).init(allocator);
+    defer group_index.deinit();
+
+    for (snapshot.segments) |segment| {
+        const group_bytes = segment.columns[group_column_index].bytes;
+        const sum_bytes = segment.columns[sum_column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, 8);
+        if (group_bytes.len != expected_len or sum_bytes.len != expected_len) return TableError.VerifyFailed;
+        var local_row: u64 = 0;
+        while (local_row < segment.rows) : (local_row += 1) {
+            const byte_offset: usize = @intCast(local_row * 8);
+            try addU64I64Group(&groups, &group_index, readU64LE(group_bytes, byte_offset), readI64LE(sum_bytes, byte_offset));
+        }
+    }
+    return copyU64I64GroupPage(groups.items, offset, limit, out_keys, out_counts, out_sums);
+}
+
+pub fn snapshotGroupRowsSumI64ByU64(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    group_column_index: usize,
+    sum_column_index: usize,
+    row_indices: []const u64,
+    offset: u64,
+    limit: u64,
+    out_keys: []u64,
+    out_counts: []u64,
+    out_sums: []i64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU64Column(snapshot, group_column_index);
+    try ensureSnapshotI64Column(snapshot, sum_column_index);
+    try validateSnapshotRows(snapshot, row_indices);
+
+    var groups = std.ArrayList(U64I64GroupAccumulator).init(allocator);
+    defer groups.deinit();
+    var group_index = std.AutoHashMap(u64, usize).init(allocator);
+    defer group_index.deinit();
+
+    for (row_indices) |row_index| {
+        try addU64I64Group(
+            &groups,
+            &group_index,
+            try snapshotU64AtRow(snapshot, group_column_index, row_index),
+            try snapshotI64AtRow(snapshot, sum_column_index, row_index),
+        );
+    }
+    return copyU64I64GroupPage(groups.items, offset, limit, out_keys, out_counts, out_sums);
 }
 
 pub fn snapshotCountU64Cmp(snapshot: *const ReadSnapshot, column_index: usize, op: U64CompareOp, expected: u64) TableError!u64 {

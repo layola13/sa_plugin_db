@@ -22,6 +22,8 @@ var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_al
 var tx_handle_mutex = std.Thread.Mutex{};
 var tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
 var empty_output_bytes: [0]u8 = .{};
+var empty_output_u64s: [0]u64 = .{};
+var empty_output_i64s: [0]i64 = .{};
 
 const ReadHandleEntry = struct {
     snapshot: *table.ReadSnapshot,
@@ -123,6 +125,22 @@ fn outputU64s(ptr: ?[*]u64, len: u64) ?[]u64 {
     if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
     const n: usize = @intCast(len);
     if (n == 0) return null;
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
+fn outputU64sAllowEmpty(ptr: ?[*]u64, len: u64) ?[]u64 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return empty_output_u64s[0..];
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
+fn outputI64sAllowEmpty(ptr: ?[*]i64, len: u64) ?[]i64 {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return empty_output_i64s[0..];
     const p = ptr orelse return null;
     return p[0..n];
 }
@@ -3454,6 +3472,73 @@ pub export fn sa_db_stats_rows_i64_handle(
     sum_slot.* = stats.sum;
     min_slot.* = stats.min;
     max_slot.* = stats.max;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_group_sum_i64_by_u64_handle(
+    handle: ?*anyopaque,
+    group_column_index: u64,
+    sum_column_index: u64,
+    offset: u64,
+    limit: u64,
+    out_keys_ptr: ?[*]u64,
+    out_counts_ptr: ?[*]u64,
+    out_sums_ptr: ?[*]i64,
+    out_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const out_keys = outputU64sAllowEmpty(out_keys_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_counts = outputU64sAllowEmpty(out_counts_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_sums = outputI64sAllowEmpty(out_sums_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotGroupSumI64ByU64(gpa.allocator(), snapshot, @intCast(group_column_index), @intCast(sum_column_index), offset, limit, out_keys, out_counts, out_sums) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_group_rows_sum_i64_by_u64_handle(
+    handle: ?*anyopaque,
+    group_column_index: u64,
+    sum_column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    offset: u64,
+    limit: u64,
+    out_keys_ptr: ?[*]u64,
+    out_counts_ptr: ?[*]u64,
+    out_sums_ptr: ?[*]i64,
+    out_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_keys = outputU64sAllowEmpty(out_keys_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_counts = outputU64sAllowEmpty(out_counts_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_sums = outputI64sAllowEmpty(out_sums_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotGroupRowsSumI64ByU64(gpa.allocator(), snapshot, @intCast(group_column_index), @intCast(sum_column_index), in_rows, offset, limit, out_keys, out_counts, out_sums) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
     return SA_DB_OK;
 }
 
@@ -8353,6 +8438,88 @@ test "db SA ABI sums signed i64 columns" {
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_sum_u64_handle(handle, 0, &wrong_sum));
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
     try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_sum_i64_handle(handle, 0, &sum));
+}
+
+test "db SA ABI groups signed sums by u64 keys" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "group_amounts";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_CUSTOMER_STRIDE = 8 // u64
+        \\#def COL_AMOUNT_STRIDE = 8 // i64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "group_amounts.sadb-schema".ptr, "group_amounts.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var customers = [_]u64{ 1, 2, 1, 3, 2 };
+    var amounts = [_]i64{ 10, -5, 20, 7, 15 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&customers), .len = @sizeOf(@TypeOf(customers)) },
+        .{ .data = @ptrCast(&amounts), .len = @sizeOf(@TypeOf(amounts)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, table_name.ptr, table_name.len, customers.len, &cols, cols.len, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &handle));
+    var keys = [_]u64{ 99, 99, 99 };
+    var counts = [_]u64{ 99, 99, 99 };
+    var sums = [_]i64{ 99, 99, 99 };
+    var written: u64 = 99;
+    var total: u64 = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_sum_i64_by_u64_handle(handle, 0, 1, 0, keys.len, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 3), written);
+    try std.testing.expectEqual(@as(u64, 1), keys[0]);
+    try std.testing.expectEqual(@as(u64, 2), counts[0]);
+    try std.testing.expectEqual(@as(i64, 30), sums[0]);
+    try std.testing.expectEqual(@as(u64, 2), keys[1]);
+    try std.testing.expectEqual(@as(u64, 2), counts[1]);
+    try std.testing.expectEqual(@as(i64, 10), sums[1]);
+    try std.testing.expectEqual(@as(u64, 3), keys[2]);
+    try std.testing.expectEqual(@as(u64, 1), counts[2]);
+    try std.testing.expectEqual(@as(i64, 7), sums[2]);
+
+    keys = .{ 99, 99, 99 };
+    counts = .{ 99, 99, 99 };
+    sums = .{ 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_sum_i64_by_u64_handle(handle, 0, 1, 1, 1, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 2), keys[0]);
+    try std.testing.expectEqual(@as(u64, 2), counts[0]);
+    try std.testing.expectEqual(@as(i64, 10), sums[0]);
+
+    const candidate_rows = [_]u64{ 1, 2, 4 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_rows_sum_i64_by_u64_handle(handle, 0, 1, &candidate_rows, candidate_rows.len, 0, keys.len, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 2), keys[0]);
+    try std.testing.expectEqual(@as(u64, 2), counts[0]);
+    try std.testing.expectEqual(@as(i64, 10), sums[0]);
+    try std.testing.expectEqual(@as(u64, 1), keys[1]);
+    try std.testing.expectEqual(@as(u64, 1), counts[1]);
+    try std.testing.expectEqual(@as(i64, 20), sums[1]);
+
+    written = 99;
+    total = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_group_rows_sum_i64_by_u64_handle(handle, 0, 1, null, 0, 0, 0, null, null, null, 0, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+
+    const invalid_rows = [_]u64{99};
+    written = 99;
+    total = 99;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_group_rows_sum_i64_by_u64_handle(handle, 0, 1, &invalid_rows, invalid_rows.len, 0, keys.len, &keys, &counts, &sums, keys.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 }
 
 test "db SA ABI commits and rolls back write transactions" {
