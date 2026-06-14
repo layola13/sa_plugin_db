@@ -4855,6 +4855,61 @@ pub export fn sa_db_plan_u64_i64_bool_handle(
     return fillPlan3Info(out_info, result);
 }
 
+pub export fn sa_db_plan_u64_i64_i64_ranges_handle(
+    handle: ?*anyopaque,
+    u64_column_index: u64,
+    u64_min_value: u64,
+    u64_max_value: u64,
+    first_i64_column_index: u64,
+    first_i64_min_value: i64,
+    first_i64_max_value: i64,
+    second_i64_column_index: u64,
+    second_i64_min_value: i64,
+    second_i64_max_value: i64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_info: ?*SaDbPlan3Info,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    info_slot.* = .{
+        .written = 0,
+        .total = 0,
+        .first_predicate = 0,
+        .first_total = 0,
+        .second_predicate = 0,
+        .second_total = 0,
+        .third_predicate = 0,
+        .third_total = 0,
+    };
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (u64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (first_i64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (second_i64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.snapshotPlanU64I64I64RangeRows(
+        gpa.allocator(),
+        snapshot,
+        @intCast(u64_column_index),
+        u64_min_value,
+        u64_max_value,
+        @intCast(first_i64_column_index),
+        first_i64_min_value,
+        first_i64_max_value,
+        @intCast(second_i64_column_index),
+        second_i64_min_value,
+        second_i64_max_value,
+        offset,
+        limit,
+        rows,
+    ) catch |err| return tableStatus(err);
+    return fillPlan3Info(out_info, result);
+}
+
 pub export fn sa_db_filter_rows_f32_range_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -7969,6 +8024,41 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 2), planned_rows[0]);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_i64_bool_handle(handle, 2, 1, 1, 1, -5, 25, 3, 1, 1, 1, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.first_total);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.second_predicate);
+    try std.testing.expectEqual(@as(u64, 5), plan3_info.second_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.third_predicate);
+    try std.testing.expectEqual(@as(u64, 6), plan3_info.third_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 4), planned_rows[0]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_i64_i64_ranges_handle(handle, 2, 2, 2, 1, -5, 25, 4, 1500, 3500, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.first_total);
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.second_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.second_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.third_predicate);
+    try std.testing.expectEqual(@as(u64, 6), plan3_info.third_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_i64_i64_ranges_handle(handle, 2, 2, 2, 1, 0, 20, 4, 1500, 5500, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.first_total);
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.second_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.second_total);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.third_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.third_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_i64_i64_ranges_handle(handle, 2, 1, 1, 1, -5, 25, 4, 0, 6000, 1, 1, &planned_rows, planned_rows.len, &plan3_info));
     try std.testing.expectEqual(@as(u64, 1), plan3_info.first_predicate);
     try std.testing.expectEqual(@as(u64, 2), plan3_info.first_total);
     try std.testing.expectEqual(@as(u64, 3), plan3_info.second_predicate);
