@@ -2793,6 +2793,13 @@ fn rowU64KeyValue(meta: TableMeta, column_index: usize, row_bytes: []const u8) T
     return readU64LE(row_bytes, offset);
 }
 
+fn rowI64KeyValue(meta: TableMeta, column_index: usize, row_bytes: []const u8) TableError!i64 {
+    try ensureI64Column(meta, column_index);
+    if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
+    const offset = try rowColumnOffset(meta, column_index);
+    return readI64LE(row_bytes, offset);
+}
+
 fn rowU64PairKeyValue(meta: TableMeta, column_index: usize, column_index2: usize, row_bytes: []const u8) TableError!U64PairKey {
     try ensureU64PairColumns(meta, column_index, column_index2);
     if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
@@ -2897,6 +2904,19 @@ fn hasUniqueU64Index(meta: TableMeta, column_index: usize) bool {
     return false;
 }
 
+fn hasUniqueI64Index(meta: TableMeta, column_index: usize) bool {
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i64") and
+            index.unique and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn hasUniqueU64PairIndex(meta: TableMeta, column_index: usize, column_index2: usize) bool {
     for (meta.indexes) |index| {
         if (std.mem.eql(u8, index.kind, "u64_pair") and
@@ -2944,6 +2964,21 @@ fn txFindU64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u
         const offset_u64 = std.math.mul(u64, row, 8) catch return TableError.CursorOverflow;
         const offset: usize = @intCast(offset_u64);
         if (readU64LE(bytes, offset) == expected) return .{ .found = true, .row_index = row };
+    }
+    return .{ .found = false, .row_index = 0 };
+}
+
+fn txFindI64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i64) TableError!U64FindResult {
+    try ensureI64Column(tx.meta, column_index);
+    if (!hasUniqueI64Index(tx.meta, column_index)) return TableError.InvalidFormat;
+    try validateTransactionBuffers(tx);
+
+    const bytes = tx.buffers[column_index].items;
+    var row: u64 = 0;
+    while (row < tx.meta.row_count) : (row += 1) {
+        const offset_u64 = std.math.mul(u64, row, 8) catch return TableError.CursorOverflow;
+        const offset: usize = @intCast(offset_u64);
+        if (readI64LE(bytes, offset) == expected) return .{ .found = true, .row_index = row };
     }
     return .{ .found = false, .row_index = 0 };
 }
@@ -3138,6 +3173,18 @@ pub fn writeTransactionUpsertRawRowU64Key(tx: *WriteTransaction, column_index: u
     return .{ .info = tableInfo(tx.meta), .inserted = true };
 }
 
+pub fn writeTransactionUpsertRawRowI64Key(tx: *WriteTransaction, column_index: usize, expected: i64, row_bytes: []const u8) TableError!UpsertResult {
+    const key_value = try rowI64KeyValue(tx.meta, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+    const found = try txFindI64KeyRow(tx, column_index, expected);
+    if (found.found) {
+        try txReplaceRawRow(tx, found.row_index, row_bytes);
+        return .{ .info = tableInfo(tx.meta), .inserted = false };
+    }
+    try txAppendRawRow(tx, row_bytes);
+    return .{ .info = tableInfo(tx.meta), .inserted = true };
+}
+
 pub fn writeTransactionUpsertRawRowU64PairKey(tx: *WriteTransaction, column_index: usize, column_index2: usize, key1: u64, key2: u64, row_bytes: []const u8) TableError!UpsertResult {
     const key_value = try rowU64PairKeyValue(tx.meta, column_index, column_index2, row_bytes);
     if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
@@ -3171,6 +3218,15 @@ pub fn writeTransactionUpdateRawRowU64Key(tx: *WriteTransaction, column_index: u
     return tableInfo(tx.meta);
 }
 
+pub fn writeTransactionUpdateRawRowI64Key(tx: *WriteTransaction, column_index: usize, expected: i64, row_bytes: []const u8) TableError!TableInfo {
+    const key_value = try rowI64KeyValue(tx.meta, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+    const found = try txFindI64KeyRow(tx, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    try txReplaceRawRow(tx, found.row_index, row_bytes);
+    return tableInfo(tx.meta);
+}
+
 pub fn writeTransactionUpdateRawRowU64PairKey(tx: *WriteTransaction, column_index: usize, column_index2: usize, key1: u64, key2: u64, row_bytes: []const u8) TableError!TableInfo {
     const key_value = try rowU64PairKeyValue(tx.meta, column_index, column_index2, row_bytes);
     if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
@@ -3191,6 +3247,13 @@ pub fn writeTransactionUpdateRawRowU64I64PairKey(tx: *WriteTransaction, column_i
 
 pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, expected: u64) TableError!TableInfo {
     const found = try txFindU64KeyRow(tx, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    try txDeleteRow(tx, found.row_index);
+    return tableInfo(tx.meta);
+}
+
+pub fn writeTransactionDeleteI64Key(tx: *WriteTransaction, column_index: usize, expected: i64) TableError!TableInfo {
+    const found = try txFindI64KeyRow(tx, column_index, expected);
     if (!found.found) return TableError.NotFound;
     try txDeleteRow(tx, found.row_index);
     return tableInfo(tx.meta);
@@ -7594,6 +7657,42 @@ fn findUniqueU64KeyRow(
     }, expected);
 }
 
+fn findUniqueI64KeyRow(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    column_index: usize,
+    expected: i64,
+) TableError!U64FindResult {
+    try ensureI64Column(meta, column_index);
+    var selected: ?IndexMeta = null;
+    for (meta.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i64") and index.unique and index.column_index == @as(u64, @intCast(column_index))) {
+            selected = index;
+            break;
+        }
+    }
+    const index = selected orelse return TableError.InvalidFormat;
+    if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+
+    const path = try activePath(allocator, root_dir, index.path);
+    defer allocator.free(path);
+    const bytes = try readFileAlloc(allocator, path, 1 << 30);
+    defer allocator.free(bytes);
+    if (bytes.len != index.bytes) return TableError.VerifyFailed;
+    const actual_hash = hashBytes(bytes);
+    const actual_hex = std.fmt.bytesToHex(actual_hash, .lower);
+    if (!std.mem.eql(u8, actual_hex[0..], index.sha256)) return TableError.VerifyFailed;
+    try validateIndexBytesShape(bytes, meta.row_count, true);
+
+    return findU64InIndex(.{
+        .kind = "i64",
+        .column_index = @intCast(column_index),
+        .unique = true,
+        .entries = bytes,
+    }, sortableI64Key(expected));
+}
+
 fn findUniqueU64PairKeyRow(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -7881,6 +7980,24 @@ pub fn deleteU64Key(
     return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
 }
 
+pub fn deleteI64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected: i64,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+}
+
 pub fn deleteU64PairKey(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -7939,6 +8056,28 @@ pub fn updateRawRowU64Key(
     if (key_value != expected) return TableError.InvalidFormat;
 
     const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+}
+
+pub fn updateRawRowI64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected: i64,
+    row_bytes: []const u8,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const key_value = try rowI64KeyValue(owned, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+
+    const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
     if (!found.found) return TableError.NotFound;
     return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
 }
@@ -8009,6 +8148,43 @@ pub fn upsertRawRowU64Key(
     if (key_value != expected) return TableError.InvalidFormat;
 
     const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
+    if (found.found) {
+        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+        return .{ .info = info, .inserted = false };
+    }
+
+    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
+    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
+    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
+    defer {
+        for (buffers) |*buf| buf.deinit();
+        allocator.free(buffers);
+    }
+
+    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
+    try rebuildIndexes(allocator, root_dir, &owned);
+    try writeMeta(allocator, root_dir, table_name, owned);
+    return .{ .info = tableInfo(owned), .inserted = true };
+}
+
+pub fn upsertRawRowI64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected: i64,
+    row_bytes: []const u8,
+) TableError!UpsertResult {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const key_value = try rowI64KeyValue(owned, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+
+    const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
     if (found.found) {
         const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
         return .{ .info = info, .inserted = false };
@@ -12421,6 +12597,120 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try writeFile(std.testing.allocator, index_path, "corrupt");
     }
     try std.testing.expectError(TableError.VerifyFailed, verifyTable(std.testing.allocator, ".", table_name));
+}
+
+test "table i64 key row writes update upsert and delete" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "signed_day_rows";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "signed_day_rows.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_DAY_STRIDE = 8 // i64 date
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+    );
+
+    var days = [_]i64{ -5, 0, 10 };
+    var totals = [_]i64{ 1000, 2000, 3000 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(days[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, days.len, &columns);
+    _ = try createI64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    var row: [16]u8 = undefined;
+    writeI64LE(&row, 0, 0);
+    writeI64LE(&row, 8, 2100);
+    const direct_update = try updateRawRowI64Key(std.testing.allocator, ".", table_name, 0, 0, &row);
+    try std.testing.expectEqual(@as(u64, 3), direct_update.row_count);
+
+    writeI64LE(&row, 0, 99);
+    writeI64LE(&row, 8, 9900);
+    try std.testing.expectError(TableError.NotFound, updateRawRowI64Key(std.testing.allocator, ".", table_name, 0, 99, &row));
+
+    writeI64LE(&row, 0, 1);
+    writeI64LE(&row, 8, 111);
+    try std.testing.expectError(TableError.InvalidFormat, updateRawRowI64Key(std.testing.allocator, ".", table_name, 0, 0, &row));
+
+    writeI64LE(&row, 0, -5);
+    writeI64LE(&row, 8, 1100);
+    const direct_upsert_existing = try upsertRawRowI64Key(std.testing.allocator, ".", table_name, 0, -5, &row);
+    try std.testing.expect(!direct_upsert_existing.inserted);
+
+    writeI64LE(&row, 0, 20);
+    writeI64LE(&row, 8, 2000);
+    const direct_upsert_new = try upsertRawRowI64Key(std.testing.allocator, ".", table_name, 0, 20, &row);
+    try std.testing.expect(direct_upsert_new.inserted);
+    try std.testing.expectEqual(@as(u64, 4), direct_upsert_new.info.row_count);
+
+    const direct_delete = try deleteI64Key(std.testing.allocator, ".", table_name, 0, 10);
+    try std.testing.expectEqual(@as(u64, 3), direct_delete.row_count);
+    try std.testing.expectError(TableError.NotFound, deleteI64Key(std.testing.allocator, ".", table_name, 0, 10));
+
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        const day0 = try snapshotFindI64(snapshot, 0, 0);
+        try std.testing.expect(day0.found);
+        try std.testing.expectEqual(@as(i64, 2100), try snapshotGetI64(snapshot, 1, day0.row_index));
+        const deleted = try snapshotFindI64(snapshot, 0, 10);
+        try std.testing.expect(!deleted.found);
+    }
+
+    var tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    writeI64LE(&row, 0, 0);
+    writeI64LE(&row, 8, 2500);
+    const tx_upsert_existing = try writeTransactionUpsertRawRowI64Key(tx, 0, 0, &row);
+    try std.testing.expect(!tx_upsert_existing.inserted);
+
+    writeI64LE(&row, 0, 99);
+    writeI64LE(&row, 8, 9900);
+    try std.testing.expectError(TableError.NotFound, writeTransactionUpdateRawRowI64Key(tx, 0, 99, &row));
+
+    writeI64LE(&row, 0, 20);
+    writeI64LE(&row, 8, 2200);
+    _ = try writeTransactionUpdateRawRowI64Key(tx, 0, 20, &row);
+
+    writeI64LE(&row, 0, -1);
+    writeI64LE(&row, 8, 900);
+    const tx_upsert_new = try writeTransactionUpsertRawRowI64Key(tx, 0, -1, &row);
+    try std.testing.expect(tx_upsert_new.inserted);
+    _ = try writeTransactionDeleteI64Key(tx, 0, -5);
+
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    destroyWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 3), committed.row_count);
+
+    tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    writeI64LE(&row, 0, 99);
+    writeI64LE(&row, 8, 9900);
+    _ = try writeTransactionUpsertRawRowI64Key(tx, 0, 99, &row);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 3), snapshot.row_count);
+        const day0 = try snapshotFindI64(snapshot, 0, 0);
+        try std.testing.expect(day0.found);
+        try std.testing.expectEqual(@as(i64, 2500), try snapshotGetI64(snapshot, 1, day0.row_index));
+        const day20 = try snapshotFindI64(snapshot, 0, 20);
+        try std.testing.expect(day20.found);
+        try std.testing.expectEqual(@as(i64, 2200), try snapshotGetI64(snapshot, 1, day20.row_index));
+        const day_neg1 = try snapshotFindI64(snapshot, 0, -1);
+        try std.testing.expect(day_neg1.found);
+        try std.testing.expectEqual(@as(i64, 900), try snapshotGetI64(snapshot, 1, day_neg1.row_index));
+        const old_day = try snapshotFindI64(snapshot, 0, -5);
+        try std.testing.expect(!old_day.found);
+        const rolled_back = try snapshotFindI64(snapshot, 0, 99);
+        try std.testing.expect(!rolled_back.found);
+    }
 }
 
 test "table unique u64 index rejects duplicate existing data" {

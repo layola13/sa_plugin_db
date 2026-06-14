@@ -44,6 +44,8 @@ Core native calls:
 - `sa_db_insert_row`
 - `sa_db_upsert_row_u64_key`
 - `sa_db_update_row_u64_key`
+- `sa_db_upsert_row_i64_key`
+- `sa_db_update_row_i64_key`
 - `sa_db_upsert_row_u64_pair_key`
 - `sa_db_update_row_u64_pair_key`
 - `sa_db_upsert_row_u64_i64_pair_key`
@@ -55,6 +57,9 @@ Core native calls:
 - `sa_db_tx_upsert_row_u64_key`
 - `sa_db_tx_update_row_u64_key`
 - `sa_db_tx_delete_u64_key`
+- `sa_db_tx_upsert_row_i64_key`
+- `sa_db_tx_update_row_i64_key`
+- `sa_db_tx_delete_i64_key`
 - `sa_db_tx_upsert_row_u64_pair_key`
 - `sa_db_tx_update_row_u64_pair_key`
 - `sa_db_tx_delete_u64_pair_key`
@@ -92,6 +97,7 @@ Core native calls:
 - `sa_db_blob_value_len_handle`
 - `sa_db_blob_value_copy_handle`
 - `sa_db_delete_u64_key`
+- `sa_db_delete_i64_key`
 - `sa_db_delete_u64_pair_key`
 - `sa_db_delete_u64_i64_pair_key`
 - `sa_db_snapshot`
@@ -268,11 +274,13 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`,
+`DB_UPSERT_ROW_I64_KEY`, `DB_UPDATE_ROW_I64_KEY`,
 `DB_UPSERT_ROW_U64_PAIR_KEY`, `DB_UPDATE_ROW_U64_PAIR_KEY`,
 `DB_UPSERT_ROW_U64_I64_PAIR_KEY`, `DB_UPDATE_ROW_U64_I64_PAIR_KEY`,
 `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`,
+`DB_TX_UPSERT_ROW_I64_KEY`, `DB_TX_UPDATE_ROW_I64_KEY`, `DB_TX_DELETE_I64_KEY`,
 `DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`,
 `DB_TX_DELETE_U64_PAIR_KEY`, `DB_TX_UPSERT_ROW_U64_I64_PAIR_KEY`,
 `DB_TX_UPDATE_ROW_U64_I64_PAIR_KEY`, `DB_TX_DELETE_U64_I64_PAIR_KEY`,
@@ -290,7 +298,8 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_BLOB_VALUE_COPY_HANDLE`, `DB_FILTER_BLOB_EQ_HANDLE`,
 `DB_FILTER_BLOB_CONTAINS_HANDLE`, `DB_FILTER_BLOB_TOKEN_HANDLE`,
 `DB_FILTER_BLOB_PREFIX_HANDLE`,
-`DB_DELETE_U64_KEY`, `DB_DELETE_U64_PAIR_KEY`, `DB_DELETE_U64_I64_PAIR_KEY`,
+`DB_DELETE_U64_KEY`, `DB_DELETE_I64_KEY`, `DB_DELETE_U64_PAIR_KEY`,
+`DB_DELETE_U64_I64_PAIR_KEY`,
 `DB_MIN_U64_HANDLE`, `DB_MAX_U64_HANDLE`,
 `DB_MIN_I64_HANDLE`, `DB_MAX_I64_HANDLE`, `DB_MIN_U8_HANDLE`, `DB_MAX_U8_HANDLE`,
 `DB_MIN_I8_HANDLE`, `DB_MAX_I8_HANDLE`, `DB_MIN_U16_HANDLE`, `DB_MAX_U16_HANDLE`,
@@ -645,7 +654,8 @@ persisted `u64` indexes.
 `sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
 returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, and
-`DB_TX_DELETE_U64_KEY`, plus the composite-key forms
+`DB_TX_DELETE_U64_KEY`, the signed-key forms `DB_TX_UPSERT_ROW_I64_KEY`,
+`DB_TX_UPDATE_ROW_I64_KEY`, and `DB_TX_DELETE_I64_KEY`, plus the composite-key forms
 `DB_TX_UPSERT_ROW_U64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_PAIR_KEY`, and
 `DB_TX_DELETE_U64_PAIR_KEY`, and the signed-second-key forms
 `DB_TX_UPSERT_ROW_U64_I64_PAIR_KEY`, `DB_TX_UPDATE_ROW_U64_I64_PAIR_KEY`, and
@@ -671,6 +681,13 @@ table into a new column segment, rebuilding indexes, and advancing the epoch;
 same indexed ingest path and `out_inserted` is `1`. The `expected` key must match
 the `u64` value encoded in the row's key column, otherwise the call returns
 `SA_DB_ERR_INVALID_FORMAT` without committing a new epoch.
+
+`sa_db_upsert_row_i64_key` / `DB_UPSERT_ROW_I64_KEY` provides the same strict
+single-key row-write contract for a unique signed `i64` index. Use it for ERP
+tables keyed by encoded dates, timestamps, signed sequence numbers, or other
+signed business keys. Existing keys are replaced with `out_inserted=0`, missing
+keys are appended with `out_inserted=1`, and the row's encoded `i64` key must
+match the expected key argument.
 
 `sa_db_upsert_row_u64_pair_key` / `DB_UPSERT_ROW_U64_PAIR_KEY` applies the same
 strict row-write contract to a unique `u64_pair` index. The row's two key
@@ -698,6 +715,10 @@ as upsert, but it returns `SA_DB_ERR_NOT_FOUND` when the key is absent and never
 appends. `sa_db_tx_update_row_u64_key` / `DB_TX_UPDATE_ROW_U64_KEY` provides the
 same semantics inside a single-table transaction image.
 
+`sa_db_update_row_i64_key` / `DB_UPDATE_ROW_I64_KEY` and
+`sa_db_tx_update_row_i64_key` / `DB_TX_UPDATE_ROW_I64_KEY` provide the same
+strict update semantics for unique signed `i64` keys.
+
 `sa_db_update_row_u64_pair_key` / `DB_UPDATE_ROW_U64_PAIR_KEY` is the strict
 composite-key update form and never inserts a missing tuple. The transaction
 variant `sa_db_tx_update_row_u64_pair_key` /
@@ -715,6 +736,10 @@ key. The target column must already have a unique `u64` index, so the operation
 has primary-key semantics instead of deleting an arbitrary non-unique match. The
 delete rewrites the remaining rows into a new column segment, rebuilds indexes,
 advances the epoch, and returns `SA_DB_ERR_NOT_FOUND` when the key is absent.
+
+`sa_db_delete_i64_key` / `DB_DELETE_I64_KEY` and
+`sa_db_tx_delete_i64_key` / `DB_TX_DELETE_I64_KEY` provide the same behavior for
+unique signed `i64` keys.
 
 `sa_db_delete_u64_pair_key` / `DB_DELETE_U64_PAIR_KEY` deletes one row by a
 unique `(u64, u64)` tuple. `sa_db_tx_delete_u64_pair_key` /
@@ -796,8 +821,8 @@ benchmarks. The required baseline is:
   text predicates.
 - Row-oriented public operations on top of the column store: fixed-width insert,
   read by row index or unique `u64` key, upsert/update/delete by unique `u64`
-  key, unique `(u64, u64)` tuple, or unique `(u64, i64)` tuple, range query
-  handles, and single-table batch transactions exist now. Projected
+  key, unique `i64` key, unique `(u64, u64)` tuple, or unique `(u64, i64)`
+  tuple, range query handles, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
   prefix, and contains filters plus fixed-first-key `u64_pair` and
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
@@ -861,6 +886,9 @@ sa build-exe db_u64_timestamp_pair_smoke.sa -o db_u64_timestamp_pair_smoke.out -
 
 sa build-exe db_u64_i64_pair_write_smoke.sa -o db_u64_i64_pair_write_smoke.out --no-incremental
 ./db_u64_i64_pair_write_smoke.out
+
+sa build-exe db_i64_key_write_smoke.sa -o db_i64_key_write_smoke.out --no-incremental
+./db_i64_key_write_smoke.out
 
 sa build-exe db_candidate_filter_smoke.sa -o db_candidate_filter_smoke.out --no-incremental
 ./db_candidate_filter_smoke.out

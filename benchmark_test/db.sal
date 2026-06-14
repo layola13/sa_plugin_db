@@ -217,6 +217,16 @@
     %out_status = call @sa_db_update_row_u64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%row, %row_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_UPSERT_ROW_I64_KEY %out_status, %out_inserted, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %row, %row_len, %out_info
+    __db_upsert_i64_inserted_slot_%out_inserted = stack_alloc 8
+    %out_status = call @sa_db_upsert_row_i64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%row, %row_len, &__db_upsert_i64_inserted_slot_%out_inserted, &%out_info)
+    %out_inserted = load __db_upsert_i64_inserted_slot_%out_inserted+0 as u64
+[END_MACRO]
+
+[MACRO] DB_UPDATE_ROW_I64_KEY %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %row, %row_len, %out_info
+    %out_status = call @sa_db_update_row_i64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%row, %row_len, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_UPSERT_ROW_U64_PAIR_KEY %out_status, %out_inserted, %root, %root_len, %table_name, %table_name_len, %column_index, %column_index2, %key1, %key2, %row, %row_len, %out_info
     __db_upsert_pair_inserted_slot_%out_inserted = stack_alloc 8
     %out_status = call @sa_db_upsert_row_u64_pair_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %column_index2, %key1, %key2, &%row, %row_len, &__db_upsert_pair_inserted_slot_%out_inserted, &%out_info)
@@ -271,6 +281,16 @@
     %out_status = call @sa_db_tx_update_row_u64_key(%handle, %column_index, %expected, &%row, %row_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_TX_UPSERT_ROW_I64_KEY %out_status, %out_inserted, %handle, %column_index, %expected, %row, %row_len, %out_info
+    __db_tx_upsert_i64_inserted_slot_%out_inserted = stack_alloc 8
+    %out_status = call @sa_db_tx_upsert_row_i64_key(%handle, %column_index, %expected, &%row, %row_len, &__db_tx_upsert_i64_inserted_slot_%out_inserted, &%out_info)
+    %out_inserted = load __db_tx_upsert_i64_inserted_slot_%out_inserted+0 as u64
+[END_MACRO]
+
+[MACRO] DB_TX_UPDATE_ROW_I64_KEY %out_status, %handle, %column_index, %expected, %row, %row_len, %out_info
+    %out_status = call @sa_db_tx_update_row_i64_key(%handle, %column_index, %expected, &%row, %row_len, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_TX_UPSERT_ROW_U64_PAIR_KEY %out_status, %out_inserted, %handle, %column_index, %column_index2, %key1, %key2, %row, %row_len, %out_info
     __db_tx_upsert_pair_inserted_slot_%out_inserted = stack_alloc 8
     %out_status = call @sa_db_tx_upsert_row_u64_pair_key(%handle, %column_index, %column_index2, %key1, %key2, &%row, %row_len, &__db_tx_upsert_pair_inserted_slot_%out_inserted, &%out_info)
@@ -293,6 +313,10 @@
 
 [MACRO] DB_TX_DELETE_U64_KEY %out_status, %handle, %column_index, %expected, %out_info
     %out_status = call @sa_db_tx_delete_u64_key(%handle, %column_index, %expected, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_TX_DELETE_I64_KEY %out_status, %handle, %column_index, %expected, %out_info
+    %out_status = call @sa_db_tx_delete_i64_key(%handle, %column_index, %expected, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_TX_DELETE_U64_PAIR_KEY %out_status, %handle, %column_index, %column_index2, %key1, %key2, %out_info
@@ -431,6 +455,10 @@
 
 [MACRO] DB_DELETE_U64_KEY %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %out_info
     %out_status = call @sa_db_delete_u64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_DELETE_I64_KEY %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %out_info
+    %out_status = call @sa_db_delete_i64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_DELETE_U64_PAIR_KEY %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %column_index2, %key1, %key2, %out_info

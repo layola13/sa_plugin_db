@@ -657,6 +657,58 @@ pub export fn sa_db_update_row_u64_key(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_upsert_row_i64_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_update_row_i64_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_upsert_row_u64_pair_key(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -908,6 +960,47 @@ pub export fn sa_db_tx_update_row_u64_key(
     return fillInfo(out_info, info);
 }
 
+pub export fn sa_db_tx_upsert_row_i64_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_inserted: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const result = table.writeTransactionUpsertRawRowI64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_i64_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowI64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_tx_upsert_row_u64_pair_key(
     handle: ?*anyopaque,
     column_index: u64,
@@ -1014,6 +1107,21 @@ pub export fn sa_db_tx_delete_u64_key(
     defer tx_handle_mutex.unlock();
     const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU64Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_delete_i64_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionDeleteI64Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -1650,6 +1758,27 @@ pub export fn sa_db_delete_u64_key(
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
     const info = table.deleteU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_delete_i64_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: i64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.deleteI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -4735,6 +4864,114 @@ test "db SA ABI creates and queries u64 pair indexes" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "order_lines".ptr, "order_lines".len, &info));
+}
+
+test "db SA ABI writes rows by i64 keys" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_DAY_STRIDE = 8 // i64 date
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64 decimal(2)
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "i64_write_days.sadb-schema".ptr, "i64_write_days.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var days = [_]i64{ -5, 0, 10 };
+    var totals = [_]i64{ 1000, 2000, 3000 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&days), .len = @sizeOf(@TypeOf(days)) },
+        .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, days.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_i64_index(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 1, &info));
+
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(i64, row[0..8], 0, .little);
+    std.mem.writeInt(i64, row[8..16], 2100, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_update_row_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 0, &row, row.len, &info));
+
+    std.mem.writeInt(i64, row[0..8], 99, .little);
+    std.mem.writeInt(i64, row[8..16], 9900, .little);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_update_row_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 99, &row, row.len, &info));
+
+    std.mem.writeInt(i64, row[0..8], 1, .little);
+    std.mem.writeInt(i64, row[8..16], 111, .little);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_update_row_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 0, &row, row.len, &info));
+
+    var inserted: u64 = 99;
+    std.mem.writeInt(i64, row[0..8], -5, .little);
+    std.mem.writeInt(i64, row[8..16], 1100, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, -5, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 0), inserted);
+
+    std.mem.writeInt(i64, row[0..8], 20, .little);
+    std.mem.writeInt(i64, row[8..16], 2000, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_upsert_row_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 20, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_delete_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 10, &info));
+    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_delete_i64_key(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, 0, 10, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, &tx_handle));
+    std.mem.writeInt(i64, row[0..8], 0, .little);
+    std.mem.writeInt(i64, row[8..16], 2500, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i64_key(tx_handle, 0, 0, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 0), inserted);
+
+    std.mem.writeInt(i64, row[0..8], 99, .little);
+    std.mem.writeInt(i64, row[8..16], 9900, .little);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_tx_update_row_i64_key(tx_handle, 0, 99, &row, row.len, &info));
+
+    std.mem.writeInt(i64, row[0..8], 20, .little);
+    std.mem.writeInt(i64, row[8..16], 2200, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_i64_key(tx_handle, 0, 20, &row, row.len, &info));
+
+    std.mem.writeInt(i64, row[0..8], -1, .little);
+    std.mem.writeInt(i64, row[8..16], 900, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i64_key(tx_handle, 0, -1, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_delete_i64_key(tx_handle, 0, -5, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+    tx_handle = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, &tx_handle));
+    std.mem.writeInt(i64, row[0..8], 99, .little);
+    std.mem.writeInt(i64, row[8..16], 9900, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_i64_key(tx_handle, 0, 99, &row, row.len, &inserted, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(tx_handle));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, &handle));
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_i64_handle(handle, 0, 0, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    var total: i64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 1, row_index, &total));
+    try std.testing.expectEqual(@as(i64, 2500), total);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_i64_handle(handle, 0, 20, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 1, row_index, &total));
+    try std.testing.expectEqual(@as(i64, 2200), total);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_i64_handle(handle, 0, -1, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_i64_handle(handle, 0, -5, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_i64_handle(handle, 0, 99, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 0), found);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "i64_write_days".ptr, "i64_write_days".len, &info));
 }
 
 test "db SA ABI writes rows by u64 pair keys" {
