@@ -6534,6 +6534,35 @@ fn snapshotFilterBlobEqRowsIndexed(
     return .{ .written = written, .total = total };
 }
 
+fn findBlobEqInUniqueIndex(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    index: ReadIndexSnapshot,
+    column_index: usize,
+    blob_bytes: []const u8,
+    needle: []const u8,
+) TableError!U64FindResult {
+    const refs = try buildBlobValueRefs(allocator, blob_bytes);
+    defer allocator.free(refs);
+
+    const key = blobValueHash(needle);
+    const start = lowerBoundU64Index(index, key);
+    const end = upperBoundU64Index(index, key);
+    var matched_row: ?u64 = null;
+    var i = start;
+    while (i < end) : (i += 1) {
+        const row = readIndexRow(index.entries, i);
+        if (row >= snapshot.row_count) return TableError.VerifyFailed;
+        const blob_id = try snapshotBlobHandleAtRow(snapshot, column_index, row);
+        const value_ref = blobRefForId(refs, blob_id) orelse continue;
+        if (!std.mem.eql(u8, value_ref.value, needle)) continue;
+        if (matched_row != null) return TableError.VerifyFailed;
+        matched_row = row;
+    }
+    if (matched_row) |row| return .{ .found = true, .row_index = row };
+    return .{ .found = false, .row_index = 0 };
+}
+
 fn snapshotFilterBlobTokenRowsIndexed(
     allocator: std.mem.Allocator,
     snapshot: *const ReadSnapshot,
@@ -7116,6 +7145,21 @@ fn snapshotUniqueIndexForU64I64PairColumns(snapshot: *const ReadSnapshot, column
 fn snapshotIndexForBlobEqColumnStore(snapshot: *const ReadSnapshot, column_index: usize, store_name: []const u8) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
         if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 == null and
+            index.store_name != null and
+            std.mem.eql(u8, index.store_name.?, store_name))
+        {
+            return index;
+        }
+    }
+    return null;
+}
+
+fn snapshotUniqueIndexForBlobEqColumnStore(snapshot: *const ReadSnapshot, column_index: usize, store_name: []const u8) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
+            index.unique and
             index.column_index == @as(u64, @intCast(column_index)) and
             index.column_index2 == null and
             index.store_name != null and
@@ -8091,6 +8135,17 @@ pub fn snapshotGetRowU64I64PairKey(snapshot: *const ReadSnapshot, column_index: 
     try ensureSnapshotI64Column(snapshot, column_index2);
     const index = snapshotUniqueIndexForU64I64PairColumns(snapshot, column_index, column_index2) orelse return TableError.InvalidFormat;
     const found = findU64PairInIndex(index, key1, sortableI64Key(key2));
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowBlobEqKey(allocator: std.mem.Allocator, snapshot: *const ReadSnapshot, column_index: usize, store_name: []const u8, value: []const u8, out_row: []u8) TableError!void {
+    try ensureSnapshotBlobHandleColumn(snapshot, column_index);
+    try validateBlobStoreName(store_name);
+    try validateBlobValue(value);
+    const index = snapshotUniqueIndexForBlobEqColumnStore(snapshot, column_index, store_name) orelse return TableError.InvalidFormat;
+    const blob_idx = snapshotFindBlobStoreIndex(snapshot, store_name) orelse return TableError.NotFound;
+    const found = try findBlobEqInUniqueIndex(allocator, snapshot, index, column_index, snapshot.blobs[blob_idx].bytes, value);
     if (!found.found) return TableError.NotFound;
     try snapshotCopyRow(snapshot, found.row_index, out_row);
 }
@@ -12356,6 +12411,70 @@ test "table blob exact index is rebuilt when blob values are appended" {
     try std.testing.expectEqual(@as(u64, 1), exact.total);
     try std.testing.expectEqual(@as(u64, 1), exact.written);
     try std.testing.expectEqual(@as(u64, 0), rows[0]);
+}
+
+test "table unique blob eq key copies full rows" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "blob_key_rows";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_key_rows.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_CODE_STRIDE = 8 // blob_handle
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    const code_a = try putBlobValue(std.testing.allocator, ".", table_name, "codes", "CUST-001");
+    const code_b = try putBlobValue(std.testing.allocator, ".", table_name, "codes", "CUST-002");
+    var row_bytes: [24]u8 = undefined;
+    writeU64LE(&row_bytes, 0, 1);
+    writeU64LE(&row_bytes, 8, code_a.id);
+    writeU64LE(&row_bytes, 16, 100);
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+    writeU64LE(&row_bytes, 0, 2);
+    writeU64LE(&row_bytes, 8, code_b.id);
+    writeU64LE(&row_bytes, 16, 200);
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+    _ = try createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "codes", true);
+
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        var fetched_row: [24]u8 = undefined;
+        try snapshotGetRowBlobEqKey(std.testing.allocator, snapshot, 1, "codes", "CUST-002", &fetched_row);
+        try std.testing.expectEqual(@as(u64, 2), readU64LE(&fetched_row, 0));
+        try std.testing.expectEqual(code_b.id, readU64LE(&fetched_row, 8));
+        try std.testing.expectEqual(@as(u64, 200), readU64LE(&fetched_row, 16));
+        try std.testing.expectError(TableError.NotFound, snapshotGetRowBlobEqKey(std.testing.allocator, snapshot, 1, "codes", "CUST-999", &fetched_row));
+        var short_row: [23]u8 = undefined;
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowBlobEqKey(std.testing.allocator, snapshot, 1, "codes", "CUST-002", &short_row));
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowBlobEqKey(std.testing.allocator, snapshot, 0, "codes", "CUST-002", &fetched_row));
+    }
+
+    const non_unique_name = "blob_key_rows_non_unique";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_key_rows_non_unique.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_CODE_STRIDE = 8 // blob_handle
+    );
+    const non_unique_code = try putBlobValue(std.testing.allocator, ".", non_unique_name, "codes", "CUST-003");
+    var non_unique_row: [16]u8 = undefined;
+    writeU64LE(&non_unique_row, 0, 3);
+    writeU64LE(&non_unique_row, 8, non_unique_code.id);
+    _ = try insertRawRow(std.testing.allocator, ".", non_unique_name, &non_unique_row);
+    _ = try createBlobEqIndex(std.testing.allocator, ".", non_unique_name, 1, "codes", false);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", non_unique_name);
+        defer snapshot.destroy();
+        var fetched_row: [16]u8 = undefined;
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowBlobEqKey(std.testing.allocator, snapshot, 1, "codes", "CUST-003", &fetched_row));
+    }
 }
 
 test "table blob token index filters ERP text tokens" {

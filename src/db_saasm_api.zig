@@ -5297,6 +5297,29 @@ pub export fn sa_db_get_row_u64_i64_pair_key_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_get_row_blob_eq_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowBlobEqKey(gpa.allocator(), snapshot, @intCast(column_index), store_name, value, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_min_u64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*u64) u32 {
     const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -6375,6 +6398,59 @@ test "db SA ABI gets full rows by typed unique keys" {
     try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_i64_key_handle(handle, 0, 99, &row, row.len));
     var short_row: [29]u8 = undefined;
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_u32_key_handle(handle, 1, 200, &short_row, short_row.len));
+}
+
+test "db SA ABI gets rows by unique blob eq key" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "blob_key_rows_abi";
+    const store_name = "codes";
+    const code_a = "CUST-001";
+    const code_b = "CUST-002";
+    const missing_code = "CUST-999";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_CODE_STRIDE = 8 // blob_handle
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "blob_key_rows_abi.sadb-schema".ptr, "blob_key_rows_abi.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var code_a_id: u64 = 0;
+    var code_b_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, code_a.ptr, code_a.len, &code_a_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, table_name.ptr, table_name.len, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &code_b_id, &info));
+
+    var row: [24]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 1, .little);
+    std.mem.writeInt(u64, row[8..16], code_a_id, .little);
+    std.mem.writeInt(u64, row[16..24], 100, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], code_b_id, .little);
+    std.mem.writeInt(u64, row[16..24], 200, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, table_name.ptr, table_name.len, &row, row.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_blob_eq_index(root.ptr, root.len, table_name.ptr, table_name.len, 1, store_name.ptr, store_name.len, 1, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &handle));
+    defer std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle)) catch unreachable;
+
+    var fetched_row: [24]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(code_b_id, std.mem.readInt(u64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 200), std.mem.readInt(u64, fetched_row[16..24], .little));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, missing_code.ptr, missing_code.len, &fetched_row, fetched_row.len));
+    var short_row: [23]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_blob_eq_key_handle(handle, 1, store_name.ptr, store_name.len, code_b.ptr, code_b.len, &short_row, short_row.len));
 }
 
 test "db SA ABI writes rows by u64 pair keys" {

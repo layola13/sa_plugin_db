@@ -241,6 +241,7 @@
 @extern sa_db_get_row_i16_key_handle(handle: ptr, column_index: u64, expected: i16, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_get_row_u64_pair_key_handle(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_get_row_u64_i64_pair_key_handle(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: i64, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_blob_eq_key_handle(handle: ptr, column_index: u64, &store_name: ptr, store_name_len: u64, &value: ptr, value_len: u64, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_min_u64_handle(handle: ptr, column_index: u64, &out_min: ptr) -> u32
 @extern sa_db_max_u64_handle(handle: ptr, column_index: u64, &out_max: ptr) -> u32
 @extern sa_db_min_i64_handle(handle: ptr, column_index: u64, &out_min: ptr) -> u32

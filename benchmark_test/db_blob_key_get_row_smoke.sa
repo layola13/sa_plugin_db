@@ -1,0 +1,147 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"blob_key_get_row_smoke"
+@const SCHEMA_PATH = utf8:"blob_key_get_row_smoke.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_CODE_STRIDE = 8 // blob_handle\n#def COL_POINTS_STRIDE = 8 // u64\n"
+@const STORE = utf8:"codes"
+@const CODE_A = utf8:"CUST-001"
+@const CODE_B = utf8:"CUST-002"
+@const CODE_MISSING = utf8:"CUST-999"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 22
+#def SCHEMA_PATH_LEN = 34
+#def SCHEMA_LEN = 122
+#def STORE_LEN = 5
+#def CODE_A_LEN = 8
+#def CODE_B_LEN = 8
+#def CODE_MISSING_LEN = 8
+#def ROW_BYTES = 24
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+    fetched_row = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_BLOB_PUT put_a_status, code_a_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, CODE_A, CODE_A_LEN, info
+    EXPAND DB_BLOB_PUT put_b_status, code_b_id, ROOT, ROOT_LEN, TABLE, TABLE_LEN, STORE, STORE_LEN, CODE_B, CODE_B_LEN, info
+
+    store row+0, 1 as u64
+    store row+8, code_a_id as u64
+    store row+16, 100 as u64
+    EXPAND DB_INSERT_ROW insert_a_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 2 as u64
+    store row+8, code_b_id as u64
+    store row+16, 200 as u64
+    EXPAND DB_INSERT_ROW insert_b_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+
+    EXPAND DB_CREATE_BLOB_EQ_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, STORE, STORE_LEN, 1, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_GET_ROW_BLOB_EQ_KEY_HANDLE get_status, read_handle, 1, STORE, STORE_LEN, CODE_B, CODE_B_LEN, fetched_row, ROW_BYTES
+    fetched_id = load fetched_row+0 as u64
+    fetched_code_id = load fetched_row+8 as u64
+    fetched_points = load fetched_row+16 as u64
+    EXPAND DB_GET_ROW_BLOB_EQ_KEY_HANDLE missing_status, read_handle, 1, STORE, STORE_LEN, CODE_MISSING, CODE_MISSING_LEN, fetched_row, ROW_BYTES
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_put_a = eq put_a_status, SA_DB_OK
+    ok_put_b = eq put_b_status, SA_DB_OK
+    ok_code_a_id = eq code_a_id, 1
+    ok_code_b_id = eq code_b_id, 2
+    ok_insert_a = eq insert_a_status, SA_DB_OK
+    ok_insert_b = eq insert_b_status, SA_DB_OK
+    ok_index = eq index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_get = eq get_status, SA_DB_OK
+    ok_fetched_id = eq fetched_id, 2
+    ok_fetched_code_id = eq fetched_code_id, code_b_id
+    ok_fetched_points = eq fetched_points, 200
+    ok_missing = eq missing_status, SA_DB_ERR_NOT_FOUND
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_put_a
+    ok03 = and ok02, ok_put_b
+    ok04 = and ok03, ok_code_a_id
+    ok05 = and ok04, ok_code_b_id
+    ok06 = and ok05, ok_insert_a
+    ok07 = and ok06, ok_insert_b
+    ok08 = and ok07, ok_index
+    ok09 = and ok08, ok_open
+    ok10 = and ok09, ok_get
+    ok11 = and ok10, ok_fetched_id
+    ok12 = and ok11, ok_fetched_code_id
+    ok13 = and ok12, ok_fetched_points
+    ok14 = and ok13, ok_missing
+    ok15 = and ok14, ok_close
+    ok = and ok15, ok_verify
+
+    !remove_status
+    !init_status
+    !put_a_status
+    !code_a_id
+    !put_b_status
+    !code_b_id
+    !insert_a_status
+    !insert_b_status
+    !index_status
+    !open_status
+    !read_handle
+    !get_status
+    !fetched_id
+    !fetched_code_id
+    !fetched_points
+    !missing_status
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_put_a
+    !ok_put_b
+    !ok_code_a_id
+    !ok_code_b_id
+    !ok_insert_a
+    !ok_insert_b
+    !ok_index
+    !ok_open
+    !ok_get
+    !ok_fetched_id
+    !ok_fetched_code_id
+    !ok_fetched_points
+    !ok_missing
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !row
+    !fetched_row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9044)
