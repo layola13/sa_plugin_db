@@ -1059,6 +1059,14 @@
     %out_total = load __db_handle_filter_rows_bool_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_INTERSECT_ROWS_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %left_rows, %left_rows_len, %right_rows, %right_rows_len, %offset, %limit
+    __db_handle_intersect_rows_written_slot_%out_written = stack_alloc 8
+    __db_handle_intersect_rows_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_intersect_rows_handle(%handle, &%left_rows, %left_rows_len, &%right_rows, %right_rows_len, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_intersect_rows_written_slot_%out_written, &__db_handle_intersect_rows_total_slot_%out_total)
+    %out_written = load __db_handle_intersect_rows_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_intersect_rows_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_SORT_ROWS_U64_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %descending, %offset, %limit
     __db_handle_sort_rows_u64_written_slot_%out_written = stack_alloc 8
     __db_handle_sort_rows_u64_total_slot_%out_total = stack_alloc 8

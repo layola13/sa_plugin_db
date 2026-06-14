@@ -3321,6 +3321,36 @@ pub export fn sa_db_filter_rows_bool_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_intersect_rows_handle(
+    handle: ?*anyopaque,
+    left_rows_ptr: ?[*]const u64,
+    left_rows_len: u64,
+    right_rows_ptr: ?[*]const u64,
+    right_rows_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const left_rows = inputU64sAllowEmpty(left_rows_ptr, left_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const right_rows = inputU64sAllowEmpty(right_rows_ptr, right_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotIntersectRows(gpa.allocator(), snapshot, left_rows, right_rows, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 fn sortRowsHandle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -4385,6 +4415,7 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 1), filtered[0]);
     try std.testing.expectEqual(@as(u64, 2), filtered[1]);
     try std.testing.expectEqual(@as(u64, 4), filtered[2]);
+    const date_written = written;
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_u64_range_handle(handle, 2, &rows, candidate_written, 2, 2, 0, rows.len, &rows, rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 3), total);
@@ -4393,6 +4424,25 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 2), rows[1]);
     try std.testing.expectEqual(@as(u64, 5), rows[2]);
     const status_written = written;
+
+    var intersect_rows = [_]u64{ 99, 99, 99, 99, 99, 99 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_intersect_rows_handle(handle, &rows, status_written, &filtered, date_written, 0, intersect_rows.len, &intersect_rows, intersect_rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), intersect_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), intersect_rows[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_intersect_rows_handle(handle, &rows, status_written, &filtered, date_written, 1, 1, &intersect_rows, intersect_rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 2), intersect_rows[0]);
+
+    const invalid_intersect_rows = [_]u64{999};
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_intersect_rows_handle(handle, &invalid_intersect_rows, invalid_intersect_rows.len, &filtered, date_written, 0, intersect_rows.len, &intersect_rows, intersect_rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
 
     var stats_count: u64 = 0;
     var stats_u64_sum: u64 = 0;

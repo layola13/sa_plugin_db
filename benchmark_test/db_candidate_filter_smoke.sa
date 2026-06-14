@@ -98,6 +98,9 @@ L_ENTRY:
     status_row0 = load status_rows+0 as u64
     status_row1 = load status_rows+8 as u64
     status_row2 = load status_rows+16 as u64
+    EXPAND DB_INTERSECT_ROWS_HANDLE intersect_status, intersect_written, intersect_total, final_rows, ROWS_CAP, read_handle, status_rows, status_written, final_rows, date_written, 0, ROWS_CAP
+    intersect_row0 = load final_rows+0 as u64
+    intersect_row1 = load final_rows+8 as u64
     EXPAND DB_STATS_ROWS_U64_HANDLE status_stats_status, status_stats_count, status_stats_sum, status_stats_min, status_stats_max, read_handle, 2, status_rows, status_written
     EXPAND DB_STATS_ROWS_I64_HANDLE amount_stats_status, amount_stats_count, amount_stats_sum, amount_stats_min, amount_stats_max, read_handle, 4, status_rows, status_written
     EXPAND DB_SORT_ROWS_U64_HANDLE status_sort_status, status_sort_written, status_sort_total, final_rows, ROWS_CAP, read_handle, 2, candidate_rows, candidate_written, 1, 0, ROWS_CAP
@@ -152,6 +155,11 @@ L_ENTRY:
     ok_status_row0 = eq status_row0, 1
     ok_status_row1 = eq status_row1, 2
     ok_status_row2 = eq status_row2, 5
+    ok_intersect_status = eq intersect_status, SA_DB_OK
+    ok_intersect_written = eq intersect_written, 2
+    ok_intersect_total = eq intersect_total, 2
+    ok_intersect_row0 = eq intersect_row0, 1
+    ok_intersect_row1 = eq intersect_row1, 2
     ok_status_stats_status = eq status_stats_status, SA_DB_OK
     ok_status_stats_count = eq status_stats_count, 3
     ok_status_stats_sum = eq status_stats_sum, 6
@@ -230,7 +238,12 @@ L_ENTRY:
     ok17 = and ok16, ok_status_row0
     ok18 = and ok17, ok_status_row1
     ok19 = and ok18, ok_status_row2
-    ok20 = and ok19, ok_status_stats_status
+    ok_intersect01 = and ok19, ok_intersect_status
+    ok_intersect02 = and ok_intersect01, ok_intersect_written
+    ok_intersect03 = and ok_intersect02, ok_intersect_total
+    ok_intersect04 = and ok_intersect03, ok_intersect_row0
+    ok_intersect05 = and ok_intersect04, ok_intersect_row1
+    ok20 = and ok_intersect05, ok_status_stats_status
     ok21 = and ok20, ok_status_stats_count
     ok22 = and ok21, ok_status_stats_sum
     ok23 = and ok22, ok_status_stats_min
@@ -310,6 +323,11 @@ L_ENTRY:
     !status_row0
     !status_row1
     !status_row2
+    !intersect_status
+    !intersect_written
+    !intersect_total
+    !intersect_row0
+    !intersect_row1
     !status_stats_status
     !status_stats_count
     !status_stats_sum
@@ -388,6 +406,11 @@ L_ENTRY:
     !ok_status_row0
     !ok_status_row1
     !ok_status_row2
+    !ok_intersect_status
+    !ok_intersect_written
+    !ok_intersect_total
+    !ok_intersect_row0
+    !ok_intersect_row1
     !ok_status_stats_status
     !ok_status_stats_count
     !ok_status_stats_sum
@@ -475,6 +498,11 @@ L_ENTRY:
     !ok27
     !ok28
     !ok29
+    !ok_intersect01
+    !ok_intersect02
+    !ok_intersect03
+    !ok_intersect04
+    !ok_intersect05
     !ok_sort01
     !ok_sort02
     !ok_sort03

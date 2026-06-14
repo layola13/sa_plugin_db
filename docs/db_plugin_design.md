@@ -48,14 +48,21 @@
 
 ## Interface Policy
 
-The plugin is intentionally CLI-only for version `0.1.0`: `sap.json` keeps `interfaces` as `{}` and exposes capability through the runtime descriptor command handler plus the `database` skill section. Generated table `.sai` files are per-project schema outputs from `sa db init`; they are not stable plugin API files shipped by the manifest.
+The current development API exposes both command-level plugin capability and a
+low-level SA-facing ABI. `sap.json` publishes `db.sai` and `db.sal`, and SA
+programs should import those files for fixed-width row writes, read-handle
+queries, candidate row filtering/sorting/intersection, dictionaries, blob stores,
+and table maintenance calls.
 
-Add a manifest `.sai` or `.sal` only after there is a stable low-level ABI that SA programs should import directly. Until then, command-level compatibility is the supported surface.
+This API is still allowed to break during `0.1.x` development, but old direct
+query symbols must not be kept alongside the read-handle model. Generated table
+`.sai` files from `sa db init` remain per-project schema outputs; `db.sai` and
+`db.sal` are the plugin-shipped ABI facade.
 
 ## Verification
 
 - Unit tests: `zig build test`.
 - Build artifact check: `zig build` produces `zig-out/lib/libdb.so`, matching `sap.json`.
-- Manifest interface policy: `jq -e '.interfaces == {} and .skills == ["database"]' sap.json`.
+- Manifest interface policy: `jq -e '.interfaces.sai.path == "db.sai" and .interfaces.sal.path == "db.sal" and .skills == ["database"]' sap.json`.
 - Installed-plugin smoke: `bash tests/smoke_installed.sh` builds, dev-installs with `SA_PLUGIN_DEV=1`, confirms the `database` skill, and runs `sa db init/ingest/verify/lock/unlock/verify` in an isolated project directory.
 - Qmod command example: `docs/qmod_examples.md` shows `sa db register`, `sa db inspect`, and `sa db exec`; the same flow is verified by `tests/smoke_installed.sh`, including a bitwise `and` DB filter qmod.

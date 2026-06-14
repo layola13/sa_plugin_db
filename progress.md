@@ -4,7 +4,7 @@
 
 - Scope: `db` plugin manifest, CLI command surface, qmod registry/execution, and local table storage helpers.
 - Progress rule: update this file, including percentages, after each completed feature.
-- Current status: `16 / 16` tracked features completed (`100.0%`). The plugin builds, unit tests pass, installed-plugin smoke passes, qmod command examples are documented/tested locally, the manifest interface policy is documented, and the tracked qmod execution-surface expansion is complete.
+- Current status: `16 / 16` original qmod/CLI features completed (`100.0%`). Since that milestone, the plugin has moved into a development ABI phase with `db.sai` and `db.sal` exported through `sap.json` for SA-facing read handles, typed queries, row writes, dictionaries, blob stores, and ERP planner helpers.
 
 ## Feature Progress
 
@@ -22,7 +22,7 @@
 - Feature 12 - `db unlock <table>` table unlock: 100% (validates current table, clears locked state, restores writable file modes, and allows ingestion again). Verified with `zig build test` on 2026-06-08.
 - Feature 13 - Installed-plugin smoke verification: 100% (`tests/smoke_installed.sh` builds, dev-installs, verifies `database` skills, and runs `sa db init/ingest/verify/lock/unlock/verify`). Verified on 2026-06-08.
 - Feature 14 - Command-level qmod integration examples: 100% (`docs/qmod_examples.md` documents `sa db register` plus `sa db exec`, and `tests/smoke_installed.sh` verifies register/inspect/exec against a dev-installed plugin). Verified on 2026-06-08.
-- Feature 15 - Stable exported interfaces decision: 100% (`sap.json` remains CLI-only with `interfaces: {}` for `0.1.0`; generated table `.sai` files are per-project outputs, not plugin-shipped stable interfaces). Documented in `docs/db_plugin_design.md` and verified with `jq -e '.interfaces == {} and .skills == ["database"]' sap.json` on 2026-06-08.
+- Feature 15 - Interface policy: superseded after the original qmod milestone. `sap.json` now exports plugin-shipped `db.sai` and `db.sal`; generated table `.sai` files remain per-project schema outputs.
 - Feature 16 - Broader qmod execution surface: 100% (added `and`, `or`, `xor`, `shl`, and `lshr` integer binary ops to the common qmod evaluator path; covered by scalar and read-only DB qmod unit tests plus installed-plugin smoke). Verified on 2026-06-08.
 
 ## Current Verification
@@ -30,7 +30,7 @@
 - `zig build test` passes in `/home/vscode/projects/sa_plugins/sa_plugin_db`.
 - `zig build` passes and produces `zig-out/lib/libdb.so` for the `linux-x86_64` artifact path in `sap.json`.
 - `bash tests/smoke_installed.sh` passes and verifies the dev-installed plugin command path, including qmod register/inspect/exec and a bitwise DB filter qmod.
-- `jq -e '.interfaces == {} and .skills == ["database"]' sap.json` passes and verifies the CLI-only manifest policy.
+- `jq -e '.interfaces.sai.path == "db.sai" and .interfaces.sal.path == "db.sal" and .skills == ["database"]' sap.json` verifies the current exported-interface policy.
 
 ## Remaining Work
 

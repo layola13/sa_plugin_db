@@ -154,6 +154,7 @@
 @extern sa_db_filter_rows_i8_range_handle(handle: ptr, column_index: u64, &in_rows: ptr, in_rows_len: u64, min_value: i8, max_value: i8, offset: u64, limit: u64, &out_rows: ptr, out_rows_len: u64, &out_written: ptr, &out_total: ptr) -> u32
 @extern sa_db_filter_rows_u16_range_handle(handle: ptr, column_index: u64, &in_rows: ptr, in_rows_len: u64, min_value: u16, max_value: u16, offset: u64, limit: u64, &out_rows: ptr, out_rows_len: u64, &out_written: ptr, &out_total: ptr) -> u32
 @extern sa_db_filter_rows_i16_range_handle(handle: ptr, column_index: u64, &in_rows: ptr, in_rows_len: u64, min_value: i16, max_value: i16, offset: u64, limit: u64, &out_rows: ptr, out_rows_len: u64, &out_written: ptr, &out_total: ptr) -> u32
+@extern sa_db_intersect_rows_handle(handle: ptr, &left_rows: ptr, left_rows_len: u64, &right_rows: ptr, right_rows_len: u64, offset: u64, limit: u64, &out_rows: ptr, out_rows_len: u64, &out_written: ptr, &out_total: ptr) -> u32
 @extern sa_db_get_u64_handle(handle: ptr, column_index: u64, row_index: u64, &out_value: ptr) -> u32
 @extern sa_db_get_i64_handle(handle: ptr, column_index: u64, row_index: u64, &out_value: ptr) -> u32
 @extern sa_db_get_u32_handle(handle: ptr, column_index: u64, row_index: u64, &out_value: ptr) -> u32

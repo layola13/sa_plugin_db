@@ -165,6 +165,7 @@ Read-handle query calls:
 - `sa_db_filter_rows_timestamp_ms_range_handle`
 - `sa_db_filter_rows_timestamp_us_range_handle`
 - `sa_db_filter_rows_bool_handle`
+- `sa_db_intersect_rows_handle`
 - `sa_db_sort_rows_u64_handle`
 - `sa_db_sort_rows_i64_handle`
 - `sa_db_sort_rows_f32_handle`
@@ -231,6 +232,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FILTER_ROWS_I16_RANGE_HANDLE`, `DB_FILTER_ROWS_DECIMAL_I64_RANGE_HANDLE`,
 `DB_FILTER_ROWS_DATE_RANGE_HANDLE`, `DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE`,
 `DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE`, `DB_FILTER_ROWS_BOOL_HANDLE`,
+`DB_INTERSECT_ROWS_HANDLE`,
 `DB_SORT_ROWS_U64_HANDLE`, `DB_SORT_ROWS_I64_HANDLE`,
 `DB_SORT_ROWS_U32_HANDLE`, `DB_SORT_ROWS_I32_HANDLE`,
 `DB_SORT_ROWS_U8_HANDLE`, `DB_SORT_ROWS_I8_HANDLE`,
@@ -486,6 +488,13 @@ compact warehouse/category/priority codes, amount/date/timestamp range, finite
 measurement/rate/weight ranges, or posted/active bool without materializing full rows in SA code. This is a planner
 building block rather than a SQL optimizer: callers still choose the first
 selective index explicitly.
+`sa_db_intersect_rows_handle` / `DB_INTERSECT_ROWS_HANDLE` is the next planner
+building block: callers can run two indexed filters independently, then intersect
+their row-id lists inside the plugin while preserving the left list's order and
+using the same `offset`/`limit`/`total` pagination contract. This is useful when
+two predicates are both selective, for example status/date, text/customer, or
+warehouse/product filters, and avoids turning every second predicate into a full
+candidate scan.
 `sa_db_stats_rows_u64_handle` / `DB_STATS_ROWS_U64_HANDLE` and
 `sa_db_stats_rows_i64_handle` / `DB_STATS_ROWS_I64_HANDLE` aggregate an existing
 candidate row list and return `count`, `sum`, `min`, and `max` in one snapshot
@@ -682,7 +691,8 @@ benchmarks. The required baseline is:
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
   customer/date, status/due-date, and product/posting-date shapes. Candidate row
   filters now compose an existing row-id list with additional integer, finite
-  float, or bool predicates for multi-condition list pages, and candidate row
+  float, or bool predicates for multi-condition list pages, row-list
+  intersection composes two independently indexed result sets, and candidate row
   sorting covers integer and finite float list ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
