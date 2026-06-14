@@ -1,0 +1,242 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"planner_orders"
+@const SCHEMA_PATH = utf8:"planner_orders.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_STATUS_STRIDE = 8 // u64\n#def COL_AMOUNT_CENTS_STRIDE = 8 // i64 decimal(2)\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 14
+#def SCHEMA_PATH_LEN = 26
+#def SCHEMA_LEN = 133
+#def ROWS = 6
+#def COL_BYTES = 48
+#def COLUMN_COUNT = 3
+#def COLUMNS_BYTES = 48
+#def ROWS_CAP = 6
+#def ROWS_BYTES = 48
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    plan_info = stack_alloc SaDbPlanInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    ids = alloc COL_BYTES
+    statuses = alloc COL_BYTES
+    amounts = alloc COL_BYTES
+    plan_rows = alloc ROWS_BYTES
+
+    store ids+0, 100 as u64
+    store ids+8, 101 as u64
+    store ids+16, 102 as u64
+    store ids+24, 103 as u64
+    store ids+32, 104 as u64
+    store ids+40, 105 as u64
+    store statuses+0, 1 as u64
+    store statuses+8, 2 as u64
+    store statuses+16, 2 as u64
+    store statuses+24, 2 as u64
+    store statuses+32, 1 as u64
+    store statuses+40, 2 as u64
+    store amounts+0, 1000 as i64
+    store amounts+8, 2000 as i64
+    store amounts+16, 3000 as i64
+    store amounts+24, 4000 as i64
+    store amounts+32, 5000 as i64
+    store amounts+40, 7000 as i64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, ids, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, statuses, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, amounts, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U64_INDEX status_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
+    EXPAND DB_CREATE_I64_INDEX amount_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_PLAN_U64_I64_RANGES_HANDLE tie_plan_status, plan_rows, ROWS_CAP, plan_info, read_handle, 1, 2, 2, 2, 1500, 5500, 0, ROWS_CAP
+    EXPAND DB_PLAN_INFO_WRITTEN tie_written, plan_info
+    EXPAND DB_PLAN_INFO_TOTAL tie_total, plan_info
+    EXPAND DB_PLAN_INFO_FIRST_PREDICATE tie_first_predicate, plan_info
+    EXPAND DB_PLAN_INFO_FIRST_TOTAL tie_first_total, plan_info
+    EXPAND DB_PLAN_INFO_SECOND_TOTAL tie_second_total, plan_info
+    tie_row0 = load plan_rows+0 as u64
+    tie_row1 = load plan_rows+8 as u64
+    tie_row2 = load plan_rows+16 as u64
+
+    EXPAND DB_PLAN_U64_I64_RANGES_HANDLE page_plan_status, plan_rows, ROWS_CAP, plan_info, read_handle, 1, 2, 2, 2, 1500, 5500, 1, 1
+    EXPAND DB_PLAN_INFO_WRITTEN page_written, plan_info
+    EXPAND DB_PLAN_INFO_TOTAL page_total, plan_info
+    page_row0 = load plan_rows+0 as u64
+
+    EXPAND DB_PLAN_U64_I64_RANGES_HANDLE amount_plan_status, plan_rows, ROWS_CAP, plan_info, read_handle, 1, 1, 2, 2, 1500, 3500, 0, ROWS_CAP
+    EXPAND DB_PLAN_INFO_WRITTEN amount_written, plan_info
+    EXPAND DB_PLAN_INFO_TOTAL amount_total, plan_info
+    EXPAND DB_PLAN_INFO_FIRST_PREDICATE amount_first_predicate, plan_info
+    EXPAND DB_PLAN_INFO_FIRST_TOTAL amount_first_total, plan_info
+    EXPAND DB_PLAN_INFO_SECOND_TOTAL amount_second_total, plan_info
+    amount_row0 = load plan_rows+0 as u64
+    amount_row1 = load plan_rows+8 as u64
+
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_ingest = eq ingest_status, SA_DB_OK
+    ok_status_index = eq status_index_status, SA_DB_OK
+    ok_amount_index = eq amount_index_status, SA_DB_OK
+    ok_open = eq open_status, SA_DB_OK
+    ok_tie_status = eq tie_plan_status, SA_DB_OK
+    ok_tie_written = eq tie_written, 3
+    ok_tie_total = eq tie_total, 3
+    ok_tie_first_predicate = eq tie_first_predicate, 1
+    ok_tie_first_total = eq tie_first_total, 4
+    ok_tie_second_total = eq tie_second_total, 4
+    ok_tie_row0 = eq tie_row0, 1
+    ok_tie_row1 = eq tie_row1, 2
+    ok_tie_row2 = eq tie_row2, 3
+    ok_page_status = eq page_plan_status, SA_DB_OK
+    ok_page_written = eq page_written, 1
+    ok_page_total = eq page_total, 3
+    ok_page_row0 = eq page_row0, 2
+    ok_amount_status = eq amount_plan_status, SA_DB_OK
+    ok_amount_written = eq amount_written, 2
+    ok_amount_total = eq amount_total, 2
+    ok_amount_first_predicate = eq amount_first_predicate, 2
+    ok_amount_first_total = eq amount_first_total, 2
+    ok_amount_second_total = eq amount_second_total, 6
+    ok_amount_row0 = eq amount_row0, 1
+    ok_amount_row1 = eq amount_row1, 2
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_ingest
+    ok03 = and ok02, ok_status_index
+    ok04 = and ok03, ok_amount_index
+    ok05 = and ok04, ok_open
+    ok06 = and ok05, ok_tie_status
+    ok07 = and ok06, ok_tie_written
+    ok08 = and ok07, ok_tie_total
+    ok09 = and ok08, ok_tie_first_predicate
+    ok10 = and ok09, ok_tie_first_total
+    ok11 = and ok10, ok_tie_second_total
+    ok12 = and ok11, ok_tie_row0
+    ok13 = and ok12, ok_tie_row1
+    ok14 = and ok13, ok_tie_row2
+    ok15 = and ok14, ok_page_status
+    ok16 = and ok15, ok_page_written
+    ok17 = and ok16, ok_page_total
+    ok18 = and ok17, ok_page_row0
+    ok19 = and ok18, ok_amount_status
+    ok20 = and ok19, ok_amount_written
+    ok21 = and ok20, ok_amount_total
+    ok22 = and ok21, ok_amount_first_predicate
+    ok23 = and ok22, ok_amount_first_total
+    ok24 = and ok23, ok_amount_second_total
+    ok25 = and ok24, ok_amount_row0
+    ok26 = and ok25, ok_amount_row1
+    ok27 = and ok26, ok_close
+    ok = and ok27, ok_verify
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !status_index_status
+    !amount_index_status
+    !open_status
+    !read_handle
+    !tie_plan_status
+    !tie_written
+    !tie_total
+    !tie_first_predicate
+    !tie_first_total
+    !tie_second_total
+    !tie_row0
+    !tie_row1
+    !tie_row2
+    !page_plan_status
+    !page_written
+    !page_total
+    !page_row0
+    !amount_plan_status
+    !amount_written
+    !amount_total
+    !amount_first_predicate
+    !amount_first_total
+    !amount_second_total
+    !amount_row0
+    !amount_row1
+    !close_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_ingest
+    !ok_status_index
+    !ok_amount_index
+    !ok_open
+    !ok_tie_status
+    !ok_tie_written
+    !ok_tie_total
+    !ok_tie_first_predicate
+    !ok_tie_first_total
+    !ok_tie_second_total
+    !ok_tie_row0
+    !ok_tie_row1
+    !ok_tie_row2
+    !ok_page_status
+    !ok_page_written
+    !ok_page_total
+    !ok_page_row0
+    !ok_amount_status
+    !ok_amount_written
+    !ok_amount_total
+    !ok_amount_first_predicate
+    !ok_amount_first_total
+    !ok_amount_second_total
+    !ok_amount_row0
+    !ok_amount_row1
+    !ok_close
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ids
+    !statuses
+    !amounts
+    !plan_rows
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9042)

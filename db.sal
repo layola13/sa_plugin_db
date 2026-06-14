@@ -66,6 +66,13 @@
 #def SaDbColumnLogicalInfo_logical_scale = +8
 #def SaDbColumnLogicalInfo_nullable = +16
 
+#def SaDbPlanInfo_SIZE = 40
+#def SaDbPlanInfo_written = +0
+#def SaDbPlanInfo_total = +8
+#def SaDbPlanInfo_first_predicate = +16
+#def SaDbPlanInfo_first_total = +24
+#def SaDbPlanInfo_second_total = +32
+
 #def SaDbColumnInput_SIZE = 16
 #def SaDbColumnInput_data = +0
 #def SaDbColumnInput_len = +8
@@ -805,6 +812,26 @@
     %out_nullable = load %info+SaDbColumnLogicalInfo_nullable as u64
 [END_MACRO]
 
+[MACRO] DB_PLAN_INFO_WRITTEN %out_written, %info
+    %out_written = load %info+SaDbPlanInfo_written as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN_INFO_TOTAL %out_total, %info
+    %out_total = load %info+SaDbPlanInfo_total as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN_INFO_FIRST_PREDICATE %out_first_predicate, %info
+    %out_first_predicate = load %info+SaDbPlanInfo_first_predicate as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN_INFO_FIRST_TOTAL %out_first_total, %info
+    %out_first_total = load %info+SaDbPlanInfo_first_total as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN_INFO_SECOND_TOTAL %out_second_total, %info
+    %out_second_total = load %info+SaDbPlanInfo_second_total as u64
+[END_MACRO]
+
 [MACRO] DB_SUM_U64_HANDLE %out_status, %out_sum, %handle, %column_index
     __db_handle_sum_slot_%out_sum = stack_alloc 8
     %out_status = call @sa_db_sum_u64_handle(%handle, %column_index, &__db_handle_sum_slot_%out_sum)
@@ -1249,6 +1276,10 @@
     %out_status = call @sa_db_filter_rows_i64_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_i64_written_slot_%out_written, &__db_handle_filter_rows_i64_total_slot_%out_total)
     %out_written = load __db_handle_filter_rows_i64_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_filter_rows_i64_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN_U64_I64_RANGES_HANDLE %out_status, %out_rows, %out_rows_len, %out_info, %handle, %u64_column_index, %u64_min_value, %u64_max_value, %i64_column_index, %i64_min_value, %i64_max_value, %offset, %limit
+    %out_status = call @sa_db_plan_u64_i64_ranges_handle(%handle, %u64_column_index, %u64_min_value, %u64_max_value, %i64_column_index, %i64_min_value, %i64_max_value, %offset, %limit, &%out_rows, %out_rows_len, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_FILTER_ROWS_F32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit

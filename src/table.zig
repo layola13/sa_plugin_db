@@ -309,6 +309,14 @@ pub const U64RangeResult = struct {
     total: u64,
 };
 
+pub const PlanRowsResult = struct {
+    written: u64,
+    total: u64,
+    first_predicate: u64,
+    first_total: u64,
+    second_total: u64,
+};
+
 pub const BoolFilterResult = struct {
     written: u64,
     total: u64,
@@ -10919,6 +10927,53 @@ pub fn snapshotFilterRowsI64Range(
     }, matchesRowsI64Range);
 }
 
+pub fn snapshotPlanU64I64RangeRows(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    u64_column_index: usize,
+    u64_min_value: u64,
+    u64_max_value: u64,
+    i64_column_index: usize,
+    i64_min_value: i64,
+    i64_max_value: i64,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!PlanRowsResult {
+    var empty_rows: [0]u64 = .{};
+    const u64_count = try snapshotRangeU64Rows(snapshot, u64_column_index, u64_min_value, u64_max_value, 0, 0, &empty_rows);
+    const i64_count = try snapshotRangeI64Rows(snapshot, i64_column_index, i64_min_value, i64_max_value, 0, 0, &empty_rows);
+    const u64_first = u64_count.total <= i64_count.total;
+    const first_predicate: u64 = if (u64_first) 1 else 2;
+    const first_total = if (u64_first) u64_count.total else i64_count.total;
+    const second_total = if (u64_first) i64_count.total else u64_count.total;
+    if (first_total == 0 or second_total == 0) {
+        return .{ .written = 0, .total = 0, .first_predicate = first_predicate, .first_total = first_total, .second_total = second_total };
+    }
+    if (first_total > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+
+    const candidate_rows = try allocator.alloc(u64, @intCast(first_total));
+    defer allocator.free(candidate_rows);
+
+    const initial = if (u64_first)
+        try snapshotRangeU64Rows(snapshot, u64_column_index, u64_min_value, u64_max_value, 0, first_total, candidate_rows)
+    else
+        try snapshotRangeI64Rows(snapshot, i64_column_index, i64_min_value, i64_max_value, 0, first_total, candidate_rows);
+    if (initial.total != first_total or initial.written != first_total) return TableError.VerifyFailed;
+
+    const filtered = if (u64_first)
+        try snapshotFilterRowsI64Range(snapshot, i64_column_index, candidate_rows, i64_min_value, i64_max_value, offset, limit, out_rows)
+    else
+        try snapshotFilterRowsU64Range(snapshot, u64_column_index, candidate_rows, u64_min_value, u64_max_value, offset, limit, out_rows);
+    return .{
+        .written = filtered.written,
+        .total = filtered.total,
+        .first_predicate = first_predicate,
+        .first_total = first_total,
+        .second_total = second_total,
+    };
+}
+
 pub fn snapshotFilterRowsU32Range(
     snapshot: *const ReadSnapshot,
     column_index: usize,
@@ -13526,6 +13581,8 @@ test "table filters candidate rows for ERP composite predicates" {
     };
     _ = try ingestRawColumns(std.testing.allocator, ".", table_name, customer_ids.len, &columns);
     _ = try createU64I64PairIndex(std.testing.allocator, ".", table_name, 0, 1, true);
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 2, false);
+    _ = try createI64Index(std.testing.allocator, ".", table_name, 4, false);
 
     const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
     defer snapshot.destroy();
@@ -13736,6 +13793,31 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 2), amount_result.written);
     try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
     try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+
+    var planned_rows = [_]u64{ 99, 99, 99, 99 };
+    const planned_status_first = try snapshotPlanU64I64RangeRows(std.testing.allocator, snapshot, 2, 2, 2, 4, 1500, 5500, 0, planned_rows.len, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 1), planned_status_first.first_predicate);
+    try std.testing.expectEqual(@as(u64, 4), planned_status_first.first_total);
+    try std.testing.expectEqual(@as(u64, 4), planned_status_first.second_total);
+    try std.testing.expectEqual(@as(u64, 3), planned_status_first.total);
+    try std.testing.expectEqual(@as(u64, 3), planned_status_first.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+    try std.testing.expectEqual(@as(u64, 3), planned_rows[2]);
+
+    const planned_status_page = try snapshotPlanU64I64RangeRows(std.testing.allocator, snapshot, 2, 2, 2, 4, 1500, 5500, 1, 1, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 3), planned_status_page.total);
+    try std.testing.expectEqual(@as(u64, 1), planned_status_page.written);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[0]);
+
+    const planned_i64_first = try snapshotPlanU64I64RangeRows(std.testing.allocator, snapshot, 2, 1, 2, 4, 1500, 3500, 0, planned_rows.len, &planned_rows);
+    try std.testing.expectEqual(@as(u64, 2), planned_i64_first.first_predicate);
+    try std.testing.expectEqual(@as(u64, 2), planned_i64_first.first_total);
+    try std.testing.expectEqual(@as(u64, 6), planned_i64_first.second_total);
+    try std.testing.expectEqual(@as(u64, 2), planned_i64_first.total);
+    try std.testing.expectEqual(@as(u64, 2), planned_i64_first.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
 
     const posted_result = try snapshotFilterRowsBool(snapshot, 3, candidate_rows[0..status_len], true, 0, filtered_rows.len, &filtered_rows);
     try std.testing.expectEqual(@as(u64, 2), posted_result.total);
