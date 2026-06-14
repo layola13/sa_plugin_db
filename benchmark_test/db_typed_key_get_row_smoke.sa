@@ -1,0 +1,259 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"typed_key_get_row_smoke"
+@const SCHEMA_PATH = utf8:"typed_key_get_row_smoke.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_I64_KEY_STRIDE = 8 // i64\n#def COL_U32_KEY_STRIDE = 4 // u32\n#def COL_I32_KEY_STRIDE = 4 // i32\n#def COL_U8_KEY_STRIDE = 1 // u8\n#def COL_I8_KEY_STRIDE = 1 // i8\n#def COL_U16_KEY_STRIDE = 2 // u16\n#def COL_I16_KEY_STRIDE = 2 // i16\n#def COL_TOTAL_STRIDE = 8 // i64 decimal(2)\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 23
+#def SCHEMA_PATH_LEN = 35
+#def SCHEMA_LEN = 303
+#def ROWS = 3
+#def I64_BYTES = 24
+#def U32_BYTES = 12
+#def I32_BYTES = 12
+#def U8_BYTES = 3
+#def I8_BYTES = 3
+#def U16_BYTES = 6
+#def I16_BYTES = 6
+#def TOTAL_BYTES = 24
+#def ROW_BYTES = 30
+#def COLUMN_COUNT = 8
+#def COLUMNS_BYTES = 128
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    i64_col = alloc I64_BYTES
+    u32_col = alloc U32_BYTES
+    i32_col = alloc I32_BYTES
+    u8_col = alloc U8_BYTES
+    i8_col = alloc I8_BYTES
+    u16_col = alloc U16_BYTES
+    i16_col = alloc I16_BYTES
+    totals = alloc TOTAL_BYTES
+    row = alloc ROW_BYTES
+
+    store i64_col+0, -10 as i64
+    store i64_col+8, 0 as i64
+    store i64_col+16, 10 as i64
+    store u32_col+0, 100 as u32
+    store u32_col+4, 200 as u32
+    store u32_col+8, 300 as u32
+    store i32_col+0, -3 as i32
+    store i32_col+4, 0 as i32
+    store i32_col+8, 3 as i32
+    store u8_col+0, 1 as u8
+    store u8_col+1, 2 as u8
+    store u8_col+2, 3 as u8
+    store i8_col+0, -1 as i8
+    store i8_col+1, 0 as i8
+    store i8_col+2, 1 as i8
+    store u16_col+0, 1000 as u16
+    store u16_col+2, 2000 as u16
+    store u16_col+4, 3000 as u16
+    store i16_col+0, -100 as i16
+    store i16_col+2, 0 as i16
+    store i16_col+4, 100 as i16
+    store totals+0, 111 as i64
+    store totals+8, 222 as i64
+    store totals+16, 333 as i64
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, i64_col, I64_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, u32_col, U32_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 2, i32_col, I32_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, u8_col, U8_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, i8_col, I8_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 5, u16_col, U16_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 6, i16_col, I16_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 7, totals, TOTAL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_I64_INDEX index_i64_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+    EXPAND DB_CREATE_U32_INDEX index_u32_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 1, info
+    EXPAND DB_CREATE_I32_INDEX index_i32_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 1, info
+    EXPAND DB_CREATE_U8_INDEX index_u8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 3, 1, info
+    EXPAND DB_CREATE_I8_INDEX index_i8_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 4, 1, info
+    EXPAND DB_CREATE_U16_INDEX index_u16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 5, 1, info
+    EXPAND DB_CREATE_I16_INDEX index_i16_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 6, 1, info
+
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_GET_ROW_I64_KEY_HANDLE get_i64_status, read_handle, 0, 0, row, ROW_BYTES
+    total_i64 = load row+22 as i64
+    EXPAND DB_GET_ROW_U32_KEY_HANDLE get_u32_status, read_handle, 1, 300, row, ROW_BYTES
+    total_u32 = load row+22 as i64
+    EXPAND DB_GET_ROW_I32_KEY_HANDLE get_i32_status, read_handle, 2, -3, row, ROW_BYTES
+    total_i32 = load row+22 as i64
+    EXPAND DB_GET_ROW_U8_KEY_HANDLE get_u8_status, read_handle, 3, 2, row, ROW_BYTES
+    total_u8 = load row+22 as i64
+    EXPAND DB_GET_ROW_I8_KEY_HANDLE get_i8_status, read_handle, 4, 1, row, ROW_BYTES
+    total_i8 = load row+22 as i64
+    EXPAND DB_GET_ROW_U16_KEY_HANDLE get_u16_status, read_handle, 5, 1000, row, ROW_BYTES
+    total_u16 = load row+22 as i64
+    EXPAND DB_GET_ROW_I16_KEY_HANDLE get_i16_status, read_handle, 6, 0, row, ROW_BYTES
+    total_i16 = load row+22 as i64
+    EXPAND DB_GET_ROW_I64_KEY_HANDLE get_missing_status, read_handle, 0, 99, row, ROW_BYTES
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok01 = eq remove_status, SA_DB_OK
+    ok02 = eq init_status, SA_DB_OK
+    ok03 = eq ingest_status, SA_DB_OK
+    ok04 = eq index_i64_status, SA_DB_OK
+    ok05 = eq index_u32_status, SA_DB_OK
+    ok06 = eq index_i32_status, SA_DB_OK
+    ok07 = eq index_u8_status, SA_DB_OK
+    ok08 = eq index_i8_status, SA_DB_OK
+    ok09 = eq index_u16_status, SA_DB_OK
+    ok10 = eq index_i16_status, SA_DB_OK
+    ok11 = eq open_status, SA_DB_OK
+    ok12 = eq get_i64_status, SA_DB_OK
+    ok13 = eq total_i64, 222
+    ok14 = eq get_u32_status, SA_DB_OK
+    ok15 = eq total_u32, 333
+    ok16 = eq get_i32_status, SA_DB_OK
+    ok17 = eq total_i32, 111
+    ok18 = eq get_u8_status, SA_DB_OK
+    ok19 = eq total_u8, 222
+    ok20 = eq get_i8_status, SA_DB_OK
+    ok21 = eq total_i8, 333
+    ok22 = eq get_u16_status, SA_DB_OK
+    ok23 = eq total_u16, 111
+    ok24 = eq get_i16_status, SA_DB_OK
+    ok25 = eq total_i16, 222
+    ok26 = eq get_missing_status, SA_DB_ERR_NOT_FOUND
+    ok27 = eq close_status, SA_DB_OK
+    ok28 = eq verify_status, SA_DB_OK
+
+    pass01 = and ok01, ok02
+    pass02 = and pass01, ok03
+    pass03 = and pass02, ok04
+    pass04 = and pass03, ok05
+    pass05 = and pass04, ok06
+    pass06 = and pass05, ok07
+    pass07 = and pass06, ok08
+    pass08 = and pass07, ok09
+    pass09 = and pass08, ok10
+    pass10 = and pass09, ok11
+    pass11 = and pass10, ok12
+    pass12 = and pass11, ok13
+    pass13 = and pass12, ok14
+    pass14 = and pass13, ok15
+    pass15 = and pass14, ok16
+    pass16 = and pass15, ok17
+    pass17 = and pass16, ok18
+    pass18 = and pass17, ok19
+    pass19 = and pass18, ok20
+    pass20 = and pass19, ok21
+    pass21 = and pass20, ok22
+    pass22 = and pass21, ok23
+    pass23 = and pass22, ok24
+    pass24 = and pass23, ok25
+    pass25 = and pass24, ok26
+    pass26 = and pass25, ok27
+    ok = and pass26, ok28
+
+    !remove_status
+    !init_status
+    !ingest_status
+    !index_i64_status
+    !index_u32_status
+    !index_i32_status
+    !index_u8_status
+    !index_i8_status
+    !index_u16_status
+    !index_i16_status
+    !open_status
+    !read_handle
+    !get_i64_status
+    !total_i64
+    !get_u32_status
+    !total_u32
+    !get_i32_status
+    !total_i32
+    !get_u8_status
+    !total_u8
+    !get_i8_status
+    !total_i8
+    !get_u16_status
+    !total_u16
+    !get_i16_status
+    !total_i16
+    !get_missing_status
+    !close_status
+    !verify_status
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !pass01
+    !pass02
+    !pass03
+    !pass04
+    !pass05
+    !pass06
+    !pass07
+    !pass08
+    !pass09
+    !pass10
+    !pass11
+    !pass12
+    !pass13
+    !pass14
+    !pass15
+    !pass16
+    !pass17
+    !pass18
+    !pass19
+    !pass20
+    !pass21
+    !pass22
+    !pass23
+    !pass24
+    !pass25
+    !pass26
+    !i64_col
+    !u32_col
+    !i32_col
+    !u8_col
+    !i8_col
+    !u16_col
+    !i16_col
+    !totals
+    !row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9042)

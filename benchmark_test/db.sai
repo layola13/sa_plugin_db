@@ -232,6 +232,13 @@
 @extern sa_db_project_rows_handle(handle: ptr, &row_indices: ptr, row_indices_len: u64, &column_indices: ptr, column_indices_len: u64, &out_bytes: ptr, out_bytes_len: u64, &out_written_rows: ptr, &out_required_bytes: ptr) -> u32
 @extern sa_db_get_row_handle(handle: ptr, row_index: u64, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_get_row_u64_key_handle(handle: ptr, column_index: u64, expected: u64, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_i64_key_handle(handle: ptr, column_index: u64, expected: i64, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_u32_key_handle(handle: ptr, column_index: u64, expected: u32, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_i32_key_handle(handle: ptr, column_index: u64, expected: i32, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_u8_key_handle(handle: ptr, column_index: u64, expected: u8, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_i8_key_handle(handle: ptr, column_index: u64, expected: i8, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_u16_key_handle(handle: ptr, column_index: u64, expected: u16, &out_row: ptr, out_row_len: u64) -> u32
+@extern sa_db_get_row_i16_key_handle(handle: ptr, column_index: u64, expected: i16, &out_row: ptr, out_row_len: u64) -> u32
 @extern sa_db_min_u64_handle(handle: ptr, column_index: u64, &out_min: ptr) -> u32
 @extern sa_db_max_u64_handle(handle: ptr, column_index: u64, &out_max: ptr) -> u32
 @extern sa_db_min_i64_handle(handle: ptr, column_index: u64, &out_min: ptr) -> u32

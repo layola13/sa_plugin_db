@@ -6947,6 +6947,13 @@ fn snapshotUniqueIndexForU64Column(snapshot: *const ReadSnapshot, column_index: 
     return null;
 }
 
+fn snapshotUniqueIndexForI64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i64") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
 fn snapshotIndexForI64Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
         if (std.mem.eql(u8, index.kind, "i64") and index.column_index == @as(u64, @intCast(column_index))) return index;
@@ -6975,9 +6982,23 @@ fn snapshotIndexForU32Column(snapshot: *const ReadSnapshot, column_index: usize)
     return null;
 }
 
+fn snapshotUniqueIndexForU32Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u32") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
 fn snapshotIndexForI32Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
         if (std.mem.eql(u8, index.kind, "i32") and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
+fn snapshotUniqueIndexForI32Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i32") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
     }
     return null;
 }
@@ -6989,9 +7010,23 @@ fn snapshotIndexForU8Column(snapshot: *const ReadSnapshot, column_index: usize) 
     return null;
 }
 
+fn snapshotUniqueIndexForU8Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u8") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
 fn snapshotIndexForI8Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
         if (std.mem.eql(u8, index.kind, "i8") and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
+fn snapshotUniqueIndexForI8Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i8") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
     }
     return null;
 }
@@ -7003,9 +7038,23 @@ fn snapshotIndexForU16Column(snapshot: *const ReadSnapshot, column_index: usize)
     return null;
 }
 
+fn snapshotUniqueIndexForU16Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u16") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
 fn snapshotIndexForI16Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
         if (std.mem.eql(u8, index.kind, "i16") and index.column_index == @as(u64, @intCast(column_index))) return index;
+    }
+    return null;
+}
+
+fn snapshotUniqueIndexForI16Column(snapshot: *const ReadSnapshot, column_index: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "i16") and index.unique and index.column_index == @as(u64, @intCast(column_index))) return index;
     }
     return null;
 }
@@ -7940,6 +7989,62 @@ pub fn snapshotGetRowU64Key(snapshot: *const ReadSnapshot, column_index: usize, 
     try ensureSnapshotU64Column(snapshot, column_index);
     const index = snapshotUniqueIndexForU64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
     const found = findU64InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowI64Key(snapshot: *const ReadSnapshot, column_index: usize, expected: i64, out_row: []u8) TableError!void {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForI64Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findI64InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowU32Key(snapshot: *const ReadSnapshot, column_index: usize, expected: u32, out_row: []u8) TableError!void {
+    try ensureSnapshotU32Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForU32Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findU64InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowI32Key(snapshot: *const ReadSnapshot, column_index: usize, expected: i32, out_row: []u8) TableError!void {
+    try ensureSnapshotI32Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForI32Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findI32InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowU8Key(snapshot: *const ReadSnapshot, column_index: usize, expected: u8, out_row: []u8) TableError!void {
+    try ensureSnapshotU8Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForU8Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findU64InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowI8Key(snapshot: *const ReadSnapshot, column_index: usize, expected: i8, out_row: []u8) TableError!void {
+    try ensureSnapshotI8Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForI8Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findI8InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowU16Key(snapshot: *const ReadSnapshot, column_index: usize, expected: u16, out_row: []u8) TableError!void {
+    try ensureSnapshotU16Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForU16Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findU64InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowI16Key(snapshot: *const ReadSnapshot, column_index: usize, expected: i16, out_row: []u8) TableError!void {
+    try ensureSnapshotI16Column(snapshot, column_index);
+    const index = snapshotUniqueIndexForI16Column(snapshot, column_index) orelse return TableError.InvalidFormat;
+    const found = findI16InIndex(index, expected);
     if (!found.found) return TableError.NotFound;
     try snapshotCopyRow(snapshot, found.row_index, out_row);
 }
@@ -14357,6 +14462,98 @@ test "table u8 i8 u16 and i16 key row writes update upsert and delete" {
         try std.testing.expect(!(try snapshotFindI16(snapshot, 0, -100)).found);
         try std.testing.expect(!(try snapshotFindI16(snapshot, 0, 999)).found);
     }
+}
+
+test "table gets full rows by typed unique keys" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "typed_key_rows";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "typed_key_rows.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_I64_KEY_STRIDE = 8 // i64
+        \\#def COL_U32_KEY_STRIDE = 4 // u32
+        \\#def COL_I32_KEY_STRIDE = 4 // i32
+        \\#def COL_U8_KEY_STRIDE = 1 // u8
+        \\#def COL_I8_KEY_STRIDE = 1 // i8
+        \\#def COL_U16_KEY_STRIDE = 2 // u16
+        \\#def COL_I16_KEY_STRIDE = 2 // i16
+        \\#def COL_TOTAL_STRIDE = 8 // i64
+    );
+
+    var i64_keys = [_]i64{ -10, 0, 10 };
+    var u32_keys = [_]u32{ 100, 200, 300 };
+    var i32_keys = [_]i32{ -3, 0, 3 };
+    var u8_keys = [_]u8{ 1, 2, 3 };
+    var i8_keys = [_]i8{ -1, 0, 1 };
+    var u16_keys = [_]u16{ 1000, 2000, 3000 };
+    var i16_keys = [_]i16{ -100, 0, 100 };
+    var totals = [_]i64{ 111, 222, 333 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(i64_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(u32_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(i32_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(u8_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(i8_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(u16_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(i16_keys[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, i64_keys.len, &columns);
+    _ = try createI64Index(std.testing.allocator, ".", table_name, 0, true);
+    _ = try createU32Index(std.testing.allocator, ".", table_name, 1, true);
+    _ = try createI32Index(std.testing.allocator, ".", table_name, 2, true);
+    _ = try createU8Index(std.testing.allocator, ".", table_name, 3, true);
+    _ = try createI8Index(std.testing.allocator, ".", table_name, 4, true);
+    _ = try createU16Index(std.testing.allocator, ".", table_name, 5, true);
+    _ = try createI16Index(std.testing.allocator, ".", table_name, 6, true);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    var row: [30]u8 = undefined;
+
+    try snapshotGetRowI64Key(snapshot, 0, 0, &row);
+    try std.testing.expectEqual(@as(i64, 222), readI64LE(&row, 22));
+    try snapshotGetRowU32Key(snapshot, 1, 300, &row);
+    try std.testing.expectEqual(@as(i64, 333), readI64LE(&row, 22));
+    try snapshotGetRowI32Key(snapshot, 2, -3, &row);
+    try std.testing.expectEqual(@as(i64, 111), readI64LE(&row, 22));
+    try snapshotGetRowU8Key(snapshot, 3, 2, &row);
+    try std.testing.expectEqual(@as(i64, 222), readI64LE(&row, 22));
+    try snapshotGetRowI8Key(snapshot, 4, 1, &row);
+    try std.testing.expectEqual(@as(i64, 333), readI64LE(&row, 22));
+    try snapshotGetRowU16Key(snapshot, 5, 1000, &row);
+    try std.testing.expectEqual(@as(i64, 111), readI64LE(&row, 22));
+    try snapshotGetRowI16Key(snapshot, 6, 0, &row);
+    try std.testing.expectEqual(@as(i64, 222), readI64LE(&row, 22));
+
+    try std.testing.expectError(TableError.NotFound, snapshotGetRowI64Key(snapshot, 0, 99, &row));
+    var short_row: [29]u8 = undefined;
+    try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowU32Key(snapshot, 1, 200, &short_row));
+
+    const non_unique_name = "typed_key_rows_non_unique";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "typed_key_rows_non_unique.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_U8_KEY_STRIDE = 1 // u8
+        \\#def COL_TOTAL_STRIDE = 8 // i64
+    );
+    var duplicate_u8 = [_]u8{ 1, 1, 2 };
+    var duplicate_totals = [_]i64{ 10, 20, 30 };
+    const non_unique_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(duplicate_u8[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(duplicate_totals[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", non_unique_name, duplicate_u8.len, &non_unique_columns);
+    _ = try createU8Index(std.testing.allocator, ".", non_unique_name, 0, false);
+    const non_unique_snapshot = try openReadSnapshot(std.testing.allocator, ".", non_unique_name);
+    defer non_unique_snapshot.destroy();
+    var non_unique_row: [9]u8 = undefined;
+    try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowU8Key(non_unique_snapshot, 0, 1, &non_unique_row));
 }
 
 test "table unique u64 index rejects duplicate existing data" {

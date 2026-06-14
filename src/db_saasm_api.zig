@@ -5156,6 +5156,111 @@ pub export fn sa_db_get_row_u64_key_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_get_row_i64_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i64,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowI64Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_u32_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u32,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowU32Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_i32_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i32,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowI32Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_u8_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u8,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowU8Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_i8_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i8,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowI8Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_u16_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u16,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowU16Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_i16_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: i16,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowI16Key(snapshot, @intCast(column_index), expected, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_min_u64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*u64) u32 {
     const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -6160,6 +6265,80 @@ test "db SA ABI writes rows by u8 i8 u16 and i16 keys" {
         try std.testing.expectEqual(@as(i64, 1000), total);
         try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
     }
+}
+
+test "db SA ABI gets full rows by typed unique keys" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    var info: SaDbTableInfo = undefined;
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_I64_KEY_STRIDE = 8 // i64
+        \\#def COL_U32_KEY_STRIDE = 4 // u32
+        \\#def COL_I32_KEY_STRIDE = 4 // i32
+        \\#def COL_U8_KEY_STRIDE = 1 // u8
+        \\#def COL_I8_KEY_STRIDE = 1 // i8
+        \\#def COL_U16_KEY_STRIDE = 2 // u16
+        \\#def COL_I16_KEY_STRIDE = 2 // i16
+        \\#def COL_TOTAL_STRIDE = 8 // i64 decimal(2)
+    ;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "typed_key_get_rows.sadb-schema".ptr, "typed_key_get_rows.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var i64_keys = [_]i64{ -10, 0, 10 };
+    var u32_keys = [_]u32{ 100, 200, 300 };
+    var i32_keys = [_]i32{ -3, 0, 3 };
+    var u8_keys = [_]u8{ 1, 2, 3 };
+    var i8_keys = [_]i8{ -1, 0, 1 };
+    var u16_keys = [_]u16{ 1000, 2000, 3000 };
+    var i16_keys = [_]i16{ -100, 0, 100 };
+    var totals = [_]i64{ 111, 222, 333 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&i64_keys), .len = @sizeOf(@TypeOf(i64_keys)) },
+        .{ .data = @ptrCast(&u32_keys), .len = @sizeOf(@TypeOf(u32_keys)) },
+        .{ .data = @ptrCast(&i32_keys), .len = @sizeOf(@TypeOf(i32_keys)) },
+        .{ .data = @ptrCast(&u8_keys), .len = @sizeOf(@TypeOf(u8_keys)) },
+        .{ .data = @ptrCast(&i8_keys), .len = @sizeOf(@TypeOf(i8_keys)) },
+        .{ .data = @ptrCast(&u16_keys), .len = @sizeOf(@TypeOf(u16_keys)) },
+        .{ .data = @ptrCast(&i16_keys), .len = @sizeOf(@TypeOf(i16_keys)) },
+        .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, i64_keys.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_i64_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 0, 1, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u32_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 1, 1, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_i32_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 2, 1, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u8_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 3, 1, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_i8_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 4, 1, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u16_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 5, 1, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_i16_index(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, 6, 1, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "typed_key_get_rows".ptr, "typed_key_get_rows".len, &handle));
+    defer std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle)) catch unreachable;
+
+    var row: [30]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_i64_key_handle(handle, 0, 0, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 222), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u32_key_handle(handle, 1, 300, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 333), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_i32_key_handle(handle, 2, -3, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 111), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u8_key_handle(handle, 3, 2, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 222), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_i8_key_handle(handle, 4, 1, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 333), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u16_key_handle(handle, 5, 1000, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 111), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_i16_key_handle(handle, 6, 0, &row, row.len));
+    try std.testing.expectEqual(@as(i64, 222), std.mem.readInt(i64, row[22..30], .little));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_i64_key_handle(handle, 0, 99, &row, row.len));
+    var short_row: [29]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_u32_key_handle(handle, 1, 200, &short_row, short_row.len));
 }
 
 test "db SA ABI writes rows by u64 pair keys" {
