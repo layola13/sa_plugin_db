@@ -216,6 +216,8 @@ Read-handle query calls:
 - `sa_db_filter_rows_u64_range_handle`
 - `sa_db_filter_rows_i64_range_handle`
 - `sa_db_plan_u64_i64_ranges_handle`
+- `sa_db_plan_u64_u64_ranges_handle`
+- `sa_db_plan_i64_i64_ranges_handle`
 - `sa_db_filter_rows_f32_range_handle`
 - `sa_db_filter_rows_f64_range_handle`
 - `sa_db_filter_rows_u32_range_handle`
@@ -307,6 +309,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FILTER_U64_PAIR_KEY1_HANDLE`, `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE`,
 `DB_FILTER_BOOL_HANDLE`, `DB_FILTER_ROWS_U64_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_PLAN_U64_I64_RANGES_HANDLE`,
+`DB_PLAN_U64_U64_RANGES_HANDLE`, `DB_PLAN_I64_I64_RANGES_HANDLE`,
 `DB_FILTER_ROWS_U32_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I32_RANGE_HANDLE`, `DB_FILTER_ROWS_U8_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I8_RANGE_HANDLE`, `DB_FILTER_ROWS_U16_RANGE_HANDLE`,
@@ -630,14 +633,18 @@ using the signed integer scan path. SA callers can therefore run an indexed
 customer/date or blob/text query first, then narrow the candidate rows by status,
 compact warehouse/category/priority codes, amount/date/timestamp range, finite
 measurement/rate/weight ranges, or posted/active bool without materializing full rows in SA code. This is a planner
-building block rather than a SQL optimizer. For the common ERP shape
-`u64 range AND i64 range`, `sa_db_plan_u64_i64_ranges_handle` /
-`DB_PLAN_U64_I64_RANGES_HANDLE` can now estimate both indexed predicates, scan
-the smaller side first, filter the second predicate inside the plugin, and
-return `SaDbPlanInfo` (`written`, `total`, `first_predicate`, `first_total`,
+building block rather than a SQL optimizer. For common two-predicate ERP range
+shapes, `sa_db_plan_u64_i64_ranges_handle` /
+`DB_PLAN_U64_I64_RANGES_HANDLE`, `sa_db_plan_u64_u64_ranges_handle` /
+`DB_PLAN_U64_U64_RANGES_HANDLE`, and `sa_db_plan_i64_i64_ranges_handle` /
+`DB_PLAN_I64_I64_RANGES_HANDLE` estimate both indexed predicates, scan the
+smaller side first, filter the second predicate inside the plugin, and return
+`SaDbPlanInfo` (`written`, `total`, `first_predicate`, `first_total`,
 `second_total`) so callers can audit which side was chosen. `first_predicate` is
-`1` for the `u64` predicate and `2` for the `i64` predicate; ties choose the
-`u64` side for stable behavior. Broader shapes still use the explicit building
+`1` for the first predicate argument and `2` for the second predicate argument;
+ties choose the first side for stable behavior. These cover dictionary/status
+codes plus amount/date ranges, two dictionary/status predicates, and two signed
+amount/date/timestamp ranges. Broader shapes still use the explicit building
 blocks above.
 `sa_db_filter_rows_blob_eq_handle` / `DB_FILTER_ROWS_BLOB_EQ_HANDLE`,
 `sa_db_filter_rows_blob_contains_handle` / `DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE`,
@@ -981,9 +988,10 @@ benchmarks. The required baseline is:
   filters now compose an existing row-id list with additional integer, finite
   float, bool, or text/blob predicates for multi-condition list pages, row-list
   intersection/union/exclusion compose independently indexed result sets for
-  AND/OR/not-in filters, the first `u64 range AND i64 range` planner chooses the
-  smaller indexed side automatically, and candidate row sorting covers integer
-  and finite float list ordering. The first ERP workflow
+  AND/OR/not-in filters, the first two-predicate range planners choose the
+  smaller indexed side automatically for `u64+i64`, `u64+u64`, and `i64+i64`
+  shapes, and candidate row sorting covers integer and finite float list
+  ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
   same composite ERP filters; next is broader index planning.
