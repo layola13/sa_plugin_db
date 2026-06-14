@@ -1789,6 +1789,119 @@ pub export fn sa_db_filter_blob_prefix_handle(
     return SA_DB_OK;
 }
 
+fn filterRowsBlobHandle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+    comptime filterFn: anytype,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = filterFn(gpa.allocator(), snapshot, @intCast(column_index), in_rows, store_name, value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_rows_blob_eq_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return filterRowsBlobHandle(handle, column_index, in_rows_ptr, in_rows_len, store_ptr, store_len, value_ptr, value_len, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotFilterRowsBlobEq);
+}
+
+pub export fn sa_db_filter_rows_blob_contains_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return filterRowsBlobHandle(handle, column_index, in_rows_ptr, in_rows_len, store_ptr, store_len, value_ptr, value_len, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotFilterRowsBlobContains);
+}
+
+pub export fn sa_db_filter_rows_blob_token_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return filterRowsBlobHandle(handle, column_index, in_rows_ptr, in_rows_len, store_ptr, store_len, value_ptr, value_len, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotFilterRowsBlobToken);
+}
+
+pub export fn sa_db_filter_rows_blob_prefix_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    return filterRowsBlobHandle(handle, column_index, in_rows_ptr, in_rows_len, store_ptr, store_len, value_ptr, value_len, offset, limit, out_rows_ptr, out_rows_len, out_written, out_total, table.snapshotFilterRowsBlobPrefix);
+}
+
 pub export fn sa_db_sum_u64_handle(handle: ?*anyopaque, column_index: u64, out_sum: ?*u64) u32 {
     const sum_slot = out_sum orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -5084,6 +5197,36 @@ test "db SA ABI creates and queries blob token indexes" {
     try std.testing.expectEqual(@as(u64, 1), total);
     try std.testing.expectEqual(@as(u64, 1), written);
     try std.testing.expectEqual(@as(u64, 1), rows[0]);
+
+    const candidate_rows = [_]u64{ 2, 1, 0 };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_blob_eq_handle(read_handle, 1, &candidate_rows, candidate_rows.len, store_name.ptr, store_name.len, value_a.ptr, value_a.len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 1), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_blob_contains_handle(read_handle, 1, &candidate_rows, candidate_rows.len, store_name.ptr, store_name.len, "idget".ptr, "idget".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 0), rows[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_blob_token_handle(read_handle, 1, &candidate_rows, candidate_rows.len, store_name.ptr, store_name.len, "WIDGET".ptr, "WIDGET".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 2), total);
+    try std.testing.expectEqual(@as(u64, 2), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 0), rows[1]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_blob_prefix_handle(read_handle, 1, &candidate_rows, candidate_rows.len, store_name.ptr, store_name.len, "SKU_".ptr, "SKU_".len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 1), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+
+    const invalid_candidate_rows = [_]u64{999};
+    written = 123;
+    total = 456;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_filter_rows_blob_eq_handle(read_handle, 1, &invalid_candidate_rows, invalid_candidate_rows.len, store_name.ptr, store_name.len, value_a.ptr, value_a.len, 0, rows.len, &rows, rows.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), total);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
 }

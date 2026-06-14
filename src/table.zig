@@ -6860,6 +6860,113 @@ pub fn snapshotExceptRows(
     return .{ .written = written, .total = total };
 }
 
+const BlobCandidateFilterMode = enum {
+    eq,
+    contains,
+    token,
+    prefix,
+};
+
+fn blobCandidateValueMatches(value: []const u8, needle: []const u8, mode: BlobCandidateFilterMode) bool {
+    return switch (mode) {
+        .eq => std.mem.eql(u8, value, needle),
+        .contains => std.mem.indexOf(u8, value, needle) != null,
+        .token => blobValueHasToken(value, needle),
+        .prefix => blobValueHasTokenPrefix(value, needle),
+    };
+}
+
+fn snapshotFilterRowsBlobMode(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    store_name: []const u8,
+    needle: []const u8,
+    mode: BlobCandidateFilterMode,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    try ensureSnapshotBlobHandleColumn(snapshot, column_index);
+    try validateBlobStoreName(store_name);
+    try validateSnapshotRows(snapshot, in_rows);
+    const blob_idx = snapshotFindBlobStoreIndex(snapshot, store_name) orelse return .{ .written = 0, .total = 0 };
+
+    const refs = try buildBlobValueRefs(allocator, snapshot.blobs[blob_idx].bytes);
+    defer allocator.free(refs);
+
+    var total: u64 = 0;
+    var written: u64 = 0;
+    for (in_rows) |row| {
+        const blob_id = try snapshotBlobHandleAtRow(snapshot, column_index, row);
+        const value_ref = blobRefForId(refs, blob_id) orelse continue;
+        if (!blobCandidateValueMatches(value_ref.value, needle, mode)) continue;
+        try appendPagedRow(row, offset, limit, out_rows, &total, &written);
+    }
+    return .{ .written = written, .total = total };
+}
+
+pub fn snapshotFilterRowsBlobEq(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    store_name: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    try validateBlobValue(needle);
+    return snapshotFilterRowsBlobMode(allocator, snapshot, column_index, in_rows, store_name, needle, .eq, offset, limit, out_rows);
+}
+
+pub fn snapshotFilterRowsBlobContains(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    store_name: []const u8,
+    needle: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    try validateBlobValue(needle);
+    return snapshotFilterRowsBlobMode(allocator, snapshot, column_index, in_rows, store_name, needle, .contains, offset, limit, out_rows);
+}
+
+pub fn snapshotFilterRowsBlobToken(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    store_name: []const u8,
+    token: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    try validateBlobToken(token);
+    return snapshotFilterRowsBlobMode(allocator, snapshot, column_index, in_rows, store_name, token, .token, offset, limit, out_rows);
+}
+
+pub fn snapshotFilterRowsBlobPrefix(
+    allocator: std.mem.Allocator,
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    store_name: []const u8,
+    prefix: []const u8,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!BlobFilterResult {
+    try validateBlobPrefix(prefix);
+    return snapshotFilterRowsBlobMode(allocator, snapshot, column_index, in_rows, store_name, prefix, .prefix, offset, limit, out_rows);
+}
+
 const FilterRowsU64RangeContext = struct {
     snapshot: *const ReadSnapshot,
     column_index: usize,
@@ -10309,6 +10416,25 @@ test "table blob handle filters exact and contains values" {
     try std.testing.expectEqual(@as(u64, 1), contains.written);
     try std.testing.expectEqual(@as(u64, 1), rows[0]);
 
+    const candidate_rows = [_]u64{ 2, 1, 0, 5 };
+    const candidate_exact = try snapshotFilterRowsBlobEq(std.testing.allocator, snapshot, 1, &candidate_rows, "notes", "first note", 0, 8, &rows);
+    try std.testing.expectEqual(@as(u64, 2), candidate_exact.total);
+    try std.testing.expectEqual(@as(u64, 2), candidate_exact.written);
+    try std.testing.expectEqual(@as(u64, 2), rows[0]);
+    try std.testing.expectEqual(@as(u64, 0), rows[1]);
+
+    const candidate_exact_page = try snapshotFilterRowsBlobEq(std.testing.allocator, snapshot, 1, &candidate_rows, "notes", "first note", 1, 1, &rows);
+    try std.testing.expectEqual(@as(u64, 2), candidate_exact_page.total);
+    try std.testing.expectEqual(@as(u64, 1), candidate_exact_page.written);
+    try std.testing.expectEqual(@as(u64, 0), rows[0]);
+
+    const candidate_contains = try snapshotFilterRowsBlobContains(std.testing.allocator, snapshot, 1, &candidate_rows, "notes", "note", 0, 8, &rows);
+    try std.testing.expectEqual(@as(u64, 3), candidate_contains.total);
+    try std.testing.expectEqual(@as(u64, 3), candidate_contains.written);
+    try std.testing.expectEqual(@as(u64, 2), rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), rows[1]);
+    try std.testing.expectEqual(@as(u64, 0), rows[2]);
+
     const empty_exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "", 0, 8, &rows);
     try std.testing.expectEqual(@as(u64, 1), empty_exact.total);
     try std.testing.expectEqual(@as(u64, 1), empty_exact.written);
@@ -10319,6 +10445,8 @@ test "table blob handle filters exact and contains values" {
     try std.testing.expectEqual(@as(u64, 0), missing_store.written);
 
     try std.testing.expectError(TableError.InvalidFormat, snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 0, "notes", "first note", 0, 8, &rows));
+    const invalid_candidate_rows = [_]u64{999};
+    try std.testing.expectError(TableError.InvalidFormat, snapshotFilterRowsBlobEq(std.testing.allocator, snapshot, 1, &invalid_candidate_rows, "notes", "first note", 0, 8, &rows));
 }
 
 test "table blob exact index is rebuilt when blob values are appended" {
@@ -10414,6 +10542,19 @@ test "table blob token index filters ERP text tokens" {
         try std.testing.expectEqual(@as(u64, 1), rows[1]);
         try std.testing.expectEqual(@as(u64, 3), rows[2]);
 
+        const candidate_rows = [_]u64{ 3, 2, 1, 0 };
+        const candidate_widget = try snapshotFilterRowsBlobToken(std.testing.allocator, snapshot, 1, &candidate_rows, "notes", "WIDGET", 0, 8, &rows);
+        try std.testing.expectEqual(@as(u64, 3), candidate_widget.total);
+        try std.testing.expectEqual(@as(u64, 3), candidate_widget.written);
+        try std.testing.expectEqual(@as(u64, 3), rows[0]);
+        try std.testing.expectEqual(@as(u64, 1), rows[1]);
+        try std.testing.expectEqual(@as(u64, 0), rows[2]);
+
+        const candidate_widget_page = try snapshotFilterRowsBlobToken(std.testing.allocator, snapshot, 1, &candidate_rows, "notes", "widget", 1, 1, &rows);
+        try std.testing.expectEqual(@as(u64, 3), candidate_widget_page.total);
+        try std.testing.expectEqual(@as(u64, 1), candidate_widget_page.written);
+        try std.testing.expectEqual(@as(u64, 1), rows[0]);
+
         const widget_page = try snapshotFilterBlobTokenRows(std.testing.allocator, snapshot, 1, "notes", "widget", 1, 1, &rows);
         try std.testing.expectEqual(@as(u64, 3), widget_page.total);
         try std.testing.expectEqual(@as(u64, 1), widget_page.written);
@@ -10503,6 +10644,13 @@ test "table blob prefix index filters ERP text prefixes" {
         try std.testing.expectEqual(@as(u64, 0), rows[0]);
         try std.testing.expectEqual(@as(u64, 1), rows[1]);
         try std.testing.expectEqual(@as(u64, 3), rows[2]);
+
+        const candidate_rows = [_]u64{ 2, 1, 0 };
+        const candidate_widget = try snapshotFilterRowsBlobPrefix(std.testing.allocator, snapshot, 1, &candidate_rows, "notes", "WID", 0, 8, &rows);
+        try std.testing.expectEqual(@as(u64, 2), candidate_widget.total);
+        try std.testing.expectEqual(@as(u64, 2), candidate_widget.written);
+        try std.testing.expectEqual(@as(u64, 1), rows[0]);
+        try std.testing.expectEqual(@as(u64, 0), rows[1]);
 
         const widget_page = try snapshotFilterBlobPrefixRows(std.testing.allocator, snapshot, 1, "notes", "wid", 1, 1, &rows);
         try std.testing.expectEqual(@as(u64, 3), widget_page.total);

@@ -8,6 +8,7 @@
 @const VALUE_A = utf8:"first note"
 @const VALUE_B = utf8:"second note with details"
 @const NEEDLE_DETAILS = utf8:"details"
+@const NEEDLE_NOTE = utf8:"note"
 @const NEEDLE_ABSENT = utf8:"absent"
 
 #def ROOT_LEN = 1
@@ -18,6 +19,7 @@
 #def VALUE_A_LEN = 10
 #def VALUE_B_LEN = 24
 #def NEEDLE_DETAILS_LEN = 7
+#def NEEDLE_NOTE_LEN = 4
 #def NEEDLE_ABSENT_LEN = 6
 #def ROW_BYTES = 16
 #def FILTER_ROWS_CAP = 4
@@ -27,6 +29,7 @@
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
     row = alloc ROW_BYTES
+    candidate_rows = alloc FILTER_ROWS_BYTES
     filter_rows = alloc FILTER_ROWS_BYTES
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
@@ -57,6 +60,17 @@ L_ENTRY:
     eq_page_row0 = load filter_rows+0 as u64
     EXPAND DB_FILTER_BLOB_CONTAINS_HANDLE contains_status, contains_written, contains_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, NEEDLE_DETAILS, NEEDLE_DETAILS_LEN, 0, FILTER_ROWS_CAP
     contains_row0 = load filter_rows+0 as u64
+    store candidate_rows+0, 2 as u64
+    store candidate_rows+8, 1 as u64
+    store candidate_rows+16, 0 as u64
+    store candidate_rows+24, 3 as u64
+    EXPAND DB_FILTER_ROWS_BLOB_EQ_HANDLE rows_eq_status, rows_eq_written, rows_eq_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, candidate_rows, FILTER_ROWS_CAP, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, 0, FILTER_ROWS_CAP
+    rows_eq_row0 = load filter_rows+0 as u64
+    rows_eq_row1 = load filter_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE rows_contains_status, rows_contains_written, rows_contains_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, candidate_rows, FILTER_ROWS_CAP, STORE, STORE_LEN, NEEDLE_NOTE, NEEDLE_NOTE_LEN, 0, FILTER_ROWS_CAP
+    rows_contains_row0 = load filter_rows+0 as u64
+    rows_contains_row1 = load filter_rows+8 as u64
+    rows_contains_row2 = load filter_rows+16 as u64
     EXPAND DB_FILTER_BLOB_CONTAINS_HANDLE absent_status, absent_written, absent_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, NEEDLE_ABSENT, NEEDLE_ABSENT_LEN, 0, FILTER_ROWS_CAP
     EXPAND DB_FILTER_BLOB_EQ_HANDLE invalid_column_status, invalid_column_written, invalid_column_total, filter_rows, FILTER_ROWS_CAP, read_handle, 0, STORE, STORE_LEN, VALUE_A, VALUE_A_LEN, 0, FILTER_ROWS_CAP
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
@@ -87,6 +101,17 @@ L_ENTRY:
     ok_contains_written = eq contains_written, 1
     ok_contains_total = eq contains_total, 1
     ok_contains_row0 = eq contains_row0, 1
+    ok_rows_eq_status = eq rows_eq_status, SA_DB_OK
+    ok_rows_eq_written = eq rows_eq_written, 2
+    ok_rows_eq_total = eq rows_eq_total, 2
+    ok_rows_eq_row0 = eq rows_eq_row0, 2
+    ok_rows_eq_row1 = eq rows_eq_row1, 0
+    ok_rows_contains_status = eq rows_contains_status, SA_DB_OK
+    ok_rows_contains_written = eq rows_contains_written, 3
+    ok_rows_contains_total = eq rows_contains_total, 3
+    ok_rows_contains_row0 = eq rows_contains_row0, 2
+    ok_rows_contains_row1 = eq rows_contains_row1, 1
+    ok_rows_contains_row2 = eq rows_contains_row2, 0
     ok_absent_status = eq absent_status, SA_DB_OK
     ok_absent_written = eq absent_written, 0
     ok_absent_total = eq absent_total, 0
@@ -120,7 +145,18 @@ L_ENTRY:
     ok23 = and ok22, ok_contains_written
     ok24 = and ok23, ok_contains_total
     ok25 = and ok24, ok_contains_row0
-    ok26 = and ok25, ok_absent_status
+    ok_rows01 = and ok25, ok_rows_eq_status
+    ok_rows02 = and ok_rows01, ok_rows_eq_written
+    ok_rows03 = and ok_rows02, ok_rows_eq_total
+    ok_rows04 = and ok_rows03, ok_rows_eq_row0
+    ok_rows05 = and ok_rows04, ok_rows_eq_row1
+    ok_rows06 = and ok_rows05, ok_rows_contains_status
+    ok_rows07 = and ok_rows06, ok_rows_contains_written
+    ok_rows08 = and ok_rows07, ok_rows_contains_total
+    ok_rows09 = and ok_rows08, ok_rows_contains_row0
+    ok_rows10 = and ok_rows09, ok_rows_contains_row1
+    ok_rows11 = and ok_rows10, ok_rows_contains_row2
+    ok26 = and ok_rows11, ok_absent_status
     ok27 = and ok26, ok_absent_written
     ok28 = and ok27, ok_absent_total
     ok29 = and ok28, ok_invalid_column_status
@@ -155,6 +191,17 @@ L_ENTRY:
     !contains_written
     !contains_total
     !contains_row0
+    !rows_eq_status
+    !rows_eq_written
+    !rows_eq_total
+    !rows_eq_row0
+    !rows_eq_row1
+    !rows_contains_status
+    !rows_contains_written
+    !rows_contains_total
+    !rows_contains_row0
+    !rows_contains_row1
+    !rows_contains_row2
     !absent_status
     !absent_written
     !absent_total
@@ -188,6 +235,17 @@ L_ENTRY:
     !ok_contains_written
     !ok_contains_total
     !ok_contains_row0
+    !ok_rows_eq_status
+    !ok_rows_eq_written
+    !ok_rows_eq_total
+    !ok_rows_eq_row0
+    !ok_rows_eq_row1
+    !ok_rows_contains_status
+    !ok_rows_contains_written
+    !ok_rows_contains_total
+    !ok_rows_contains_row0
+    !ok_rows_contains_row1
+    !ok_rows_contains_row2
     !ok_absent_status
     !ok_absent_written
     !ok_absent_total
@@ -220,6 +278,17 @@ L_ENTRY:
     !ok23
     !ok24
     !ok25
+    !ok_rows01
+    !ok_rows02
+    !ok_rows03
+    !ok_rows04
+    !ok_rows05
+    !ok_rows06
+    !ok_rows07
+    !ok_rows08
+    !ok_rows09
+    !ok_rows10
+    !ok_rows11
     !ok26
     !ok27
     !ok28
@@ -227,6 +296,7 @@ L_ENTRY:
     !ok30
     !ok31
     !row
+    !candidate_rows
     !filter_rows
     br ok -> L_OK, L_FAIL
 

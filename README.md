@@ -182,6 +182,10 @@ Read-handle query calls:
 - `sa_db_filter_blob_contains_handle`
 - `sa_db_filter_blob_token_handle`
 - `sa_db_filter_blob_prefix_handle`
+- `sa_db_filter_rows_blob_eq_handle`
+- `sa_db_filter_rows_blob_contains_handle`
+- `sa_db_filter_rows_blob_token_handle`
+- `sa_db_filter_rows_blob_prefix_handle`
 - `sa_db_get_u64_handle`
 - `sa_db_get_i64_handle`
 - `sa_db_get_u32_handle`
@@ -240,7 +244,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_SORT_ROWS_U8_HANDLE`, `DB_SORT_ROWS_I8_HANDLE`,
 `DB_SORT_ROWS_U16_HANDLE`, `DB_SORT_ROWS_I16_HANDLE`,
 `DB_FILTER_BLOB_EQ_HANDLE`, `DB_FILTER_BLOB_CONTAINS_HANDLE`,
-`DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
+`DB_FILTER_BLOB_TOKEN_HANDLE`, `DB_FILTER_BLOB_PREFIX_HANDLE`,
+`DB_FILTER_ROWS_BLOB_EQ_HANDLE`, `DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE`,
+`DB_FILTER_ROWS_BLOB_TOKEN_HANDLE`, `DB_FILTER_ROWS_BLOB_PREFIX_HANDLE`, `DB_GET_U64_HANDLE`,
 `DB_GET_I64_HANDLE`, `DB_GET_U32_HANDLE`, `DB_GET_I32_HANDLE`, `DB_GET_U8_HANDLE`,
 `DB_GET_I8_HANDLE`, `DB_GET_U16_HANDLE`, `DB_GET_I16_HANDLE`, `DB_GET_F32_HANDLE`,
 `DB_GET_F64_HANDLE`,
@@ -390,6 +396,12 @@ the scan path to preserve exact contains semantics. Blob filters return row indi
 `offset`/`limit`/`total` contract as other list
 queries, and let ERP screens filter notes, addresses, descriptions, or external
 payload keys before projecting rows.
+`sa_db_filter_rows_blob_eq_handle`, `sa_db_filter_rows_blob_contains_handle`,
+`sa_db_filter_rows_blob_token_handle`, and `sa_db_filter_rows_blob_prefix_handle`
+apply the same text/blob predicates to an existing candidate row-id list. They
+preserve the candidate list order and pagination contract, so callers can run a
+selective customer/date/status index first, then narrow notes, addresses,
+descriptions, SKUs, or external keys without materializing text values in SA.
 
 `sa_db_range_u64_handle` / `DB_RANGE_U64_HANDLE` returns row indices for an
 inclusive `[min, max]` range over an indexed `u64` column. It is designed for ERP
@@ -490,6 +502,12 @@ compact warehouse/category/priority codes, amount/date/timestamp range, finite
 measurement/rate/weight ranges, or posted/active bool without materializing full rows in SA code. This is a planner
 building block rather than a SQL optimizer: callers still choose the first
 selective index explicitly.
+`sa_db_filter_rows_blob_eq_handle` / `DB_FILTER_ROWS_BLOB_EQ_HANDLE`,
+`sa_db_filter_rows_blob_contains_handle` / `DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE`,
+`sa_db_filter_rows_blob_token_handle` / `DB_FILTER_ROWS_BLOB_TOKEN_HANDLE`, and
+`sa_db_filter_rows_blob_prefix_handle` / `DB_FILTER_ROWS_BLOB_PREFIX_HANDLE`
+extend that candidate-row composition model to ERP text/blob fields while
+preserving input row order.
 `sa_db_intersect_rows_handle` / `DB_INTERSECT_ROWS_HANDLE` is the next planner
 building block: callers can run two indexed filters independently, then intersect
 their row-id lists inside the plugin while preserving the left list's order and
@@ -699,7 +717,7 @@ benchmarks. The required baseline is:
   `u64_i64_pair` filters cover common high-frequency text, child-row equality,
   customer/date, status/due-date, and product/posting-date shapes. Candidate row
   filters now compose an existing row-id list with additional integer, finite
-  float, or bool predicates for multi-condition list pages, row-list
+  float, bool, or text/blob predicates for multi-condition list pages, row-list
   intersection/union/exclusion compose independently indexed result sets for
   AND/OR/not-in filters, and candidate row sorting covers integer and finite float list ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,

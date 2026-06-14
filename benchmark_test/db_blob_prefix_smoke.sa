@@ -31,6 +31,7 @@
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
     row = alloc ROW_BYTES
+    candidate_rows = alloc FILTER_ROWS_BYTES
     filter_rows = alloc FILTER_ROWS_BYTES
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
@@ -59,6 +60,13 @@ L_ENTRY:
     widget_page_row0 = load filter_rows+0 as u64
     EXPAND DB_FILTER_BLOB_PREFIX_HANDLE sku_status, sku_written, sku_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, PREFIX_SKU, PREFIX_SKU_LEN, 0, FILTER_ROWS_CAP
     sku_row0 = load filter_rows+0 as u64
+    store candidate_rows+0, 2 as u64
+    store candidate_rows+8, 1 as u64
+    store candidate_rows+16, 0 as u64
+    store candidate_rows+24, 0 as u64
+    EXPAND DB_FILTER_ROWS_BLOB_PREFIX_HANDLE rows_widget_status, rows_widget_written, rows_widget_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, candidate_rows, 3, STORE, STORE_LEN, PREFIX_WIDGET, PREFIX_WIDGET_LEN, 0, FILTER_ROWS_CAP
+    rows_widget_row0 = load filter_rows+0 as u64
+    rows_widget_row1 = load filter_rows+8 as u64
     EXPAND DB_FILTER_BLOB_PREFIX_HANDLE invalid_status, invalid_written, invalid_total, filter_rows, FILTER_ROWS_CAP, read_handle, 1, STORE, STORE_LEN, PREFIX_INVALID, PREFIX_INVALID_LEN, 0, FILTER_ROWS_CAP
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
     EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
@@ -89,6 +97,11 @@ L_ENTRY:
     ok_sku_written = eq sku_written, 1
     ok_sku_total = eq sku_total, 1
     ok_sku_row0 = eq sku_row0, 1
+    ok_rows_widget_status = eq rows_widget_status, SA_DB_OK
+    ok_rows_widget_written = eq rows_widget_written, 2
+    ok_rows_widget_total = eq rows_widget_total, 2
+    ok_rows_widget_row0 = eq rows_widget_row0, 1
+    ok_rows_widget_row1 = eq rows_widget_row1, 0
     ok_invalid_status = eq invalid_status, SA_DB_ERR_INVALID_FORMAT
     ok_invalid_written = eq invalid_written, 0
     ok_invalid_total = eq invalid_total, 0
@@ -120,7 +133,12 @@ L_ENTRY:
     ok23 = and ok22, ok_sku_written
     ok24 = and ok23, ok_sku_total
     ok25 = and ok24, ok_sku_row0
-    ok26 = and ok25, ok_invalid_status
+    ok_rows01 = and ok25, ok_rows_widget_status
+    ok_rows02 = and ok_rows01, ok_rows_widget_written
+    ok_rows03 = and ok_rows02, ok_rows_widget_total
+    ok_rows04 = and ok_rows03, ok_rows_widget_row0
+    ok_rows05 = and ok_rows04, ok_rows_widget_row1
+    ok26 = and ok_rows05, ok_invalid_status
     ok27 = and ok26, ok_invalid_written
     ok28 = and ok27, ok_invalid_total
     ok29 = and ok28, ok_close
@@ -153,6 +171,11 @@ L_ENTRY:
     !sku_written
     !sku_total
     !sku_row0
+    !rows_widget_status
+    !rows_widget_written
+    !rows_widget_total
+    !rows_widget_row0
+    !rows_widget_row1
     !invalid_status
     !invalid_written
     !invalid_total
@@ -184,6 +207,11 @@ L_ENTRY:
     !ok_sku_written
     !ok_sku_total
     !ok_sku_row0
+    !ok_rows_widget_status
+    !ok_rows_widget_written
+    !ok_rows_widget_total
+    !ok_rows_widget_row0
+    !ok_rows_widget_row1
     !ok_invalid_status
     !ok_invalid_written
     !ok_invalid_total
@@ -214,11 +242,17 @@ L_ENTRY:
     !ok23
     !ok24
     !ok25
+    !ok_rows01
+    !ok_rows02
+    !ok_rows03
+    !ok_rows04
+    !ok_rows05
     !ok26
     !ok27
     !ok28
     !ok29
     !row
+    !candidate_rows
     !filter_rows
     br ok -> L_OK, L_FAIL
 
