@@ -3046,6 +3046,15 @@ pub fn writeTransactionUpsertRawRowU64Key(tx: *WriteTransaction, column_index: u
     return .{ .info = tableInfo(tx.meta), .inserted = true };
 }
 
+pub fn writeTransactionUpdateRawRowU64Key(tx: *WriteTransaction, column_index: usize, expected: u64, row_bytes: []const u8) TableError!TableInfo {
+    const key_value = try rowU64KeyValue(tx.meta, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+    const found = try txFindU64KeyRow(tx, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    try txReplaceRawRow(tx, found.row_index, row_bytes);
+    return tableInfo(tx.meta);
+}
+
 pub fn writeTransactionDeleteU64Key(tx: *WriteTransaction, column_index: usize, expected: u64) TableError!TableInfo {
     const found = try txFindU64KeyRow(tx, column_index, expected);
     if (!found.found) return TableError.NotFound;
@@ -7593,6 +7602,28 @@ pub fn deleteU64Key(
     return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
 }
 
+pub fn updateRawRowU64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected: u64,
+    row_bytes: []const u8,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    defer owned.deinit(allocator);
+    if (owned.locked) return TableError.Locked;
+    const key_value = try rowU64KeyValue(owned, column_index, row_bytes);
+    if (key_value != expected) return TableError.InvalidFormat;
+
+    const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
+    if (!found.found) return TableError.NotFound;
+    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+}
+
 pub fn upsertRawRowU64Key(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -11291,6 +11322,12 @@ test "table write transaction commits atomically and preserves previous epoch on
     writeU64LE(&row, 8, 25);
     const upsert_existing = try writeTransactionUpsertRawRowU64Key(tx, 0, 2, &row);
     try std.testing.expect(!upsert_existing.inserted);
+    writeU64LE(&row, 0, 99);
+    writeU64LE(&row, 8, 990);
+    try std.testing.expectError(TableError.NotFound, writeTransactionUpdateRawRowU64Key(tx, 0, 99, &row));
+    writeU64LE(&row, 0, 2);
+    writeU64LE(&row, 8, 26);
+    _ = try writeTransactionUpdateRawRowU64Key(tx, 0, 2, &row);
     writeU64LE(&row, 0, 3);
     writeU64LE(&row, 8, 30);
     const upsert_new = try writeTransactionUpsertRawRowU64Key(tx, 0, 3, &row);
@@ -11304,7 +11341,7 @@ test "table write transaction commits atomically and preserves previous epoch on
     {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
-        try std.testing.expectEqual(@as(u64, 55), try snapshotSumU64(snapshot, 1));
+        try std.testing.expectEqual(@as(u64, 56), try snapshotSumU64(snapshot, 1));
     }
 }
 
@@ -11481,6 +11518,31 @@ test "table persistent u64 index tracks ingest update and corruption" {
         try std.testing.expectEqual(@as(u64, 4), readU64LE(&fetched_row, 0));
         try std.testing.expectEqual(@as(u64, 44), readU64LE(&fetched_row, 8));
     }
+
+    var update_existing_row: [16]u8 = undefined;
+    writeU64LE(&update_existing_row, 0, 4);
+    writeU64LE(&update_existing_row, 8, 45);
+    const update_existing = try updateRawRowU64Key(std.testing.allocator, ".", table_name, 0, 4, &update_existing_row);
+    try std.testing.expectEqual(@as(u64, 4), update_existing.row_count);
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        var fetched_row: [16]u8 = undefined;
+        try snapshotGetRowU64Key(snapshot, 0, 4, &fetched_row);
+        try std.testing.expectEqual(@as(u64, 45), readU64LE(&fetched_row, 8));
+    }
+    writeU64LE(&update_existing_row, 8, 44);
+    _ = try updateRawRowU64Key(std.testing.allocator, ".", table_name, 0, 4, &update_existing_row);
+
+    var missing_update_row: [16]u8 = undefined;
+    writeU64LE(&missing_update_row, 0, 99);
+    writeU64LE(&missing_update_row, 8, 990);
+    try std.testing.expectError(TableError.NotFound, updateRawRowU64Key(std.testing.allocator, ".", table_name, 0, 99, &missing_update_row));
+
+    var mismatched_update_row: [16]u8 = undefined;
+    writeU64LE(&mismatched_update_row, 0, 6);
+    writeU64LE(&mismatched_update_row, 8, 60);
+    try std.testing.expectError(TableError.InvalidFormat, updateRawRowU64Key(std.testing.allocator, ".", table_name, 0, 4, &mismatched_update_row));
 
     var mismatched_upsert_row: [16]u8 = undefined;
     writeU64LE(&mismatched_upsert_row, 0, 6);

@@ -633,6 +633,30 @@ pub export fn sa_db_upsert_row_u64_key(
     return fillInfo(info_slot, result.info);
 }
 
+pub export fn sa_db_update_row_u64_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.updateRawRowU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
 pub export fn sa_db_tx_begin(
     root_ptr: ?[*]const u8,
     root_len: u64,
@@ -718,6 +742,24 @@ pub export fn sa_db_tx_upsert_row_u64_key(
     const result = table.writeTransactionUpsertRawRowU64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_tx_update_row_u64_key(
+    handle: ?*anyopaque,
+    column_index: u64,
+    expected: u64,
+    row_ptr: ?[*]const u8,
+    row_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    tx_handle_mutex.lock();
+    defer tx_handle_mutex.unlock();
+    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info = table.writeTransactionUpdateRawRowU64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
 }
 
 pub export fn sa_db_tx_delete_u64_key(
@@ -5017,6 +5059,12 @@ test "db SA ABI commits and rolls back write transactions" {
     std.mem.writeInt(u64, row[8..16], 25, .little);
     try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_u64_key(tx_handle, 0, 2, &row, row.len, &inserted, &info));
     try std.testing.expectEqual(@as(u64, 0), inserted);
+    std.mem.writeInt(u64, row[0..8], 99, .little);
+    std.mem.writeInt(u64, row[8..16], 990, .little);
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_tx_update_row_u64_key(tx_handle, 0, 99, &row, row.len, &info));
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], 26, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_update_row_u64_key(tx_handle, 0, 2, &row, row.len, &info));
     std.mem.writeInt(u64, row[0..8], 3, .little);
     std.mem.writeInt(u64, row[8..16], 30, .little);
     try std.testing.expectEqual(SA_DB_OK, sa_db_tx_upsert_row_u64_key(tx_handle, 0, 3, &row, row.len, &inserted, &info));
@@ -5034,7 +5082,7 @@ test "db SA ABI commits and rolls back write transactions" {
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "tx_members".ptr, "tx_members".len, &read_handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
-    try std.testing.expectEqual(@as(u64, 55), sum);
+    try std.testing.expectEqual(@as(u64, 56), sum);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "tx_members".ptr, "tx_members".len, &info));
 }

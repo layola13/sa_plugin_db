@@ -1,0 +1,216 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"update_members"
+@const SCHEMA_PATH = utf8:"update_members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 4\n#def COL_ID_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 14
+#def SCHEMA_PATH_LEN = 26
+#def SCHEMA_LEN = 82
+#def ROW_BYTES = 16
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+    fetched = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_CREATE_U64_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+
+    store row+0, 1 as u64
+    store row+8, 10 as u64
+    EXPAND DB_INSERT_ROW insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_insert, info
+
+    store row+0, 1 as u64
+    store row+8, 15 as u64
+    EXPAND DB_UPDATE_ROW_U64_KEY update_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_update, info
+
+    store row+0, 2 as u64
+    store row+8, 20 as u64
+    EXPAND DB_UPDATE_ROW_U64_KEY missing_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 2, row, ROW_BYTES, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_missing, info
+
+    EXPAND DB_OPEN_READ_TABLE open1_status, read1, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_GET_ROW_U64_KEY_HANDLE get1_status, read1, 0, 1, fetched, ROW_BYTES
+    direct_id = load fetched+0 as u64
+    direct_points = load fetched+8 as u64
+    EXPAND DB_CLOSE_READ_TABLE close1_status, read1
+
+    EXPAND DB_TX_BEGIN tx_begin_status, tx, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 1 as u64
+    store row+8, 20 as u64
+    EXPAND DB_TX_UPDATE_ROW_U64_KEY tx_update_status, tx, 0, 1, row, ROW_BYTES, info
+    store row+0, 3 as u64
+    store row+8, 30 as u64
+    EXPAND DB_TX_UPDATE_ROW_U64_KEY tx_missing_status, tx, 0, 3, row, ROW_BYTES, info
+    EXPAND DB_TX_COMMIT tx_commit_status, tx, info
+    EXPAND DB_INFO_ROW_COUNT rows_after_tx, info
+
+    EXPAND DB_OPEN_READ_TABLE open2_status, read2, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SUM_U64_HANDLE sum_status, sum_points, read2, 1
+    EXPAND DB_GET_ROW_U64_KEY_HANDLE get2_status, read2, 0, 1, fetched, ROW_BYTES
+    tx_id = load fetched+0 as u64
+    tx_points = load fetched+8 as u64
+    EXPAND DB_GET_ROW_U64_KEY_HANDLE get_missing_status, read2, 0, 3, fetched, ROW_BYTES
+    EXPAND DB_CLOSE_READ_TABLE close2_status, read2
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_index = eq index_status, SA_DB_OK
+    ok_insert = eq insert_status, SA_DB_OK
+    ok_rows_insert = eq rows_after_insert, 1
+    ok_update = eq update_status, SA_DB_OK
+    ok_rows_update = eq rows_after_update, 1
+    ok_missing = eq missing_status, SA_DB_ERR_NOT_FOUND
+    ok_rows_missing = eq rows_after_missing, 1
+    ok_open1 = eq open1_status, SA_DB_OK
+    ok_get1 = eq get1_status, SA_DB_OK
+    ok_direct_id = eq direct_id, 1
+    ok_direct_points = eq direct_points, 15
+    ok_close1 = eq close1_status, SA_DB_OK
+    ok_tx_begin = eq tx_begin_status, SA_DB_OK
+    ok_tx_update = eq tx_update_status, SA_DB_OK
+    ok_tx_missing = eq tx_missing_status, SA_DB_ERR_NOT_FOUND
+    ok_tx_commit = eq tx_commit_status, SA_DB_OK
+    ok_rows_tx = eq rows_after_tx, 1
+    ok_open2 = eq open2_status, SA_DB_OK
+    ok_sum_status = eq sum_status, SA_DB_OK
+    ok_sum = eq sum_points, 20
+    ok_get2 = eq get2_status, SA_DB_OK
+    ok_tx_id = eq tx_id, 1
+    ok_tx_points = eq tx_points, 20
+    ok_get_missing = eq get_missing_status, SA_DB_ERR_NOT_FOUND
+    ok_close2 = eq close2_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_index
+    ok03 = and ok02, ok_insert
+    ok04 = and ok03, ok_rows_insert
+    ok05 = and ok04, ok_update
+    ok06 = and ok05, ok_rows_update
+    ok07 = and ok06, ok_missing
+    ok08 = and ok07, ok_rows_missing
+    ok09 = and ok08, ok_open1
+    ok10 = and ok09, ok_get1
+    ok11 = and ok10, ok_direct_id
+    ok12 = and ok11, ok_direct_points
+    ok13 = and ok12, ok_close1
+    ok14 = and ok13, ok_tx_begin
+    ok15 = and ok14, ok_tx_update
+    ok16 = and ok15, ok_tx_missing
+    ok17 = and ok16, ok_tx_commit
+    ok18 = and ok17, ok_rows_tx
+    ok19 = and ok18, ok_open2
+    ok20 = and ok19, ok_sum_status
+    ok21 = and ok20, ok_sum
+    ok22 = and ok21, ok_get2
+    ok23 = and ok22, ok_tx_id
+    ok24 = and ok23, ok_tx_points
+    ok25 = and ok24, ok_get_missing
+    ok26 = and ok25, ok_close2
+    ok = and ok26, ok_verify
+
+    !remove_status
+    !init_status
+    !index_status
+    !insert_status
+    !rows_after_insert
+    !update_status
+    !rows_after_update
+    !missing_status
+    !rows_after_missing
+    !open1_status
+    !read1
+    !get1_status
+    !direct_id
+    !direct_points
+    !close1_status
+    !tx_begin_status
+    !tx
+    !tx_update_status
+    !tx_missing_status
+    !tx_commit_status
+    !rows_after_tx
+    !open2_status
+    !read2
+    !sum_status
+    !sum_points
+    !get2_status
+    !tx_id
+    !tx_points
+    !get_missing_status
+    !close2_status
+    !verify_status
+    !ok_remove
+    !ok_init
+    !ok_index
+    !ok_insert
+    !ok_rows_insert
+    !ok_update
+    !ok_rows_update
+    !ok_missing
+    !ok_rows_missing
+    !ok_open1
+    !ok_get1
+    !ok_direct_id
+    !ok_direct_points
+    !ok_close1
+    !ok_tx_begin
+    !ok_tx_update
+    !ok_tx_missing
+    !ok_tx_commit
+    !ok_rows_tx
+    !ok_open2
+    !ok_sum_status
+    !ok_sum
+    !ok_get2
+    !ok_tx_id
+    !ok_tx_points
+    !ok_get_missing
+    !ok_close2
+    !ok_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !row
+    !fetched
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9006)

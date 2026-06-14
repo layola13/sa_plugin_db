@@ -43,10 +43,12 @@ Core native calls:
 - `sa_db_ingest_columns`
 - `sa_db_insert_row`
 - `sa_db_upsert_row_u64_key`
+- `sa_db_update_row_u64_key`
 - `sa_db_tx_begin`
 - `sa_db_tx_insert_row`
 - `sa_db_tx_blob_put`
 - `sa_db_tx_upsert_row_u64_key`
+- `sa_db_tx_update_row_u64_key`
 - `sa_db_tx_delete_u64_key`
 - `sa_db_tx_commit`
 - `sa_db_tx_rollback`
@@ -252,9 +254,9 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_F64_HANDLE`,
 `DB_GET_BOOL_HANDLE`, `DB_PROJECT_ROWS_HANDLE`, `DB_GET_ROW_HANDLE`,
 `DB_GET_ROW_U64_KEY_HANDLE`, `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
-`DB_UPSERT_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
+`DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`, `DB_TX_BEGIN`, `DB_TX_INSERT_ROW`,
 `DB_TX_BLOB_PUT`,
-`DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
+`DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, `DB_TX_DELETE_U64_KEY`, `DB_TX_COMMIT`,
 `DB_TX_ROLLBACK`, `DB_CREATE_U64_INDEX`, `DB_CREATE_I64_INDEX`,
 `DB_CREATE_U32_INDEX`, `DB_CREATE_I32_INDEX`, `DB_CREATE_U8_INDEX`,
 `DB_CREATE_I8_INDEX`, `DB_CREATE_U16_INDEX`, `DB_CREATE_I16_INDEX`, `DB_CREATE_F32_INDEX`,
@@ -616,7 +618,8 @@ persisted `u64` indexes.
 
 `sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
 returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_BLOB_PUT`,
-`DB_TX_UPSERT_ROW_U64_KEY`, and `DB_TX_DELETE_U64_KEY` mutate a transaction
+`DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, and
+`DB_TX_DELETE_U64_KEY` mutate a transaction
 image; no new table epoch or manifest is published until `sa_db_tx_commit` /
 `DB_TX_COMMIT`. Commit writes changed row segments when needed, versioned blob
 artifacts referenced by the transaction metadata, rebuilds all persisted indexes,
@@ -638,6 +641,13 @@ table into a new column segment, rebuilding indexes, and advancing the epoch;
 same indexed ingest path and `out_inserted` is `1`. The `expected` key must match
 the `u64` value encoded in the row's key column, otherwise the call returns
 `SA_DB_ERR_INVALID_FORMAT` without committing a new epoch.
+
+`sa_db_update_row_u64_key` / `DB_UPDATE_ROW_U64_KEY` is the strict update form
+for ERP screens that must not accidentally insert a new customer, order, item,
+or ledger row. It has the same fixed-width row layout and unique-key requirement
+as upsert, but it returns `SA_DB_ERR_NOT_FOUND` when the key is absent and never
+appends. `sa_db_tx_update_row_u64_key` / `DB_TX_UPDATE_ROW_U64_KEY` provides the
+same semantics inside a single-table transaction image.
 
 `sa_db_delete_u64_key` / `DB_DELETE_U64_KEY` deletes one row by a unique `u64`
 key. The target column must already have a unique `u64` index, so the operation
