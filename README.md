@@ -258,6 +258,8 @@ Read-handle query calls:
 - `sa_db_get_row_i8_key_handle`
 - `sa_db_get_row_u16_key_handle`
 - `sa_db_get_row_i16_key_handle`
+- `sa_db_get_row_u64_pair_key_handle`
+- `sa_db_get_row_u64_i64_pair_key_handle`
 - `sa_db_min_u64_handle`
 - `sa_db_max_u64_handle`
 - `sa_db_min_i64_handle`
@@ -319,6 +321,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_GET_ROW_U32_KEY_HANDLE`, `DB_GET_ROW_I32_KEY_HANDLE`,
 `DB_GET_ROW_U8_KEY_HANDLE`, `DB_GET_ROW_I8_KEY_HANDLE`,
 `DB_GET_ROW_U16_KEY_HANDLE`, `DB_GET_ROW_I16_KEY_HANDLE`,
+`DB_GET_ROW_U64_PAIR_KEY_HANDLE`, `DB_GET_ROW_U64_I64_PAIR_KEY_HANDLE`,
 `DB_INGEST_COLUMNS`, `DB_INSERT_ROW`,
 `DB_UPSERT_ROW_U64_KEY`, `DB_UPDATE_ROW_U64_KEY`,
 `DB_UPSERT_ROW_U32_KEY`, `DB_UPDATE_ROW_U32_KEY`,
@@ -409,9 +412,10 @@ Read queries now use snapshots:
    match, row-list filtering, and get helpers over `u8`/`i1` or `u64` `0/1`
    encodings. `project_rows_handle` copies only selected columns for a batch of
    row indices. `get_row_handle` copies a full fixed-width row by snapshot row
-   index, while `get_row_*_key_handle` requires a matching unique integer index
-   (`u64`, `i64`, `u32`, `i32`, `u8`, `i8`, `u16`, or `i16`) and copies the
-   matching row into the caller's row buffer.
+   index, while `get_row_*_key_handle` requires a matching unique integer or
+   composite-key index (`u64`, `i64`, `u32`, `i32`, `u8`, `i8`, `u16`, `i16`,
+   `(u64, u64)`, or `(u64, i64)`) and copies the matching row into the caller's
+   row buffer.
 4. `sa_db_close_read_table` releases the snapshot.
 
 Primitive type codes exported through `db.sal` match the schema compiler enum:
@@ -510,8 +514,8 @@ indices in index order. The target column must have a persisted `u64` index, so
 range pagination uses binary-search bounds instead of a full scan.
 Use `sa_db_get_row_handle` / `DB_GET_ROW_HANDLE` to materialize any returned row
 index into a fixed-width row buffer. Use `DB_GET_ROW_*_KEY_HANDLE` when an ERP
-form needs a direct full-row fetch by a unique typed primary key without a
-separate `find` call.
+form needs a direct full-row fetch by a unique typed primary key or unique
+composite child-row key without a separate `find` call.
 `sa_db_range_i64_handle` / `DB_RANGE_I64_HANDLE` behaves the same for indexed
 `i64` columns, but uses signed ordering so negative values sort before zero and
 positive values.
@@ -554,7 +558,10 @@ inclusive second-key range, with the same `offset`/`limit` pagination contract a
 single-column range reads. `sa_db_filter_u64_pair_key1_handle` /
 `DB_FILTER_U64_PAIR_KEY1_HANDLE` lists every row matching a fixed first key with
 the same pagination contract, which covers ERP child-row screens such as all
-lines for one order or all stock movements for one product.
+lines for one order or all stock movements for one product. When the pair index
+is unique, `sa_db_get_row_u64_pair_key_handle` /
+`DB_GET_ROW_U64_PAIR_KEY_HANDLE` fetches the full fixed-width row for one exact
+tuple.
 `sa_db_create_u64_i64_pair_index` / `DB_CREATE_U64_I64_PAIR_INDEX` provides the
 same persisted composite index shape for a `u64` first column and signed `i64`
 second column. `sa_db_find_u64_i64_pair_handle` /
@@ -575,7 +582,9 @@ same `u64_i64_pair` index.
 `DB_FILTER_U64_I64_PAIR_KEY1_HANDLE` lists every row for the fixed first key.
 Use this for customer/date, status/due-date, product/posting-date, and other
 ERP list filters where the second key is a signed date, timestamp, or amount
-encoding.
+encoding. When the pair index is unique, `sa_db_get_row_u64_i64_pair_key_handle`
+/ `DB_GET_ROW_U64_I64_PAIR_KEY_HANDLE` fetches the full fixed-width row for one
+exact tuple.
 Candidate row filters are the first explicit composition layer above these
 indexes. `sa_db_filter_rows_u64_range_handle` /
 `DB_FILTER_ROWS_U64_RANGE_HANDLE`, `sa_db_filter_rows_i64_range_handle` /
@@ -911,8 +920,8 @@ benchmarks. The required baseline is:
   token, prefix, and trigram contains indexes cover high-frequency equality and
   text predicates.
 - Row-oriented public operations on top of the column store: fixed-width insert,
-  read by row index or unique typed integer key, upsert/update/delete by unique `u64`,
-  `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, or `i64` key, unique `(u64, u64)` tuple, or unique `(u64, i64)`
+  read by row index, unique typed integer key, or unique composite key,
+  upsert/update/delete by unique `u64`, `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, or `i64` key, unique `(u64, u64)` tuple, or unique `(u64, i64)`
   tuple, range query handles, and single-table batch transactions exist now. Projected
   batch reads now cover the first ERP list-page shape. Indexed blob exact, token,
   prefix, and contains filters plus fixed-first-key `u64_pair` and
@@ -989,6 +998,9 @@ sa build-exe db_u8_i8_u16_i16_key_write_smoke.sa -o db_u8_i8_u16_i16_key_write_s
 
 sa build-exe db_typed_key_get_row_smoke.sa -o db_typed_key_get_row_smoke.out --no-incremental
 ./db_typed_key_get_row_smoke.out
+
+sa build-exe db_pair_key_get_row_smoke.sa -o db_pair_key_get_row_smoke.out --no-incremental
+./db_pair_key_get_row_smoke.out
 
 sa build-exe db_candidate_filter_smoke.sa -o db_candidate_filter_smoke.out --no-incremental
 ./db_candidate_filter_smoke.out

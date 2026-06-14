@@ -7072,9 +7072,37 @@ fn snapshotIndexForU64PairColumns(snapshot: *const ReadSnapshot, column_index: u
     return null;
 }
 
+fn snapshotUniqueIndexForU64PairColumns(snapshot: *const ReadSnapshot, column_index: usize, column_index2: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u64_pair") and
+            index.unique and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 != null and
+            index.column_index2.? == @as(u64, @intCast(column_index2)))
+        {
+            return index;
+        }
+    }
+    return null;
+}
+
 fn snapshotIndexForU64I64PairColumns(snapshot: *const ReadSnapshot, column_index: usize, column_index2: usize) ?ReadIndexSnapshot {
     for (snapshot.indexes) |index| {
         if (std.mem.eql(u8, index.kind, "u64_i64_pair") and
+            index.column_index == @as(u64, @intCast(column_index)) and
+            index.column_index2 != null and
+            index.column_index2.? == @as(u64, @intCast(column_index2)))
+        {
+            return index;
+        }
+    }
+    return null;
+}
+
+fn snapshotUniqueIndexForU64I64PairColumns(snapshot: *const ReadSnapshot, column_index: usize, column_index2: usize) ?ReadIndexSnapshot {
+    for (snapshot.indexes) |index| {
+        if (std.mem.eql(u8, index.kind, "u64_i64_pair") and
+            index.unique and
             index.column_index == @as(u64, @intCast(column_index)) and
             index.column_index2 != null and
             index.column_index2.? == @as(u64, @intCast(column_index2)))
@@ -8045,6 +8073,24 @@ pub fn snapshotGetRowI16Key(snapshot: *const ReadSnapshot, column_index: usize, 
     try ensureSnapshotI16Column(snapshot, column_index);
     const index = snapshotUniqueIndexForI16Column(snapshot, column_index) orelse return TableError.InvalidFormat;
     const found = findI16InIndex(index, expected);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowU64PairKey(snapshot: *const ReadSnapshot, column_index: usize, column_index2: usize, key1: u64, key2: u64, out_row: []u8) TableError!void {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    try ensureSnapshotU64Column(snapshot, column_index2);
+    const index = snapshotUniqueIndexForU64PairColumns(snapshot, column_index, column_index2) orelse return TableError.InvalidFormat;
+    const found = findU64PairInIndex(index, key1, key2);
+    if (!found.found) return TableError.NotFound;
+    try snapshotCopyRow(snapshot, found.row_index, out_row);
+}
+
+pub fn snapshotGetRowU64I64PairKey(snapshot: *const ReadSnapshot, column_index: usize, column_index2: usize, key1: u64, key2: i64, out_row: []u8) TableError!void {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    try ensureSnapshotI64Column(snapshot, column_index2);
+    const index = snapshotUniqueIndexForU64I64PairColumns(snapshot, column_index, column_index2) orelse return TableError.InvalidFormat;
+    const found = findU64PairInIndex(index, key1, sortableI64Key(key2));
     if (!found.found) return TableError.NotFound;
     try snapshotCopyRow(snapshot, found.row_index, out_row);
 }
@@ -12650,6 +12696,15 @@ test "table persistent u64 pair index supports ERP composite lookups" {
         try std.testing.expect(found.found);
         try std.testing.expectEqual(@as(u64, 1), found.row_index);
         try std.testing.expectEqual(@as(u64, 7), try snapshotGetU64(snapshot, 3, found.row_index));
+        var fetched_row: [32]u8 = undefined;
+        try snapshotGetRowU64PairKey(snapshot, 0, 1, 10, 2, &fetched_row);
+        try std.testing.expectEqual(@as(u64, 10), readU64LE(&fetched_row, 0));
+        try std.testing.expectEqual(@as(u64, 2), readU64LE(&fetched_row, 8));
+        try std.testing.expectEqual(@as(u64, 200), readU64LE(&fetched_row, 16));
+        try std.testing.expectEqual(@as(u64, 7), readU64LE(&fetched_row, 24));
+        try std.testing.expectError(TableError.NotFound, snapshotGetRowU64PairKey(snapshot, 0, 1, 99, 1, &fetched_row));
+        var short_row: [31]u8 = undefined;
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowU64PairKey(snapshot, 0, 1, 10, 2, &short_row));
 
         var range_rows = [_]u64{ 99, 99, 99, 99 };
         const range = try snapshotRangeU64PairRows(snapshot, 0, 1, 10, 1, 3, 0, 4, &range_rows);
@@ -12680,6 +12735,7 @@ test "table persistent u64 pair index supports ERP composite lookups" {
         try std.testing.expectEqual(@as(u64, 0), key1_missing.total);
         try std.testing.expectEqual(@as(u64, 0), key1_missing.written);
         try std.testing.expectError(TableError.InvalidFormat, snapshotFindU64Pair(snapshot, 1, 0, 2, 10));
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowU64PairKey(snapshot, 1, 0, 2, 10, &fetched_row));
     }
 
     var duplicate_row: [32]u8 = undefined;
@@ -12866,6 +12922,14 @@ test "table persistent u64 i64 pair index supports ERP date lookups" {
         try std.testing.expect(found.found);
         try std.testing.expectEqual(@as(u64, 0), found.row_index);
         try std.testing.expectEqual(@as(i64, 1000), try snapshotGetI64(snapshot, 2, found.row_index));
+        var fetched_row: [24]u8 = undefined;
+        try snapshotGetRowU64I64PairKey(snapshot, 0, 1, 7, -5, &fetched_row);
+        try std.testing.expectEqual(@as(u64, 7), readU64LE(&fetched_row, 0));
+        try std.testing.expectEqual(@as(i64, -5), readI64LE(&fetched_row, 8));
+        try std.testing.expectEqual(@as(i64, 1000), readI64LE(&fetched_row, 16));
+        try std.testing.expectError(TableError.NotFound, snapshotGetRowU64I64PairKey(snapshot, 0, 1, 7, -99, &fetched_row));
+        var short_row: [23]u8 = undefined;
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowU64I64PairKey(snapshot, 0, 1, 7, -5, &short_row));
 
         var range_rows = [_]u64{ 99, 99, 99, 99 };
         const range = try snapshotRangeU64I64PairRows(snapshot, 0, 1, 7, -5, 10, 0, 4, &range_rows);
@@ -12892,6 +12956,7 @@ test "table persistent u64 i64 pair index supports ERP date lookups" {
         try std.testing.expectEqual(@as(u64, 0), missing.total);
         try std.testing.expectEqual(@as(u64, 0), missing.written);
         try std.testing.expectError(TableError.InvalidFormat, snapshotFindU64I64Pair(snapshot, 1, 0, 7, -5));
+        try std.testing.expectError(TableError.InvalidFormat, snapshotGetRowU64I64PairKey(snapshot, 1, 0, 7, -5, &fetched_row));
     }
 
     var duplicate_row: [24]u8 = undefined;

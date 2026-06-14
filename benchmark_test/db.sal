@@ -1605,6 +1605,14 @@
     %out_status = call @sa_db_get_row_i16_key_handle(%handle, %column_index, %expected, &%out_row, %out_row_len)
 [END_MACRO]
 
+[MACRO] DB_GET_ROW_U64_PAIR_KEY_HANDLE %out_status, %handle, %column_index, %column_index2, %key1, %key2, %out_row, %out_row_len
+    %out_status = call @sa_db_get_row_u64_pair_key_handle(%handle, %column_index, %column_index2, %key1, %key2, &%out_row, %out_row_len)
+[END_MACRO]
+
+[MACRO] DB_GET_ROW_U64_I64_PAIR_KEY_HANDLE %out_status, %handle, %column_index, %column_index2, %key1, %key2, %out_row, %out_row_len
+    %out_status = call @sa_db_get_row_u64_i64_pair_key_handle(%handle, %column_index, %column_index2, %key1, %key2, &%out_row, %out_row_len)
+[END_MACRO]
+
 [MACRO] DB_MIN_U64_HANDLE %out_status, %out_min, %handle, %column_index
     __db_handle_min_slot_%out_min = stack_alloc 8
     %out_status = call @sa_db_min_u64_handle(%handle, %column_index, &__db_handle_min_slot_%out_min)

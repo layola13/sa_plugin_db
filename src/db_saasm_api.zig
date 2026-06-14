@@ -5261,6 +5261,42 @@ pub export fn sa_db_get_row_i16_key_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_get_row_u64_pair_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    key2: u64,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowU64PairKey(snapshot, @intCast(column_index), @intCast(column_index2), key1, key2, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_get_row_u64_i64_pair_key_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    column_index2: u64,
+    key1: u64,
+    key2: i64,
+    out_row_ptr: ?[*]u8,
+    out_row_len: u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    table.snapshotGetRowU64I64PairKey(snapshot, @intCast(column_index), @intCast(column_index2), key1, key2, out_row) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_min_u64_handle(handle: ?*anyopaque, column_index: u64, out_min: ?*u64) u32 {
     const min_slot = out_min orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -6444,6 +6480,14 @@ test "db SA ABI writes rows by u64 pair keys" {
     try std.testing.expectEqual(@as(u64, 1), found);
     try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(handle, 2, row_index, &qty));
     try std.testing.expectEqual(@as(u64, 50), qty);
+    var fetched_row: [24]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u64_pair_key_handle(handle, 0, 1, 10, 1, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 10), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 50), std.mem.readInt(u64, fetched_row[16..24], .little));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_u64_pair_key_handle(handle, 0, 1, 99, 1, &fetched_row, fetched_row.len));
+    var short_row: [23]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_u64_pair_key_handle(handle, 0, 1, 10, 1, &short_row, short_row.len));
     try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_pair_handle(handle, 0, 1, 10, 2, &found, &row_index));
     try std.testing.expectEqual(@as(u64, 0), found);
     try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_pair_handle(handle, 0, 1, 10, 3, &found, &row_index));
@@ -6500,6 +6544,14 @@ test "db SA ABI creates and queries u64 i64 pair indexes" {
     var total_cents: i64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_get_i64_handle(handle, 2, row_index, &total_cents));
     try std.testing.expectEqual(@as(i64, 1000), total_cents);
+    var fetched_row: [24]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_row_u64_i64_pair_key_handle(handle, 0, 1, 7, -5, &fetched_row, fetched_row.len));
+    try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, fetched_row[0..8], .little));
+    try std.testing.expectEqual(@as(i64, -5), std.mem.readInt(i64, fetched_row[8..16], .little));
+    try std.testing.expectEqual(@as(i64, 1000), std.mem.readInt(i64, fetched_row[16..24], .little));
+    try std.testing.expectEqual(SA_DB_ERR_NOT_FOUND, sa_db_get_row_u64_i64_pair_key_handle(handle, 0, 1, 7, -99, &fetched_row, fetched_row.len));
+    var short_row: [23]u8 = undefined;
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_get_row_u64_i64_pair_key_handle(handle, 0, 1, 7, -5, &short_row, short_row.len));
 
     var rows = [_]u64{ 99, 99, 99, 99 };
     var written: u64 = 0;

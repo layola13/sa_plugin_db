@@ -1,0 +1,227 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE_PAIR = utf8:"pair_key_get_row_smoke"
+@const SCHEMA_PAIR_PATH = utf8:"pair_key_get_row_smoke.sadb-schema"
+@const SCHEMA_PAIR = utf8:"#def MAX_ROWS = 8\n#def COL_ORDER_ID_STRIDE = 8 // u64\n#def COL_LINE_NO_STRIDE = 8 // u64\n#def COL_TOTAL_STRIDE = 8 // i64\n"
+@const TABLE_I64_PAIR = utf8:"pair_i64_key_get_row_smoke"
+@const SCHEMA_I64_PAIR_PATH = utf8:"pair_i64_key_get_row_smoke.sadb-schema"
+@const SCHEMA_I64_PAIR = utf8:"#def MAX_ROWS = 8\n#def COL_CUSTOMER_ID_STRIDE = 8 // u64\n#def COL_DAY_STRIDE = 8 // i64\n#def COL_TOTAL_STRIDE = 8 // i64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_PAIR_LEN = 22
+#def SCHEMA_PAIR_PATH_LEN = 34
+#def SCHEMA_PAIR_LEN = 122
+#def TABLE_I64_PAIR_LEN = 26
+#def SCHEMA_I64_PAIR_PATH_LEN = 38
+#def SCHEMA_I64_PAIR_LEN = 121
+#def ROWS = 3
+#def COL_BYTES = 24
+#def ROW_BYTES = 24
+#def COLUMN_COUNT = 3
+#def COLUMNS_BYTES = 48
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    pair_columns = stack_alloc COLUMNS_BYTES
+    pair_order_ids = alloc COL_BYTES
+    pair_line_nos = alloc COL_BYTES
+    pair_totals = alloc COL_BYTES
+    pair_row = alloc ROW_BYTES
+    i64_pair_columns = stack_alloc COLUMNS_BYTES
+    i64_pair_customer_ids = alloc COL_BYTES
+    i64_pair_days = alloc COL_BYTES
+    i64_pair_totals = alloc COL_BYTES
+    i64_pair_row = alloc ROW_BYTES
+
+    store pair_order_ids+0, 10 as u64
+    store pair_order_ids+8, 10 as u64
+    store pair_order_ids+16, 11 as u64
+    store pair_line_nos+0, 1 as u64
+    store pair_line_nos+8, 2 as u64
+    store pair_line_nos+16, 1 as u64
+    store pair_totals+0, 1000 as i64
+    store pair_totals+8, 2000 as i64
+    store pair_totals+16, 3000 as i64
+
+    store i64_pair_customer_ids+0, 7 as u64
+    store i64_pair_customer_ids+8, 7 as u64
+    store i64_pair_customer_ids+16, 8 as u64
+    store i64_pair_days+0, -5 as i64
+    store i64_pair_days+8, 0 as i64
+    store i64_pair_days+16, -3 as i64
+    store i64_pair_totals+0, 1100 as i64
+    store i64_pair_totals+8, 2200 as i64
+    store i64_pair_totals+16, 3300 as i64
+
+    EXPAND DB_REMOVE_TABLE remove_pair_status, ROOT, ROOT_LEN, TABLE_PAIR, TABLE_PAIR_LEN, info
+    EXPAND DB_INIT_SCHEMA init_pair_status, ROOT, ROOT_LEN, SCHEMA_PAIR_PATH, SCHEMA_PAIR_PATH_LEN, SCHEMA_PAIR, SCHEMA_PAIR_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET pair_columns, 0, pair_order_ids, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET pair_columns, 1, pair_line_nos, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET pair_columns, 2, pair_totals, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_pair_status, ROOT, ROOT_LEN, TABLE_PAIR, TABLE_PAIR_LEN, ROWS, pair_columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U64_PAIR_INDEX index_pair_status, ROOT, ROOT_LEN, TABLE_PAIR, TABLE_PAIR_LEN, 0, 1, 1, info
+    EXPAND DB_OPEN_READ_TABLE open_pair_status, pair_handle, ROOT, ROOT_LEN, TABLE_PAIR, TABLE_PAIR_LEN
+    EXPAND DB_GET_ROW_U64_PAIR_KEY_HANDLE get_pair_status, pair_handle, 0, 1, 10, 2, pair_row, ROW_BYTES
+    pair_order_id = load pair_row+0 as u64
+    pair_line_no = load pair_row+8 as u64
+    pair_total = load pair_row+16 as i64
+    EXPAND DB_GET_ROW_U64_PAIR_KEY_HANDLE missing_pair_status, pair_handle, 0, 1, 99, 1, pair_row, ROW_BYTES
+    EXPAND DB_CLOSE_READ_TABLE close_pair_status, pair_handle
+    EXPAND DB_VERIFY verify_pair_status, ROOT, ROOT_LEN, TABLE_PAIR, TABLE_PAIR_LEN, info
+
+    EXPAND DB_REMOVE_TABLE remove_i64_pair_status, ROOT, ROOT_LEN, TABLE_I64_PAIR, TABLE_I64_PAIR_LEN, info
+    EXPAND DB_INIT_SCHEMA init_i64_pair_status, ROOT, ROOT_LEN, SCHEMA_I64_PAIR_PATH, SCHEMA_I64_PAIR_PATH_LEN, SCHEMA_I64_PAIR, SCHEMA_I64_PAIR_LEN, info
+    EXPAND DB_COLUMN_INPUT_SET i64_pair_columns, 0, i64_pair_customer_ids, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET i64_pair_columns, 1, i64_pair_days, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET i64_pair_columns, 2, i64_pair_totals, COL_BYTES
+    EXPAND DB_INGEST_COLUMNS ingest_i64_pair_status, ROOT, ROOT_LEN, TABLE_I64_PAIR, TABLE_I64_PAIR_LEN, ROWS, i64_pair_columns, COLUMN_COUNT, info
+    EXPAND DB_CREATE_U64_I64_PAIR_INDEX index_i64_pair_status, ROOT, ROOT_LEN, TABLE_I64_PAIR, TABLE_I64_PAIR_LEN, 0, 1, 1, info
+    EXPAND DB_OPEN_READ_TABLE open_i64_pair_status, i64_pair_handle, ROOT, ROOT_LEN, TABLE_I64_PAIR, TABLE_I64_PAIR_LEN
+    EXPAND DB_GET_ROW_U64_I64_PAIR_KEY_HANDLE get_i64_pair_status, i64_pair_handle, 0, 1, 7, -5, i64_pair_row, ROW_BYTES
+    i64_pair_customer_id = load i64_pair_row+0 as u64
+    i64_pair_day = load i64_pair_row+8 as i64
+    i64_pair_total = load i64_pair_row+16 as i64
+    EXPAND DB_GET_ROW_U64_I64_PAIR_KEY_HANDLE missing_i64_pair_status, i64_pair_handle, 0, 1, 7, -99, i64_pair_row, ROW_BYTES
+    EXPAND DB_CLOSE_READ_TABLE close_i64_pair_status, i64_pair_handle
+    EXPAND DB_VERIFY verify_i64_pair_status, ROOT, ROOT_LEN, TABLE_I64_PAIR, TABLE_I64_PAIR_LEN, info
+
+    ok_remove_pair = eq remove_pair_status, SA_DB_OK
+    ok_init_pair = eq init_pair_status, SA_DB_OK
+    ok_ingest_pair = eq ingest_pair_status, SA_DB_OK
+    ok_index_pair = eq index_pair_status, SA_DB_OK
+    ok_open_pair = eq open_pair_status, SA_DB_OK
+    ok_get_pair = eq get_pair_status, SA_DB_OK
+    ok_pair_order_id = eq pair_order_id, 10
+    ok_pair_line_no = eq pair_line_no, 2
+    ok_pair_total = eq pair_total, 2000
+    ok_missing_pair = eq missing_pair_status, SA_DB_ERR_NOT_FOUND
+    ok_close_pair = eq close_pair_status, SA_DB_OK
+    ok_verify_pair = eq verify_pair_status, SA_DB_OK
+    ok_remove_i64_pair = eq remove_i64_pair_status, SA_DB_OK
+    ok_init_i64_pair = eq init_i64_pair_status, SA_DB_OK
+    ok_ingest_i64_pair = eq ingest_i64_pair_status, SA_DB_OK
+    ok_index_i64_pair = eq index_i64_pair_status, SA_DB_OK
+    ok_open_i64_pair = eq open_i64_pair_status, SA_DB_OK
+    ok_get_i64_pair = eq get_i64_pair_status, SA_DB_OK
+    ok_i64_pair_customer_id = eq i64_pair_customer_id, 7
+    ok_i64_pair_day = eq i64_pair_day, -5
+    ok_i64_pair_total = eq i64_pair_total, 1100
+    ok_missing_i64_pair = eq missing_i64_pair_status, SA_DB_ERR_NOT_FOUND
+    ok_close_i64_pair = eq close_i64_pair_status, SA_DB_OK
+    ok_verify_i64_pair = eq verify_i64_pair_status, SA_DB_OK
+
+    ok01 = and ok_remove_pair, ok_init_pair
+    ok02 = and ok01, ok_ingest_pair
+    ok03 = and ok02, ok_index_pair
+    ok04 = and ok03, ok_open_pair
+    ok05 = and ok04, ok_get_pair
+    ok06 = and ok05, ok_pair_order_id
+    ok07 = and ok06, ok_pair_line_no
+    ok08 = and ok07, ok_pair_total
+    ok09 = and ok08, ok_missing_pair
+    ok10 = and ok09, ok_close_pair
+    ok11 = and ok10, ok_verify_pair
+    ok12 = and ok11, ok_remove_i64_pair
+    ok13 = and ok12, ok_init_i64_pair
+    ok14 = and ok13, ok_ingest_i64_pair
+    ok15 = and ok14, ok_index_i64_pair
+    ok16 = and ok15, ok_open_i64_pair
+    ok17 = and ok16, ok_get_i64_pair
+    ok18 = and ok17, ok_i64_pair_customer_id
+    ok19 = and ok18, ok_i64_pair_day
+    ok20 = and ok19, ok_i64_pair_total
+    ok21 = and ok20, ok_missing_i64_pair
+    ok22 = and ok21, ok_close_i64_pair
+    ok = and ok22, ok_verify_i64_pair
+
+    !remove_pair_status
+    !init_pair_status
+    !ingest_pair_status
+    !index_pair_status
+    !open_pair_status
+    !pair_handle
+    !get_pair_status
+    !pair_order_id
+    !pair_line_no
+    !pair_total
+    !missing_pair_status
+    !close_pair_status
+    !verify_pair_status
+    !remove_i64_pair_status
+    !init_i64_pair_status
+    !ingest_i64_pair_status
+    !index_i64_pair_status
+    !open_i64_pair_status
+    !i64_pair_handle
+    !get_i64_pair_status
+    !i64_pair_customer_id
+    !i64_pair_day
+    !i64_pair_total
+    !missing_i64_pair_status
+    !close_i64_pair_status
+    !verify_i64_pair_status
+    !ok_remove_pair
+    !ok_init_pair
+    !ok_ingest_pair
+    !ok_index_pair
+    !ok_open_pair
+    !ok_get_pair
+    !ok_pair_order_id
+    !ok_pair_line_no
+    !ok_pair_total
+    !ok_missing_pair
+    !ok_close_pair
+    !ok_verify_pair
+    !ok_remove_i64_pair
+    !ok_init_i64_pair
+    !ok_ingest_i64_pair
+    !ok_index_i64_pair
+    !ok_open_i64_pair
+    !ok_get_i64_pair
+    !ok_i64_pair_customer_id
+    !ok_i64_pair_day
+    !ok_i64_pair_total
+    !ok_missing_i64_pair
+    !ok_close_i64_pair
+    !ok_verify_i64_pair
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !pair_order_ids
+    !pair_line_nos
+    !pair_totals
+    !pair_row
+    !i64_pair_customer_ids
+    !i64_pair_days
+    !i64_pair_totals
+    !i64_pair_row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9043)
