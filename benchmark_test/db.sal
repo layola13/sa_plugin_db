@@ -73,6 +73,16 @@
 #def SaDbPlanInfo_first_total = +24
 #def SaDbPlanInfo_second_total = +32
 
+#def SaDbPlan3Info_SIZE = 64
+#def SaDbPlan3Info_written = +0
+#def SaDbPlan3Info_total = +8
+#def SaDbPlan3Info_first_predicate = +16
+#def SaDbPlan3Info_first_total = +24
+#def SaDbPlan3Info_second_predicate = +32
+#def SaDbPlan3Info_second_total = +40
+#def SaDbPlan3Info_third_predicate = +48
+#def SaDbPlan3Info_third_total = +56
+
 #def SaDbColumnInput_SIZE = 16
 #def SaDbColumnInput_data = +0
 #def SaDbColumnInput_len = +8
@@ -832,6 +842,38 @@
     %out_second_total = load %info+SaDbPlanInfo_second_total as u64
 [END_MACRO]
 
+[MACRO] DB_PLAN3_INFO_WRITTEN %out_written, %info
+    %out_written = load %info+SaDbPlan3Info_written as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_TOTAL %out_total, %info
+    %out_total = load %info+SaDbPlan3Info_total as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_FIRST_PREDICATE %out_first_predicate, %info
+    %out_first_predicate = load %info+SaDbPlan3Info_first_predicate as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_FIRST_TOTAL %out_first_total, %info
+    %out_first_total = load %info+SaDbPlan3Info_first_total as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_SECOND_PREDICATE %out_second_predicate, %info
+    %out_second_predicate = load %info+SaDbPlan3Info_second_predicate as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_SECOND_TOTAL %out_second_total, %info
+    %out_second_total = load %info+SaDbPlan3Info_second_total as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_THIRD_PREDICATE %out_third_predicate, %info
+    %out_third_predicate = load %info+SaDbPlan3Info_third_predicate as u64
+[END_MACRO]
+
+[MACRO] DB_PLAN3_INFO_THIRD_TOTAL %out_third_total, %info
+    %out_third_total = load %info+SaDbPlan3Info_third_total as u64
+[END_MACRO]
+
 [MACRO] DB_SUM_U64_HANDLE %out_status, %out_sum, %handle, %column_index
     __db_handle_sum_slot_%out_sum = stack_alloc 8
     %out_status = call @sa_db_sum_u64_handle(%handle, %column_index, &__db_handle_sum_slot_%out_sum)
@@ -1296,6 +1338,10 @@
 
 [MACRO] DB_PLAN_I64_BLOB_EQ_HANDLE %out_status, %out_rows, %out_rows_len, %out_info, %handle, %i64_column_index, %i64_min_value, %i64_max_value, %blob_column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
     %out_status = call @sa_db_plan_i64_blob_eq_handle(%handle, %i64_column_index, %i64_min_value, %i64_max_value, %blob_column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_PLAN_U64_I64_BLOB_EQ_HANDLE %out_status, %out_rows, %out_rows_len, %out_info, %handle, %u64_column_index, %u64_min_value, %u64_max_value, %i64_column_index, %i64_min_value, %i64_max_value, %blob_column_index, %store_name, %store_name_len, %value, %value_len, %offset, %limit
+    %out_status = call @sa_db_plan_u64_i64_blob_eq_handle(%handle, %u64_column_index, %u64_min_value, %u64_max_value, %i64_column_index, %i64_min_value, %i64_max_value, %blob_column_index, &%store_name, %store_name_len, &%value, %value_len, %offset, %limit, &%out_rows, %out_rows_len, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_FILTER_ROWS_F32_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit

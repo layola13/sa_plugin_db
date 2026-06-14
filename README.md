@@ -218,6 +218,9 @@ Read-handle query calls:
 - `sa_db_plan_u64_i64_ranges_handle`
 - `sa_db_plan_u64_u64_ranges_handle`
 - `sa_db_plan_i64_i64_ranges_handle`
+- `sa_db_plan_u64_blob_eq_handle`
+- `sa_db_plan_i64_blob_eq_handle`
+- `sa_db_plan_u64_i64_blob_eq_handle`
 - `sa_db_filter_rows_f32_range_handle`
 - `sa_db_filter_rows_f64_range_handle`
 - `sa_db_filter_rows_u32_range_handle`
@@ -311,6 +314,7 @@ The `sal` facade exposes matching macros such as `DB_OPEN_READ_TABLE`,
 `DB_FILTER_ROWS_I64_RANGE_HANDLE`, `DB_PLAN_U64_I64_RANGES_HANDLE`,
 `DB_PLAN_U64_U64_RANGES_HANDLE`, `DB_PLAN_I64_I64_RANGES_HANDLE`,
 `DB_PLAN_U64_BLOB_EQ_HANDLE`, `DB_PLAN_I64_BLOB_EQ_HANDLE`,
+`DB_PLAN_U64_I64_BLOB_EQ_HANDLE`,
 `DB_FILTER_ROWS_U32_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I32_RANGE_HANDLE`, `DB_FILTER_ROWS_U8_RANGE_HANDLE`,
 `DB_FILTER_ROWS_I8_RANGE_HANDLE`, `DB_FILTER_ROWS_U16_RANGE_HANDLE`,
@@ -650,6 +654,14 @@ codes plus amount/date ranges, two dictionary/status predicates, two signed
 amount/date/timestamp ranges, and numeric range plus exact text/blob business
 keys such as status/doc-type or due-date/business-code. Broader shapes still use
 the explicit building blocks above.
+For the common ERP three-filter list shape, `sa_db_plan_u64_i64_blob_eq_handle` /
+`DB_PLAN_U64_I64_BLOB_EQ_HANDLE` estimates a `u64` range, an `i64` range, and an
+exact text/blob predicate, then orders all three by candidate count before
+filtering. It returns `SaDbPlan3Info` (`written`, `total`, and three
+`predicate`/`total` pairs). Predicate ids are `1` for the `u64` range, `2` for
+the `i64` range, and `3` for the `blob_eq` predicate. This covers list pages such
+as status + due date + document type without forcing SA code to materialize and
+intersect three row-id lists manually.
 `sa_db_filter_rows_blob_eq_handle` / `DB_FILTER_ROWS_BLOB_EQ_HANDLE`,
 `sa_db_filter_rows_blob_contains_handle` / `DB_FILTER_ROWS_BLOB_CONTAINS_HANDLE`,
 `sa_db_filter_rows_blob_token_handle` / `DB_FILTER_ROWS_BLOB_TOKEN_HANDLE`, and
@@ -992,10 +1004,11 @@ benchmarks. The required baseline is:
   filters now compose an existing row-id list with additional integer, finite
   float, bool, or text/blob predicates for multi-condition list pages, row-list
   intersection/union/exclusion compose independently indexed result sets for
-  AND/OR/not-in filters, the first two-predicate range planners choose the
-  smaller indexed side automatically for `u64+i64`, `u64+u64`, `i64+i64`,
-  `u64+blob_eq`, and `i64+blob_eq` shapes, and candidate row sorting covers
-  integer and finite float list ordering. The first ERP workflow
+  AND/OR/not-in filters, two-predicate planners choose the smaller indexed side
+  automatically for `u64+i64`, `u64+u64`, `i64+i64`, `u64+blob_eq`, and
+  `i64+blob_eq` shapes, the first three-predicate planner covers
+  `u64+i64+blob_eq`, and candidate row sorting covers integer and finite float
+  list ordering. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
   same composite ERP filters; next is broader index planning.

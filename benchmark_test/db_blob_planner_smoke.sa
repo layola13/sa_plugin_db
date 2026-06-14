@@ -25,6 +25,7 @@
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
     plan_info = stack_alloc SaDbPlanInfo_SIZE
+    plan3_info = stack_alloc SaDbPlan3Info_SIZE
     row = alloc ROW_BYTES
     plan_rows = alloc ROWS_BYTES
 
@@ -108,6 +109,17 @@ L_ENTRY:
     EXPAND DB_PLAN_INFO_SECOND_TOTAL due_invoice_second_total, plan_info
     due_invoice_row0 = load plan_rows+0 as u64
 
+    EXPAND DB_PLAN_U64_I64_BLOB_EQ_HANDLE three_status, plan_rows, ROWS_CAP, plan3_info, read_handle, 1, 2, 2, 2, 0, 20, 3, STORE, STORE_LEN, VALUE_INVOICE, VALUE_INVOICE_LEN, 0, ROWS_CAP
+    EXPAND DB_PLAN3_INFO_WRITTEN three_written, plan3_info
+    EXPAND DB_PLAN3_INFO_TOTAL three_total, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_PREDICATE three_first_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_FIRST_TOTAL three_first_total, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_PREDICATE three_second_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_SECOND_TOTAL three_second_total, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_PREDICATE three_third_predicate, plan3_info
+    EXPAND DB_PLAN3_INFO_THIRD_TOTAL three_third_total, plan3_info
+    three_row0 = load plan_rows+0 as u64
+
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
     EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
 
@@ -159,6 +171,16 @@ L_ENTRY:
     ok_due_invoice_first_total = eq due_invoice_first_total, 2
     ok_due_invoice_second_total = eq due_invoice_second_total, 3
     ok_due_invoice_row0 = eq due_invoice_row0, 5
+    ok_three_status = eq three_status, SA_DB_OK
+    ok_three_written = eq three_written, 1
+    ok_three_total = eq three_total, 1
+    ok_three_first_predicate = eq three_first_predicate, 2
+    ok_three_first_total = eq three_first_total, 3
+    ok_three_second_predicate = eq three_second_predicate, 3
+    ok_three_second_total = eq three_second_total, 3
+    ok_three_third_predicate = eq three_third_predicate, 1
+    ok_three_third_total = eq three_third_total, 4
+    ok_three_row0 = eq three_row0, 2
     ok_close = eq close_status, SA_DB_OK
     ok_verify = eq verify_status, SA_DB_OK
 
@@ -209,8 +231,18 @@ L_ENTRY:
     ok45 = and ok44, ok_due_invoice_first_total
     ok46 = and ok45, ok_due_invoice_second_total
     ok47 = and ok46, ok_due_invoice_row0
-    ok48 = and ok47, ok_close
-    ok = and ok48, ok_verify
+    ok48 = and ok47, ok_three_status
+    ok49 = and ok48, ok_three_written
+    ok50 = and ok49, ok_three_total
+    ok51 = and ok50, ok_three_first_predicate
+    ok52 = and ok51, ok_three_first_total
+    ok53 = and ok52, ok_three_second_predicate
+    ok54 = and ok53, ok_three_second_total
+    ok55 = and ok54, ok_three_third_predicate
+    ok56 = and ok55, ok_three_third_total
+    ok57 = and ok56, ok_three_row0
+    ok58 = and ok57, ok_close
+    ok = and ok58, ok_verify
 
     !remove_status
     !init_status
@@ -264,6 +296,16 @@ L_ENTRY:
     !due_invoice_first_total
     !due_invoice_second_total
     !due_invoice_row0
+    !three_status
+    !three_written
+    !three_total
+    !three_first_predicate
+    !three_first_total
+    !three_second_predicate
+    !three_second_total
+    !three_third_predicate
+    !three_third_total
+    !three_row0
     !close_status
     !verify_status
     !ok_remove
@@ -314,6 +356,16 @@ L_ENTRY:
     !ok_due_invoice_first_total
     !ok_due_invoice_second_total
     !ok_due_invoice_row0
+    !ok_three_status
+    !ok_three_written
+    !ok_three_total
+    !ok_three_first_predicate
+    !ok_three_first_total
+    !ok_three_second_predicate
+    !ok_three_second_total
+    !ok_three_third_predicate
+    !ok_three_third_total
+    !ok_three_row0
     !ok_close
     !ok_verify
     !ok01
@@ -364,6 +416,16 @@ L_ENTRY:
     !ok46
     !ok47
     !ok48
+    !ok49
+    !ok50
+    !ok51
+    !ok52
+    !ok53
+    !ok54
+    !ok55
+    !ok56
+    !ok57
+    !ok58
     !row
     !plan_rows
     br ok -> L_OK, L_FAIL
