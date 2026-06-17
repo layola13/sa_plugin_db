@@ -33,6 +33,14 @@ pub const RawColumnBytes = struct {
     bytes: []const u8,
 };
 
+const StagedColumnFile = struct {
+    staged_path: []u8,
+    sha256: []u8,
+    bytes: u64,
+    block_size: u64 = 0,
+    block_sha256: [][]const u8 = &.{},
+};
+
 pub const ColumnMeta = struct {
     name: []const u8,
     stride: u32,
@@ -190,18 +198,50 @@ pub const TableWriteLock = struct {
 };
 
 pub const WriteTransaction = struct {
+    allocator: std.mem.Allocator,
     root_dir: []const u8,
     table_name: []const u8,
     write_lock: TableWriteLock,
     meta: TableMeta,
     buffers: []std.ArrayList(u8),
+    pending_append_buffers: []std.ArrayList(u8),
+    base_row_count: u64,
+    pending_append_row_count: u64 = 0,
     dirty: bool = false,
     rows_dirty: bool = false,
 
     pub fn deinit(self: *WriteTransaction, allocator: std.mem.Allocator) void {
         self.write_lock.release();
         self.meta.deinit(allocator);
-        freeColumnBuffers(allocator, self.buffers);
+        if (self.buffers.len != 0) freeColumnBuffers(allocator, self.buffers);
+        if (self.pending_append_buffers.len != 0) freeColumnBuffers(allocator, self.pending_append_buffers);
+        allocator.free(self.root_dir);
+        allocator.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+pub const ColumnBatch = struct {
+    row_count: u64,
+    files: []StagedColumnFile,
+
+    fn deinit(self: *ColumnBatch, allocator: std.mem.Allocator) void {
+        freeStagedColumnFiles(allocator, self.files, true);
+        self.* = undefined;
+    }
+};
+
+pub const ColumnIngestSession = struct {
+    root_dir: []const u8,
+    table_name: []const u8,
+    columns_len: usize,
+    column_strides: []u32,
+    batches: std.ArrayList(ColumnBatch),
+
+    pub fn deinit(self: *ColumnIngestSession, allocator: std.mem.Allocator) void {
+        for (self.batches.items) |*batch| batch.deinit(allocator);
+        self.batches.deinit();
+        allocator.free(self.column_strides);
         allocator.free(self.root_dir);
         allocator.free(self.table_name);
         self.* = undefined;
@@ -252,6 +292,10 @@ const WrittenMeta = struct {
 
 pub const ReadColumnSnapshot = struct {
     bytes: []const u8,
+};
+
+const MappedReadRegion = struct {
+    memory: []align(std.heap.page_size_min) const u8,
 };
 
 pub const ReadSegmentSnapshot = struct {
@@ -401,9 +445,14 @@ pub const ReadSnapshot = struct {
     indexes: []ReadIndexSnapshot,
     dicts: []ReadDictSnapshot,
     blobs: []ReadBlobStoreSnapshot,
+    mapped_regions: []MappedReadRegion,
 
     pub fn destroy(self: *ReadSnapshot) void {
         const backing_allocator = self.backing_allocator;
+        for (self.mapped_regions) |region| {
+            if (region.memory.len != 0) std.posix.munmap(region.memory);
+        }
+        backing_allocator.free(self.mapped_regions);
         self.arena.deinit();
         backing_allocator.destroy(self);
     }
@@ -429,6 +478,11 @@ fn hashBytes(bytes: []const u8) [32]u8 {
 
 fn hashHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) TableError![]u8 {
     const hash = hashBytes(bytes);
+    const encoded = std.fmt.bytesToHex(hash, .lower);
+    return allocator.dupe(u8, encoded[0..]) catch TableError.OutOfMemory;
+}
+
+fn hashHexFromDigestAlloc(allocator: std.mem.Allocator, hash: [32]u8) TableError![]u8 {
     const encoded = std.fmt.bytesToHex(hash, .lower);
     return allocator.dupe(u8, encoded[0..]) catch TableError.OutOfMemory;
 }
@@ -632,6 +686,24 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usiz
     return file.readToEndAlloc(allocator, max_bytes) catch |err| return mapFileError(err);
 }
 
+fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRegion {
+    if (expected_len == 0) return .{ .memory = &[_]u8{} };
+    var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
+    defer file.close();
+    const stat = file.stat() catch |err| return mapFileError(err);
+    if (stat.size != expected_len) return TableError.VerifyFailed;
+    const mapped = std.posix.mmap(null, expected_len, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0) catch |err| switch (err) {
+        error.OutOfMemory => return TableError.OutOfMemory,
+        error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
+        else => return TableError.InvalidFormat,
+    };
+    return .{ .memory = mapped };
+}
+
+fn mappedRegionBytes(region: MappedReadRegion) []const u8 {
+    return region.memory;
+}
+
 fn tempWritePath(allocator: std.mem.Allocator, path: []const u8) TableError![]u8 {
     const parent = std.fs.path.dirname(path);
     const basename = std.fs.path.basename(path);
@@ -652,6 +724,10 @@ fn tempWritePath(allocator: std.mem.Allocator, path: []const u8) TableError![]u8
 fn syncParentDirBestEffort(path: []const u8) void {
     const parent = std.fs.path.dirname(path) orelse ".";
     const dir_path = if (parent.len == 0) "." else parent;
+    syncDirBestEffort(dir_path);
+}
+
+fn syncDirBestEffort(dir_path: []const u8) void {
     var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
     defer dir.close();
     if (builtin.os.tag == .linux) {
@@ -665,7 +741,7 @@ fn syncFile(path: []const u8) TableError!void {
     file.sync() catch |err| return mapFileError(err);
 }
 
-fn writeFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
+fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8, sync_parent: bool) TableError!void {
     try ensureParentDir(path);
     const temp_path = try tempWritePath(allocator, path);
     defer allocator.free(temp_path);
@@ -679,7 +755,11 @@ fn writeFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) 
     }
 
     std.fs.cwd().rename(temp_path, path) catch |err| return mapFileError(err);
-    syncParentDirBestEffort(path);
+    if (sync_parent) syncParentDirBestEffort(path);
+}
+
+fn writeFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
+    try writeFileWithParentSync(allocator, path, bytes, true);
 }
 
 fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) TableError!void {
@@ -742,16 +822,26 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn loadRecoveredActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    var best: ?TableMeta = null;
+    defer if (best) |*meta| meta.deinit(allocator);
+
+    try scanVersionedRecoveryMetas(allocator, root_dir, table_name, &best);
+
+    const compat_path = try tableMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(compat_path);
+    try maybeSelectRecoveryMeta(allocator, root_dir, table_name, compat_path, &best);
+
+    const recovered = best orelse return TableError.NotFound;
+    return std.json.stringifyAlloc(allocator, recovered, .{}) catch |err| return mapJsonError(err);
+}
+
 pub fn readActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
     const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
     defer allocator.free(manifest_path);
 
     const manifest_source = readFileAlloc(allocator, manifest_path, 1024 * 1024) catch |err| switch (err) {
-        TableError.NotFound => {
-            const compat_meta_path = try tableMetaPath(allocator, root_dir, table_name);
-            defer allocator.free(compat_meta_path);
-            return try readFileAlloc(allocator, compat_meta_path, 16 * 1024 * 1024);
-        },
+        TableError.NotFound => return try loadRecoveredActiveMetaSource(allocator, root_dir, table_name),
         else => return err,
     };
     defer allocator.free(manifest_source);
@@ -973,6 +1063,33 @@ fn makeBlockSha256List(allocator: std.mem.Allocator, bytes: []const u8, block_si
     return out;
 }
 
+fn makeFileHashesSinglePass(allocator: std.mem.Allocator, bytes: []const u8, block_size: usize) TableError!struct {
+    sha256: []const u8,
+    block_size: u64,
+    block_sha256: [][]const u8,
+} {
+    const sha256 = try hashHexFromDigestAlloc(allocator, hashBytes(bytes));
+    errdefer allocator.free(sha256);
+
+    if (bytes.len == 0) {
+        const block_sha256 = try allocator.alloc([]const u8, 0);
+        return .{ .sha256 = sha256, .block_size = 0, .block_sha256 = block_sha256 };
+    }
+
+    const count = blockHashCount(bytes.len, block_size);
+    const block_sha256 = try allocator.alloc([]const u8, count);
+    for (block_sha256) |*hash| hash.* = &.{};
+    errdefer freeBlockSha256List(allocator, block_sha256);
+
+    for (block_sha256, 0..) |*slot, idx| {
+        const start = idx * block_size;
+        const end = @min(start + block_size, bytes.len);
+        slot.* = try hashHexFromDigestAlloc(allocator, hashBytes(bytes[start..end]));
+    }
+
+    return .{ .sha256 = sha256, .block_size = FILE_BLOCK_BYTES, .block_sha256 = block_sha256 };
+}
+
 fn freeBlockSha256List(allocator: std.mem.Allocator, hashes: [][]const u8) void {
     for (hashes) |hash| allocator.free(hash);
     allocator.free(hashes);
@@ -1013,16 +1130,15 @@ fn validateBlockSha256List(block_size_value: u64, block_sha256: []const []const 
 fn makeFileMeta(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!FileMeta {
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
-    const sha256 = try hashHexAlloc(allocator, bytes);
-    errdefer allocator.free(sha256);
-    const block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
-    errdefer freeBlockSha256List(allocator, block_sha256);
+    const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer allocator.free(hashes.sha256);
+    errdefer freeBlockSha256List(allocator, hashes.block_sha256);
     return .{
         .path = owned_path,
-        .sha256 = sha256,
+        .sha256 = hashes.sha256,
         .bytes = bytes.len,
-        .block_size = artifactBlockSize(bytes),
-        .block_sha256 = block_sha256,
+        .block_size = hashes.block_size,
+        .block_sha256 = hashes.block_sha256,
     };
 }
 
@@ -1030,6 +1146,26 @@ fn freeFileMeta(allocator: std.mem.Allocator, file: FileMeta) void {
     allocator.free(file.path);
     allocator.free(file.sha256);
     freeBlockSha256List(allocator, file.block_sha256);
+}
+
+fn emptyStagedColumnFile() StagedColumnFile {
+    return .{ .staged_path = &.{}, .sha256 = &.{}, .bytes = 0, .block_size = 0, .block_sha256 = &.{} };
+}
+
+fn initStagedColumnFiles(files: []StagedColumnFile) void {
+    for (files) |*file| file.* = emptyStagedColumnFile();
+}
+
+fn freeStagedColumnFile(allocator: std.mem.Allocator, file: StagedColumnFile, delete_path: bool) void {
+    if (delete_path and file.staged_path.len != 0) deleteIfExists(file.staged_path) catch {};
+    allocator.free(file.staged_path);
+    allocator.free(file.sha256);
+    freeBlockSha256List(allocator, file.block_sha256);
+}
+
+fn freeStagedColumnFiles(allocator: std.mem.Allocator, files: []StagedColumnFile, delete_paths: bool) void {
+    for (files) |file| freeStagedColumnFile(allocator, file, delete_paths);
+    allocator.free(files);
 }
 
 fn duplicateFileMeta(allocator: std.mem.Allocator, file: FileMeta) TableError!FileMeta {
@@ -1103,8 +1239,74 @@ fn writeSegmentFiles(
         defer allocator.free(basename);
         const path = try activePath(allocator, root_dir, basename);
         defer allocator.free(path);
-        try writeFile(allocator, path, buffer.items);
+        try writeFileWithParentSync(allocator, path, buffer.items, false);
         files[idx] = try makeFileMeta(allocator, basename, buffer.items);
+    }
+    const dir_sync_path = try activePath(allocator, root_dir, table_name);
+    defer allocator.free(dir_sync_path);
+    syncParentDirBestEffort(dir_sync_path);
+
+    return files;
+}
+
+fn writeSegmentRawFiles(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    seg_id: u64,
+    columns: []const RawColumnBytes,
+) TableError![]FileMeta {
+    const files = try allocator.alloc(FileMeta, columns.len);
+    initFileMetas(files);
+    errdefer {
+        for (files) |file| freeFileMeta(allocator, file);
+        allocator.free(files);
+    }
+
+    for (columns, 0..) |column, idx| {
+        const basename = try segmentFileName(allocator, table_name, seg_id, idx);
+        defer allocator.free(basename);
+        const path = try activePath(allocator, root_dir, basename);
+        defer allocator.free(path);
+        try writeFileWithParentSync(allocator, path, column.bytes, false);
+        files[idx] = try makeFileMeta(allocator, basename, column.bytes);
+    }
+    const dir_sync_path = try activePath(allocator, root_dir, table_name);
+    defer allocator.free(dir_sync_path);
+    syncParentDirBestEffort(dir_sync_path);
+
+    return files;
+}
+
+fn stageRawColumnFiles(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    columns: []const RawColumnBytes,
+) TableError![]StagedColumnFile {
+    const batch_id = temp_write_counter.fetchAdd(1, .monotonic);
+    const files = try allocator.alloc(StagedColumnFile, columns.len);
+    initStagedColumnFiles(files);
+    errdefer freeStagedColumnFiles(allocator, files, true);
+
+    for (columns, 0..) |column, idx| {
+        const staged_name = try allocPrintPath(allocator, "{s}.stage.{d}.{d}.dat", .{ table_name, batch_id, idx });
+        defer allocator.free(staged_name);
+        const staged_path = try activePath(allocator, root_dir, staged_name);
+        errdefer allocator.free(staged_path);
+        try writeFileWithParentSync(allocator, staged_path, column.bytes, false);
+
+        const hashes = try makeFileHashesSinglePass(allocator, column.bytes, FILE_BLOCK_BYTES);
+        errdefer allocator.free(hashes.sha256);
+        errdefer freeBlockSha256List(allocator, hashes.block_sha256);
+
+        files[idx] = .{
+            .staged_path = staged_path,
+            .sha256 = @constCast(hashes.sha256),
+            .bytes = column.bytes.len,
+            .block_size = hashes.block_size,
+            .block_sha256 = hashes.block_sha256,
+        };
     }
 
     return files;
@@ -1331,23 +1533,103 @@ fn appendSegmentToMeta(
     row_count: u64,
 ) TableError!void {
     const old_segments = meta.segments;
-    const preserved_segments = try duplicateSegmentMetas(allocator, old_segments);
-    errdefer freeSegmentMetas(allocator, preserved_segments);
-
     const files = try writeSegmentFiles(allocator, root_dir, table_name, meta.next_segment_id, buffers);
     errdefer freeFileMetas(allocator, files);
 
-    const new_segments = try allocator.alloc(SegmentMeta, preserved_segments.len + 1);
+    const new_segments = try allocator.alloc(SegmentMeta, old_segments.len + 1);
     errdefer allocator.free(new_segments);
-    @memcpy(new_segments[0..preserved_segments.len], preserved_segments);
-    new_segments[preserved_segments.len] = .{
+    @memcpy(new_segments[0..old_segments.len], old_segments);
+    new_segments[old_segments.len] = .{
         .id = meta.next_segment_id,
         .rows = row_count,
         .files = files,
     };
 
-    freeSegmentMetas(allocator, old_segments);
-    allocator.free(preserved_segments);
+    allocator.free(old_segments);
+    meta.segments = new_segments;
+    meta.row_count = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
+    meta.epoch += 1;
+    meta.next_segment_id += 1;
+}
+
+fn appendRawSegmentToMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    columns: []const RawColumnBytes,
+    row_count: u64,
+) TableError!void {
+    const old_segments = meta.segments;
+    const files = try writeSegmentRawFiles(allocator, root_dir, table_name, meta.next_segment_id, columns);
+    errdefer freeFileMetas(allocator, files);
+
+    const new_segments = try allocator.alloc(SegmentMeta, old_segments.len + 1);
+    errdefer allocator.free(new_segments);
+    @memcpy(new_segments[0..old_segments.len], old_segments);
+    new_segments[old_segments.len] = .{
+        .id = meta.next_segment_id,
+        .rows = row_count,
+        .files = files,
+    };
+
+    allocator.free(old_segments);
+    meta.segments = new_segments;
+    meta.row_count = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
+    meta.epoch += 1;
+    meta.next_segment_id += 1;
+}
+
+fn publishStagedSegmentToMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    staged_files: []StagedColumnFile,
+    row_count: u64,
+) TableError!void {
+    const old_segments = meta.segments;
+    const files = try allocator.alloc(FileMeta, staged_files.len);
+    initFileMetas(files);
+    errdefer freeFileMetas(allocator, files);
+
+    for (staged_files, 0..) |*staged_file, idx| {
+        const basename = try segmentFileName(allocator, table_name, meta.next_segment_id, idx);
+        errdefer allocator.free(basename);
+        const final_path = try activePath(allocator, root_dir, basename);
+        defer allocator.free(final_path);
+        std.fs.cwd().rename(staged_file.staged_path, final_path) catch |err| return mapFileError(err);
+
+        allocator.free(staged_file.staged_path);
+        staged_file.staged_path = &.{};
+
+        files[idx] = .{
+            .path = basename,
+            .sha256 = staged_file.sha256,
+            .bytes = staged_file.bytes,
+            .block_size = staged_file.block_size,
+            .block_sha256 = staged_file.block_sha256,
+        };
+        staged_file.sha256 = &.{};
+        staged_file.bytes = 0;
+        staged_file.block_size = 0;
+        staged_file.block_sha256 = &.{};
+    }
+
+    const dir_sync_path = try activePath(allocator, root_dir, table_name);
+    defer allocator.free(dir_sync_path);
+    syncParentDirBestEffort(dir_sync_path);
+
+    const new_segments = try allocator.alloc(SegmentMeta, old_segments.len + 1);
+    errdefer allocator.free(new_segments);
+    @memcpy(new_segments[0..old_segments.len], old_segments);
+    new_segments[old_segments.len] = .{
+        .id = meta.next_segment_id,
+        .rows = row_count,
+        .files = files,
+    };
+
+    allocator.free(old_segments);
     meta.segments = new_segments;
     meta.row_count = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
     meta.epoch += 1;
@@ -1413,6 +1695,29 @@ fn loadCurrentMeta(
     if (!std.mem.eql(u8, meta.schema_hash, schema_hex)) return TableError.InvalidFormat;
     try verifySchemaAgainstMeta(schema_obj, meta);
     return meta;
+}
+
+fn loadWritableMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError!TableMeta {
+    return loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
+        TableError.NotFound => {
+            var schema_obj = try loadSchema(allocator, root_dir, table_name);
+            defer schema_obj.deinit();
+
+            const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
+            defer allocator.free(schema_path);
+            const schema_source = try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
+            defer allocator.free(schema_source);
+            const schema_hash = try hashHexAlloc(allocator, schema_source);
+            defer allocator.free(schema_hash);
+
+            return try buildInitialMeta(allocator, table_name, schema_path, schema_hash, schema_obj);
+        },
+        else => return err,
+    };
 }
 
 fn verifySchemaAgainstMeta(schema_obj: schema.Schema, meta: TableMeta) TableError!void {
@@ -2496,7 +2801,7 @@ fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     errdefer allocator.free(versioned_name);
     const versioned_path = try activePath(allocator, root_dir, versioned_name);
     defer allocator.free(versioned_path);
-    try writeFile(allocator, versioned_path, json);
+    try writeFileWithParentSync(allocator, versioned_path, json, false);
 
     const meta_hash = try hashHexAlloc(allocator, json);
     errdefer allocator.free(meta_hash);
@@ -2522,11 +2827,8 @@ fn publishWrittenMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     defer allocator.free(manifest_json);
     const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
     defer allocator.free(manifest_path);
-    try writeFile(allocator, manifest_path, manifest_json);
-
-    const compat_path = try tableMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(compat_path);
-    try writeFile(allocator, compat_path, written.json);
+    try writeFileWithParentSync(allocator, manifest_path, manifest_json, false);
+    syncParentDirBestEffort(manifest_path);
 }
 
 fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
@@ -2742,17 +3044,7 @@ fn ingestRawColumnsUnlocked(
     row_count: u64,
     columns: []const RawColumnBytes,
 ) TableError!TableInfo {
-    var schema_obj = try loadSchema(allocator, root_dir, table_name);
-    defer schema_obj.deinit();
-
-    const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(schema_path);
-    const schema_source = try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
-    defer allocator.free(schema_source);
-    const schema_hash = try hashHexAlloc(allocator, schema_source);
-    defer allocator.free(schema_hash);
-
-    var meta = try loadCurrentMeta(allocator, root_dir, table_name, schema_obj, schema_path, schema_hash);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
 
     if (meta.locked) return TableError.Locked;
@@ -2760,25 +3052,14 @@ fn ingestRawColumnsUnlocked(
     const total_rows = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
     if (total_rows > meta.max_rows) return TableError.CursorOverflow;
 
-    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
-    errdefer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
-
     for (columns, 0..) |column, idx| {
         const expected_len = std.math.mul(u64, row_count, meta.columns[idx].stride) catch return TableError.CursorOverflow;
         if (column.bytes.len != expected_len) return TableError.InvalidFormat;
-        try buffers[idx].appendSlice(column.bytes);
     }
 
-    try appendSegmentToMeta(allocator, root_dir, table_name, &meta, buffers, row_count);
+    try appendRawSegmentToMeta(allocator, root_dir, table_name, &meta, columns, row_count);
     try rebuildIndexes(allocator, root_dir, &meta);
     try writeMeta(allocator, root_dir, table_name, meta);
-
-    for (buffers) |*buf| buf.deinit();
-    allocator.free(buffers);
 
     return tableInfo(meta);
 }
@@ -2790,9 +3071,116 @@ pub fn ingestRawColumns(
     row_count: u64,
     columns: []const RawColumnBytes,
 ) TableError!TableInfo {
+    const staged_files = try stageRawColumnFiles(allocator, root_dir, table_name, columns);
+    defer freeStagedColumnFiles(allocator, staged_files, true);
+
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
-    return try ingestRawColumnsUnlocked(allocator, root_dir, table_name, row_count, columns);
+
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+
+    if (meta.locked) return TableError.Locked;
+    if (columns.len != meta.columns.len) return TableError.InvalidFormat;
+    const total_rows = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
+    if (total_rows > meta.max_rows) return TableError.CursorOverflow;
+
+    for (columns, 0..) |column, idx| {
+        const expected_len = std.math.mul(u64, row_count, meta.columns[idx].stride) catch return TableError.CursorOverflow;
+        if (column.bytes.len != expected_len) return TableError.InvalidFormat;
+    }
+
+    const previous_row_count = meta.row_count;
+    try publishStagedSegmentToMeta(allocator, root_dir, table_name, &meta, staged_files, row_count);
+    const incremental_ok = try tryAppendIndexesForSegment(allocator, root_dir, &meta, meta.segments.len - 1, previous_row_count);
+    if (!incremental_ok) try rebuildIndexes(allocator, root_dir, &meta);
+    try writeMeta(allocator, root_dir, table_name, meta);
+    return tableInfo(meta);
+}
+
+pub fn beginColumnIngestSession(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError!*ColumnIngestSession {
+    const root_copy = try allocator.dupe(u8, root_dir);
+    errdefer allocator.free(root_copy);
+    const table_copy = try allocator.dupe(u8, table_name);
+    errdefer allocator.free(table_copy);
+
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+
+    const column_strides = try allocator.alloc(u32, meta.columns.len);
+    errdefer allocator.free(column_strides);
+    for (meta.columns, 0..) |column, idx| column_strides[idx] = column.stride;
+
+    const session = try allocator.create(ColumnIngestSession);
+    errdefer allocator.destroy(session);
+    session.* = .{
+        .root_dir = root_copy,
+        .table_name = table_copy,
+        .columns_len = meta.columns.len,
+        .column_strides = column_strides,
+        .batches = std.ArrayList(ColumnBatch).init(allocator),
+    };
+    return session;
+}
+
+pub fn destroyColumnIngestSession(allocator: std.mem.Allocator, session: *ColumnIngestSession) void {
+    session.deinit(allocator);
+    allocator.destroy(session);
+}
+
+pub fn columnIngestSessionAddRawColumns(
+    allocator: std.mem.Allocator,
+    session: *ColumnIngestSession,
+    row_count: u64,
+    columns: []const RawColumnBytes,
+) TableError!void {
+    if (columns.len != session.columns_len) return TableError.InvalidFormat;
+    for (columns, 0..) |column, idx| {
+        const expected_len = std.math.mul(u64, row_count, session.column_strides[idx]) catch return TableError.CursorOverflow;
+        if (column.bytes.len != expected_len) return TableError.InvalidFormat;
+    }
+    const files = try stageRawColumnFiles(allocator, session.root_dir, session.table_name, columns);
+    errdefer freeStagedColumnFiles(allocator, files, true);
+    session.batches.append(.{ .row_count = row_count, .files = files }) catch return TableError.OutOfMemory;
+}
+
+pub fn commitColumnIngestSession(
+    allocator: std.mem.Allocator,
+    session: *ColumnIngestSession,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, session.root_dir, session.table_name);
+    defer write_lock.release();
+
+    var meta = try loadWritableMeta(allocator, session.root_dir, session.table_name);
+    defer meta.deinit(allocator);
+    if (meta.locked) return TableError.Locked;
+
+    var total_added_rows: u64 = 0;
+    for (session.batches.items) |batch| {
+        const next_total = std.math.add(u64, total_added_rows, batch.row_count) catch return TableError.CursorOverflow;
+        total_added_rows = next_total;
+    }
+    const total_rows = std.math.add(u64, meta.row_count, total_added_rows) catch return TableError.CursorOverflow;
+    if (total_rows > meta.max_rows) return TableError.CursorOverflow;
+
+    var incremental_ok = true;
+    for (session.batches.items) |*batch| {
+        const previous_row_count = meta.row_count;
+        try publishStagedSegmentToMeta(allocator, session.root_dir, session.table_name, &meta, batch.files, batch.row_count);
+        freeStagedColumnFiles(allocator, batch.files, false);
+        batch.files = &.{};
+        if (incremental_ok) incremental_ok = try tryAppendIndexesForSegment(allocator, session.root_dir, &meta, meta.segments.len - 1, previous_row_count);
+    }
+    session.batches.clearRetainingCapacity();
+
+    if (!incremental_ok) try rebuildIndexes(allocator, session.root_dir, &meta);
+    try writeMeta(allocator, session.root_dir, session.table_name, meta);
+    return tableInfo(meta);
 }
 
 pub fn insertRawRow(
@@ -2948,16 +3336,22 @@ fn splitRawRowColumns(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: 
     return columns;
 }
 
-fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]std.ArrayList(u8) {
-    const columns = try splitRawRowColumns(allocator, meta, row_bytes);
-    defer allocator.free(columns);
-
-    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+fn allocateColumnBuffers(allocator: std.mem.Allocator, column_count: usize) TableError![]std.ArrayList(u8) {
+    const buffers = try allocator.alloc(std.ArrayList(u8), column_count);
     errdefer allocator.free(buffers);
     for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
     errdefer {
         for (buffers) |*buf| buf.deinit();
     }
+    return buffers;
+}
+
+fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]std.ArrayList(u8) {
+    const columns = try splitRawRowColumns(allocator, meta, row_bytes);
+    defer allocator.free(columns);
+
+    const buffers = try allocateColumnBuffers(allocator, meta.columns.len);
+    errdefer freeColumnBuffers(allocator, buffers);
 
     for (columns, 0..) |column, idx| {
         try buffers[idx].appendSlice(column.bytes);
@@ -2971,12 +3365,8 @@ fn freeColumnBuffers(allocator: std.mem.Allocator, buffers: []std.ArrayList(u8))
 }
 
 fn buildAllColumnBuffers(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError![]std.ArrayList(u8) {
-    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
-    errdefer allocator.free(buffers);
-    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
-    errdefer {
-        for (buffers) |*buf| buf.deinit();
-    }
+    const buffers = try allocateColumnBuffers(allocator, meta.columns.len);
+    errdefer freeColumnBuffers(allocator, buffers);
 
     for (meta.columns, 0..) |column, col_idx| {
         var copied_rows: u64 = 0;
@@ -3148,6 +3538,14 @@ fn hasUniqueBlobEqIndex(meta: TableMeta, column_index: usize, store_name: []cons
 }
 
 fn validateTransactionBuffers(tx: *const WriteTransaction) TableError!void {
+    if (tx.buffers.len == 0) {
+        if (tx.pending_append_buffers.len != tx.meta.columns.len) return TableError.InvalidFormat;
+        for (tx.meta.columns, 0..) |column, col_idx| {
+            const expected_len = try expectedColumnBytes(tx.pending_append_row_count, column.stride);
+            if (tx.pending_append_buffers[col_idx].items.len != expected_len) return TableError.VerifyFailed;
+        }
+        return;
+    }
     if (tx.buffers.len != tx.meta.columns.len) return TableError.InvalidFormat;
     for (tx.meta.columns, 0..) |column, col_idx| {
         const expected_len = try expectedColumnBytes(tx.meta.row_count, column.stride);
@@ -3155,7 +3553,24 @@ fn validateTransactionBuffers(tx: *const WriteTransaction) TableError!void {
     }
 }
 
+fn materializeTransactionBuffers(tx: *WriteTransaction) TableError!void {
+    if (tx.buffers.len != 0) return;
+    var base_meta = tx.meta;
+    base_meta.row_count = tx.base_row_count;
+    tx.buffers = try buildAllColumnBuffers(tx.allocator, tx.root_dir, base_meta);
+    errdefer {
+        freeColumnBuffers(tx.allocator, tx.buffers);
+        tx.buffers = &.{};
+    }
+    for (tx.meta.columns, 0..) |_, col_idx| {
+        try tx.buffers[col_idx].appendSlice(tx.pending_append_buffers[col_idx].items);
+    }
+    freeColumnBuffers(tx.allocator, tx.pending_append_buffers);
+    tx.pending_append_buffers = &.{};
+}
+
 fn txFindU64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u64) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureU64Column(tx.meta, column_index);
     if (!hasUniqueU64Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3171,6 +3586,7 @@ fn txFindU64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u
 }
 
 fn txFindI64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i64) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureI64Column(tx.meta, column_index);
     if (!hasUniqueI64Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3186,6 +3602,7 @@ fn txFindI64KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i
 }
 
 fn txFindU32KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u32) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureU32Column(tx.meta, column_index);
     if (!hasUniqueU32Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3201,6 +3618,7 @@ fn txFindU32KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u
 }
 
 fn txFindI32KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i32) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureI32Column(tx.meta, column_index);
     if (!hasUniqueI32Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3216,6 +3634,7 @@ fn txFindI32KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i
 }
 
 fn txFindU8KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u8) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureU8Column(tx.meta, column_index);
     if (!hasUniqueU8Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3230,6 +3649,7 @@ fn txFindU8KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u8
 }
 
 fn txFindI8KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i8) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureI8Column(tx.meta, column_index);
     if (!hasUniqueI8Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3244,6 +3664,7 @@ fn txFindI8KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i8
 }
 
 fn txFindU16KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u16) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureU16Column(tx.meta, column_index);
     if (!hasUniqueU16Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3259,6 +3680,7 @@ fn txFindU16KeyRow(tx: *const WriteTransaction, column_index: usize, expected: u
 }
 
 fn txFindI16KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i16) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureI16Column(tx.meta, column_index);
     if (!hasUniqueI16Index(tx.meta, column_index)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3274,6 +3696,7 @@ fn txFindI16KeyRow(tx: *const WriteTransaction, column_index: usize, expected: i
 }
 
 fn txFindU64PairKeyRow(tx: *const WriteTransaction, column_index: usize, column_index2: usize, key1: u64, key2: u64) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureU64PairColumns(tx.meta, column_index, column_index2);
     if (!hasUniqueU64PairIndex(tx.meta, column_index, column_index2)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3290,6 +3713,7 @@ fn txFindU64PairKeyRow(tx: *const WriteTransaction, column_index: usize, column_
 }
 
 fn txFindU64I64PairKeyRow(tx: *const WriteTransaction, column_index: usize, column_index2: usize, key1: u64, key2: i64) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureU64I64PairColumns(tx.meta, column_index, column_index2);
     if (!hasUniqueU64I64PairIndex(tx.meta, column_index, column_index2)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3306,6 +3730,7 @@ fn txFindU64I64PairKeyRow(tx: *const WriteTransaction, column_index: usize, colu
 }
 
 fn txFindBlobEqKeyRow(allocator: std.mem.Allocator, tx: *const WriteTransaction, column_index: usize, store_name: []const u8, value: []const u8) TableError!U64FindResult {
+    try materializeTransactionBuffers(@constCast(tx));
     try ensureBlobHandleColumn(tx.meta, column_index);
     try validateBlobStoreName(store_name);
     try validateBlobValue(value);
@@ -3335,6 +3760,23 @@ fn txAppendRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!void 
     const next_row_count = std.math.add(u64, tx.meta.row_count, 1) catch return TableError.CursorOverflow;
     if (next_row_count > tx.meta.max_rows) return TableError.CursorOverflow;
 
+    if (tx.buffers.len == 0) {
+        var offset_append: usize = 0;
+        for (tx.meta.columns, 0..) |column, col_idx| {
+            const stride_append: usize = @intCast(column.stride);
+            const next_offset_append = std.math.add(usize, offset_append, stride_append) catch return TableError.CursorOverflow;
+            if (next_offset_append > row_bytes.len) return TableError.InvalidFormat;
+            try tx.pending_append_buffers[col_idx].appendSlice(row_bytes[offset_append..next_offset_append]);
+            offset_append = next_offset_append;
+        }
+        if (offset_append != row_bytes.len) return TableError.InvalidFormat;
+        tx.meta.row_count = next_row_count;
+        tx.pending_append_row_count = std.math.add(u64, tx.pending_append_row_count, 1) catch return TableError.CursorOverflow;
+        tx.dirty = true;
+        tx.rows_dirty = true;
+        return;
+    }
+
     var offset: usize = 0;
     for (tx.meta.columns, 0..) |column, col_idx| {
         const stride: usize = @intCast(column.stride);
@@ -3350,6 +3792,7 @@ fn txAppendRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!void 
 }
 
 fn txReplaceRawRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8) TableError!void {
+    try materializeTransactionBuffers(tx);
     if (row_index >= tx.meta.row_count) return TableError.InvalidFormat;
     if (row_bytes.len != try fixedRowBytes(tx.meta)) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
@@ -3378,6 +3821,7 @@ fn removeBufferRange(buf: *std.ArrayList(u8), start: usize, len: usize) void {
 }
 
 fn txDeleteRow(tx: *WriteTransaction, row_index: u64) TableError!void {
+    try materializeTransactionBuffers(tx);
     if (row_index >= tx.meta.row_count) return TableError.InvalidFormat;
     try validateTransactionBuffers(tx);
 
@@ -3393,6 +3837,7 @@ fn txDeleteRow(tx: *WriteTransaction, row_index: u64) TableError!void {
 }
 
 fn rewriteSegmentsFromTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!void {
+    try materializeTransactionBuffers(tx);
     try validateTransactionBuffers(tx);
 
     const next_row_count = tx.meta.row_count;
@@ -3423,6 +3868,20 @@ fn rewriteSegmentsFromTransaction(allocator: std.mem.Allocator, tx: *WriteTransa
     tx.meta.epoch += 1;
 }
 
+fn appendPendingSegmentsFromTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!bool {
+    if (tx.pending_append_row_count == 0) return true;
+    try validateTransactionBuffers(tx);
+    tx.meta.row_count = tx.base_row_count;
+    const previous_row_count = tx.base_row_count;
+    try appendSegmentToMeta(allocator, tx.root_dir, tx.table_name, &tx.meta, tx.pending_append_buffers, tx.pending_append_row_count);
+    const incremental_ok = try tryAppendIndexesForSegment(allocator, tx.root_dir, &tx.meta, tx.meta.segments.len - 1, previous_row_count);
+    freeColumnBuffers(allocator, tx.pending_append_buffers);
+    tx.pending_append_buffers = try allocateColumnBuffers(allocator, tx.meta.columns.len);
+    tx.base_row_count = tx.meta.row_count;
+    tx.pending_append_row_count = 0;
+    return incremental_ok;
+}
+
 pub fn beginWriteTransaction(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -3442,23 +3901,26 @@ pub fn beginWriteTransaction(
     errdefer if (!meta_transferred) meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
 
-    const buffers = try buildAllColumnBuffers(allocator, root_dir, meta);
-    var buffers_transferred = false;
-    errdefer if (!buffers_transferred) freeColumnBuffers(allocator, buffers);
+    const pending_append_buffers = try allocateColumnBuffers(allocator, meta.columns.len);
+    var pending_append_transferred = false;
+    errdefer if (!pending_append_transferred) freeColumnBuffers(allocator, pending_append_buffers);
 
     const tx = try allocator.create(WriteTransaction);
     errdefer allocator.destroy(tx);
     tx.* = .{
+        .allocator = allocator,
         .root_dir = root_copy,
         .table_name = table_copy,
         .write_lock = write_lock,
         .meta = meta,
-        .buffers = buffers,
+        .buffers = &.{},
+        .pending_append_buffers = pending_append_buffers,
+        .base_row_count = meta.row_count,
         .dirty = false,
     };
     write_lock_transferred = true;
     meta_transferred = true;
-    buffers_transferred = true;
+    pending_append_transferred = true;
     return tx;
 }
 
@@ -3872,12 +4334,27 @@ pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransactio
     var pending_marker_live = true;
     errdefer if (pending_marker_live) deleteTxPendingMarkerIfExists(allocator, tx.root_dir, tx.table_name, target_epoch) catch {};
 
+    var rebuilt_indexes = false;
     if (tx.rows_dirty) {
-        try rewriteSegmentsFromTransaction(allocator, tx);
+        if (tx.buffers.len == 0) {
+            const incremental_ok = try appendPendingSegmentsFromTransaction(allocator, tx);
+            if (!incremental_ok) {
+                try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
+                rebuilt_indexes = true;
+            }
+        } else {
+            try rewriteSegmentsFromTransaction(allocator, tx);
+            try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
+            rebuilt_indexes = true;
+        }
     } else {
         tx.meta.epoch = target_epoch;
+        try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
+        rebuilt_indexes = true;
     }
-    try rebuildIndexes(allocator, tx.root_dir, &tx.meta);
+    if (!rebuilt_indexes) {
+        // append-only incremental path already refreshed index artifacts for the new epoch
+    }
     var written = try writeVersionedMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
     defer written.deinit(allocator);
     try writeTxCommitMarker(allocator, tx.root_dir, tx.table_name, tx.meta, written);
@@ -5171,6 +5648,18 @@ const BlobEqIndexEntry = struct {
     blob_id: u64,
 };
 
+const CachedColumnBytes = struct {
+    loaded: bool = false,
+    bytes: []u8 = &.{},
+};
+
+const CachedBlobStore = struct {
+    loaded: bool = false,
+    blob_idx: usize = 0,
+    bytes: []u8 = &.{},
+    refs: []BlobValueRef = &.{},
+};
+
 fn indexEntryLessThan(_: void, lhs: IndexEntry, rhs: IndexEntry) bool {
     return lhs.key < rhs.key or (lhs.key == rhs.key and lhs.row < rhs.row);
 }
@@ -5376,6 +5865,55 @@ fn buildBlobValueRefs(allocator: std.mem.Allocator, bytes: []const u8) TableErro
         offset += len;
     }
     return refs;
+}
+
+fn getCachedSegmentColumnBytes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    segment: SegmentMeta,
+    column_index: usize,
+    expected_stride: u32,
+    cache: []CachedColumnBytes,
+) TableError![]const u8 {
+    if (column_index >= segment.files.len or column_index >= cache.len) return TableError.InvalidFormat;
+    if (!cache[column_index].loaded) {
+        const file_meta = segment.files[column_index];
+        const path = try activePath(allocator, root_dir, file_meta.path);
+        defer allocator.free(path);
+        const bytes = try readFileAlloc(allocator, path, 1 << 30);
+        errdefer allocator.free(bytes);
+        const expected_len = try expectedColumnBytes(segment.rows, expected_stride);
+        if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        cache[column_index] = .{ .loaded = true, .bytes = bytes };
+    }
+    return cache[column_index].bytes;
+}
+
+fn getCachedBlobStore(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    store_name: []const u8,
+    cache: *CachedBlobStore,
+) TableError!*const CachedBlobStore {
+    const blob_idx = findBlobStoreMetaIndex(meta, store_name) orelse return TableError.InvalidFormat;
+    if (!cache.loaded or cache.blob_idx != blob_idx) {
+        if (cache.loaded) {
+            allocator.free(cache.refs);
+            allocator.free(cache.bytes);
+        }
+        const bytes = try readBlobStoreBytes(allocator, root_dir, meta.blobs[blob_idx]);
+        errdefer allocator.free(bytes);
+        const refs = try buildBlobValueRefs(allocator, bytes);
+        errdefer allocator.free(refs);
+        cache.* = .{
+            .loaded = true,
+            .blob_idx = blob_idx,
+            .bytes = bytes,
+            .refs = refs,
+        };
+    }
+    return cache;
 }
 
 fn blobRefForId(refs: []const BlobValueRef, id: u64) ?BlobValueRef {
@@ -6150,6 +6688,679 @@ fn buildBlobContainsIndexBytes(
     return out;
 }
 
+fn mergeIndexEntryBytes(
+    allocator: std.mem.Allocator,
+    existing_bytes: []const u8,
+    appended_bytes: []const u8,
+    total_row_count: u64,
+    unique: bool,
+) TableError![]u8 {
+    if (existing_bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+    if (appended_bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+
+    const existing_count = existing_bytes.len / INDEX_RECORD_BYTES;
+    const appended_count = appended_bytes.len / INDEX_RECORD_BYTES;
+    const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, total_count * INDEX_RECORD_BYTES);
+    errdefer allocator.free(out);
+
+    var existing_idx: usize = 0;
+    var appended_idx: usize = 0;
+    var out_idx: usize = 0;
+    while (existing_idx < existing_count or appended_idx < appended_count) : (out_idx += 1) {
+        const use_existing = if (existing_idx >= existing_count)
+            false
+        else if (appended_idx >= appended_count)
+            true
+        else blk: {
+            const existing = IndexEntry{ .key = readIndexKey(existing_bytes, existing_idx), .row = readIndexRow(existing_bytes, existing_idx) };
+            const appended = IndexEntry{ .key = readIndexKey(appended_bytes, appended_idx), .row = readIndexRow(appended_bytes, appended_idx) };
+            break :blk indexEntryLessThan({}, existing, appended);
+        };
+
+        const chosen = if (use_existing) blk: {
+            const entry = IndexEntry{ .key = readIndexKey(existing_bytes, existing_idx), .row = readIndexRow(existing_bytes, existing_idx) };
+            existing_idx += 1;
+            break :blk entry;
+        } else blk: {
+            const entry = IndexEntry{ .key = readIndexKey(appended_bytes, appended_idx), .row = readIndexRow(appended_bytes, appended_idx) };
+            appended_idx += 1;
+            break :blk entry;
+        };
+
+        if (out_idx > 0) {
+            const prev = IndexEntry{ .key = readIndexKey(out, out_idx - 1), .row = readIndexRow(out, out_idx - 1) };
+            if (prev.key > chosen.key) return TableError.VerifyFailed;
+            if (prev.key == chosen.key) {
+                if (unique) return TableError.ConstraintViolation;
+                if (prev.row > chosen.row) return TableError.VerifyFailed;
+            }
+        }
+        writeIndexEntry(out, out_idx, chosen);
+    }
+
+    if (out_idx != total_count) return TableError.VerifyFailed;
+    try validateIndexBytesShape(out, total_row_count, unique);
+    return out;
+}
+
+fn mergeVariableIndexEntryBytes(
+    allocator: std.mem.Allocator,
+    existing_bytes: []const u8,
+    appended_bytes: []const u8,
+    total_row_count: u64,
+) TableError![]u8 {
+    if (existing_bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+    if (appended_bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+
+    const existing_count = existing_bytes.len / INDEX_RECORD_BYTES;
+    const appended_count = appended_bytes.len / INDEX_RECORD_BYTES;
+    const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, total_count * INDEX_RECORD_BYTES);
+    errdefer allocator.free(out);
+
+    var existing_idx: usize = 0;
+    var appended_idx: usize = 0;
+    var out_idx: usize = 0;
+    var dedup_count: usize = 0;
+    while (existing_idx < existing_count or appended_idx < appended_count) : (out_idx += 1) {
+        const use_existing = if (existing_idx >= existing_count)
+            false
+        else if (appended_idx >= appended_count)
+            true
+        else blk: {
+            const existing = IndexEntry{ .key = readIndexKey(existing_bytes, existing_idx), .row = readIndexRow(existing_bytes, existing_idx) };
+            const appended = IndexEntry{ .key = readIndexKey(appended_bytes, appended_idx), .row = readIndexRow(appended_bytes, appended_idx) };
+            break :blk indexEntryLessThan({}, existing, appended);
+        };
+
+        const chosen = if (use_existing) blk: {
+            const entry = IndexEntry{ .key = readIndexKey(existing_bytes, existing_idx), .row = readIndexRow(existing_bytes, existing_idx) };
+            existing_idx += 1;
+            break :blk entry;
+        } else blk: {
+            const entry = IndexEntry{ .key = readIndexKey(appended_bytes, appended_idx), .row = readIndexRow(appended_bytes, appended_idx) };
+            appended_idx += 1;
+            break :blk entry;
+        };
+
+        if (dedup_count == 0) {
+            writeIndexEntry(out, dedup_count, chosen);
+            dedup_count = 1;
+            continue;
+        }
+
+        const prev = IndexEntry{ .key = readIndexKey(out, dedup_count - 1), .row = readIndexRow(out, dedup_count - 1) };
+        if (prev.key > chosen.key or (prev.key == chosen.key and prev.row > chosen.row)) return TableError.VerifyFailed;
+        if (prev.key == chosen.key and prev.row == chosen.row) continue;
+        writeIndexEntry(out, dedup_count, chosen);
+        dedup_count += 1;
+    }
+
+    const final_len = std.math.mul(usize, dedup_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    const trimmed = try allocator.alloc(u8, final_len);
+    errdefer allocator.free(trimmed);
+    if (final_len != 0) @memcpy(trimmed, out[0..final_len]);
+    allocator.free(out);
+    try validateVariableIndexBytesShape(trimmed, total_row_count);
+    return trimmed;
+}
+
+fn mergeU64PairIndexBytes(
+    allocator: std.mem.Allocator,
+    existing_bytes: []const u8,
+    appended_bytes: []const u8,
+    total_row_count: u64,
+    unique: bool,
+) TableError![]u8 {
+    if (existing_bytes.len % U64_PAIR_INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+    if (appended_bytes.len % U64_PAIR_INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+
+    const existing_count = existing_bytes.len / U64_PAIR_INDEX_RECORD_BYTES;
+    const appended_count = appended_bytes.len / U64_PAIR_INDEX_RECORD_BYTES;
+    const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, total_count * U64_PAIR_INDEX_RECORD_BYTES);
+    errdefer allocator.free(out);
+
+    var existing_idx: usize = 0;
+    var appended_idx: usize = 0;
+    var out_idx: usize = 0;
+    while (existing_idx < existing_count or appended_idx < appended_count) : (out_idx += 1) {
+        const use_existing = if (existing_idx >= existing_count)
+            false
+        else if (appended_idx >= appended_count)
+            true
+        else blk: {
+            const existing = U64PairIndexEntry{
+                .key1 = readU64PairIndexKey1(existing_bytes, existing_idx),
+                .key2 = readU64PairIndexKey2(existing_bytes, existing_idx),
+                .row = readU64PairIndexRow(existing_bytes, existing_idx),
+            };
+            const appended = U64PairIndexEntry{
+                .key1 = readU64PairIndexKey1(appended_bytes, appended_idx),
+                .key2 = readU64PairIndexKey2(appended_bytes, appended_idx),
+                .row = readU64PairIndexRow(appended_bytes, appended_idx),
+            };
+            break :blk u64PairIndexEntryLessThan({}, existing, appended);
+        };
+
+        const chosen = if (use_existing) blk: {
+            const entry = U64PairIndexEntry{
+                .key1 = readU64PairIndexKey1(existing_bytes, existing_idx),
+                .key2 = readU64PairIndexKey2(existing_bytes, existing_idx),
+                .row = readU64PairIndexRow(existing_bytes, existing_idx),
+            };
+            existing_idx += 1;
+            break :blk entry;
+        } else blk: {
+            const entry = U64PairIndexEntry{
+                .key1 = readU64PairIndexKey1(appended_bytes, appended_idx),
+                .key2 = readU64PairIndexKey2(appended_bytes, appended_idx),
+                .row = readU64PairIndexRow(appended_bytes, appended_idx),
+            };
+            appended_idx += 1;
+            break :blk entry;
+        };
+
+        if (out_idx > 0) {
+            const prev = U64PairIndexEntry{
+                .key1 = readU64PairIndexKey1(out, out_idx - 1),
+                .key2 = readU64PairIndexKey2(out, out_idx - 1),
+                .row = readU64PairIndexRow(out, out_idx - 1),
+            };
+            if (prev.key1 > chosen.key1) return TableError.VerifyFailed;
+            if (prev.key1 == chosen.key1) {
+                if (prev.key2 > chosen.key2) return TableError.VerifyFailed;
+                if (prev.key2 == chosen.key2) {
+                    if (unique) return TableError.ConstraintViolation;
+                    if (prev.row > chosen.row) return TableError.VerifyFailed;
+                }
+            }
+        }
+        writeU64PairIndexEntry(out, out_idx, chosen);
+    }
+
+    if (out_idx != total_count) return TableError.VerifyFailed;
+    try validateU64PairIndexBytesShape(out, total_row_count, unique);
+    return out;
+}
+
+fn buildSingleIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    kind: SingleIndexKind,
+    unique: bool,
+    column_cache: []CachedColumnBytes,
+) TableError![]u8 {
+    try ensureSingleIndexColumn(meta, column_index, kind);
+    const row_count = segment.rows;
+    if (row_count > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const entries = try allocator.alloc(IndexEntry, @intCast(row_count));
+    defer allocator.free(entries);
+
+    const stride = singleIndexKindStride(kind);
+    const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, stride, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * @as(u64, stride));
+        entries[@intCast(i)] = .{ .key = try readSingleIndexKey(kind, bytes, byte_offset), .row = row_base + i };
+    }
+
+    std.sort.block(IndexEntry, entries, {}, indexEntryLessThan);
+    if (unique and entries.len > 1) {
+        for (entries[1..], 1..) |entry, idx| {
+            if (entry.key == entries[idx - 1].key) return TableError.ConstraintViolation;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedIndexBytes(row_count));
+    for (entries, 0..) |entry, idx| writeIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn buildU64PairIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    column_index2: usize,
+    unique: bool,
+    column_cache: []CachedColumnBytes,
+) TableError![]u8 {
+    try ensureU64PairColumns(meta, column_index, column_index2);
+    if (segment.rows > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const entries = try allocator.alloc(U64PairIndexEntry, @intCast(segment.rows));
+    defer allocator.free(entries);
+
+    const bytes1 = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, column_cache);
+    const bytes2 = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * 8);
+        entries[@intCast(i)] = .{
+            .key1 = readU64LE(bytes1, byte_offset),
+            .key2 = readU64LE(bytes2, byte_offset),
+            .row = row_base + i,
+        };
+    }
+
+    std.sort.block(U64PairIndexEntry, entries, {}, u64PairIndexEntryLessThan);
+    if (unique and entries.len > 1) {
+        for (entries[1..], 1..) |entry, idx| {
+            const previous = entries[idx - 1];
+            if (entry.key1 == previous.key1 and entry.key2 == previous.key2) return TableError.ConstraintViolation;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedU64PairIndexBytes(segment.rows));
+    for (entries, 0..) |entry, idx| writeU64PairIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn buildU64I64PairIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    column_index2: usize,
+    unique: bool,
+    column_cache: []CachedColumnBytes,
+) TableError![]u8 {
+    try ensureU64I64PairColumns(meta, column_index, column_index2);
+    if (segment.rows > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const entries = try allocator.alloc(U64PairIndexEntry, @intCast(segment.rows));
+    defer allocator.free(entries);
+
+    const bytes1 = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, column_cache);
+    const bytes2 = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * 8);
+        entries[@intCast(i)] = .{
+            .key1 = readU64LE(bytes1, byte_offset),
+            .key2 = sortableI64Key(readI64LE(bytes2, byte_offset)),
+            .row = row_base + i,
+        };
+    }
+
+    std.sort.block(U64PairIndexEntry, entries, {}, u64PairIndexEntryLessThan);
+    if (unique and entries.len > 1) {
+        for (entries[1..], 1..) |entry, idx| {
+            const previous = entries[idx - 1];
+            if (entry.key1 == previous.key1 and entry.key2 == previous.key2) return TableError.ConstraintViolation;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedU64PairIndexBytes(segment.rows));
+    for (entries, 0..) |entry, idx| writeU64PairIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn buildBlobEqIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    store_name: []const u8,
+    unique: bool,
+    column_cache: []CachedColumnBytes,
+    blob_cache: *CachedBlobStore,
+) TableError![]u8 {
+    try ensureBlobHandleColumn(meta, column_index);
+    try validateBlobStoreName(store_name);
+
+    const blob_store = try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache);
+    const blob_refs = blob_store.refs;
+
+    if (segment.rows > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
+    const entries = try allocator.alloc(BlobEqIndexEntry, @intCast(segment.rows));
+    defer allocator.free(entries);
+
+    const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * 8);
+        const blob_id = readU64LE(bytes, byte_offset);
+        const key = if (blobRefForId(blob_refs, blob_id)) |value_ref| value_ref.hash else 0;
+        entries[@intCast(i)] = .{ .key = key, .row = row_base + i, .blob_id = blob_id };
+    }
+
+    std.sort.block(BlobEqIndexEntry, entries, {}, blobEqIndexEntryLessThan);
+    if (unique and entries.len > 1) {
+        var group_start: usize = 0;
+        while (group_start < entries.len) {
+            var group_end = group_start + 1;
+            while (group_end < entries.len and entries[group_end].key == entries[group_start].key) : (group_end += 1) {}
+            var lhs = group_start;
+            while (lhs < group_end) : (lhs += 1) {
+                const value = blobRefForId(blob_refs, entries[lhs].blob_id) orelse continue;
+                var rhs = group_start;
+                while (rhs < lhs) : (rhs += 1) {
+                    const previous_value = blobRefForId(blob_refs, entries[rhs].blob_id) orelse continue;
+                    if (std.mem.eql(u8, value.value, previous_value.value)) return TableError.ConstraintViolation;
+                }
+            }
+            group_start = group_end;
+        }
+    }
+
+    const out = try allocator.alloc(u8, try expectedIndexBytes(segment.rows));
+    for (entries, 0..) |entry, idx| writeIndexEntry(out, idx, .{ .key = entry.key, .row = entry.row });
+    return out;
+}
+
+fn buildBlobTokenIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    store_name: []const u8,
+    column_cache: []CachedColumnBytes,
+    blob_cache: *CachedBlobStore,
+) TableError![]u8 {
+    try ensureBlobHandleColumn(meta, column_index);
+    try validateBlobStoreName(store_name);
+
+    const blob_store = try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache);
+    const blob_refs = blob_store.refs;
+
+    var entries = std.ArrayList(IndexEntry).init(allocator);
+    defer entries.deinit();
+
+    const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * 8);
+        const blob_id = readU64LE(bytes, byte_offset);
+        const value_ref = blobRefForId(blob_refs, blob_id) orelse continue;
+        try appendBlobTokenEntriesForValue(&entries, row_base + i, value_ref.value);
+    }
+
+    std.sort.block(IndexEntry, entries.items, {}, indexEntryLessThan);
+    var dedup_count: usize = 0;
+    for (entries.items) |entry| {
+        if (dedup_count == 0 or
+            entries.items[dedup_count - 1].key != entry.key or
+            entries.items[dedup_count - 1].row != entry.row)
+        {
+            entries.items[dedup_count] = entry;
+            dedup_count += 1;
+        }
+    }
+
+    const out_len = std.math.mul(usize, dedup_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, out_len);
+    for (entries.items[0..dedup_count], 0..) |entry, idx| writeIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn buildBlobPrefixIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    store_name: []const u8,
+    column_cache: []CachedColumnBytes,
+    blob_cache: *CachedBlobStore,
+) TableError![]u8 {
+    try ensureBlobHandleColumn(meta, column_index);
+    try validateBlobStoreName(store_name);
+
+    const blob_store = try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache);
+    const blob_refs = blob_store.refs;
+
+    var entries = std.ArrayList(IndexEntry).init(allocator);
+    defer entries.deinit();
+
+    const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * 8);
+        const blob_id = readU64LE(bytes, byte_offset);
+        const value_ref = blobRefForId(blob_refs, blob_id) orelse continue;
+        try appendBlobPrefixEntriesForValue(&entries, row_base + i, value_ref.value);
+    }
+
+    std.sort.block(IndexEntry, entries.items, {}, indexEntryLessThan);
+    var dedup_count: usize = 0;
+    for (entries.items) |entry| {
+        if (dedup_count == 0 or
+            entries.items[dedup_count - 1].key != entry.key or
+            entries.items[dedup_count - 1].row != entry.row)
+        {
+            entries.items[dedup_count] = entry;
+            dedup_count += 1;
+        }
+    }
+
+    const out_len = std.math.mul(usize, dedup_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, out_len);
+    for (entries.items[0..dedup_count], 0..) |entry, idx| writeIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn buildBlobContainsIndexBytesForSegment(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    segment: SegmentMeta,
+    row_base: u64,
+    column_index: usize,
+    store_name: []const u8,
+    column_cache: []CachedColumnBytes,
+    blob_cache: *CachedBlobStore,
+) TableError![]u8 {
+    try ensureBlobHandleColumn(meta, column_index);
+    try validateBlobStoreName(store_name);
+
+    const blob_store = try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache);
+    const blob_refs = blob_store.refs;
+
+    var entries = std.ArrayList(IndexEntry).init(allocator);
+    defer entries.deinit();
+
+    const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, column_cache);
+
+    var i: u64 = 0;
+    while (i < segment.rows) : (i += 1) {
+        const byte_offset: usize = @intCast(i * 8);
+        const blob_id = readU64LE(bytes, byte_offset);
+        const value_ref = blobRefForId(blob_refs, blob_id) orelse continue;
+        try appendBlobContainsEntriesForValue(&entries, row_base + i, value_ref.value);
+    }
+
+    std.sort.block(IndexEntry, entries.items, {}, indexEntryLessThan);
+    var dedup_count: usize = 0;
+    for (entries.items) |entry| {
+        if (dedup_count == 0 or
+            entries.items[dedup_count - 1].key != entry.key or
+            entries.items[dedup_count - 1].row != entry.row)
+        {
+            entries.items[dedup_count] = entry;
+            dedup_count += 1;
+        }
+    }
+
+    const out_len = std.math.mul(usize, dedup_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    const out = try allocator.alloc(u8, out_len);
+    for (entries.items[0..dedup_count], 0..) |entry, idx| writeIndexEntry(out, idx, entry);
+    return out;
+}
+
+fn rewriteIndexMetaBytes(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64, index: *IndexMeta, bytes: []const u8) TableError!void {
+    const store_name = if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) or std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND) or std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND) or std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND)) try indexBlobStoreName(index.*) else null;
+    const column_index2 = if (std.mem.eql(u8, index.kind, "u64_pair") or std.mem.eql(u8, index.kind, "u64_i64_pair")) try indexColumnIndex2(index.*) else null;
+    const basename = if (store_name) |name|
+        if (std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND))
+            try blobTokenIndexFileName(allocator, table_name, index.column_index, name, epoch)
+        else if (std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND))
+            try blobPrefixIndexFileName(allocator, table_name, index.column_index, name, epoch)
+        else if (std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND))
+            try blobContainsIndexFileName(allocator, table_name, index.column_index, name, epoch)
+        else
+            try blobEqIndexFileName(allocator, table_name, index.column_index, name, epoch)
+    else if (column_index2) |c2|
+        try pairIndexFileName(allocator, table_name, index.kind, index.column_index, c2, epoch)
+    else
+        try indexFileName(allocator, table_name, index.kind, index.column_index, epoch);
+    defer allocator.free(basename);
+
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, bytes);
+
+    const next_path = try allocator.dupe(u8, basename);
+    errdefer allocator.free(next_path);
+    const next_hash = try hashHexAlloc(allocator, bytes);
+    errdefer allocator.free(next_hash);
+    const next_block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer freeBlockSha256List(allocator, next_block_sha256);
+
+    allocator.free(index.path);
+    allocator.free(index.sha256);
+    freeBlockSha256List(allocator, index.block_sha256);
+    index.path = next_path;
+    index.sha256 = next_hash;
+    index.bytes = bytes.len;
+    index.block_size = artifactBlockSize(bytes);
+    index.block_sha256 = next_block_sha256;
+}
+
+fn tryAppendIndexesForSegment(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, segment_index: usize, previous_row_count: u64) TableError!bool {
+    if (segment_index >= meta.segments.len) return TableError.InvalidFormat;
+    const segment = meta.segments[segment_index];
+    if (previous_row_count + segment.rows != meta.row_count) return TableError.VerifyFailed;
+    if (meta.indexes.len == 0) return true;
+
+    const column_cache = try allocator.alloc(CachedColumnBytes, segment.files.len);
+    defer {
+        for (column_cache) |cached| if (cached.loaded) allocator.free(cached.bytes);
+        allocator.free(column_cache);
+    }
+    for (column_cache) |*cached| cached.* = .{};
+
+    var blob_cache = CachedBlobStore{};
+    defer {
+        if (blob_cache.loaded) {
+            allocator.free(blob_cache.refs);
+            allocator.free(blob_cache.bytes);
+        }
+    }
+
+    for (0..meta.indexes.len) |idx| {
+        const index = &meta.indexes[idx];
+        const index_path = try activePath(allocator, root_dir, index.path);
+        defer allocator.free(index_path);
+        const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+        defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+        const existing_bytes = mappedRegionBytes(mapped_existing);
+
+        if (std.mem.eql(u8, index.kind, "u64") or
+            std.mem.eql(u8, index.kind, "i64") or
+            std.mem.eql(u8, index.kind, "u32") or
+            std.mem.eql(u8, index.kind, "i32") or
+            std.mem.eql(u8, index.kind, "u8") or
+            std.mem.eql(u8, index.kind, "i8") or
+            std.mem.eql(u8, index.kind, "u16") or
+            std.mem.eql(u8, index.kind, "i16") or
+            std.mem.eql(u8, index.kind, "f32") or
+            std.mem.eql(u8, index.kind, "f64"))
+        {
+            const kind = singleIndexKindFromName(index.kind) orelse return TableError.InvalidFormat;
+            const appended = try buildSingleIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), kind, index.unique, column_cache);
+            defer allocator.free(appended);
+            const merged = try mergeIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        if (std.mem.eql(u8, index.kind, "u64_pair")) {
+            const column_index2 = try indexColumnIndex2(index.*);
+            const appended = try buildU64PairIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), column_index2, index.unique, column_cache);
+            defer allocator.free(appended);
+            const merged = try mergeU64PairIndexBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        if (std.mem.eql(u8, index.kind, "u64_i64_pair")) {
+            const column_index2 = try indexColumnIndex2(index.*);
+            const appended = try buildU64I64PairIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), column_index2, index.unique, column_cache);
+            defer allocator.free(appended);
+            const merged = try mergeU64PairIndexBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) {
+            const store_name = try indexBlobStoreName(index.*);
+            const appended = try buildBlobEqIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, index.unique, column_cache, &blob_cache);
+            defer allocator.free(appended);
+            const merged = try mergeIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        if (std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND)) {
+            const store_name = try indexBlobStoreName(index.*);
+            const appended = try buildBlobTokenIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, column_cache, &blob_cache);
+            defer allocator.free(appended);
+            const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        if (std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND)) {
+            const store_name = try indexBlobStoreName(index.*);
+            const appended = try buildBlobPrefixIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, column_cache, &blob_cache);
+            defer allocator.free(appended);
+            const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        if (std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND)) {
+            const store_name = try indexBlobStoreName(index.*);
+            const appended = try buildBlobContainsIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, column_cache, &blob_cache);
+            defer allocator.free(appended);
+            const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
+            defer allocator.free(merged);
+            try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
 fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, index_idx: usize) TableError!void {
     const index = &meta.indexes[index_idx];
     if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
@@ -6257,6 +7468,7 @@ pub fn openReadSnapshot(
         .indexes = &.{},
         .dicts = &.{},
         .blobs = &.{},
+        .mapped_regions = &.{},
     };
     errdefer snapshot.destroy();
 
@@ -6275,6 +7487,10 @@ pub fn openReadSnapshot(
     snapshot.indexes = try arena_allocator.alloc(ReadIndexSnapshot, parsed.value.indexes.len);
     snapshot.dicts = try arena_allocator.alloc(ReadDictSnapshot, parsed.value.dicts.len);
     snapshot.blobs = try arena_allocator.alloc(ReadBlobStoreSnapshot, parsed.value.blobs.len);
+    snapshot.mapped_regions = try backing_allocator.alloc(MappedReadRegion, parsed.value.segments.len * parsed.value.columns.len + parsed.value.indexes.len + parsed.value.dicts.len + parsed.value.blobs.len);
+    for (snapshot.mapped_regions) |*region| region.* = .{ .memory = &[_]u8{} };
+
+    var mapped_region_idx: usize = 0;
 
     for (parsed.value.segments, 0..) |segment, segment_idx| {
         const segment_columns = try arena_allocator.alloc(ReadColumnSnapshot, segment.files.len);
@@ -6284,8 +7500,10 @@ pub fn openReadSnapshot(
             if (file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
             const path = try activePath(backing_allocator, root_dir, file_meta.path);
             defer backing_allocator.free(path);
-            const bytes = try readFileAlloc(arena_allocator, path, 1 << 30);
-            if (bytes.len != expected_len) return TableError.VerifyFailed;
+            const mapped = try mappedReadFile(path, expected_len);
+            snapshot.mapped_regions[mapped_region_idx] = mapped;
+            mapped_region_idx += 1;
+            const bytes = mappedRegionBytes(mapped);
             try validateFileMetaBytes(file_meta, bytes);
             segment_columns[column_idx] = .{ .bytes = bytes };
         }
@@ -6386,8 +7604,10 @@ pub fn openReadSnapshot(
         if (index.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
         const path = try activePath(backing_allocator, root_dir, index.path);
         defer backing_allocator.free(path);
-        const bytes = try readFileAlloc(arena_allocator, path, 1 << 30);
-        if (bytes.len != index.bytes) return TableError.VerifyFailed;
+        const mapped = try mappedReadFile(path, @intCast(index.bytes));
+        snapshot.mapped_regions[mapped_region_idx] = mapped;
+        mapped_region_idx += 1;
+        const bytes = mappedRegionBytes(mapped);
         const hash = hashBytes(bytes);
         const hex = std.fmt.bytesToHex(hash, .lower);
         if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
@@ -6417,7 +7637,18 @@ pub fn openReadSnapshot(
         for (parsed.value.dicts[0..dict_idx]) |previous| {
             if (std.mem.eql(u8, previous.name, dict.name)) return TableError.VerifyFailed;
         }
-        const bytes = try readDictBytes(arena_allocator, root_dir, dict);
+        const path = try activePath(backing_allocator, root_dir, dict.path);
+        defer backing_allocator.free(path);
+        const mapped = try mappedReadFile(path, @intCast(dict.bytes));
+        snapshot.mapped_regions[mapped_region_idx] = mapped;
+        mapped_region_idx += 1;
+        const bytes = mappedRegionBytes(mapped);
+        if (bytes.len != dict.bytes) return TableError.VerifyFailed;
+        if (try dictEntryCount(bytes) != dict.entries) return TableError.VerifyFailed;
+        const dict_hash = hashBytes(bytes);
+        const dict_hex = std.fmt.bytesToHex(dict_hash, .lower);
+        if (!std.mem.eql(u8, dict_hex[0..], dict.sha256)) return TableError.VerifyFailed;
+        try validateDictBlockHashes(dict, bytes);
         snapshot.dicts[dict_idx] = .{
             .name = try arena_allocator.dupe(u8, dict.name),
             .bytes = bytes,
@@ -6431,7 +7662,18 @@ pub fn openReadSnapshot(
         for (parsed.value.blobs[0..blob_idx]) |previous| {
             if (std.mem.eql(u8, previous.name, blob.name)) return TableError.VerifyFailed;
         }
-        const bytes = try readBlobStoreBytes(arena_allocator, root_dir, blob);
+        const path = try activePath(backing_allocator, root_dir, blob.path);
+        defer backing_allocator.free(path);
+        const mapped = try mappedReadFile(path, @intCast(blob.bytes));
+        snapshot.mapped_regions[mapped_region_idx] = mapped;
+        mapped_region_idx += 1;
+        const bytes = mappedRegionBytes(mapped);
+        if (bytes.len != blob.bytes) return TableError.VerifyFailed;
+        if (try blobEntryCount(bytes) != blob.entries) return TableError.VerifyFailed;
+        const blob_hash = hashBytes(bytes);
+        const blob_hex = std.fmt.bytesToHex(blob_hash, .lower);
+        if (!std.mem.eql(u8, blob_hex[0..], blob.sha256)) return TableError.VerifyFailed;
+        try validateBlobStoreBlockHashes(blob, bytes);
         snapshot.blobs[blob_idx] = .{
             .name = try arena_allocator.dupe(u8, blob.name),
             .bytes = bytes,
@@ -13496,17 +14738,7 @@ pub fn ingestTable(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var schema_obj = try loadSchema(allocator, root_dir, table_name);
-    defer schema_obj.deinit();
-
-    const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
-    defer allocator.free(schema_path);
-    const schema_source = try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
-    defer allocator.free(schema_source);
-    const schema_hash = try hashHexAlloc(allocator, schema_source);
-    defer allocator.free(schema_hash);
-
-    var meta = try loadCurrentMeta(allocator, root_dir, table_name, schema_obj, schema_path, schema_hash);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
 
     if (meta.locked) return TableError.Locked;
@@ -13769,9 +15001,7 @@ test "table verify rejects segment byte-count metadata mismatch" {
 
     _ = try ingestTable(std.testing.allocator, ".", table_name, "rows.csv");
 
-    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
-    defer std.testing.allocator.free(meta_path);
-    const source = try readFileAlloc(std.testing.allocator, meta_path, 16 * 1024 * 1024);
+    const source = try readActiveMetaSource(std.testing.allocator, ".", table_name);
     defer std.testing.allocator.free(source);
     var parsed = try parseTableMeta(std.testing.allocator, source);
     defer parsed.deinit();
@@ -15610,6 +16840,12 @@ test "table write transaction commits atomically and preserves previous epoch on
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
         try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
+        const found1 = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(found1.found);
+        try std.testing.expectEqual(@as(u64, 0), found1.row_index);
+        const found2 = try snapshotFindU64(snapshot, 0, 2);
+        try std.testing.expect(found2.found);
+        try std.testing.expectEqual(@as(u64, 1), found2.row_index);
     }
 
     tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
@@ -15626,6 +16862,12 @@ test "table write transaction commits atomically and preserves previous epoch on
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
         try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
+        const found1 = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(found1.found);
+        try std.testing.expectEqual(@as(u64, 0), found1.row_index);
+        const found2 = try snapshotFindU64(snapshot, 0, 2);
+        try std.testing.expect(found2.found);
+        try std.testing.expectEqual(@as(u64, 1), found2.row_index);
     }
 
     tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
@@ -17757,9 +18999,7 @@ test "table ingest, verify, snapshot, restore, lock, unlock and compact are real
     try std.testing.expectEqual(@as(u64, 2), restored.row_count);
     try std.testing.expect(!restored.locked);
 
-    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
-    defer std.testing.allocator.free(meta_path);
-    const source = try readFileAlloc(std.testing.allocator, meta_path, 16 * 1024 * 1024);
+    const source = try readActiveMetaSource(std.testing.allocator, ".", table_name);
     defer std.testing.allocator.free(source);
     var parsed = try parseTableMeta(std.testing.allocator, source);
     defer parsed.deinit();
