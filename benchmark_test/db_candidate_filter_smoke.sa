@@ -13,6 +13,7 @@
 #def U64_COL_BYTES = 48
 #def I64_COL_BYTES = 48
 #def BOOL_COL_BYTES = 6
+#def NULL_BITMAP_BYTES = 1
 #def COLUMN_COUNT = 7
 #def COLUMNS_BYTES = 112
 #def ROWS_CAP = 6
@@ -29,6 +30,7 @@ L_ENTRY:
     totals = alloc I64_COL_BYTES
     posted_ms = alloc I64_COL_BYTES
     posted_us = alloc I64_COL_BYTES
+    null_bitmap = alloc NULL_BITMAP_BYTES
     candidate_rows = alloc ROWS_BYTES
     status_rows = alloc ROWS_BYTES
     date_rows = alloc ROWS_BYTES
@@ -138,6 +140,14 @@ L_ENTRY:
     EXPAND DB_FILTER_ROWS_BOOL_HANDLE posted_filter_status, posted_written, posted_total, final_rows, ROWS_CAP, read_handle, 3, status_rows, status_written, 1, 0, ROWS_CAP
     posted_row0 = load final_rows+0 as u64
     posted_row1 = load final_rows+8 as u64
+    EXPAND DB_NULL_BITMAP_CLEAR null_clear_status, null_bitmap, NULL_BITMAP_BYTES
+    EXPAND DB_NULL_BITMAP_SET null_set_row1_status, null_bitmap, NULL_BITMAP_BYTES, 1, 1
+    EXPAND DB_NULL_BITMAP_SET null_set_row5_status, null_bitmap, NULL_BITMAP_BYTES, 5, 1
+    EXPAND DB_FILTER_ROWS_U64_RANGE_NULL_BITMAP_HANDLE null_u64_status, null_u64_written, null_u64_total, final_rows, ROWS_CAP, read_handle, 2, candidate_rows, candidate_written, 2, 2, null_bitmap, NULL_BITMAP_BYTES, 1, 0, ROWS_CAP
+    null_u64_row0 = load final_rows+0 as u64
+    null_u64_row1 = load final_rows+8 as u64
+    EXPAND DB_FILTER_ROWS_I64_RANGE_NULL_BITMAP_HANDLE null_i64_status, null_i64_written, null_i64_total, final_rows, ROWS_CAP, read_handle, 4, status_rows, status_written, 1500, 5500, null_bitmap, NULL_BITMAP_BYTES, 0, 0, ROWS_CAP
+    null_i64_row0 = load final_rows+0 as u64
     EXPAND DB_FILTER_ROWS_BOOL_HANDLE invalid_bool_status, invalid_bool_written, invalid_bool_total, final_rows, ROWS_CAP, read_handle, 3, status_rows, status_written, 2, 0, ROWS_CAP
 
     EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
@@ -232,6 +242,18 @@ L_ENTRY:
     ok_posted_total = eq posted_total, 2
     ok_posted_row0 = eq posted_row0, 1
     ok_posted_row1 = eq posted_row1, 5
+    ok_null_clear_status = eq null_clear_status, SA_DB_OK
+    ok_null_set_row1_status = eq null_set_row1_status, SA_DB_OK
+    ok_null_set_row5_status = eq null_set_row5_status, SA_DB_OK
+    ok_null_u64_status = eq null_u64_status, SA_DB_OK
+    ok_null_u64_written = eq null_u64_written, 2
+    ok_null_u64_total = eq null_u64_total, 2
+    ok_null_u64_row0 = eq null_u64_row0, 1
+    ok_null_u64_row1 = eq null_u64_row1, 5
+    ok_null_i64_status = eq null_i64_status, SA_DB_OK
+    ok_null_i64_written = eq null_i64_written, 1
+    ok_null_i64_total = eq null_i64_total, 1
+    ok_null_i64_row0 = eq null_i64_row0, 2
     ok_invalid_bool_status = eq invalid_bool_status, SA_DB_ERR_INVALID_ARGUMENT
     ok_invalid_bool_written = eq invalid_bool_written, 0
     ok_invalid_bool_total = eq invalid_bool_total, 0
@@ -326,11 +348,23 @@ L_ENTRY:
     ok52 = and ok51, ok_posted_total
     ok53 = and ok52, ok_posted_row0
     ok54 = and ok53, ok_posted_row1
-    ok55 = and ok54, ok_invalid_bool_status
-    ok56 = and ok55, ok_invalid_bool_written
-    ok57 = and ok56, ok_invalid_bool_total
-    ok58 = and ok57, ok_close
-    ok = and ok58, ok_verify
+    ok55 = and ok54, ok_null_clear_status
+    ok56 = and ok55, ok_null_set_row1_status
+    ok57 = and ok56, ok_null_set_row5_status
+    ok58 = and ok57, ok_null_u64_status
+    ok59 = and ok58, ok_null_u64_written
+    ok60 = and ok59, ok_null_u64_total
+    ok61 = and ok60, ok_null_u64_row0
+    ok62 = and ok61, ok_null_u64_row1
+    ok63 = and ok62, ok_null_i64_status
+    ok64 = and ok63, ok_null_i64_written
+    ok65 = and ok64, ok_null_i64_total
+    ok66 = and ok65, ok_null_i64_row0
+    ok67 = and ok66, ok_invalid_bool_status
+    ok68 = and ok67, ok_invalid_bool_written
+    ok69 = and ok68, ok_invalid_bool_total
+    ok70 = and ok69, ok_close
+    ok = and ok70, ok_verify
 
     !remove_status
     !init_status
@@ -422,6 +456,18 @@ L_ENTRY:
     !posted_total
     !posted_row0
     !posted_row1
+    !null_clear_status
+    !null_set_row1_status
+    !null_set_row5_status
+    !null_u64_status
+    !null_u64_written
+    !null_u64_total
+    !null_u64_row0
+    !null_u64_row1
+    !null_i64_status
+    !null_i64_written
+    !null_i64_total
+    !null_i64_row0
     !invalid_bool_status
     !invalid_bool_written
     !invalid_bool_total
@@ -516,6 +562,18 @@ L_ENTRY:
     !ok_posted_total
     !ok_posted_row0
     !ok_posted_row1
+    !ok_null_clear_status
+    !ok_null_set_row1_status
+    !ok_null_set_row5_status
+    !ok_null_u64_status
+    !ok_null_u64_written
+    !ok_null_u64_total
+    !ok_null_u64_row0
+    !ok_null_u64_row1
+    !ok_null_i64_status
+    !ok_null_i64_written
+    !ok_null_i64_total
+    !ok_null_i64_row0
     !ok_invalid_bool_status
     !ok_invalid_bool_written
     !ok_invalid_bool_total

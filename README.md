@@ -1049,9 +1049,10 @@ benchmarks. The required baseline is:
   AND/OR/not-in filters, two-predicate planners choose the smaller indexed side
   automatically for `u64+i64`, `u64+u64`, `i64+i64`, `u64+blob_eq`, and
   `i64+blob_eq` shapes, three-predicate planners cover `u64+i64+blob_eq`,
-  `u64+i64+bool`, and `u64+i64+i64`, and candidate row sorting covers integer
-  and finite float
-  list ordering. The first ERP workflow
+  `u64+i64+bool`, and `u64+i64+i64`, candidate row sorting covers integer
+  and finite float list ordering, and nullable candidate-row filters now accept
+  a sidecar null bitmap for `u64/i64` range predicates and the semantic
+  decimal/date/timestamp wrappers that build on them. The first ERP workflow
   benchmark now covers customers, products, orders, order lines,
   inventory movement, and invoices, with a matching SQLite comparison for the
   same composite ERP filters; next is broader index planning.

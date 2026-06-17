@@ -8001,6 +8001,88 @@ fn matchesRowsBool(context: FilterRowsBoolContext, row: u64) TableError!bool {
     return (try snapshotBoolAtRow(context.snapshot, context.column_index, row)) == context.expected;
 }
 
+const FilterRowsU64NullBitmapContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: u64,
+    max_value: u64,
+    null_bitmap: []const u8,
+    want_null: bool,
+};
+
+fn matchesRowsU64NullBitmap(context: FilterRowsU64NullBitmapContext, row: u64) TableError!bool {
+    const value = try snapshotU64AtRow(context.snapshot, context.column_index, row);
+    if (value < context.min_value or value > context.max_value) return false;
+    return nullBitmapRowIsNull(context.null_bitmap, row) == context.want_null;
+}
+
+const FilterRowsI64NullBitmapContext = struct {
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    min_value: i64,
+    max_value: i64,
+    null_bitmap: []const u8,
+    want_null: bool,
+};
+
+fn matchesRowsI64NullBitmap(context: FilterRowsI64NullBitmapContext, row: u64) TableError!bool {
+    const value = try snapshotI64AtRow(context.snapshot, context.column_index, row);
+    if (value < context.min_value or value > context.max_value) return false;
+    return nullBitmapRowIsNull(context.null_bitmap, row) == context.want_null;
+}
+
+pub fn snapshotFilterRowsU64RangeNullBitmap(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: u64,
+    max_value: u64,
+    null_bitmap: []const u8,
+    want_null: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotU64Column(snapshot, column_index);
+    try validateSnapshotRows(snapshot, in_rows);
+    try ensureNullBitmapRows(snapshot.row_count, null_bitmap);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsU64NullBitmapContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+        .null_bitmap = null_bitmap,
+        .want_null = want_null,
+    }, matchesRowsU64NullBitmap);
+}
+
+pub fn snapshotFilterRowsI64RangeNullBitmap(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    in_rows: []const u64,
+    min_value: i64,
+    max_value: i64,
+    null_bitmap: []const u8,
+    want_null: bool,
+    offset: u64,
+    limit: u64,
+    out_rows: []u64,
+) TableError!U64RangeResult {
+    try ensureSnapshotI64Column(snapshot, column_index);
+    try validateSnapshotRows(snapshot, in_rows);
+    try ensureNullBitmapRows(snapshot.row_count, null_bitmap);
+    if (min_value > max_value) return .{ .written = 0, .total = 0 };
+    return try copyCandidateRowsByPredicate(in_rows, offset, limit, out_rows, FilterRowsI64NullBitmapContext{
+        .snapshot = snapshot,
+        .column_index = column_index,
+        .min_value = min_value,
+        .max_value = max_value,
+        .null_bitmap = null_bitmap,
+        .want_null = want_null,
+    }, matchesRowsI64NullBitmap);
+}
+
 const SortRowsContext = struct {
     descending: bool,
 };
@@ -14931,6 +15013,20 @@ test "table filters candidate rows for ERP composite predicates" {
     try std.testing.expectEqual(@as(u64, 2), amount_result.written);
     try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
     try std.testing.expectEqual(@as(u64, 2), filtered_rows[1]);
+
+    var null_bitmap = [_]u8{0};
+    null_bitmap[0] |= 1 << @as(u3, 1);
+    null_bitmap[0] |= 1 << @as(u3, 5);
+    const null_u64_result = try snapshotFilterRowsU64RangeNullBitmap(snapshot, 2, original_candidate_rows[0..candidate_len], 2, 2, &null_bitmap, true, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 2), null_u64_result.total);
+    try std.testing.expectEqual(@as(u64, 2), null_u64_result.written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 5), filtered_rows[1]);
+
+    const null_i64_result = try snapshotFilterRowsI64RangeNullBitmap(snapshot, 4, candidate_rows[0..status_len], 1500, 5500, &null_bitmap, false, 0, filtered_rows.len, &filtered_rows);
+    try std.testing.expectEqual(@as(u64, 1), null_i64_result.total);
+    try std.testing.expectEqual(@as(u64, 1), null_i64_result.written);
+    try std.testing.expectEqual(@as(u64, 2), filtered_rows[0]);
 
     var planned_rows = [_]u64{ 99, 99, 99, 99 };
     const planned_status_first = try snapshotPlanU64I64RangeRows(std.testing.allocator, snapshot, 2, 2, 2, 4, 1500, 5500, 0, planned_rows.len, &planned_rows);

@@ -1382,12 +1382,28 @@
     %out_total = load __db_handle_filter_rows_u64_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_ROWS_U64_RANGE_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_filter_rows_u64_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_u64_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_u64_range_null_bitmap_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_u64_null_written_slot_%out_written, &__db_handle_filter_rows_u64_null_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_u64_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_u64_null_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_I64_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit
     __db_handle_filter_rows_i64_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_i64_total_slot_%out_total = stack_alloc 8
     %out_status = call @sa_db_filter_rows_i64_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_i64_written_slot_%out_written, &__db_handle_filter_rows_i64_total_slot_%out_total)
     %out_written = load __db_handle_filter_rows_i64_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_filter_rows_i64_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_I64_RANGE_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_value, %max_value, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_filter_rows_i64_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_i64_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_i64_range_null_bitmap_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_value, %max_value, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_i64_null_written_slot_%out_written, &__db_handle_filter_rows_i64_null_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_i64_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_i64_null_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_PLAN_U64_I64_RANGES_HANDLE %out_status, %out_rows, %out_rows_len, %out_info, %handle, %u64_column_index, %u64_min_value, %u64_max_value, %i64_column_index, %i64_min_value, %i64_max_value, %offset, %limit
@@ -1498,12 +1514,28 @@
     %out_total = load __db_handle_filter_rows_decimal_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_ROWS_DECIMAL_I64_RANGE_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %scale, %min_negative, %min_whole, %min_fraction, %max_negative, %max_whole, %max_fraction, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_filter_rows_decimal_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_decimal_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_decimal_i64_range_null_bitmap_handle(%handle, %column_index, &%in_rows, %in_rows_len, %scale, %min_negative, %min_whole, %min_fraction, %max_negative, %max_whole, %max_fraction, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_decimal_null_written_slot_%out_written, &__db_handle_filter_rows_decimal_null_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_decimal_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_decimal_null_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_DATE_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %offset, %limit
     __db_handle_filter_rows_date_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_date_total_slot_%out_total = stack_alloc 8
     %out_status = call @sa_db_filter_rows_date_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_date_written_slot_%out_written, &__db_handle_filter_rows_date_total_slot_%out_total)
     %out_written = load __db_handle_filter_rows_date_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_filter_rows_date_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_DATE_RANGE_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_filter_rows_date_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_date_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_date_range_null_bitmap_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_year, %min_month, %min_day, %max_year, %max_month, %max_day, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_date_null_written_slot_%out_written, &__db_handle_filter_rows_date_null_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_date_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_date_null_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %offset, %limit
@@ -1514,12 +1546,28 @@
     %out_total = load __db_handle_filter_rows_ts_ms_total_slot_%out_total+0 as u64
 [END_MACRO]
 
+[MACRO] DB_FILTER_ROWS_TIMESTAMP_MS_RANGE_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_filter_rows_ts_ms_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_ts_ms_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_timestamp_ms_range_null_bitmap_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_days, %min_millis_of_day, %max_days, %max_millis_of_day, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_ts_ms_null_written_slot_%out_written, &__db_handle_filter_rows_ts_ms_null_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_ts_ms_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_ts_ms_null_total_slot_%out_total+0 as u64
+[END_MACRO]
+
 [MACRO] DB_FILTER_ROWS_TIMESTAMP_US_RANGE_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %offset, %limit
     __db_handle_filter_rows_ts_us_written_slot_%out_written = stack_alloc 8
     __db_handle_filter_rows_ts_us_total_slot_%out_total = stack_alloc 8
     %out_status = call @sa_db_filter_rows_timestamp_us_range_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_ts_us_written_slot_%out_written, &__db_handle_filter_rows_ts_us_total_slot_%out_total)
     %out_written = load __db_handle_filter_rows_ts_us_written_slot_%out_written+0 as u64
     %out_total = load __db_handle_filter_rows_ts_us_total_slot_%out_total+0 as u64
+[END_MACRO]
+
+[MACRO] DB_FILTER_ROWS_TIMESTAMP_US_RANGE_NULL_BITMAP_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, %null_bitmap, %null_bitmap_len, %want_null, %offset, %limit
+    __db_handle_filter_rows_ts_us_null_written_slot_%out_written = stack_alloc 8
+    __db_handle_filter_rows_ts_us_null_total_slot_%out_total = stack_alloc 8
+    %out_status = call @sa_db_filter_rows_timestamp_us_range_null_bitmap_handle(%handle, %column_index, &%in_rows, %in_rows_len, %min_days, %min_micros_of_day, %max_days, %max_micros_of_day, &%null_bitmap, %null_bitmap_len, %want_null, %offset, %limit, &%out_rows, %out_rows_len, &__db_handle_filter_rows_ts_us_null_written_slot_%out_written, &__db_handle_filter_rows_ts_us_null_total_slot_%out_total)
+    %out_written = load __db_handle_filter_rows_ts_us_null_written_slot_%out_written+0 as u64
+    %out_total = load __db_handle_filter_rows_ts_us_null_total_slot_%out_total+0 as u64
 [END_MACRO]
 
 [MACRO] DB_FILTER_ROWS_BOOL_HANDLE %out_status, %out_written, %out_total, %out_rows, %out_rows_len, %handle, %column_index, %in_rows, %in_rows_len, %expected, %offset, %limit
