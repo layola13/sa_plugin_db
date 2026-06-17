@@ -3819,6 +3819,29 @@ pub export fn sa_db_count_u64_eq_handle(handle: ?*anyopaque, column_index: u64, 
     return SA_DB_OK;
 }
 
+pub export fn sa_db_count_dict_eq_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_count: ?*u64,
+) u32 {
+    const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    count_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const lookup = table.snapshotDictLookup(snapshot, dict_name, value) catch |err| return tableStatus(err);
+    if (!lookup.found) return SA_DB_OK;
+    const count = table.snapshotCountU64Cmp(snapshot, @intCast(column_index), .eq, lookup.id) catch |err| return tableStatus(err);
+    count_slot.* = count;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_count_u64_cmp_handle(handle: ?*anyopaque, column_index: u64, op: u32, expected: u64, out_count: ?*u64) u32 {
     const count_slot = out_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
@@ -4843,6 +4866,36 @@ pub export fn sa_db_filter_bool_handle(
     return SA_DB_OK;
 }
 
+pub export fn sa_db_filter_dict_eq_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterDictEqRows(snapshot, @intCast(column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_filter_rows_u64_range_handle(
     handle: ?*anyopaque,
     column_index: u64,
@@ -4896,6 +4949,39 @@ pub export fn sa_db_filter_rows_i64_range_handle(
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
     const result = table.snapshotFilterRowsI64Range(snapshot, @intCast(column_index), in_rows, min_value, max_value, offset, limit, rows) catch |err| return tableStatus(err);
+    written_slot.* = result.written;
+    total_slot.* = result.total;
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_filter_rows_dict_eq_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    in_rows_ptr: ?[*]const u64,
+    in_rows_len: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_written: ?*u64,
+    out_total: ?*u64,
+) u32 {
+    const written_slot = out_written orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const total_slot = out_total orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    total_slot.* = 0;
+    const in_rows = inputU64sAllowEmpty(in_rows_ptr, in_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotFilterRowsDictEq(snapshot, @intCast(column_index), in_rows, dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     written_slot.* = result.written;
     total_slot.* = result.total;
     return SA_DB_OK;
@@ -5127,6 +5213,68 @@ pub export fn sa_db_plan_u64_blob_eq_handle(
     return fillPlanInfo(out_info, result);
 }
 
+pub export fn sa_db_plan_u64_dict_eq_handle(
+    handle: ?*anyopaque,
+    u64_column_index: u64,
+    u64_min_value: u64,
+    u64_max_value: u64,
+    dict_column_index: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_info: ?*SaDbPlanInfo,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    info_slot.* = .{ .written = 0, .total = 0, .first_predicate = 0, .first_total = 0, .second_total = 0 };
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (u64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (dict_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.snapshotPlanU64DictEqRows(gpa.allocator(), snapshot, @intCast(u64_column_index), u64_min_value, u64_max_value, @intCast(dict_column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
+    return fillPlanInfo(out_info, result);
+}
+
+pub export fn sa_db_plan_i64_dict_eq_handle(
+    handle: ?*anyopaque,
+    i64_column_index: u64,
+    i64_min_value: i64,
+    i64_max_value: i64,
+    dict_column_index: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_info: ?*SaDbPlanInfo,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    info_slot.* = .{ .written = 0, .total = 0, .first_predicate = 0, .first_total = 0, .second_total = 0 };
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (i64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (dict_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.snapshotPlanI64DictEqRows(gpa.allocator(), snapshot, @intCast(i64_column_index), i64_min_value, i64_max_value, @intCast(dict_column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
+    return fillPlanInfo(out_info, result);
+}
+
 pub export fn sa_db_plan_i64_blob_eq_handle(
     handle: ?*anyopaque,
     i64_column_index: u64,
@@ -5226,6 +5374,41 @@ pub export fn sa_db_plan_u64_i64_blob_eq_handle(
         limit,
         rows,
     ) catch |err| return tableStatus(err);
+    return fillPlan3Info(out_info, result);
+}
+
+pub export fn sa_db_plan_u64_i64_dict_eq_handle(
+    handle: ?*anyopaque,
+    u64_column_index: u64,
+    u64_min_value: u64,
+    u64_max_value: u64,
+    i64_column_index: u64,
+    i64_min_value: i64,
+    i64_max_value: i64,
+    dict_column_index: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    offset: u64,
+    limit: u64,
+    out_rows_ptr: ?[*]u64,
+    out_rows_len: u64,
+    out_info: ?*SaDbPlan3Info,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    info_slot.* = .{ .written = 0, .total = 0, .first_predicate = 0, .first_total = 0, .second_predicate = 0, .second_total = 0, .third_predicate = 0, .third_total = 0 };
+    const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (u64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (i64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (dict_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const result = table.snapshotPlanU64I64DictEqRows(gpa.allocator(), snapshot, @intCast(u64_column_index), u64_min_value, u64_max_value, @intCast(i64_column_index), i64_min_value, i64_max_value, @intCast(dict_column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     return fillPlan3Info(out_info, result);
 }
 
@@ -8202,13 +8385,26 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     var invoice_doc_id: u64 = 0;
     var order_doc_id: u64 = 0;
     var credit_doc_id: u64 = 0;
+    var active_status_id: u64 = 0;
+    var paid_status_id: u64 = 0;
+    var closed_status_id: u64 = 0;
+    var inserted: u64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, "doc_type".ptr, "doc_type".len, "invoice".ptr, "invoice".len, &invoice_doc_id, &info));
     try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, "doc_type".ptr, "doc_type".len, "order".ptr, "order".len, &order_doc_id, &info));
     try std.testing.expectEqual(SA_DB_OK, sa_db_blob_put(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, "doc_type".ptr, "doc_type".len, "credit".ptr, "credit".len, &credit_doc_id, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, "status".ptr, "status".len, "active".ptr, "active".len, &active_status_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 1), active_status_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, "status".ptr, "status".len, "paid".ptr, "paid".len, &paid_status_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 2), paid_status_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern(root.ptr, root.len, "candidate_filters".ptr, "candidate_filters".len, "status".ptr, "status".len, "closed".ptr, "closed".len, &closed_status_id, &inserted, &info));
+    try std.testing.expectEqual(@as(u64, 3), closed_status_id);
+    try std.testing.expectEqual(@as(u64, 1), inserted);
 
     var customer_ids = [_]u64{ 7, 7, 7, 8, 7, 7 };
     var order_days = [_]i64{ -5, 0, 10, -3, 20, 25 };
-    var status_ids = [_]u64{ 1, 2, 2, 2, 1, 2 };
+    var status_ids = [_]u64{ active_status_id, paid_status_id, paid_status_id, paid_status_id, active_status_id, paid_status_id };
     var posted = [_]u8{ 1, 1, 0, 1, 1, 1 };
     var totals = [_]i64{ 1000, 2000, 3000, 4000, 5000, 7000 };
     var posted_ms = [_]i64{ 0, 1000, 2000, 86_400_000, 86_400_001, 172_800_000 };
@@ -8273,35 +8469,56 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 5), rows[2]);
     const status_written = written;
 
+    var dict_count: u64 = 99;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_count_dict_eq_handle(handle, 2, "status".ptr, "status".len, "paid".ptr, "paid".len, &dict_count));
+    try std.testing.expectEqual(@as(u64, 4), dict_count);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_count_dict_eq_handle(handle, 2, "status".ptr, "status".len, "missing".ptr, "missing".len, &dict_count));
+    try std.testing.expectEqual(@as(u64, 0), dict_count);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_dict_eq_handle(handle, 2, "status".ptr, "status".len, "paid".ptr, "paid".len, 0, filtered.len, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 4), total);
+    try std.testing.expectEqual(@as(u64, 4), written);
+    try std.testing.expectEqual(@as(u64, 1), filtered[0]);
+    try std.testing.expectEqual(@as(u64, 2), filtered[1]);
+    try std.testing.expectEqual(@as(u64, 3), filtered[2]);
+    try std.testing.expectEqual(@as(u64, 5), filtered[3]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_filter_rows_dict_eq_handle(handle, 2, &original_candidate_rows, candidate_written, "status".ptr, "status".len, "paid".ptr, "paid".len, 1, 1, &filtered, filtered.len, &written, &total));
+    try std.testing.expectEqual(@as(u64, 3), total);
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 2), filtered[0]);
+
+    var dict_candidate_rows = [_]u64{ 1, 2, 3 };
+
     var intersect_rows = [_]u64{ 99, 99, 99, 99, 99, 99 };
-    try std.testing.expectEqual(SA_DB_OK, sa_db_intersect_rows_handle(handle, &rows, status_written, &filtered, date_written, 0, intersect_rows.len, &intersect_rows, intersect_rows.len, &written, &total));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_intersect_rows_handle(handle, &rows, status_written, &dict_candidate_rows, dict_candidate_rows.len, 0, intersect_rows.len, &intersect_rows, intersect_rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);
     try std.testing.expectEqual(@as(u64, 2), written);
     try std.testing.expectEqual(@as(u64, 1), intersect_rows[0]);
     try std.testing.expectEqual(@as(u64, 2), intersect_rows[1]);
 
-    try std.testing.expectEqual(SA_DB_OK, sa_db_intersect_rows_handle(handle, &rows, status_written, &filtered, date_written, 1, 1, &intersect_rows, intersect_rows.len, &written, &total));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_intersect_rows_handle(handle, &rows, status_written, &dict_candidate_rows, dict_candidate_rows.len, 1, 1, &intersect_rows, intersect_rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 2), total);
     try std.testing.expectEqual(@as(u64, 1), written);
     try std.testing.expectEqual(@as(u64, 2), intersect_rows[0]);
 
     var union_rows = [_]u64{ 99, 99, 99, 99, 99, 99 };
-    try std.testing.expectEqual(SA_DB_OK, sa_db_union_rows_handle(handle, &rows, status_written, &filtered, date_written, 0, union_rows.len, &union_rows, union_rows.len, &written, &total));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_union_rows_handle(handle, &rows, status_written, &dict_candidate_rows, dict_candidate_rows.len, 0, union_rows.len, &union_rows, union_rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 4), total);
     try std.testing.expectEqual(@as(u64, 4), written);
     try std.testing.expectEqual(@as(u64, 1), union_rows[0]);
     try std.testing.expectEqual(@as(u64, 2), union_rows[1]);
     try std.testing.expectEqual(@as(u64, 5), union_rows[2]);
-    try std.testing.expectEqual(@as(u64, 4), union_rows[3]);
+    try std.testing.expectEqual(@as(u64, 3), union_rows[3]);
 
-    try std.testing.expectEqual(SA_DB_OK, sa_db_union_rows_handle(handle, &rows, status_written, &filtered, date_written, 2, 2, &union_rows, union_rows.len, &written, &total));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_union_rows_handle(handle, &rows, status_written, &dict_candidate_rows, dict_candidate_rows.len, 2, 2, &union_rows, union_rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 4), total);
     try std.testing.expectEqual(@as(u64, 2), written);
     try std.testing.expectEqual(@as(u64, 5), union_rows[0]);
-    try std.testing.expectEqual(@as(u64, 4), union_rows[1]);
+    try std.testing.expectEqual(@as(u64, 3), union_rows[1]);
 
     var except_rows = [_]u64{ 99, 99, 99, 99, 99, 99 };
-    try std.testing.expectEqual(SA_DB_OK, sa_db_except_rows_handle(handle, &rows, status_written, &filtered, date_written, 0, except_rows.len, &except_rows, except_rows.len, &written, &total));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_except_rows_handle(handle, &rows, status_written, &dict_candidate_rows, dict_candidate_rows.len, 0, except_rows.len, &except_rows, except_rows.len, &written, &total));
     try std.testing.expectEqual(@as(u64, 1), total);
     try std.testing.expectEqual(@as(u64, 1), written);
     try std.testing.expectEqual(@as(u64, 5), except_rows[0]);
@@ -8540,6 +8757,25 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
     try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
 
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_dict_eq_handle(handle, 0, 7, 7, 2, "status".ptr, "status".len, "paid".ptr, "paid".len, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan_info));
+    try std.testing.expectEqual(@as(u64, 2), plan_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan_info.first_total);
+    try std.testing.expectEqual(@as(u64, 5), plan_info.second_total);
+    try std.testing.expectEqual(@as(u64, 3), plan_info.total);
+    try std.testing.expectEqual(@as(u64, 3), plan_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+    try std.testing.expectEqual(@as(u64, 5), planned_rows[2]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_i64_dict_eq_handle(handle, 1, 0, 20, 2, "status".ptr, "status".len, "paid".ptr, "paid".len, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan_info));
+    try std.testing.expectEqual(@as(u64, 1), plan_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 3), plan_info.first_total);
+    try std.testing.expectEqual(@as(u64, 4), plan_info.second_total);
+    try std.testing.expectEqual(@as(u64, 2), plan_info.total);
+    try std.testing.expectEqual(@as(u64, 2), plan_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
+
     try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_u64_ranges_handle(handle, 0, 7, 7, 2, 2, 2, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan_info));
     try std.testing.expectEqual(@as(u64, 2), plan_info.first_predicate);
     try std.testing.expectEqual(@as(u64, 4), plan_info.first_total);
@@ -8630,6 +8866,18 @@ test "db SA ABI filters candidate rows for ERP predicates" {
     try std.testing.expectEqual(@as(u64, 1), plan3_info.total);
     try std.testing.expectEqual(@as(u64, 1), plan3_info.written);
     try std.testing.expectEqual(@as(u64, 0), planned_rows[0]);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_i64_dict_eq_handle(handle, 0, 7, 7, 1, 0, 20, 2, "status".ptr, "status".len, "paid".ptr, "paid".len, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.first_predicate);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.first_total);
+    try std.testing.expectEqual(@as(u64, 3), plan3_info.second_predicate);
+    try std.testing.expectEqual(@as(u64, 4), plan3_info.second_total);
+    try std.testing.expectEqual(@as(u64, 1), plan3_info.third_predicate);
+    try std.testing.expectEqual(@as(u64, 5), plan3_info.third_total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.total);
+    try std.testing.expectEqual(@as(u64, 2), plan3_info.written);
+    try std.testing.expectEqual(@as(u64, 1), planned_rows[0]);
+    try std.testing.expectEqual(@as(u64, 2), planned_rows[1]);
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_plan_u64_i64_bool_handle(handle, 2, 2, 2, 1, 0, 20, 3, 1, 0, planned_rows.len, &planned_rows, planned_rows.len, &plan3_info));
     try std.testing.expectEqual(@as(u64, 2), plan3_info.first_predicate);

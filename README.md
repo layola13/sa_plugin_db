@@ -188,6 +188,7 @@ Read-handle query calls:
 - `sa_db_group_stats_i64_by_u64_sorted_handle`
 - `sa_db_group_rows_stats_i64_by_u64_sorted_handle`
 - `sa_db_count_u64_eq_handle`
+- `sa_db_count_dict_eq_handle`
 - `sa_db_count_u64_cmp_handle`
 - `sa_db_count_i64_cmp_handle`
 - `sa_db_count_u32_cmp_handle`
@@ -222,14 +223,19 @@ Read-handle query calls:
 - `sa_db_filter_u64_pair_key1_handle`
 - `sa_db_filter_u64_i64_pair_key1_handle`
 - `sa_db_filter_bool_handle`
+- `sa_db_filter_dict_eq_handle`
 - `sa_db_filter_rows_u64_range_handle`
 - `sa_db_filter_rows_i64_range_handle`
+- `sa_db_filter_rows_dict_eq_handle`
 - `sa_db_plan_u64_i64_ranges_handle`
 - `sa_db_plan_u64_u64_ranges_handle`
 - `sa_db_plan_i64_i64_ranges_handle`
+- `sa_db_plan_u64_dict_eq_handle`
+- `sa_db_plan_i64_dict_eq_handle`
 - `sa_db_plan_u64_blob_eq_handle`
 - `sa_db_plan_i64_blob_eq_handle`
 - `sa_db_plan_u64_i64_blob_eq_handle`
+- `sa_db_plan_u64_i64_dict_eq_handle`
 - `sa_db_plan_u64_i64_bool_handle`
 - `sa_db_plan_u64_i64_i64_ranges_handle`
 - `sa_db_plan_u64_date_decimal_i64_handle`
@@ -497,6 +503,20 @@ For read-heavy ERP list rendering, prefer the read-handle variants
 `sa_db_dict_value_copy_handle` after `sa_db_open_read_table`; the dictionary bytes
 are already part of the immutable snapshot, so repeated lookups do not re-open the
 table metadata or dictionary artifact.
+When a `u64` row column stores dictionary IDs, read handles can query by the
+dictionary value directly instead of requiring a separate lookup in SA code.
+`sa_db_count_dict_eq_handle` / `DB_COUNT_DICT_EQ_HANDLE` counts rows whose
+dictionary-backed `u64` column resolves to one exact value. `sa_db_filter_dict_eq_handle`
+/ `DB_FILTER_DICT_EQ_HANDLE` returns matching row ids directly, and
+`sa_db_filter_rows_dict_eq_handle` / `DB_FILTER_ROWS_DICT_EQ_HANDLE` applies the
+same exact dictionary-value predicate to an existing candidate row-id list while
+preserving candidate order. For common ERP list shapes, `sa_db_plan_u64_dict_eq_handle`
+/ `DB_PLAN_U64_DICT_EQ_HANDLE`, `sa_db_plan_i64_dict_eq_handle` /
+`DB_PLAN_I64_DICT_EQ_HANDLE`, and `sa_db_plan_u64_i64_dict_eq_handle` /
+`DB_PLAN_U64_I64_DICT_EQ_HANDLE` combine one or two numeric range predicates with
+one exact dictionary-value predicate and choose the smallest candidate side first.
+These APIs take both `dict_name` and the stored `value` bytes because the current
+schema metadata does not yet bind a column to one dictionary namespace.
 
 General variable-width bytes and text use table-level blob stores plus a
 fixed-width `blob_handle` row column. `sa_db_blob_put` / `DB_BLOB_PUT` appends a
