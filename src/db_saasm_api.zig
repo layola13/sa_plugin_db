@@ -3043,6 +3043,29 @@ pub export fn sa_db_column_logical_info_handle(handle: ?*anyopaque, column_index
     return fillColumnLogicalInfo(out_info, info);
 }
 
+pub export fn sa_db_export_null_bitmap_handle(
+    handle: ?*anyopaque,
+    column_index: u64,
+    out_bitmap_ptr: ?[*]u8,
+    out_bitmap_len: u64,
+    out_written_bytes: ?*u64,
+    out_row_count: ?*u64,
+) u32 {
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_bitmap = outputBytesAllowEmpty(out_bitmap_ptr, out_bitmap_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const written_slot = out_written_bytes orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const row_count_slot = out_row_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    written_slot.* = 0;
+    row_count_slot.* = 0;
+
+    const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseReadSnapshot(snapshot);
+    const result = table.snapshotExportNullBitmap(snapshot, @intCast(column_index), out_bitmap) catch |err| return tableStatus(err);
+    written_slot.* = result.written_bytes;
+    row_count_slot.* = result.row_count;
+    return SA_DB_OK;
+}
+
 pub export fn sa_db_dict_lookup_handle(
     handle: ?*anyopaque,
     dict_ptr: ?[*]const u8,
@@ -9627,4 +9650,62 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &handle_sum));
     try std.testing.expectEqual(@as(u64, 154), handle_sum);
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+}
+
+test "db SA ABI exports packed null bitmap from logical null_bitmap column" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable
+        \\#def COL_AMOUNT_NULLS_STRIDE = 1 // u8 null_bitmap
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "packed_nulls.sadb-schema".ptr, "packed_nulls.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var ids = [_]u64{ 1, 2, 3, 4 };
+    var amounts = [_]i64{ 1000, 2000, 3000, 4000 };
+    var amount_nulls = [_]u8{ 0, 1, 0, 1 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&amounts), .len = @sizeOf(@TypeOf(amounts)) },
+        .{ .data = @ptrCast(&amount_nulls), .len = @sizeOf(@TypeOf(amount_nulls)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "packed_nulls".ptr, "packed_nulls".len, ids.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_i64_index(root.ptr, root.len, "packed_nulls".ptr, "packed_nulls".len, 1, 0, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "packed_nulls".ptr, "packed_nulls".len, &handle));
+    defer _ = sa_db_close_read_table(handle);
+
+    var exported = [_]u8{0};
+    var written: u64 = 0;
+    var row_count: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_export_null_bitmap_handle(handle, 2, &exported, exported.len, &written, &row_count));
+    try std.testing.expectEqual(@as(u64, 1), written);
+    try std.testing.expectEqual(@as(u64, 4), row_count);
+    try std.testing.expectEqual(@as(u8, 0b00001010), exported[0]);
+
+    var filtered_rows = [_]u64{ 99, 99, 99, 99 };
+    var filtered_written: u64 = 0;
+    var filtered_total: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_range_i64_null_bitmap_handle(handle, 1, 0, 5000, &exported, exported.len, 1, 0, filtered_rows.len, &filtered_rows, filtered_rows.len, &filtered_written, &filtered_total));
+    try std.testing.expectEqual(@as(u64, 2), filtered_total);
+    try std.testing.expectEqual(@as(u64, 2), filtered_written);
+    try std.testing.expectEqual(@as(u64, 1), filtered_rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), filtered_rows[1]);
+
+    written = 99;
+    row_count = 99;
+    try std.testing.expectEqual(SA_DB_ERR_CURSOR_OVERFLOW, sa_db_export_null_bitmap_handle(handle, 2, null, 0, &written, &row_count));
+    try std.testing.expectEqual(@as(u64, 0), written);
+    try std.testing.expectEqual(@as(u64, 0), row_count);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_export_null_bitmap_handle(handle, 1, &exported, exported.len, &written, &row_count));
 }

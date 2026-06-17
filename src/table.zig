@@ -385,6 +385,11 @@ pub const ColumnLogicalInfo = struct {
     nullable: u64,
 };
 
+pub const ExportNullBitmapResult = struct {
+    written_bytes: u64,
+    row_count: u64,
+};
+
 pub const ReadSnapshot = struct {
     backing_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -6503,6 +6508,14 @@ fn ensureSnapshotBoolColumn(snapshot: *const ReadSnapshot, column_index: usize) 
     }
 }
 
+fn ensureSnapshotNullBitmapColumn(snapshot: *const ReadSnapshot, column_index: usize) TableError!void {
+    if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
+    const column = snapshot.columns[column_index];
+    if (column.logical_type != schema.LOGICAL_NULL_BITMAP) return TableError.InvalidFormat;
+    const ty = try parsePrimTypeTable(column.ty);
+    if (ty != .u8 or column.stride != 1) return TableError.InvalidFormat;
+}
+
 fn ensureSnapshotBlobHandleColumn(snapshot: *const ReadSnapshot, column_index: usize) TableError!void {
     if (column_index >= snapshot.columns.len) return TableError.InvalidFormat;
     const column = snapshot.columns[column_index];
@@ -7007,6 +7020,11 @@ fn readBoolColumnValue(column: ColumnMeta, bytes: []const u8, local_row: u64) Ta
         1 => true,
         else => TableError.InvalidFormat,
     };
+}
+
+fn readNullBitmapColumnValue(column: ColumnMeta, bytes: []const u8, local_row: u64) TableError!bool {
+    if (column.logical_type != schema.LOGICAL_NULL_BITMAP) return TableError.InvalidFormat;
+    return try readBoolColumnValue(column, bytes, local_row);
 }
 
 fn compareU64(value: u64, op: U64CompareOp, expected: u64) bool {
@@ -8235,6 +8253,38 @@ pub fn snapshotColumnLogicalInfo(snapshot: *const ReadSnapshot, column_index: us
         .logical_scale = column.logical_scale,
         .nullable = if (column.nullable) 1 else 0,
     };
+}
+
+pub fn snapshotExportNullBitmap(
+    snapshot: *const ReadSnapshot,
+    column_index: usize,
+    out_bitmap: []u8,
+) TableError!ExportNullBitmapResult {
+    try ensureSnapshotNullBitmapColumn(snapshot, column_index);
+    const required = try requiredNullBitmapBytes(snapshot.row_count);
+    if (out_bitmap.len < required) return TableError.CursorOverflow;
+    @memset(out_bitmap[0..required], 0);
+
+    var row_base: u64 = 0;
+    for (snapshot.segments) |segment| {
+        const column = snapshot.columns[column_index];
+        const bytes = segment.columns[column_index].bytes;
+        const expected_len = try expectedColumnBytes(segment.rows, column.stride);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+
+        var local_row: u64 = 0;
+        while (local_row < segment.rows) : (local_row += 1) {
+            if (try readNullBitmapColumnValue(column, bytes, local_row)) {
+                const row_index = std.math.add(u64, row_base, local_row) catch return TableError.CursorOverflow;
+                const byte_index: usize = @intCast(row_index / 8);
+                const bit: u3 = @intCast(row_index & 7);
+                out_bitmap[byte_index] |= @as(u8, 1) << bit;
+            }
+        }
+        row_base = std.math.add(u64, row_base, segment.rows) catch return TableError.CursorOverflow;
+    }
+    if (row_base != snapshot.row_count) return TableError.VerifyFailed;
+    return .{ .written_bytes = @intCast(required), .row_count = snapshot.row_count };
 }
 
 fn snapshotCopyRow(snapshot: *const ReadSnapshot, row_index: u64, out_row: []u8) TableError!void {
@@ -16553,6 +16603,62 @@ test "table persistent i64 index uses signed ordering" {
     try std.testing.expectEqual(@as(u64, 1), range_rows[1]);
     try std.testing.expectEqual(@as(i64, -100), try snapshotMinI64(snapshot, 1));
     try std.testing.expectEqual(@as(i64, 50), try snapshotMaxI64(snapshot, 1));
+}
+
+test "table exports packed null bitmap from logical null_bitmap column" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "packed_null_bitmap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "packed_null_bitmap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable
+        \\#def COL_AMOUNT_NULLS_STRIDE = 1 // u8 null_bitmap
+    );
+
+    var ids = [_]u64{ 1, 2, 3, 4 };
+    var amounts = [_]i64{ 1000, 2000, 3000, 4000 };
+    var amount_nulls = [_]u8{ 0, 1, 0, 1 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(amounts[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(amount_nulls[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    _ = try createI64Index(std.testing.allocator, ".", table_name, 1, false);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+
+    const amount_logical = try snapshotColumnLogicalInfo(snapshot, 1);
+    try std.testing.expectEqual(@as(u64, schema.LOGICAL_DECIMAL_I64), amount_logical.logical_type);
+    try std.testing.expectEqual(@as(u64, 1), amount_logical.nullable);
+    const nulls_logical = try snapshotColumnLogicalInfo(snapshot, 2);
+    try std.testing.expectEqual(@as(u64, schema.LOGICAL_NULL_BITMAP), nulls_logical.logical_type);
+    try std.testing.expectEqual(@as(u64, 0), nulls_logical.nullable);
+
+    var exported = [_]u8{0};
+    const result = try snapshotExportNullBitmap(snapshot, 2, &exported);
+    try std.testing.expectEqual(@as(u64, 1), result.written_bytes);
+    try std.testing.expectEqual(@as(u64, 4), result.row_count);
+    try std.testing.expectEqual(@as(u8, 0b00001010), exported[0]);
+
+    var rows = [_]u64{ 99, 99, 99, 99 };
+    const filtered = try snapshotRangeI64RowsNullBitmap(snapshot, 1, 0, 5000, &exported, true, 0, rows.len, &rows);
+    try std.testing.expectEqual(@as(u64, 2), filtered.total);
+    try std.testing.expectEqual(@as(u64, 2), filtered.written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), rows[1]);
+
+    var too_small = [_]u8{};
+    try std.testing.expectError(TableError.CursorOverflow, snapshotExportNullBitmap(snapshot, 2, &too_small));
+    try std.testing.expectError(TableError.InvalidFormat, snapshotExportNullBitmap(snapshot, 1, &exported));
 }
 
 test "table persistent u32 and i32 indexes use compact typed ordering" {

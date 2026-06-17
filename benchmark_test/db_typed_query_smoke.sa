@@ -3,16 +3,17 @@
 @const ROOT = utf8:"."
 @const TABLE = utf8:"typed_orders"
 @const SCHEMA_PATH = utf8:"typed_orders.sadb-schema"
-@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable\n#def COL_DUE_DATE_STRIDE = 8 // i64 date nullable\n"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable\n#def COL_DUE_DATE_STRIDE = 8 // i64 date nullable\n#def COL_AMOUNT_NULLS_STRIDE = 1 // u8 null_bitmap\n#def COL_DUE_DATE_NULLS_STRIDE = 1 // u8 null_bitmap\n"
 
 #def ROOT_LEN = 1
 #def TABLE_LEN = 12
 #def SCHEMA_PATH_LEN = 24
-#def SCHEMA_LEN = 152
+#def SCHEMA_LEN = 256
 #def ROWS = 4
-#def COLUMN_COUNT = 3
+#def COLUMN_COUNT = 5
 #def COL_BYTES = 32
-#def COLUMNS_BYTES = 48
+#def NULL_COL_BYTES = 4
+#def COLUMNS_BYTES = 80
 #def RANGE_ROWS_CAP = 4
 #def RANGE_ROWS_BYTES = 32
 #def NULL_BITMAP_BYTES = 1
@@ -25,6 +26,8 @@ L_ENTRY:
     id_col = alloc COL_BYTES
     amount_col = alloc COL_BYTES
     due_date_col = alloc COL_BYTES
+    amount_null_col = alloc NULL_COL_BYTES
+    due_date_null_col = alloc NULL_COL_BYTES
     range_rows = alloc RANGE_ROWS_BYTES
     amount_nulls = alloc NULL_BITMAP_BYTES
     due_date_nulls = alloc NULL_BITMAP_BYTES
@@ -52,16 +55,25 @@ L_ENTRY:
     store due_date_col+16, due_feb20 as i64
     store due_date_col+24, due_mar as i64
 
+    store amount_null_col+0, 0 as u8
+    store amount_null_col+1, 0 as u8
+    store amount_null_col+2, 1 as u8
+    store amount_null_col+3, 0 as u8
+    store due_date_null_col+0, 0 as u8
+    store due_date_null_col+1, 0 as u8
+    store due_date_null_col+2, 1 as u8
+    store due_date_null_col+3, 0 as u8
+
     EXPAND DB_NULL_BITMAP_CLEAR amount_null_clear_status, amount_nulls, NULL_BITMAP_BYTES
     EXPAND DB_NULL_BITMAP_CLEAR due_null_clear_status, due_date_nulls, NULL_BITMAP_BYTES
-    EXPAND DB_NULL_BITMAP_SET amount_null_set_status, amount_nulls, NULL_BITMAP_BYTES, 2, 1
-    EXPAND DB_NULL_BITMAP_SET due_null_set_status, due_date_nulls, NULL_BITMAP_BYTES, 2, 1
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
     EXPAND DB_COLUMN_INPUT_SET columns, 0, id_col, COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 1, amount_col, COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 2, due_date_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 3, amount_null_col, NULL_COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 4, due_date_null_col, NULL_COL_BYTES
     EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, ROWS, columns, COLUMN_COUNT, info
     EXPAND DB_CREATE_I64_INDEX amount_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 1, 0, info
     EXPAND DB_CREATE_I64_INDEX due_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 2, 0, info
@@ -75,6 +87,16 @@ L_ENTRY:
     EXPAND DB_COLUMN_LOGICAL_INFO_TYPE due_logical_type, logical_info
     EXPAND DB_COLUMN_LOGICAL_INFO_SCALE due_logical_scale, logical_info
     EXPAND DB_COLUMN_LOGICAL_INFO_NULLABLE due_nullable, logical_info
+    EXPAND DB_EXPORT_NULL_BITMAP_HANDLE amount_export_status, amount_export_written, amount_export_rows, amount_nulls, NULL_BITMAP_BYTES, read_handle, 3
+    EXPAND DB_EXPORT_NULL_BITMAP_HANDLE due_export_status, due_export_written, due_export_rows, due_date_nulls, NULL_BITMAP_BYTES, read_handle, 4
+    EXPAND DB_NULL_BITMAP_GET amount_null_row0_status, amount_null_row0, amount_nulls, NULL_BITMAP_BYTES, 0
+    EXPAND DB_NULL_BITMAP_GET amount_null_row1_status, amount_null_row1, amount_nulls, NULL_BITMAP_BYTES, 1
+    EXPAND DB_NULL_BITMAP_GET amount_null_row2_status, amount_null_row2, amount_nulls, NULL_BITMAP_BYTES, 2
+    EXPAND DB_NULL_BITMAP_GET amount_null_row3_status, amount_null_row3, amount_nulls, NULL_BITMAP_BYTES, 3
+    EXPAND DB_NULL_BITMAP_GET due_null_row0_status, due_null_row0, due_date_nulls, NULL_BITMAP_BYTES, 0
+    EXPAND DB_NULL_BITMAP_GET due_null_row1_status, due_null_row1, due_date_nulls, NULL_BITMAP_BYTES, 1
+    EXPAND DB_NULL_BITMAP_GET due_null_row2_status, due_null_row2, due_date_nulls, NULL_BITMAP_BYTES, 2
+    EXPAND DB_NULL_BITMAP_GET due_null_row3_status, due_null_row3, due_date_nulls, NULL_BITMAP_BYTES, 3
 
     EXPAND DB_RANGE_DECIMAL_I64_HANDLE amount_range_status, amount_range_written, amount_range_total, range_rows, RANGE_ROWS_CAP, read_handle, 1, 2, 0, 0, 0, 0, 50, 0, 0, 4
     amount_range_row0 = load range_rows+0 as u64
@@ -102,8 +124,6 @@ L_ENTRY:
     ok_due_mar_status = eq due_mar_status, SA_DB_OK
     ok_amount_null_clear_status = eq amount_null_clear_status, SA_DB_OK
     ok_due_null_clear_status = eq due_null_clear_status, SA_DB_OK
-    ok_amount_null_set_status = eq amount_null_set_status, SA_DB_OK
-    ok_due_null_set_status = eq due_null_set_status, SA_DB_OK
     ok_remove = eq remove_status, SA_DB_OK
     ok_init = eq init_status, SA_DB_OK
     ok_ingest = eq ingest_status, SA_DB_OK
@@ -118,6 +138,28 @@ L_ENTRY:
     ok_due_logical_type = eq due_logical_type, SA_DB_LOGICAL_DATE_DAYS
     ok_due_logical_scale = eq due_logical_scale, 0
     ok_due_nullable = eq due_nullable, 1
+    ok_amount_export_status = eq amount_export_status, SA_DB_OK
+    ok_amount_export_written = eq amount_export_written, NULL_BITMAP_BYTES
+    ok_amount_export_rows = eq amount_export_rows, ROWS
+    ok_due_export_status = eq due_export_status, SA_DB_OK
+    ok_due_export_written = eq due_export_written, NULL_BITMAP_BYTES
+    ok_due_export_rows = eq due_export_rows, ROWS
+    ok_amount_null_row0_status = eq amount_null_row0_status, SA_DB_OK
+    ok_amount_null_row0 = eq amount_null_row0, 0
+    ok_amount_null_row1_status = eq amount_null_row1_status, SA_DB_OK
+    ok_amount_null_row1 = eq amount_null_row1, 0
+    ok_amount_null_row2_status = eq amount_null_row2_status, SA_DB_OK
+    ok_amount_null_row2 = eq amount_null_row2, 1
+    ok_amount_null_row3_status = eq amount_null_row3_status, SA_DB_OK
+    ok_amount_null_row3 = eq amount_null_row3, 0
+    ok_due_null_row0_status = eq due_null_row0_status, SA_DB_OK
+    ok_due_null_row0 = eq due_null_row0, 0
+    ok_due_null_row1_status = eq due_null_row1_status, SA_DB_OK
+    ok_due_null_row1 = eq due_null_row1, 0
+    ok_due_null_row2_status = eq due_null_row2_status, SA_DB_OK
+    ok_due_null_row2 = eq due_null_row2, 1
+    ok_due_null_row3_status = eq due_null_row3_status, SA_DB_OK
+    ok_due_null_row3 = eq due_null_row3, 0
     ok_amount_range_status = eq amount_range_status, SA_DB_OK
     ok_amount_range_written = eq amount_range_written, 2
     ok_amount_range_total = eq amount_range_total, 2
@@ -151,21 +193,43 @@ L_ENTRY:
     ok11 = and ok10, ok_due_mar_status
     ok12 = and ok11, ok_amount_null_clear_status
     ok13 = and ok12, ok_due_null_clear_status
-    ok14 = and ok13, ok_amount_null_set_status
-    ok15 = and ok14, ok_due_null_set_status
-    ok16 = and ok15, ok_remove
-    ok17 = and ok16, ok_init
-    ok18 = and ok17, ok_ingest
-    ok19 = and ok18, ok_amount_index
-    ok20 = and ok19, ok_due_index
-    ok21 = and ok20, ok_open
+    ok14 = and ok13, ok_remove
+    ok15 = and ok14, ok_init
+    ok16 = and ok15, ok_ingest
+    ok17 = and ok16, ok_amount_index
+    ok18 = and ok17, ok_due_index
+    ok19 = and ok18, ok_open
+    ok20 = and ok19, ok_amount_logical_status
+    ok21 = and ok20, ok_amount_logical_type
     ok_logical01 = and ok_amount_logical_status, ok_amount_logical_type
     ok_logical02 = and ok_logical01, ok_amount_logical_scale
     ok_logical03 = and ok_logical02, ok_amount_nullable
     ok_logical04 = and ok_logical03, ok_due_logical_status
     ok_logical05 = and ok_logical04, ok_due_logical_type
     ok_logical06 = and ok_logical05, ok_due_logical_scale
-    ok_logical_all = and ok_logical06, ok_due_nullable
+    ok_logical07 = and ok_logical06, ok_due_nullable
+    ok_logical08 = and ok_logical07, ok_amount_export_status
+    ok_logical09 = and ok_logical08, ok_amount_export_written
+    ok_logical10 = and ok_logical09, ok_amount_export_rows
+    ok_logical11 = and ok_logical10, ok_due_export_status
+    ok_logical12 = and ok_logical11, ok_due_export_written
+    ok_logical13 = and ok_logical12, ok_due_export_rows
+    ok_logical14 = and ok_logical13, ok_amount_null_row0_status
+    ok_logical15 = and ok_logical14, ok_amount_null_row0
+    ok_logical16 = and ok_logical15, ok_amount_null_row1_status
+    ok_logical17 = and ok_logical16, ok_amount_null_row1
+    ok_logical18 = and ok_logical17, ok_amount_null_row2_status
+    ok_logical19 = and ok_logical18, ok_amount_null_row2
+    ok_logical20 = and ok_logical19, ok_amount_null_row3_status
+    ok_logical21 = and ok_logical20, ok_amount_null_row3
+    ok_logical22 = and ok_logical21, ok_due_null_row0_status
+    ok_logical23 = and ok_logical22, ok_due_null_row0
+    ok_logical24 = and ok_logical23, ok_due_null_row1_status
+    ok_logical25 = and ok_logical24, ok_due_null_row1
+    ok_logical26 = and ok_logical25, ok_due_null_row2_status
+    ok_logical27 = and ok_logical26, ok_due_null_row2
+    ok_logical28 = and ok_logical27, ok_due_null_row3_status
+    ok_logical_all = and ok_logical28, ok_due_null_row3
     ok21a = and ok21, ok_logical_all
     ok22 = and ok21a, ok_amount_range_status
     ok23 = and ok22, ok_amount_range_written
@@ -205,8 +269,6 @@ L_ENTRY:
     !due_mar
     !amount_null_clear_status
     !due_null_clear_status
-    !amount_null_set_status
-    !due_null_set_status
     !remove_status
     !init_status
     !ingest_status
@@ -222,6 +284,28 @@ L_ENTRY:
     !due_logical_type
     !due_logical_scale
     !due_nullable
+    !amount_export_status
+    !amount_export_written
+    !amount_export_rows
+    !due_export_status
+    !due_export_written
+    !due_export_rows
+    !amount_null_row0_status
+    !amount_null_row0
+    !amount_null_row1_status
+    !amount_null_row1
+    !amount_null_row2_status
+    !amount_null_row2
+    !amount_null_row3_status
+    !amount_null_row3
+    !due_null_row0_status
+    !due_null_row0
+    !due_null_row1_status
+    !due_null_row1
+    !due_null_row2_status
+    !due_null_row2
+    !due_null_row3_status
+    !due_null_row3
     !amount_range_status
     !amount_range_written
     !amount_range_total
@@ -257,8 +341,6 @@ L_ENTRY:
     !ok_due_mar_status
     !ok_amount_null_clear_status
     !ok_due_null_clear_status
-    !ok_amount_null_set_status
-    !ok_due_null_set_status
     !ok_remove
     !ok_init
     !ok_ingest
@@ -273,6 +355,28 @@ L_ENTRY:
     !ok_due_logical_type
     !ok_due_logical_scale
     !ok_due_nullable
+    !ok_amount_export_status
+    !ok_amount_export_written
+    !ok_amount_export_rows
+    !ok_due_export_status
+    !ok_due_export_written
+    !ok_due_export_rows
+    !ok_amount_null_row0_status
+    !ok_amount_null_row0
+    !ok_amount_null_row1_status
+    !ok_amount_null_row1
+    !ok_amount_null_row2_status
+    !ok_amount_null_row2
+    !ok_amount_null_row3_status
+    !ok_amount_null_row3
+    !ok_due_null_row0_status
+    !ok_due_null_row0
+    !ok_due_null_row1_status
+    !ok_due_null_row1
+    !ok_due_null_row2_status
+    !ok_due_null_row2
+    !ok_due_null_row3_status
+    !ok_due_null_row3
     !ok_amount_range_status
     !ok_amount_range_written
     !ok_amount_range_total
@@ -337,11 +441,35 @@ L_ENTRY:
     !ok_logical04
     !ok_logical05
     !ok_logical06
+    !ok_logical07
+    !ok_logical08
+    !ok_logical09
+    !ok_logical10
+    !ok_logical11
+    !ok_logical12
+    !ok_logical13
+    !ok_logical14
+    !ok_logical15
+    !ok_logical16
+    !ok_logical17
+    !ok_logical18
+    !ok_logical19
+    !ok_logical20
+    !ok_logical21
+    !ok_logical22
+    !ok_logical23
+    !ok_logical24
+    !ok_logical25
+    !ok_logical26
+    !ok_logical27
+    !ok_logical28
     !ok_logical_all
     !ok21a
     !id_col
     !amount_col
     !due_date_col
+    !amount_null_col
+    !due_date_null_col
     !range_rows
     !amount_nulls
     !due_date_nulls

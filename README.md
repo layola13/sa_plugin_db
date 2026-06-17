@@ -416,6 +416,10 @@ Read queries now use snapshots:
    row width, epoch, column stride, primitive type code, metadata string lengths,
    logical type, logical scale, and nullable marker without requiring callers to
    parse JSON meta.
+   `sa_db_export_null_bitmap_handle` / `DB_EXPORT_NULL_BITMAP_HANDLE` exports a
+   logical `u8 null_bitmap` column from the snapshot into the same packed bitmap
+   layout used by the nullable range/filter helper APIs, so persisted null state
+   can be reused directly by SA query code.
 3. `*_handle` query functions scan the in-memory snapshot; `find_u64` and
    `count_u64_cmp` use a persisted sorted `u64 -> row` index when one exists for
    the column. Signed `i64` columns now have the same point/range/count/min/max
@@ -1009,6 +1013,9 @@ The `db.sal` facade exposes matching helper macros: `DB_DECIMAL_FROM_PARTS`,
 day `19782`; callers can build normal signed indexes over those `i64` columns.
 The typed range macros listed above now let SA query those same encoded columns
 directly with business parameters such as decimal parts or Y-M-D dates.
+When null state is stored as a logical `u8 null_bitmap` column, use
+`sa_db_export_null_bitmap_handle` / `DB_EXPORT_NULL_BITMAP_HANDLE` to materialize
+the packed bitmap for `*_NULL_BITMAP_HANDLE` range/filter calls.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2

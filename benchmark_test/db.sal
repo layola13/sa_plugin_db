@@ -770,6 +770,14 @@
     %out_status = call @sa_db_column_logical_info_handle(%handle, %column_index, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_EXPORT_NULL_BITMAP_HANDLE %out_status, %out_written_bytes, %out_row_count, %out_bitmap, %out_bitmap_len, %handle, %column_index
+    __db_export_null_bitmap_written_slot_%out_written_bytes = stack_alloc 8
+    __db_export_null_bitmap_row_count_slot_%out_row_count = stack_alloc 8
+    %out_status = call @sa_db_export_null_bitmap_handle(%handle, %column_index, &%out_bitmap, %out_bitmap_len, &__db_export_null_bitmap_written_slot_%out_written_bytes, &__db_export_null_bitmap_row_count_slot_%out_row_count)
+    %out_written_bytes = load __db_export_null_bitmap_written_slot_%out_written_bytes+0 as u64
+    %out_row_count = load __db_export_null_bitmap_row_count_slot_%out_row_count+0 as u64
+[END_MACRO]
+
 [MACRO] DB_DICT_LOOKUP_HANDLE %out_status, %out_found, %out_id, %handle, %dict_name, %dict_name_len, %value, %value_len
     __db_dict_lookup_handle_found_slot_%out_found = stack_alloc 8
     __db_dict_lookup_handle_id_slot_%out_id = stack_alloc 8
