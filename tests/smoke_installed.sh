@@ -93,7 +93,8 @@ odd_hash="$(printf '%s\n' "$odd_output" | awk '/^Hash:/ {print $2}')"
 test "${#odd_hash}" -eq 64
 SA_PLUGIN_DEV=1 sa db exec "$odd_hash" | grep -F 'result_u64: 1' >/dev/null
 
-test -f flash_sale.meta
+test -f flash_sale.manifest
+find . -maxdepth 1 -type f -name 'flash_sale.meta.*' | grep -F 'flash_sale.meta.' >/dev/null
 test -f flash_sale.col0.0.dat
 test -f flash_sale.col1.0.dat
 test -f .sa/db/qmods/$query_hash.qmod
