@@ -520,6 +520,24 @@
     %out_status = call @sa_db_tx_rollback(%handle)
 [END_MACRO]
 
+[MACRO] DB_COLTX_BEGIN %out_status, %out_handle, %root, %root_len, %table_name, %table_name_len
+    __db_coltx_handle_slot_%out_handle = stack_alloc 8
+    %out_status = call @sa_db_coltx_begin(&%root, %root_len, &%table_name, %table_name_len, &__db_coltx_handle_slot_%out_handle)
+    %out_handle = load __db_coltx_handle_slot_%out_handle+0 as ptr
+[END_MACRO]
+
+[MACRO] DB_COLTX_ADD_COLUMNS %out_status, %handle, %row_count, %columns, %columns_len
+    %out_status = call @sa_db_coltx_add_columns(%handle, %row_count, %columns, %columns_len)
+[END_MACRO]
+
+[MACRO] DB_COLTX_COMMIT %out_status, %handle, %out_info
+    %out_status = call @sa_db_coltx_commit(%handle, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_COLTX_ROLLBACK %out_status, %handle
+    %out_status = call @sa_db_coltx_rollback(%handle)
+[END_MACRO]
+
 [MACRO] DB_CREATE_U64_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %unique, %out_info
     %out_status = call @sa_db_create_u64_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, %unique, &%out_info)
 [END_MACRO]

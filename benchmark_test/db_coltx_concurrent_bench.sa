@@ -4,7 +4,7 @@
 @import "sa_std/io/print.sai"
 @import "sa_std/time.sai"
 
-@const ROOT = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_raw"
+@const ROOT = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_coltx"
 @const TABLE_Q = utf8:"members"
 @const TABLE_I = utf8:"members_ci"
 @const SCHEMA_Q_PATH = utf8:"members.sadb-schema"
@@ -17,15 +17,20 @@
 @const DB_SERIAL_QUERY = utf8:"db_serial_query_ns="
 @const DB_CONCURRENT_QUERY = utf8:"db_concurrent_query_ns="
 @const DB_CONCURRENT_INSERT = utf8:"db_concurrent_insert_ns="
+@const DB_COLTX_CONCURRENT_INSERT = utf8:"db_coltx_concurrent_insert_ns="
 @const DB_SERIAL_QUERY_OK = utf8:"db_serial_query_ok="
 @const DB_CONCURRENT_QUERY_OK = utf8:"db_concurrent_query_ok="
 @const DB_CONCURRENT_INSERT_OK = utf8:"db_concurrent_insert_ok="
 @const DB_CONCURRENT_INSERT_ROWS = utf8:"db_concurrent_insert_rows="
 @const DB_REMOVE_Q_STATUS = utf8:"db_remove_q_status="
 @const DB_INIT_Q_STATUS = utf8:"db_init_q_status="
+@const DB_FILL_Q_STATUS = utf8:"db_fill_q_status="
+@const DB_INGEST_Q_STATUS = utf8:"db_ingest_q_status="
 @const DB_REMOVE_I_STATUS = utf8:"db_remove_i_status="
 @const DB_INIT_I_STATUS = utf8:"db_init_i_status="
 @const DB_VERIFY_I_STATUS = utf8:"db_verify_i_status="
+@const DB_QUERY_OPEN_STATUS = utf8:"db_query_open_status="
+@const DB_QUERY_CLOSE_STATUS = utf8:"db_query_close_status="
 @const DB_INSERT_STATUS0 = utf8:"db_insert_status0="
 @const DB_INSERT_STATUS1 = utf8:"db_insert_status1="
 @const DB_INSERT_STATUS2 = utf8:"db_insert_status2="
@@ -38,7 +43,7 @@
 @extern pthread_join(handle: i32, *out: ptr) -> i32
 @extern pthread_drop(handle: i32) -> void
 
-#def ROOT_LEN = 71
+#def ROOT_LEN = 73
 #def TABLE_Q_LEN = 7
 #def TABLE_I_LEN = 10
 #def SCHEMA_Q_PATH_LEN = 19
@@ -59,15 +64,20 @@
 #def DB_SERIAL_QUERY_LEN = 19
 #def DB_CONCURRENT_QUERY_LEN = 23
 #def DB_CONCURRENT_INSERT_LEN = 24
+#def DB_COLTX_CONCURRENT_INSERT_LEN = 30
 #def DB_SERIAL_QUERY_OK_LEN = 19
 #def DB_CONCURRENT_QUERY_OK_LEN = 23
 #def DB_CONCURRENT_INSERT_OK_LEN = 24
 #def DB_CONCURRENT_INSERT_ROWS_LEN = 26
 #def DB_REMOVE_Q_STATUS_LEN = 19
 #def DB_INIT_Q_STATUS_LEN = 17
+#def DB_FILL_Q_STATUS_LEN = 17
+#def DB_INGEST_Q_STATUS_LEN = 19
 #def DB_REMOVE_I_STATUS_LEN = 19
 #def DB_INIT_I_STATUS_LEN = 17
 #def DB_VERIFY_I_STATUS_LEN = 19
+#def DB_QUERY_OPEN_STATUS_LEN = 21
+#def DB_QUERY_CLOSE_STATUS_LEN = 22
 #def DB_INSERT_STATUS0_LEN = 18
 #def DB_INSERT_STATUS1_LEN = 18
 #def DB_INSERT_STATUS2_LEN = 18
@@ -254,19 +264,32 @@ L_ENTRY:
     EXPAND DB_COLUMN_INPUT_SET columns, 1, plan_col, BATCH_COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 2, status_col, BATCH_COL_BYTES
     EXPAND DB_COLUMN_INPUT_SET columns, 3, points_col, BATCH_COL_BYTES
-    EXPAND DB_INGEST_COLUMNS ingest_status, ROOT, ROOT_LEN, TABLE_I, TABLE_I_LEN, rows, columns, COLUMN_COUNT, info
+    EXPAND DB_COLTX_BEGIN begin_status, tx_handle, ROOT, ROOT_LEN, TABLE_I, TABLE_I_LEN
+    EXPAND DB_COLTX_ADD_COLUMNS add_status, tx_handle, rows, columns, COLUMN_COUNT
+    EXPAND DB_COLTX_COMMIT commit_status, tx_handle, info
     EXPAND DB_INFO_ROW_COUNT seen_rows, info
     ok_fill = eq fill_status, 0
-    ok_ingest = eq ingest_status, SA_DB_OK
-    ok = and ok_fill, ok_ingest
+    ok_begin = eq begin_status, SA_DB_OK
+    ok_add = eq add_status, SA_DB_OK
+    ok_commit = eq commit_status, SA_DB_OK
+    ok_a = and ok_fill, ok_begin
+    ok_b = and ok_add, ok_commit
+    ok = and ok_a, ok_b
     store slot+InsertThread_ok, ok as u64
     store slot+InsertThread_seen_rows, seen_rows as u64
-    store slot+InsertThread_status, ingest_status as u64
+    store slot+InsertThread_status, commit_status as u64
     !fill_status
-    !ingest_status
+    !begin_status
+    !tx_handle
+    !add_status
+    !commit_status
     !seen_rows
     !ok_fill
-    !ok_ingest
+    !ok_begin
+    !ok_add
+    !ok_commit
+    !ok_a
+    !ok_b
     !ok
     !start_base
     !rows
@@ -337,6 +360,8 @@ L_ENTRY:
     db_serial_query_ns = sub t_serial1, t_serial0
     serial_ok = load serial_thread+QueryThread_ok as u64
     serial_sum_total = load serial_thread+QueryThread_sum_total as u64
+    serial_query_close_status = load serial_thread+QueryThread_verify_status as u64
+    serial_query_open_status = load serial_thread+QueryThread_last_status as u64
 
     qthreads = alloc 384
     store qthreads+QueryThread_iterations, QUERY_REPEATS as u64
@@ -385,6 +410,14 @@ L_ENTRY:
     qok1 = load qt1+QueryThread_ok as u64
     qok2 = load qt2+QueryThread_ok as u64
     qok3 = load qt3+QueryThread_ok as u64
+    qopen0 = load qthreads+QueryThread_last_status as u64
+    qopen1 = load qt1+QueryThread_last_status as u64
+    qopen2 = load qt2+QueryThread_last_status as u64
+    qopen3 = load qt3+QueryThread_last_status as u64
+    qclose0 = load qthreads+QueryThread_verify_status as u64
+    qclose1 = load qt1+QueryThread_verify_status as u64
+    qclose2 = load qt2+QueryThread_verify_status as u64
+    qclose3 = load qt3+QueryThread_verify_status as u64
     qsum0 = load qthreads+QueryThread_sum_total as u64
     qsum1 = load qt1+QueryThread_sum_total as u64
     qsum2 = load qt2+QueryThread_sum_total as u64
@@ -476,9 +509,13 @@ L_ENTRY:
     EXPAND PRINT_U64_LINE DB_CONCURRENT_INSERT_ROWS, DB_CONCURRENT_INSERT_ROWS_LEN, concurrent_insert_rows
     EXPAND PRINT_U64_LINE DB_REMOVE_Q_STATUS, DB_REMOVE_Q_STATUS_LEN, remove_q_status
     EXPAND PRINT_U64_LINE DB_INIT_Q_STATUS, DB_INIT_Q_STATUS_LEN, init_q_status
+    EXPAND PRINT_U64_LINE DB_FILL_Q_STATUS, DB_FILL_Q_STATUS_LEN, fill_q_status
+    EXPAND PRINT_U64_LINE DB_INGEST_Q_STATUS, DB_INGEST_Q_STATUS_LEN, ingest_q_status
     EXPAND PRINT_U64_LINE DB_REMOVE_I_STATUS, DB_REMOVE_I_STATUS_LEN, remove_i_status
     EXPAND PRINT_U64_LINE DB_INIT_I_STATUS, DB_INIT_I_STATUS_LEN, init_i_status
     EXPAND PRINT_U64_LINE DB_VERIFY_I_STATUS, DB_VERIFY_I_STATUS_LEN, verify_i_status
+    EXPAND PRINT_U64_LINE DB_QUERY_OPEN_STATUS, DB_QUERY_OPEN_STATUS_LEN, qopen0
+    EXPAND PRINT_U64_LINE DB_QUERY_CLOSE_STATUS, DB_QUERY_CLOSE_STATUS_LEN, qclose0
     EXPAND PRINT_U64_LINE DB_INSERT_STATUS0, DB_INSERT_STATUS0_LEN, istatus0
     EXPAND PRINT_U64_LINE DB_INSERT_STATUS1, DB_INSERT_STATUS1_LEN, istatus1
     EXPAND PRINT_U64_LINE DB_INSERT_STATUS2, DB_INSERT_STATUS2_LEN, istatus2

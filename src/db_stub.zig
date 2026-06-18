@@ -2803,9 +2803,7 @@ test "qmod exec rejects corrupted table snapshot segment" {
     const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
     defer std.testing.allocator.free(hash_hex);
 
-    const meta_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.meta", .{"simple"});
-    defer std.testing.allocator.free(meta_path);
-    const meta_bytes = try std.fs.cwd().readFileAlloc(std.testing.allocator, meta_path, 1 << 20);
+    const meta_bytes = try readActiveTableMetaSource(std.testing.allocator, "simple");
     defer std.testing.allocator.free(meta_bytes);
     var parsed = try std.json.parseFromSlice(QmodTableMeta, std.testing.allocator, meta_bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();

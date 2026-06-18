@@ -22,9 +22,15 @@
 @const QUERY_WORKER_VT = vtable { call = @sqlite_query_worker }
 @const INSERT_WORKER_VT = vtable { call = @sqlite_insert_worker }
 
-@const DB_PATH_Q_C = utf8:"sqlite_members.db\0"
-@const DB_PATH_I_FS = utf8:"sqlite_members_ci.db"
-@const DB_PATH_I_C = utf8:"sqlite_members_ci.db\0"
+@const ROOT = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite"
+@const DB_PATH_Q_C = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members.db\0"
+@const DB_PATH_Q_FS = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members.db"
+@const DB_PATH_Q_WAL_FS = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members.db-wal"
+@const DB_PATH_Q_SHM_FS = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members.db-shm"
+@const DB_PATH_I_FS = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members_ci.db"
+@const DB_PATH_I_C = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members_ci.db\0"
+@const DB_PATH_I_WAL_FS = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members_ci.db-wal"
+@const DB_PATH_I_SHM_FS = utf8:"/home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test/.bench_sqlite/sqlite_members_ci.db-shm"
 @const SQL_PRAGMA_WRITE = utf8:"PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;\0"
 @const SQL_CREATE = utf8:"CREATE TABLE members(id INTEGER PRIMARY KEY, plan INTEGER, status INTEGER, points INTEGER);\0"
 @const SQL_BEGIN = utf8:"BEGIN TRANSACTION;\0"
@@ -45,7 +51,13 @@
 @const THREADS_LABEL = utf8:"threads="
 @const SUM_TOTAL_LABEL = utf8:"sum_total="
 
-#def DB_PATH_I_FS_LEN = 20
+#def ROOT_LEN = 74
+#def DB_PATH_Q_FS_LEN = 91
+#def DB_PATH_Q_WAL_FS_LEN = 95
+#def DB_PATH_Q_SHM_FS_LEN = 95
+#def DB_PATH_I_FS_LEN = 94
+#def DB_PATH_I_WAL_FS_LEN = 98
+#def DB_PATH_I_SHM_FS_LEN = 98
 #def SQLITE_OPEN_READWRITE = 2
 #def SQLITE_OPEN_READWRITE_CREATE = 6
 #def SQLITE_OK = 0
@@ -56,7 +68,7 @@
 #def THREADS = 4
 #def QUERY_REPEATS = 25
 #def TOTAL_QUERIES = 100
-#def EXPECTED_QUERY_SUM = 12500500000
+#def EXPECTED_QUERY_SUM = 12500250000
 #def FMT_BUF_BYTES = 32
 
 #def SQLITE_SERIAL_QUERY_LEN = 23
@@ -363,6 +375,77 @@ L_ENTRY:
 
 @main() -> i32:
 L_ENTRY:
+    remove_root_status = call @sa_fs_remove_dir_all(&ROOT, ROOT_LEN)
+    create_root_status = call @sa_fs_make_dir(&ROOT, ROOT_LEN)
+    remove_q_status = call @sa_fs_remove_file(&DB_PATH_Q_FS, DB_PATH_Q_FS_LEN)
+    remove_q_wal_status = call @sa_fs_remove_file(&DB_PATH_Q_WAL_FS, DB_PATH_Q_WAL_FS_LEN)
+    remove_q_shm_status = call @sa_fs_remove_file(&DB_PATH_Q_SHM_FS, DB_PATH_Q_SHM_FS_LEN)
+    !remove_root_status
+    !create_root_status
+    !remove_q_status
+    !remove_q_wal_status
+    !remove_q_shm_status
+    db_slot = stack_alloc 8
+    stmt_slot = stack_alloc 8
+    null_slot = stack_alloc 8
+    store null_slot+0, 0 as ptr
+    null_ptr = load null_slot+0 as ptr
+    setup_q_open = call @sqlite3_open_v2(*DB_PATH_Q_C, *db_slot, SQLITE_OPEN_READWRITE_CREATE, *null_ptr)
+    setup_q_db = load db_slot+0 as ptr
+    setup_q_busy = call @sqlite3_busy_timeout(*setup_q_db, 10000)
+    setup_q_pragma = call @sqlite3_exec(*setup_q_db, *SQL_PRAGMA_WRITE, *null_ptr, *null_ptr, *null_ptr)
+    setup_q_create = call @sqlite3_exec(*setup_q_db, *SQL_CREATE, *null_ptr, *null_ptr, *null_ptr)
+    setup_q_begin = call @sqlite3_exec(*setup_q_db, *SQL_BEGIN, *null_ptr, *null_ptr, *null_ptr)
+    setup_q_prepare = call @sqlite3_prepare_v2(*setup_q_db, *SQL_INSERT, -1, *stmt_slot, *null_ptr)
+    setup_q_stmt = load stmt_slot+0 as ptr
+    setup_i_slot = stack_alloc 8
+    store setup_i_slot+0, 0 as u64
+    jmp L_SETUP_QUERY_INSERT_COND
+
+L_SETUP_QUERY_INSERT_COND:
+    setup_i = load setup_i_slot+0 as u64
+    setup_insert_cond = ult setup_i, ROWS
+    br setup_insert_cond -> L_SETUP_QUERY_INSERT_BODY, L_SETUP_QUERY_INSERT_DONE
+
+L_SETUP_QUERY_INSERT_BODY:
+    setup_id_value = add setup_i, 1
+    setup_plan_low = and setup_i, 3
+    setup_plan_value = add setup_plan_low, 1
+    setup_status_value = and setup_i, 1
+    setup_points_value = mul setup_id_value, 10
+    setup_bind1 = call @sqlite3_bind_int64(*setup_q_stmt, 1, setup_id_value)
+    setup_bind2 = call @sqlite3_bind_int64(*setup_q_stmt, 2, setup_plan_value)
+    setup_bind3 = call @sqlite3_bind_int64(*setup_q_stmt, 3, setup_status_value)
+    setup_bind4 = call @sqlite3_bind_int64(*setup_q_stmt, 4, setup_points_value)
+    setup_step = call @sqlite3_step(*setup_q_stmt)
+    setup_reset = call @sqlite3_reset(*setup_q_stmt)
+    setup_clear = call @sqlite3_clear_bindings(*setup_q_stmt)
+    !setup_bind1
+    !setup_bind2
+    !setup_bind3
+    !setup_bind4
+    !setup_step
+    !setup_reset
+    !setup_clear
+    setup_next_i = add setup_i, 1
+    store setup_i_slot+0, setup_next_i as u64
+    !setup_i
+    !setup_insert_cond
+    !setup_id_value
+    !setup_plan_low
+    !setup_plan_value
+    !setup_status_value
+    !setup_points_value
+    !setup_next_i
+    jmp L_SETUP_QUERY_INSERT_COND
+
+L_SETUP_QUERY_INSERT_DONE:
+    !setup_i
+    !setup_insert_cond
+    setup_q_finalize = call @sqlite3_finalize(*setup_q_stmt)
+    setup_q_commit = call @sqlite3_exec(*setup_q_db, *SQL_COMMIT, *null_ptr, *null_ptr, *null_ptr)
+    setup_q_close = call @sqlite3_close(*setup_q_db)
+
     serial_thread = alloc QueryThread_SIZE
     store serial_thread+QueryThread_iterations, TOTAL_QUERIES as u64
     store serial_thread+QueryThread_ok, 0 as u64
@@ -424,12 +507,11 @@ L_ENTRY:
     sqlite_concurrent_query_ok = and qjoins, qoks
 
     remove_status = call @sa_fs_remove_file(&DB_PATH_I_FS, DB_PATH_I_FS_LEN)
+    remove_i_wal_status = call @sa_fs_remove_file(&DB_PATH_I_WAL_FS, DB_PATH_I_WAL_FS_LEN)
+    remove_i_shm_status = call @sa_fs_remove_file(&DB_PATH_I_SHM_FS, DB_PATH_I_SHM_FS_LEN)
     !remove_status
-    db_slot = stack_alloc 8
-    stmt_slot = stack_alloc 8
-    null_slot = stack_alloc 8
-    store null_slot+0, 0 as ptr
-    null_ptr = load null_slot+0 as ptr
+    !remove_i_wal_status
+    !remove_i_shm_status
     setup_open = call @sqlite3_open_v2(*DB_PATH_I_C, *db_slot, SQLITE_OPEN_READWRITE_CREATE, *null_ptr)
     setup_db = load db_slot+0 as ptr
     setup_busy = call @sqlite3_busy_timeout(*setup_db, 10000)
@@ -512,6 +594,18 @@ L_ENTRY:
     EXPAND PRINT_U64_LINE THREADS_LABEL, THREADS_LABEL_LEN, THREADS
     EXPAND PRINT_U64_LINE SUM_TOTAL_LABEL, SUM_TOTAL_LABEL_LEN, concurrent_sum_total
 
+    !null_ptr
+    !setup_q_open
+    !setup_q_db
+    !setup_q_busy
+    !setup_q_pragma
+    !setup_q_create
+    !setup_q_begin
+    !setup_q_prepare
+    !setup_q_stmt
+    !setup_q_finalize
+    !setup_q_commit
+    !setup_q_close
     !serial_thread
     !t_serial0
     !t_serial1
@@ -555,7 +649,6 @@ L_ENTRY:
     !qoks23
     !qoks
     !sqlite_concurrent_query_ok
-    !null_ptr
     !setup_open
     !setup_db
     !setup_busy

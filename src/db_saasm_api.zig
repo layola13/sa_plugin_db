@@ -17,17 +17,24 @@ const MS_PER_DAY: u64 = 86_400_000;
 const US_PER_DAY: u64 = 86_400_000_000;
 
 var mutation_mutex = std.Thread.Mutex{};
-var read_handle_mutex = std.Thread.Mutex{};
+var read_handle_lock = std.Thread.RwLock{};
 var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
 var tx_handle_mutex = std.Thread.Mutex{};
 var tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
+var coltx_handle_lock = std.Thread.RwLock{};
+var coltx_handles = std.AutoHashMap(usize, ColtxHandleEntry).init(std.heap.page_allocator);
 var empty_output_bytes: [0]u8 = .{};
 var empty_output_u64s: [0]u64 = .{};
 var empty_output_i64s: [0]i64 = .{};
 
 const ReadHandleEntry = struct {
     snapshot: *table.ReadSnapshot,
-    refs: usize = 0,
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+const ColtxHandleEntry = struct {
+    session: *table.ColumnIngestSession,
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 };
 
 pub const SaDbTableInfo = extern struct {
@@ -246,37 +253,38 @@ fn readHandleKey(handle: ?*anyopaque) ?usize {
 
 fn registerReadSnapshot(snapshot: *table.ReadSnapshot) bool {
     const key = @intFromPtr(snapshot);
-    read_handle_mutex.lock();
-    defer read_handle_mutex.unlock();
-    read_handles.put(key, .{ .snapshot = snapshot }) catch return false;
+    read_handle_lock.lock();
+    defer read_handle_lock.unlock();
+    read_handles.put(key, .{ .snapshot = snapshot, .refs = std.atomic.Value(usize).init(0) }) catch return false;
     return true;
 }
 
 fn acquireReadSnapshot(handle: ?*anyopaque) ?*table.ReadSnapshot {
     const key = readHandleKey(handle) orelse return null;
-    read_handle_mutex.lock();
-    defer read_handle_mutex.unlock();
+    read_handle_lock.lockShared();
+    defer read_handle_lock.unlockShared();
     const entry = read_handles.getPtr(key) orelse return null;
-    entry.refs += 1;
+    _ = entry.refs.fetchAdd(1, .acq_rel);
     return entry.snapshot;
 }
 
 fn releaseReadSnapshot(snapshot: *table.ReadSnapshot) void {
     const key = @intFromPtr(snapshot);
-    read_handle_mutex.lock();
-    defer read_handle_mutex.unlock();
+    read_handle_lock.lockShared();
+    defer read_handle_lock.unlockShared();
     if (read_handles.getPtr(key)) |entry| {
-        if (entry.refs > 0) entry.refs -= 1;
+        const previous = entry.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
     }
 }
 
 fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapshot) u32 {
     out_snapshot.* = null;
     const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    read_handle_mutex.lock();
-    defer read_handle_mutex.unlock();
+    read_handle_lock.lock();
+    defer read_handle_lock.unlock();
     const entry = read_handles.getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    if (entry.refs != 0) return SA_DB_ERR_LOCKED;
+    if (entry.refs.load(.acquire) != 0) return SA_DB_ERR_LOCKED;
     out_snapshot.* = entry.snapshot;
     _ = read_handles.remove(key);
     return SA_DB_OK;
@@ -290,6 +298,33 @@ fn registerWriteTransaction(tx: *table.WriteTransaction) bool {
     return true;
 }
 
+fn registerColumnIngestSession(session: *table.ColumnIngestSession) bool {
+    const key = @intFromPtr(session);
+    coltx_handle_lock.lock();
+    defer coltx_handle_lock.unlock();
+    coltx_handles.put(key, .{ .session = session, .refs = std.atomic.Value(usize).init(0) }) catch return false;
+    return true;
+}
+
+fn acquireColumnIngestSession(handle: ?*anyopaque) ?*table.ColumnIngestSession {
+    const key = readHandleKey(handle) orelse return null;
+    coltx_handle_lock.lockShared();
+    defer coltx_handle_lock.unlockShared();
+    const entry = coltx_handles.getPtr(key) orelse return null;
+    _ = entry.refs.fetchAdd(1, .acq_rel);
+    return entry.session;
+}
+
+fn releaseColumnIngestSession(session: *table.ColumnIngestSession) void {
+    const key = @intFromPtr(session);
+    coltx_handle_lock.lockShared();
+    defer coltx_handle_lock.unlockShared();
+    if (coltx_handles.getPtr(key)) |entry| {
+        const previous = entry.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+    }
+}
+
 fn unregisterWriteTransaction(handle: ?*anyopaque, out_tx: *?*table.WriteTransaction) u32 {
     out_tx.* = null;
     const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
@@ -298,6 +333,18 @@ fn unregisterWriteTransaction(handle: ?*anyopaque, out_tx: *?*table.WriteTransac
     const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     out_tx.* = tx;
     _ = tx_handles.remove(key);
+    return SA_DB_OK;
+}
+
+fn unregisterColumnIngestSession(handle: ?*anyopaque, out_session: *?*table.ColumnIngestSession) u32 {
+    out_session.* = null;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    coltx_handle_lock.lock();
+    defer coltx_handle_lock.unlock();
+    const entry = coltx_handles.getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (entry.refs.load(.acquire) != 0) return SA_DB_ERR_LOCKED;
+    out_session.* = entry.session;
+    _ = coltx_handles.remove(key);
     return SA_DB_OK;
 }
 
@@ -653,8 +700,6 @@ pub export fn sa_db_ingest_columns(
         raw_columns[idx] = .{ .bytes = inputBytes(input.data, input.len) orelse return SA_DB_ERR_INVALID_ARGUMENT };
     }
 
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.ingestRawColumns(allocator, root, table_name, row_count, raw_columns) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1289,7 +1334,7 @@ pub export fn sa_db_tx_begin(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    mutation_mutex.lock();
+    if (!mutation_mutex.tryLock()) return SA_DB_ERR_LOCKED;
     const tx = table.beginWriteTransaction(std.heap.page_allocator, root, table_name) catch |err| {
         mutation_mutex.unlock();
         return tableStatus(err);
@@ -2040,6 +2085,72 @@ pub export fn sa_db_tx_rollback(handle: ?*anyopaque) u32 {
     if (status != SA_DB_OK) return status;
     table.destroyWriteTransaction(std.heap.page_allocator, tx.?);
     mutation_mutex.unlock();
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_coltx_begin(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    out_handle: ?*?*anyopaque,
+) u32 {
+    const slot = out_handle orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    slot.* = null;
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    const session = table.beginColumnIngestSession(std.heap.page_allocator, root, table_name) catch |err| return tableStatus(err);
+    if (!registerColumnIngestSession(session)) {
+        table.destroyColumnIngestSession(std.heap.page_allocator, session);
+        return SA_DB_ERR_OUT_OF_MEMORY;
+    }
+    slot.* = @ptrCast(session);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_coltx_add_columns(
+    handle: ?*anyopaque,
+    row_count: u64,
+    columns_ptr: ?[*]const SaDbColumnInput,
+    columns_len: u64,
+) u32 {
+    if (columns_len > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const n: usize = @intCast(columns_len);
+    const columns_in = if (n == 0) return SA_DB_ERR_INVALID_ARGUMENT else (columns_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
+
+    var raw_columns = std.heap.page_allocator.alloc(table.RawColumnBytes, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    defer std.heap.page_allocator.free(raw_columns);
+    for (columns_in, 0..) |column, idx| {
+        const bytes = inputBytes(column.data, column.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+        raw_columns[idx] = .{ .bytes = bytes };
+    }
+
+    const session = acquireColumnIngestSession(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer releaseColumnIngestSession(session);
+    table.columnIngestSessionAddRawColumns(std.heap.page_allocator, session, row_count, raw_columns) catch |err| return tableStatus(err);
+    return SA_DB_OK;
+}
+
+pub export fn sa_db_coltx_commit(handle: ?*anyopaque, out_info: ?*SaDbTableInfo) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    var session: ?*table.ColumnIngestSession = null;
+    const status = unregisterColumnIngestSession(handle, &session);
+    if (status != SA_DB_OK) return status;
+
+    const info = table.commitColumnIngestSession(std.heap.page_allocator, session.?) catch |err| {
+        table.destroyColumnIngestSession(std.heap.page_allocator, session.?);
+        return tableStatus(err);
+    };
+    table.destroyColumnIngestSession(std.heap.page_allocator, session.?);
+    return fillInfo(info_slot, info);
+}
+
+pub export fn sa_db_coltx_rollback(handle: ?*anyopaque) u32 {
+    var session: ?*table.ColumnIngestSession = null;
+    const status = unregisterColumnIngestSession(handle, &session);
+    if (status != SA_DB_OK) return status;
+    table.destroyColumnIngestSession(std.heap.page_allocator, session.?);
     return SA_DB_OK;
 }
 
@@ -3001,8 +3112,6 @@ pub export fn sa_db_open_read_table(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const snapshot = table.openReadSnapshot(std.heap.page_allocator, root, table_name) catch |err| return tableStatus(err);
     if (!registerReadSnapshot(snapshot)) {
         snapshot.destroy();
@@ -9956,4 +10065,238 @@ test "db SA ABI exports packed null bitmap from logical null_bitmap column" {
     try std.testing.expectEqual(@as(u64, 0), written);
     try std.testing.expectEqual(@as(u64, 0), row_count);
     try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_export_null_bitmap_handle(handle, 1, &exported, exported.len, &written, &row_count));
+}
+
+test "db SA ABI column ingest session batches column writes and commits once" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "coltx_members.sadb-schema".ptr, "coltx_members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_begin(root.ptr, root.len, "coltx_members".ptr, "coltx_members".len, &handle));
+    try std.testing.expect(handle != null);
+
+    var ids1 = [_]u64{ 1, 2 };
+    var points1 = [_]u64{ 10, 20 };
+    const cols1 = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids1), .len = @sizeOf(@TypeOf(ids1)) },
+        .{ .data = @ptrCast(&points1), .len = @sizeOf(@TypeOf(points1)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_add_columns(handle, ids1.len, &cols1, cols1.len));
+
+    var ids2 = [_]u64{ 3, 4 };
+    var points2 = [_]u64{ 30, 40 };
+    const cols2 = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids2), .len = @sizeOf(@TypeOf(ids2)) },
+        .{ .data = @ptrCast(&points2), .len = @sizeOf(@TypeOf(points2)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_add_columns(handle, ids2.len, &cols2, cols2.len));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_commit(handle, &info));
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "coltx_members".ptr, "coltx_members".len, &read_handle));
+    defer _ = sa_db_close_read_table(read_handle);
+
+    var sum: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 100), sum);
+
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(read_handle, 0, 3, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 2), row_index);
+    var points: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(read_handle, 1, row_index, &points));
+    try std.testing.expectEqual(@as(u64, 30), points);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(read_handle, 0, 4, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 3), row_index);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(read_handle, 1, row_index, &points));
+    try std.testing.expectEqual(@as(u64, 40), points);
+
+    handle = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_begin(root.ptr, root.len, "coltx_members".ptr, "coltx_members".len, &handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_add_columns(handle, ids1.len, &cols1, cols1.len));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_rollback(handle));
+}
+
+test "db SA ABI coltx commit waits for active add_columns refs" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "coltx_waits.sadb-schema".ptr, "coltx_waits.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_begin(root.ptr, root.len, "coltx_waits".ptr, "coltx_waits".len, &handle));
+    const session = acquireColumnIngestSession(handle);
+    try std.testing.expect(session != null);
+
+    try std.testing.expectEqual(SA_DB_ERR_LOCKED, sa_db_coltx_commit(handle, &info));
+
+    var ids = [_]u64{ 1, 2 };
+    var points = [_]u64{ 10, 20 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&points), .len = @sizeOf(@TypeOf(points)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_add_columns(handle, ids.len, &cols, cols.len));
+
+    releaseColumnIngestSession(session.?);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_commit(handle, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+}
+
+test "db SA ABI read handle close waits for active query refs" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 4
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "close_waits.sadb-schema".ptr, "close_waits.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var ids = [_]u64{ 1, 2, 3, 4 };
+    var points = [_]u64{ 10, 20, 30, 40 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&points), .len = @sizeOf(@TypeOf(points)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "close_waits".ptr, "close_waits".len, ids.len, &cols, cols.len, &info));
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "close_waits".ptr, "close_waits".len, &handle));
+
+    const snapshot = acquireReadSnapshot(handle);
+    try std.testing.expect(snapshot != null);
+    try std.testing.expectEqual(SA_DB_ERR_LOCKED, sa_db_close_read_table(handle));
+
+    var sum: u64 = 0;
+    try std.testing.expectEqual(@as(u64, 100), table.snapshotSumU64(snapshot.?, 1));
+    releaseReadSnapshot(snapshot.?);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 100), sum);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_close_read_table(handle));
+}
+
+test "db SA ABI open read handle during active write transaction sees committed snapshot" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_read_open.sadb-schema".ptr, "tx_read_open.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_index(root.ptr, root.len, "tx_read_open".ptr, "tx_read_open".len, 0, 1, &info));
+
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 1, .little);
+    std.mem.writeInt(u64, row[8..16], 10, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_insert_row(root.ptr, root.len, "tx_read_open".ptr, "tx_read_open".len, &row, row.len, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_read_open".ptr, "tx_read_open".len, &tx_handle));
+    std.mem.writeInt(u64, row[0..8], 2, .little);
+    std.mem.writeInt(u64, row[8..16], 20, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_insert_row(tx_handle, &row, row.len, &info));
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "tx_read_open".ptr, "tx_read_open".len, &read_handle));
+    var sum: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 10), sum);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+
+    read_handle = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "tx_read_open".ptr, "tx_read_open".len, &read_handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 30), sum);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+}
+
+test "db SA ABI rejects nested tx begin with locked status instead of deadlocking" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VALUE_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    const root = ".";
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_nested_lock.sadb-schema".ptr, "tx_nested_lock.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var first_tx: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_nested_lock".ptr, "tx_nested_lock".len, &first_tx));
+    defer {
+        if (first_tx != null) {
+            _ = sa_db_tx_rollback(first_tx);
+            first_tx = null;
+        }
+    }
+
+    var second_tx: ?*anyopaque = @ptrFromInt(1);
+    try std.testing.expectEqual(SA_DB_ERR_LOCKED, sa_db_tx_begin(root.ptr, root.len, "tx_nested_lock".ptr, "tx_nested_lock".len, &second_tx));
+    try std.testing.expectEqual(@as(?*anyopaque, null), second_tx);
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(first_tx));
+    first_tx = null;
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_nested_lock".ptr, "tx_nested_lock".len, &second_tx));
+    try std.testing.expect(second_tx != null);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(second_tx));
 }

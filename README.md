@@ -870,6 +870,20 @@ manifest remains visible and the transaction handle is closed. `sa_db_tx_rollbac
 handles. This is currently a single-table, single-writer transaction model; read
 handles still see only committed snapshots.
 
+`sa_db_coltx_begin` / `DB_COLTX_BEGIN` starts a column-ingest session for
+batch-oriented writes. Unlike `tx_begin`, it does not hold the global mutation
+mutex across the whole session. `sa_db_coltx_add_columns` /
+`DB_COLTX_ADD_COLUMNS` validates one fixed-width column batch, stages the column
+files and hashes off the commit path, and keeps them private to the session.
+The ABI handle registry now uses a shared lock plus per-session refcounts, so
+different `coltx` sessions no longer serialize their `add_columns` staging I/O
+behind one global mutex.
+`sa_db_coltx_commit` / `DB_COLTX_COMMIT` then takes the table write lock once,
+publishes every staged batch as new segments, rebuilds indexes, and advances the
+manifest once. `sa_db_coltx_rollback` / `DB_COLTX_ROLLBACK` drops all staged
+files. For multi-threaded ERP imports and large member-table loads, this is the
+preferred write path over raw concurrent `sa_db_ingest_columns` calls.
+
 `sa_db_upsert_row_u64_key` / `DB_UPSERT_ROW_U64_KEY` upserts one fixed-width row
 by a unique `u64` key. The target column must already have a unique `u64` index.
 When the key exists, the existing row is atomically replaced by rewriting the
@@ -1232,7 +1246,24 @@ zig cc -O1 sqlite_erp_workflow_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.
 ./sqlite_erp_workflow_bench.out
 ```
 
-Latest 5-run median results:
+Latest verified concurrent rerun results. Each benchmark now runs in its own
+isolated root directory (`.bench_raw`, `.bench_coltx`, `.bench_sqlite`) so old
+artifacts, WAL side files, and sibling benchmarks do not contaminate the next
+run.
+
+On 2026-06-18, a fresh 3-run isolated sample produced these medians:
+
+- db raw read-handle benchmark: `167.317 ms` serial 100x SUM,
+  `157.531 ms` concurrent 4x25 SUM, `95.736 ms` concurrent insert.
+- db `coltx` benchmark: `143.751 ms` serial 100x SUM,
+  `160.721 ms` concurrent 4x25 SUM, `72.192 ms` concurrent insert.
+- SQLite control: `338.595 ms` serial 100x SUM, `197.866 ms` concurrent 4x25
+  SUM, `108.089 ms` concurrent insert.
+
+This rerun also confirms two behavioral changes: read handles now open during
+active write transactions while still seeing only committed snapshots, and
+`coltx` staging no longer serializes `add_columns` behind one global handle
+mutex.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
@@ -1244,9 +1275,13 @@ Latest 5-run median results:
 | count `plan = 1` | 1.108 ms | 2.253 ms | db plugin |
 | compact/vacuum | 20.293 ms | 5.597 ms | SQLite |
 | verify/integrity | 11.624 ms | 3.518 ms | SQLite |
-| serial 100x SUM with read handle | 122.111 ms | 308.089 ms | db plugin |
-| concurrent 4x25 SUM with read handles | 48.385 ms | 120.165 ms | db plugin |
-| concurrent insert, 4x12,500 rows | 55.618 ms | 90.713 ms | db plugin |
+| serial 100x SUM with read handle | 167.317 ms | 338.595 ms | db plugin |
+| concurrent 4x25 SUM with read handles | 157.531 ms | 197.866 ms | db plugin |
+| concurrent insert, 4x12,500 rows, raw `ingest_columns` | 95.736 ms | 108.089 ms | db plugin |
+| concurrent insert, 4x12,500 rows, `coltx` batch session | 72.192 ms | 108.089 ms* | db plugin |
+
+`*` SQLite side only has one concurrent transaction-insert benchmark path; it
+does not distinguish raw ingest from `coltx`.
 
 ERP workflow 7-run median results:
 
@@ -1264,13 +1299,21 @@ ERP workflow 7-run median results:
 
 Summary:
 
-- Reused read-handle queries are faster than SQLite in this benchmark.
-- Concurrent read-handle SUM is about 2.5x faster than the SQLite comparison.
-- Concurrent insert is about 1.6x faster than the SQLite comparison.
+- Reused read-handle queries are still faster than SQLite in this benchmark.
+- The isolated-root rerun removed the earlier benchmark cross-contamination and
+  kept db ahead of SQLite on serial and concurrent read-handle SUM.
+- Read-handle open no longer waits on the global mutation mutex, so active write
+  transactions do not block opening committed read snapshots.
+- The latest raw concurrent rerun also beat SQLite on concurrent insert.
+- Concurrent insert via the `coltx` batch session is the fastest path in the
+  current benchmark set.
 - ERP indexed list/projection queries favor the db plugin in the current
   workflow, especially status/date due-invoice scans and projected order lines.
-- Single SUM queries can still favor SQLite when db handle open/snapshot cost is
-  included.
+- The concurrent insert suite still does not include explicit secondary-index
+  maintenance, so ERP write-path conclusions should remain scoped to the tested
+  workload.
+- The earlier intermittent concurrent failures were not reproduced after moving
+  each benchmark to a dedicated root and cleaning SQLite WAL/SHM side files.
 - SQLite remains stronger for SQL, index creation, ACID, WAL, crash recovery,
   compact/vacuum, and integrity checks.
 
