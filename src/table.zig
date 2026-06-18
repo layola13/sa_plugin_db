@@ -78,6 +78,33 @@ pub const IndexMeta = struct {
     block_sha256: [][]const u8 = &.{},
 };
 
+pub const CreateIndexKind = enum(u32) {
+    u64 = 1,
+    i64 = 2,
+    u32 = 3,
+    i32 = 4,
+    u8 = 5,
+    i8 = 6,
+    u16 = 7,
+    i16 = 8,
+    f32 = 9,
+    f64 = 10,
+    u64_pair = 11,
+    u64_i64_pair = 12,
+    blob_eq = 13,
+    blob_token = 14,
+    blob_prefix = 15,
+    blob_contains = 16,
+};
+
+pub const CreateIndexRequest = struct {
+    kind: CreateIndexKind,
+    column_index: usize,
+    column_index2: ?usize = null,
+    store_name: ?[]const u8 = null,
+    unique: bool = false,
+};
+
 pub const DictMeta = struct {
     name: []const u8,
     path: []const u8,
@@ -704,6 +731,22 @@ fn mappedRegionBytes(region: MappedReadRegion) []const u8 {
     return region.memory;
 }
 
+fn mappedSegmentColumnBytes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    segment: SegmentMeta,
+    column_index: usize,
+    expected_stride: u32,
+) TableError!MappedReadRegion {
+    if (column_index >= segment.files.len) return TableError.InvalidFormat;
+    const file_meta = segment.files[column_index];
+    const expected_len = try expectedColumnBytes(segment.rows, expected_stride);
+    if (file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+    const path = try activePath(allocator, root_dir, file_meta.path);
+    defer allocator.free(path);
+    return mappedReadFile(path, expected_len);
+}
+
 fn tempWritePath(allocator: std.mem.Allocator, path: []const u8) TableError![]u8 {
     const parent = std.fs.path.dirname(path);
     const basename = std.fs.path.basename(path);
@@ -760,6 +803,12 @@ fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes
 
 fn writeFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
     try writeFileWithParentSync(allocator, path, bytes, true);
+}
+
+fn writeArtifactFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
+    // Artifact files become durable only after a later meta/manifest publish points at them,
+    // so avoid an extra parent-directory fsync for every intermediate artifact rewrite.
+    try writeFileWithParentSync(allocator, path, bytes, false);
 }
 
 fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) TableError!void {
@@ -1220,6 +1269,54 @@ fn validateFileMetaBytes(file: FileMeta, bytes: []const u8) TableError!void {
     try validateFileBlockHashes(file, bytes);
 }
 
+fn validateFileMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, file: FileMeta) TableError!void {
+    const path = try activePath(allocator, root_dir, file.path);
+    defer allocator.free(path);
+    const mapped = try mappedReadFile(path, @intCast(file.bytes));
+    defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+    try validateFileMetaBytes(file, mappedRegionBytes(mapped));
+}
+
+fn validateIndexMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, index: IndexMeta) TableError!MappedReadRegion {
+    const path = try activePath(allocator, root_dir, index.path);
+    defer allocator.free(path);
+    const mapped = try mappedReadFile(path, @intCast(index.bytes));
+    const bytes = mappedRegionBytes(mapped);
+    const hash = hashBytes(bytes);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
+    try validateIndexBlockHashes(index, bytes);
+    return mapped;
+}
+
+fn validateDictMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, dict: DictMeta) TableError!void {
+    const path = try activePath(allocator, root_dir, dict.path);
+    defer allocator.free(path);
+    const mapped = try mappedReadFile(path, @intCast(dict.bytes));
+    defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+    const bytes = mappedRegionBytes(mapped);
+    const count = try dictEntryCount(bytes);
+    if (count != dict.entries) return TableError.VerifyFailed;
+    const hash = hashBytes(bytes);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    if (!std.mem.eql(u8, hex[0..], dict.sha256)) return TableError.VerifyFailed;
+    try validateDictBlockHashes(dict, bytes);
+}
+
+fn validateBlobStoreMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, blob: BlobStoreMeta) TableError!void {
+    const path = try activePath(allocator, root_dir, blob.path);
+    defer allocator.free(path);
+    const mapped = try mappedReadFile(path, @intCast(blob.bytes));
+    defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+    const bytes = mappedRegionBytes(mapped);
+    const count = try blobEntryCount(bytes);
+    if (count != blob.entries) return TableError.VerifyFailed;
+    const hash = hashBytes(bytes);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    if (!std.mem.eql(u8, hex[0..], blob.sha256)) return TableError.VerifyFailed;
+    try validateBlobStoreBlockHashes(blob, bytes);
+}
+
 fn writeSegmentFiles(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -1382,6 +1479,284 @@ fn duplicateIndexMeta(allocator: std.mem.Allocator, index: IndexMeta) TableError
         .block_size = index.block_size,
         .block_sha256 = block_sha256,
     };
+}
+
+fn indexExistsConflict(meta: TableMeta, request: CreateIndexRequest) TableError!bool {
+    for (meta.indexes) |index| {
+        switch (request.kind) {
+            .u64, .i64, .u32, .i32, .u8, .i8, .u16, .i16, .f32, .f64 => {
+                const kind_name = switch (request.kind) {
+                    .u64 => "u64",
+                    .i64 => "i64",
+                    .u32 => "u32",
+                    .i32 => "i32",
+                    .u8 => "u8",
+                    .i8 => "i8",
+                    .u16 => "u16",
+                    .i16 => "i16",
+                    .f32 => "f32",
+                    .f64 => "f64",
+                    else => unreachable,
+                };
+                if (std.mem.eql(u8, index.kind, kind_name) and index.column_index == @as(u64, @intCast(request.column_index))) {
+                    if (index.unique == request.unique) return true;
+                    return TableError.InvalidFormat;
+                }
+            },
+            .u64_pair, .u64_i64_pair => {
+                const kind_name = if (request.kind == .u64_pair) "u64_pair" else "u64_i64_pair";
+                const column_index2 = request.column_index2 orelse return TableError.InvalidFormat;
+                if (std.mem.eql(u8, index.kind, kind_name) and
+                    index.column_index == @as(u64, @intCast(request.column_index)) and
+                    index.column_index2 != null and
+                    index.column_index2.? == @as(u64, @intCast(column_index2)))
+                {
+                    if (index.unique == request.unique) return true;
+                    return TableError.InvalidFormat;
+                }
+            },
+            .blob_eq, .blob_token, .blob_prefix, .blob_contains => {
+                const kind_name = switch (request.kind) {
+                    .blob_eq => BLOB_EQ_INDEX_KIND,
+                    .blob_token => BLOB_TOKEN_INDEX_KIND,
+                    .blob_prefix => BLOB_PREFIX_INDEX_KIND,
+                    .blob_contains => BLOB_CONTAINS_INDEX_KIND,
+                    else => unreachable,
+                };
+                const store_name = request.store_name orelse return TableError.InvalidFormat;
+                if (std.mem.eql(u8, index.kind, kind_name) and
+                    index.column_index == @as(u64, @intCast(request.column_index)) and
+                    index.column_index2 == null and
+                    index.store_name != null and
+                    std.mem.eql(u8, index.store_name.?, store_name))
+                {
+                    if (request.kind == .blob_eq) {
+                        if (index.unique == request.unique) return true;
+                        return TableError.InvalidFormat;
+                    }
+                    return true;
+                }
+            },
+        }
+    }
+    return false;
+}
+
+fn validateCreateIndexRequest(meta: TableMeta, request: CreateIndexRequest) TableError!void {
+    switch (request.kind) {
+        .u64 => try ensureU64Column(meta, request.column_index),
+        .i64 => try ensureI64Column(meta, request.column_index),
+        .u32 => try ensureU32Column(meta, request.column_index),
+        .i32 => try ensureI32Column(meta, request.column_index),
+        .u8 => try ensureU8Column(meta, request.column_index),
+        .i8 => try ensureI8Column(meta, request.column_index),
+        .u16 => try ensureU16Column(meta, request.column_index),
+        .i16 => try ensureI16Column(meta, request.column_index),
+        .f32 => try ensureF32Column(meta, request.column_index),
+        .f64 => try ensureF64Column(meta, request.column_index),
+        .u64_pair => try ensureU64PairColumns(meta, request.column_index, request.column_index2 orelse return TableError.InvalidFormat),
+        .u64_i64_pair => try ensureU64I64PairColumns(meta, request.column_index, request.column_index2 orelse return TableError.InvalidFormat),
+        .blob_eq => {
+            const store_name = request.store_name orelse return TableError.InvalidFormat;
+            try validateBlobStoreName(store_name);
+            try ensureBlobHandleColumn(meta, request.column_index);
+        },
+        .blob_token, .blob_prefix, .blob_contains => {
+            const store_name = request.store_name orelse return TableError.InvalidFormat;
+            try validateBlobStoreName(store_name);
+            try ensureBlobHandleColumn(meta, request.column_index);
+        },
+    }
+}
+
+fn makeIndexMetaFromRequest(allocator: std.mem.Allocator, request: CreateIndexRequest) TableError!IndexMeta {
+    return switch (request.kind) {
+        .u64 => .{
+            .name = try allocPrintPath(allocator, "u64_col{d}", .{request.column_index}),
+            .kind = try allocator.dupe(u8, "u64"),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .i64 => .{
+            .name = try allocPrintPath(allocator, "i64_col{d}", .{request.column_index}),
+            .kind = try allocator.dupe(u8, "i64"),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .u32 => .{
+            .name = try allocPrintPath(allocator, "u32_col{d}", .{request.column_index}),
+            .kind = try allocator.dupe(u8, "u32"),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .i32 => .{
+            .name = try allocPrintPath(allocator, "i32_col{d}", .{request.column_index}),
+            .kind = try allocator.dupe(u8, "i32"),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .u8, .i8, .u16, .i16, .f32, .f64 => blk: {
+            const kind_name = switch (request.kind) {
+                .u8 => "u8",
+                .i8 => "i8",
+                .u16 => "u16",
+                .i16 => "i16",
+                .f32 => "f32",
+                .f64 => "f64",
+                else => unreachable,
+            };
+            break :blk .{
+                .name = try allocPrintPath(allocator, "{s}_col{d}", .{ kind_name, request.column_index }),
+                .kind = try allocator.dupe(u8, kind_name),
+                .column_index = @intCast(request.column_index),
+                .column_index2 = null,
+                .unique = request.unique,
+                .path = try allocator.dupe(u8, ""),
+                .sha256 = try allocator.dupe(u8, ""),
+                .bytes = 0,
+            };
+        },
+        .u64_pair => .{
+            .name = try allocPrintPath(allocator, "u64_pair_col{d}_col{d}", .{ request.column_index, request.column_index2.? }),
+            .kind = try allocator.dupe(u8, "u64_pair"),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = @intCast(request.column_index2.?),
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .u64_i64_pair => .{
+            .name = try allocPrintPath(allocator, "u64_i64_pair_col{d}_col{d}", .{ request.column_index, request.column_index2.? }),
+            .kind = try allocator.dupe(u8, "u64_i64_pair"),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = @intCast(request.column_index2.?),
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .blob_eq => .{
+            .name = try allocPrintPath(allocator, "blob_eq_col{d}_{s}", .{ request.column_index, request.store_name.? }),
+            .kind = try allocator.dupe(u8, BLOB_EQ_INDEX_KIND),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .store_name = try allocator.dupe(u8, request.store_name.?),
+            .unique = request.unique,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .blob_token => .{
+            .name = try allocPrintPath(allocator, "blob_token_col{d}_{s}", .{ request.column_index, request.store_name.? }),
+            .kind = try allocator.dupe(u8, BLOB_TOKEN_INDEX_KIND),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .store_name = try allocator.dupe(u8, request.store_name.?),
+            .unique = false,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .blob_prefix => .{
+            .name = try allocPrintPath(allocator, "blob_prefix_col{d}_{s}", .{ request.column_index, request.store_name.? }),
+            .kind = try allocator.dupe(u8, BLOB_PREFIX_INDEX_KIND),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .store_name = try allocator.dupe(u8, request.store_name.?),
+            .unique = false,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+        .blob_contains => .{
+            .name = try allocPrintPath(allocator, "blob_contains_col{d}_{s}", .{ request.column_index, request.store_name.? }),
+            .kind = try allocator.dupe(u8, BLOB_CONTAINS_INDEX_KIND),
+            .column_index = @intCast(request.column_index),
+            .column_index2 = null,
+            .store_name = try allocator.dupe(u8, request.store_name.?),
+            .unique = false,
+            .path = try allocator.dupe(u8, ""),
+            .sha256 = try allocator.dupe(u8, ""),
+            .bytes = 0,
+        },
+    };
+}
+
+fn createIndexesForTableLocked(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    requests: []const CreateIndexRequest,
+) TableError!TableInfo {
+    if (meta.locked) return TableError.Locked;
+    if (requests.len == 0) return tableInfo(meta.*);
+
+    var add_count: usize = 0;
+    for (requests) |request| {
+        try validateCreateIndexRequest(meta.*, request);
+        if (!(try indexExistsConflict(meta.*, request))) add_count += 1;
+    }
+    if (add_count == 0) return tableInfo(meta.*);
+
+    const old_indexes = meta.indexes;
+    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + add_count);
+    initIndexMetas(new_indexes);
+    var assigned_indexes = false;
+    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
+
+    for (old_indexes, 0..) |index, idx| {
+        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
+    }
+
+    var next_idx = old_indexes.len;
+    for (requests) |request| {
+        if (try indexExistsConflict(meta.*, request)) continue;
+        new_indexes[next_idx] = try makeIndexMetaFromRequest(allocator, request);
+        next_idx += 1;
+    }
+
+    freeIndexMetas(allocator, old_indexes);
+    meta.indexes = new_indexes;
+    assigned_indexes = true;
+    meta.epoch += 1;
+
+    for (old_indexes.len..meta.indexes.len) |idx| {
+        try rebuildIndexAt(allocator, root_dir, meta, idx);
+    }
+    try writeMeta(allocator, root_dir, table_name, meta.*);
+    return tableInfo(meta.*);
+}
+
+pub fn createIndexes(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    requests: []const CreateIndexRequest,
+) TableError!TableInfo {
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+
+    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer meta.deinit(allocator);
+    return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, requests);
 }
 
 fn emptyDictMeta() DictMeta {
@@ -1868,12 +2243,7 @@ fn validateSegmentHashes(allocator: std.mem.Allocator, root_dir: []const u8, met
         for (segment.files, 0..) |file, column_idx| {
             const expected_bytes = try expectedColumnBytes(segment.rows, meta.columns[column_idx].stride);
             if (file.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
-            const path = try activePath(allocator, root_dir, file.path);
-            defer allocator.free(path);
-            const bytes = try readFileAlloc(allocator, path, 1 << 30);
-            defer allocator.free(bytes);
-            try validateFileMetaBytes(file, bytes);
-            if (bytes.len != expected_bytes) return TableError.VerifyFailed;
+            try validateFileMetaPath(allocator, root_dir, file);
         }
     }
     if (total_rows != meta.row_count) return TableError.VerifyFailed;
@@ -1959,15 +2329,9 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
             return TableError.VerifyFailed;
         }
         if (index.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
-        const path = try activePath(allocator, root_dir, index.path);
-        defer allocator.free(path);
-        const bytes = try readFileAlloc(allocator, path, 1 << 30);
-        defer allocator.free(bytes);
-        if (bytes.len != index.bytes) return TableError.VerifyFailed;
-        const hash = hashBytes(bytes);
-        const hex = std.fmt.bytesToHex(hash, .lower);
-        if (!std.mem.eql(u8, hex[0..], index.sha256)) return TableError.VerifyFailed;
-        try validateIndexBlockHashes(index, bytes);
+        const mapped = try validateIndexMetaPath(allocator, root_dir, index);
+        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        const bytes = mappedRegionBytes(mapped);
         if (std.mem.eql(u8, index.kind, "u64_pair") or std.mem.eql(u8, index.kind, "u64_i64_pair")) {
             try validateU64PairIndexBytesShape(bytes, meta.row_count, index.unique);
         } else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND)) {
@@ -1977,40 +2341,6 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
         } else {
             try validateIndexBytesShape(bytes, meta.row_count, index.unique);
         }
-        const expected = if (std.mem.eql(u8, index.kind, "u64"))
-            try buildU64IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "i64"))
-            try buildI64IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "f32"))
-            try buildF32IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "f64"))
-            try buildF64IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "u8"))
-            try buildU8IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "i8"))
-            try buildI8IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "u16"))
-            try buildU16IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "i16"))
-            try buildI16IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "u32"))
-            try buildU32IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, "i32"))
-            try buildI32IndexBytes(allocator, root_dir, meta, column_index, index.unique)
-        else if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND))
-            try buildBlobEqIndexBytes(allocator, root_dir, meta, column_index, try indexBlobStoreName(index), index.unique)
-        else if (std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND))
-            try buildBlobTokenIndexBytes(allocator, root_dir, meta, column_index, try indexBlobStoreName(index))
-        else if (std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND))
-            try buildBlobPrefixIndexBytes(allocator, root_dir, meta, column_index, try indexBlobStoreName(index))
-        else if (std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND))
-            try buildBlobContainsIndexBytes(allocator, root_dir, meta, column_index, try indexBlobStoreName(index))
-        else if (std.mem.eql(u8, index.kind, "u64_pair"))
-            try buildU64PairIndexBytes(allocator, root_dir, meta, column_index, try indexColumnIndex2(index), index.unique)
-        else
-            try buildU64I64PairIndexBytes(allocator, root_dir, meta, column_index, try indexColumnIndex2(index), index.unique);
-        defer allocator.free(expected);
-        if (!std.mem.eql(u8, bytes, expected)) return TableError.VerifyFailed;
     }
 }
 
@@ -2123,8 +2453,7 @@ fn validateDictFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: T
         for (meta.dicts[0..idx]) |previous| {
             if (std.mem.eql(u8, previous.name, dict.name)) return TableError.VerifyFailed;
         }
-        const bytes = try readDictBytes(allocator, root_dir, dict);
-        allocator.free(bytes);
+        try validateDictMetaPath(allocator, root_dir, dict);
     }
 }
 
@@ -2193,8 +2522,7 @@ fn validateBlobStoreFiles(allocator: std.mem.Allocator, root_dir: []const u8, me
         for (meta.blobs[0..idx]) |previous| {
             if (std.mem.eql(u8, previous.name, blob.name)) return TableError.VerifyFailed;
         }
-        const bytes = try readBlobStoreBytes(allocator, root_dir, blob);
-        allocator.free(bytes);
+        try validateBlobStoreMetaPath(allocator, root_dir, blob);
     }
 }
 
@@ -4682,45 +5010,12 @@ pub fn createU64Index(
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureU64Column(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, "u64") and index.column_index == @as(u64, @intCast(column_index))) {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "u64_col{d}", .{column_index}),
-        .kind = try allocator.dupe(u8, "u64"),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
+    const request = [_]CreateIndexRequest{.{
+        .kind = .u64,
+        .column_index = column_index,
         .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    }};
+    return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, &request);
 }
 
 pub fn createI64Index(
@@ -4735,45 +5030,12 @@ pub fn createI64Index(
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureI64Column(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, "i64") and index.column_index == @as(u64, @intCast(column_index))) {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "i64_col{d}", .{column_index}),
-        .kind = try allocator.dupe(u8, "i64"),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
+    const request = [_]CreateIndexRequest{.{
+        .kind = .i64,
+        .column_index = column_index,
         .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    }};
+    return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, &request);
 }
 
 pub fn createU32Index(
@@ -4783,50 +5045,7 @@ pub fn createU32Index(
     column_index: usize,
     unique: bool,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureU32Column(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, "u32") and index.column_index == @as(u64, @intCast(column_index))) {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "u32_col{d}", .{column_index}),
-        .kind = try allocator.dupe(u8, "u32"),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    return createSmallIntegerIndex(allocator, root_dir, table_name, column_index, unique, .u32);
 }
 
 pub fn createI32Index(
@@ -4836,50 +5055,7 @@ pub fn createI32Index(
     column_index: usize,
     unique: bool,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureI32Column(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, "i32") and index.column_index == @as(u64, @intCast(column_index))) {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "i32_col{d}", .{column_index}),
-        .kind = try allocator.dupe(u8, "i32"),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    return createSmallIntegerIndex(allocator, root_dir, table_name, column_index, unique, .i32);
 }
 
 fn createSmallIntegerIndex(
@@ -4895,46 +5071,24 @@ fn createSmallIntegerIndex(
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureSingleIndexColumn(meta, column_index, kind);
-
-    const kind_name = singleIndexKindName(kind);
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, kind_name) and index.column_index == @as(u64, @intCast(column_index))) {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "{s}_col{d}", .{ kind_name, column_index }),
-        .kind = try allocator.dupe(u8, kind_name),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
+    const request_kind: CreateIndexKind = switch (kind) {
+        .u8 => .u8,
+        .i8 => .i8,
+        .u16 => .u16,
+        .i16 => .i16,
+        .u32 => .u32,
+        .i32 => .i32,
+        .u64 => .u64,
+        .i64 => .i64,
+        .f32 => .f32,
+        .f64 => .f64,
     };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    const request = [_]CreateIndexRequest{.{
+        .kind = request_kind,
+        .column_index = column_index,
+        .unique = unique,
+    }};
+    return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, &request);
 }
 
 pub fn createU8Index(
@@ -5010,49 +5164,13 @@ pub fn createU64PairIndex(
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureU64PairColumns(meta, column_index, column_index2);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, "u64_pair") and
-            index.column_index == @as(u64, @intCast(column_index)) and
-            index.column_index2 != null and
-            index.column_index2.? == @as(u64, @intCast(column_index2)))
-        {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "u64_pair_col{d}_col{d}", .{ column_index, column_index2 }),
-        .kind = try allocator.dupe(u8, "u64_pair"),
-        .column_index = @intCast(column_index),
-        .column_index2 = @intCast(column_index2),
+    const request = [_]CreateIndexRequest{.{
+        .kind = .u64_pair,
+        .column_index = column_index,
+        .column_index2 = column_index2,
         .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    }};
+    return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, &request);
 }
 
 pub fn createU64I64PairIndex(
@@ -5068,49 +5186,13 @@ pub fn createU64I64PairIndex(
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureU64I64PairColumns(meta, column_index, column_index2);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, "u64_i64_pair") and
-            index.column_index == @as(u64, @intCast(column_index)) and
-            index.column_index2 != null and
-            index.column_index2.? == @as(u64, @intCast(column_index2)))
-        {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "u64_i64_pair_col{d}_col{d}", .{ column_index, column_index2 }),
-        .kind = try allocator.dupe(u8, "u64_i64_pair"),
-        .column_index = @intCast(column_index),
-        .column_index2 = @intCast(column_index2),
+    const request = [_]CreateIndexRequest{.{
+        .kind = .u64_i64_pair,
+        .column_index = column_index,
+        .column_index2 = column_index2,
         .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    }};
+    return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, &request);
 }
 
 pub fn createBlobEqIndex(
@@ -5122,57 +5204,13 @@ pub fn createBlobEqIndex(
     unique: bool,
 ) TableError!TableInfo {
     try validateBlobStoreName(store_name);
-
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureBlobHandleColumn(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) and
-            index.column_index == @as(u64, @intCast(column_index)) and
-            index.column_index2 == null and
-            index.store_name != null and
-            std.mem.eql(u8, index.store_name.?, store_name))
-        {
-            if (index.unique == unique) return tableInfo(meta);
-            return TableError.InvalidFormat;
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "blob_eq_col{d}_{s}", .{ column_index, store_name }),
-        .kind = try allocator.dupe(u8, BLOB_EQ_INDEX_KIND),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .store_name = try allocator.dupe(u8, store_name),
+    const request = [_]CreateIndexRequest{.{
+        .kind = .blob_eq,
+        .column_index = column_index,
+        .store_name = store_name,
         .unique = unique,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    }};
+    return createIndexes(allocator, root_dir, table_name, &request);
 }
 
 pub fn createBlobTokenIndex(
@@ -5183,56 +5221,12 @@ pub fn createBlobTokenIndex(
     store_name: []const u8,
 ) TableError!TableInfo {
     try validateBlobStoreName(store_name);
-
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureBlobHandleColumn(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND) and
-            index.column_index == @as(u64, @intCast(column_index)) and
-            index.column_index2 == null and
-            index.store_name != null and
-            std.mem.eql(u8, index.store_name.?, store_name))
-        {
-            return tableInfo(meta);
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "blob_token_col{d}_{s}", .{ column_index, store_name }),
-        .kind = try allocator.dupe(u8, BLOB_TOKEN_INDEX_KIND),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .store_name = try allocator.dupe(u8, store_name),
-        .unique = false,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    const request = [_]CreateIndexRequest{.{
+        .kind = .blob_token,
+        .column_index = column_index,
+        .store_name = store_name,
+    }};
+    return createIndexes(allocator, root_dir, table_name, &request);
 }
 
 pub fn createBlobPrefixIndex(
@@ -5243,56 +5237,12 @@ pub fn createBlobPrefixIndex(
     store_name: []const u8,
 ) TableError!TableInfo {
     try validateBlobStoreName(store_name);
-
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureBlobHandleColumn(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND) and
-            index.column_index == @as(u64, @intCast(column_index)) and
-            index.column_index2 == null and
-            index.store_name != null and
-            std.mem.eql(u8, index.store_name.?, store_name))
-        {
-            return tableInfo(meta);
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "blob_prefix_col{d}_{s}", .{ column_index, store_name }),
-        .kind = try allocator.dupe(u8, BLOB_PREFIX_INDEX_KIND),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .store_name = try allocator.dupe(u8, store_name),
-        .unique = false,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    const request = [_]CreateIndexRequest{.{
+        .kind = .blob_prefix,
+        .column_index = column_index,
+        .store_name = store_name,
+    }};
+    return createIndexes(allocator, root_dir, table_name, &request);
 }
 
 pub fn createBlobContainsIndex(
@@ -5303,56 +5253,12 @@ pub fn createBlobContainsIndex(
     store_name: []const u8,
 ) TableError!TableInfo {
     try validateBlobStoreName(store_name);
-
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    if (meta.locked) return TableError.Locked;
-    try ensureBlobHandleColumn(meta, column_index);
-
-    for (meta.indexes) |index| {
-        if (std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND) and
-            index.column_index == @as(u64, @intCast(column_index)) and
-            index.column_index2 == null and
-            index.store_name != null and
-            std.mem.eql(u8, index.store_name.?, store_name))
-        {
-            return tableInfo(meta);
-        }
-    }
-
-    const old_indexes = meta.indexes;
-    const new_indexes = try allocator.alloc(IndexMeta, old_indexes.len + 1);
-    initIndexMetas(new_indexes);
-    var assigned_indexes = false;
-    errdefer if (!assigned_indexes) freeIndexMetas(allocator, new_indexes);
-
-    for (old_indexes, 0..) |index, idx| {
-        new_indexes[idx] = try duplicateIndexMeta(allocator, index);
-    }
-
-    const new_index = &new_indexes[old_indexes.len];
-    new_index.* = .{
-        .name = try allocPrintPath(allocator, "blob_contains_col{d}_{s}", .{ column_index, store_name }),
-        .kind = try allocator.dupe(u8, BLOB_CONTAINS_INDEX_KIND),
-        .column_index = @intCast(column_index),
-        .column_index2 = null,
-        .store_name = try allocator.dupe(u8, store_name),
-        .unique = false,
-        .path = try allocator.dupe(u8, ""),
-        .sha256 = try allocator.dupe(u8, ""),
-        .bytes = 0,
-    };
-
-    freeIndexMetas(allocator, old_indexes);
-    meta.indexes = new_indexes;
-    assigned_indexes = true;
-    meta.epoch += 1;
-    try rebuildIndexAt(allocator, root_dir, &meta, meta.indexes.len - 1);
-    try writeMeta(allocator, root_dir, table_name, meta);
-    return tableInfo(meta);
+    const request = [_]CreateIndexRequest{.{
+        .kind = .blob_contains,
+        .column_index = column_index,
+        .store_name = store_name,
+    }};
+    return createIndexes(allocator, root_dir, table_name, &request);
 }
 
 fn ensureU64Column(meta: TableMeta, column_index: usize) TableError!void {
@@ -6052,13 +5958,9 @@ fn buildU64IndexBytes(
     var row_base: u64 = 0;
     var entry_idx: usize = 0;
     for (meta.segments) |segment| {
-        const file_meta = segment.files[column_index];
-        const path = try activePath(allocator, root_dir, file_meta.path);
-        defer allocator.free(path);
-        const bytes = try readFileAlloc(allocator, path, 1 << 30);
-        defer allocator.free(bytes);
-        const expected_len = try expectedColumnBytes(segment.rows, 8);
-        if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
+        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
             const byte_offset: usize = @intCast(i * 8);
@@ -6322,19 +6224,12 @@ fn buildU64PairIndexBytes(
     var row_base: u64 = 0;
     var entry_idx: usize = 0;
     for (meta.segments) |segment| {
-        const file_meta1 = segment.files[column_index];
-        const file_meta2 = segment.files[column_index2];
-        const path1 = try activePath(allocator, root_dir, file_meta1.path);
-        defer allocator.free(path1);
-        const path2 = try activePath(allocator, root_dir, file_meta2.path);
-        defer allocator.free(path2);
-        const bytes1 = try readFileAlloc(allocator, path1, 1 << 30);
-        defer allocator.free(bytes1);
-        const bytes2 = try readFileAlloc(allocator, path2, 1 << 30);
-        defer allocator.free(bytes2);
-        const expected_len = try expectedColumnBytes(segment.rows, 8);
-        if (bytes1.len != expected_len or file_meta1.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
-        if (bytes2.len != expected_len or file_meta2.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        const mapped1 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
+        defer if (mapped1.memory.len != 0) std.posix.munmap(mapped1.memory);
+        const mapped2 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8);
+        defer if (mapped2.memory.len != 0) std.posix.munmap(mapped2.memory);
+        const bytes1 = mappedRegionBytes(mapped1);
+        const bytes2 = mappedRegionBytes(mapped2);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
             const byte_offset: usize = @intCast(i * 8);
@@ -6378,19 +6273,12 @@ fn buildU64I64PairIndexBytes(
     var row_base: u64 = 0;
     var entry_idx: usize = 0;
     for (meta.segments) |segment| {
-        const file_meta1 = segment.files[column_index];
-        const file_meta2 = segment.files[column_index2];
-        const path1 = try activePath(allocator, root_dir, file_meta1.path);
-        defer allocator.free(path1);
-        const path2 = try activePath(allocator, root_dir, file_meta2.path);
-        defer allocator.free(path2);
-        const bytes1 = try readFileAlloc(allocator, path1, 1 << 30);
-        defer allocator.free(bytes1);
-        const bytes2 = try readFileAlloc(allocator, path2, 1 << 30);
-        defer allocator.free(bytes2);
-        const expected_len = try expectedColumnBytes(segment.rows, 8);
-        if (bytes1.len != expected_len or file_meta1.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
-        if (bytes2.len != expected_len or file_meta2.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        const mapped1 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
+        defer if (mapped1.memory.len != 0) std.posix.munmap(mapped1.memory);
+        const mapped2 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8);
+        defer if (mapped2.memory.len != 0) std.posix.munmap(mapped2.memory);
+        const bytes1 = mappedRegionBytes(mapped1);
+        const bytes2 = mappedRegionBytes(mapped2);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
             const byte_offset: usize = @intCast(i * 8);
@@ -6450,13 +6338,9 @@ fn buildBlobEqIndexBytes(
     var row_base: u64 = 0;
     var entry_idx: usize = 0;
     for (meta.segments) |segment| {
-        const file_meta = segment.files[column_index];
-        const path = try activePath(allocator, root_dir, file_meta.path);
-        defer allocator.free(path);
-        const bytes = try readFileAlloc(allocator, path, 1 << 30);
-        defer allocator.free(bytes);
-        const expected_len = try expectedColumnBytes(segment.rows, 8);
-        if (bytes.len != expected_len or file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
+        const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
+        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
             const byte_offset: usize = @intCast(i * 8);
@@ -7227,7 +7111,7 @@ fn rewriteIndexMetaBytes(allocator: std.mem.Allocator, root_dir: []const u8, tab
 
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeFile(allocator, path, bytes);
+    try writeArtifactFile(allocator, path, bytes);
 
     const next_path = try allocator.dupe(u8, basename);
     errdefer allocator.free(next_path);
@@ -7418,7 +7302,7 @@ fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *Tab
     defer allocator.free(basename);
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeFile(allocator, path, bytes);
+    try writeArtifactFile(allocator, path, bytes);
     const next_path = try allocator.dupe(u8, basename);
     errdefer allocator.free(next_path);
     const next_hash = try hashHexAlloc(allocator, bytes);

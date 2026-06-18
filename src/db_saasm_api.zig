@@ -88,6 +88,16 @@ pub const SaDbColumnInput = extern struct {
     len: u64,
 };
 
+pub const SaDbCreateIndexRequest = extern struct {
+    kind: u32,
+    unique: u32,
+    reserved: u64,
+    column_index: u64,
+    column_index2: u64,
+    store_name_ptr: ?[*]const u8,
+    store_name_len: u64,
+};
+
 fn inputBytes(ptr: ?[*]const u8, len: u64) ?[]const u8 {
     if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
     const n: usize = @intCast(len);
@@ -110,6 +120,40 @@ fn inputU64sAllowEmpty(ptr: ?[*]const u64, len: u64) ?[]const u64 {
     if (n == 0) return &.{};
     const p = ptr orelse return null;
     return p[0..n];
+}
+
+fn inputCreateIndexRequests(ptr: ?[*]const SaDbCreateIndexRequest, len: u64) ?[]const SaDbCreateIndexRequest {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return &.{};
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
+fn decodeCreateIndexRequest(request: SaDbCreateIndexRequest) ?table.CreateIndexRequest {
+    if (request.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    if (request.column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+
+    const kind = std.meta.intToEnum(table.CreateIndexKind, request.kind) catch return null;
+    const store_name = inputBytes(request.store_name_ptr, request.store_name_len) orelse return null;
+    const needs_second = switch (kind) {
+        .u64_pair, .u64_i64_pair => true,
+        else => false,
+    };
+    const needs_store = switch (kind) {
+        .blob_eq, .blob_token, .blob_prefix, .blob_contains => true,
+        else => false,
+    };
+    if (needs_store and store_name.len == 0) return null;
+    if (!needs_store and store_name.len != 0) return null;
+
+    return .{
+        .kind = kind,
+        .column_index = @intCast(request.column_index),
+        .column_index2 = if (needs_second) @as(usize, @intCast(request.column_index2)) else null,
+        .store_name = if (needs_store) store_name else null,
+        .unique = request.unique != 0,
+    };
 }
 
 fn outputBytes(ptr: ?[*]u8, len: u64) ?[]u8 {
@@ -2500,6 +2544,34 @@ pub export fn sa_db_create_blob_contains_index(
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
     const info = table.createBlobContainsIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
+    return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_create_indexes(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    requests_ptr: ?[*]const SaDbCreateIndexRequest,
+    requests_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const requests_in = inputCreateIndexRequests(requests_ptr, requests_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const requests = allocator.alloc(table.CreateIndexRequest, requests_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    defer allocator.free(requests);
+    for (requests_in, 0..) |request, idx| {
+        requests[idx] = decodeCreateIndexRequest(request) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    }
+
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const info = table.createIndexes(allocator, root, table_name, requests) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -8272,6 +8344,87 @@ test "db SA ABI creates and queries u64 i64 pair indexes" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "customer_orders".ptr, "customer_orders".len, &info));
+}
+
+test "db SA ABI creates indexes in one batch call" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const table_name = "batch_orders";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_CUSTOMER_ID_STRIDE = 8 // u64
+        \\#def COL_ORDER_DAY_STRIDE = 8 // i64
+        \\#def COL_TOTAL_CENTS_STRIDE = 8 // i64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "batch_orders.sadb-schema".ptr, "batch_orders.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var customer_ids = [_]u64{ 7, 7, 8, 9 };
+    var order_days = [_]i64{ -5, 0, 3, 10 };
+    var totals = [_]i64{ 1000, 2000, 3000, 4000 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&customer_ids), .len = @sizeOf(@TypeOf(customer_ids)) },
+        .{ .data = @ptrCast(&order_days), .len = @sizeOf(@TypeOf(order_days)) },
+        .{ .data = @ptrCast(&totals), .len = @sizeOf(@TypeOf(totals)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, table_name.ptr, table_name.len, customer_ids.len, &cols, cols.len, &info));
+
+    const requests = [_]SaDbCreateIndexRequest{
+        .{
+            .kind = @intFromEnum(table.CreateIndexKind.u64),
+            .unique = 0,
+            .reserved = 0,
+            .column_index = 0,
+            .column_index2 = 0,
+            .store_name_ptr = null,
+            .store_name_len = 0,
+        },
+        .{
+            .kind = @intFromEnum(table.CreateIndexKind.u64_i64_pair),
+            .unique = 1,
+            .reserved = 0,
+            .column_index = 0,
+            .column_index2 = 1,
+            .store_name_ptr = null,
+            .store_name_len = 0,
+        },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_indexes(root.ptr, root.len, table_name.ptr, table_name.len, &requests, requests.len, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, table_name.ptr, table_name.len, &handle));
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(handle, 0, 8, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 2), row_index);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_i64_pair_handle(handle, 0, 1, 7, 0, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 1), row_index);
+
+    var duplicate_info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_indexes(root.ptr, root.len, table_name.ptr, table_name.len, &requests, requests.len, &duplicate_info));
+    try std.testing.expectEqual(info.epoch, duplicate_info.epoch);
+
+    const bad_request = [_]SaDbCreateIndexRequest{.{
+        .kind = 999,
+        .unique = 0,
+        .reserved = 0,
+        .column_index = 0,
+        .column_index2 = 0,
+        .store_name_ptr = null,
+        .store_name_len = 0,
+    }};
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_create_indexes(root.ptr, root.len, table_name.ptr, table_name.len, &bad_request, bad_request.len, &duplicate_info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, table_name.ptr, table_name.len, &info));
 }
 
 test "db SA ABI writes rows by u64 i64 pair keys" {

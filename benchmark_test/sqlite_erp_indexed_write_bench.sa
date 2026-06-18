@@ -1,0 +1,557 @@
+@import "sa_std/fmt.sai"
+@import "sa_std/fs.sai"
+@import "sa_std/io/print.sai"
+@import "sa_std/time.sai"
+
+@extern sqlite3_open_v2(*filename: ptr, *out_db: ptr, flags: i32, *vfs: ptr) -> i32
+@extern sqlite3_close(*db: ptr) -> i32
+@extern sqlite3_exec(*db: ptr, *sql: ptr, *callback: ptr, *arg: ptr, *errmsg: ptr) -> i32
+@extern sqlite3_prepare_v2(*db: ptr, *sql: ptr, nbyte: i32, *out_stmt: ptr, *tail: ptr) -> i32
+@extern sqlite3_bind_int64(*stmt: ptr, idx: i32, value: u64) -> i32
+@extern sqlite3_step(*stmt: ptr) -> i32
+@extern sqlite3_reset(*stmt: ptr) -> i32
+@extern sqlite3_clear_bindings(*stmt: ptr) -> i32
+@extern sqlite3_finalize(*stmt: ptr) -> i32
+@extern sqlite3_column_int64(*stmt: ptr, col: i32) -> u64
+
+@const DB_PATH_FS = utf8:"sqlite_erp_indexed_write.db"
+@const DB_PATH_C = utf8:"sqlite_erp_indexed_write.db\0"
+@const SQL_PRAGMA = utf8:"PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;\0"
+@const SQL_CREATE = utf8:"CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, status INTEGER, order_day INTEGER); CREATE TABLE order_lines(order_id INTEGER, line_no INTEGER, product_id INTEGER, qty INTEGER, net_cents INTEGER, PRIMARY KEY(order_id, line_no)); CREATE TABLE invoices(id INTEGER PRIMARY KEY, order_id INTEGER UNIQUE, status INTEGER, due_day INTEGER, amount_cents INTEGER);\0"
+@const SQL_INDEX = utf8:"CREATE INDEX idx_orders_customer_day ON orders(customer_id, order_day); CREATE INDEX idx_lines_product ON order_lines(product_id); CREATE INDEX idx_invoices_status_due ON invoices(status, due_day);\0"
+@const SQL_BEGIN = utf8:"BEGIN TRANSACTION;\0"
+@const SQL_COMMIT = utf8:"COMMIT;\0"
+@const SQL_INSERT_ORDERS = utf8:"INSERT INTO orders(id, customer_id, status, order_day) VALUES(?, ?, ?, ?);\0"
+@const SQL_INSERT_LINES = utf8:"INSERT INTO order_lines(order_id, line_no, product_id, qty, net_cents) VALUES(?, ?, ?, ?, ?);\0"
+@const SQL_INSERT_INVOICES = utf8:"INSERT INTO invoices(id, order_id, status, due_day, amount_cents) VALUES(?, ?, ?, ?, ?);\0"
+@const SQL_COUNT_ORDERS = utf8:"SELECT COUNT(*) FROM orders;\0"
+@const SQL_COUNT_LINES = utf8:"SELECT COUNT(*) FROM order_lines;\0"
+@const SQL_COUNT_INVOICES = utf8:"SELECT COUNT(*) FROM invoices;\0"
+@const SQL_CHECK = utf8:"PRAGMA integrity_check;\0"
+@const NL = utf8:"\n"
+
+@const SQLITE_INDEXED_INIT = utf8:"sqlite_erp_indexed_init_ns="
+@const SQLITE_INDEXED_BASELINE = utf8:"sqlite_erp_indexed_baseline_ns="
+@const SQLITE_INDEXED_BUILD = utf8:"sqlite_erp_indexed_build_ns="
+@const SQLITE_INDEXED_APPEND = utf8:"sqlite_erp_indexed_append_ns="
+@const SQLITE_INDEXED_VERIFY = utf8:"sqlite_erp_indexed_verify_ns="
+@const ORDER_ROW_TOTAL = utf8:"indexed_order_rows="
+@const LINE_ROW_TOTAL = utf8:"indexed_line_rows="
+@const INVOICE_ROW_TOTAL = utf8:"indexed_invoice_rows="
+
+#def DB_PATH_FS_LEN = 27
+#def SQLITE_OPEN_READWRITE_CREATE = 6
+#def SQLITE_OK = 0
+#def SQLITE_ROW = 100
+#def SQLITE_DONE = 101
+#def BASE_ORDER_ROWS = 8192
+#def BASE_LINE_ROWS = 32768
+#def BASE_INVOICE_ROWS = 8192
+#def APPEND_ORDER_ROWS = 256
+#def APPEND_LINE_ROWS = 1024
+#def APPEND_INVOICE_ROWS = 256
+#def EXPECTED_ORDER_ROWS = 8448
+#def EXPECTED_LINE_ROWS = 33792
+#def EXPECTED_INVOICE_ROWS = 8448
+#def BASE_DAY = 20454
+#def FMT_BUF_BYTES = 32
+
+#def SQLITE_INDEXED_INIT_LEN = 27
+#def SQLITE_INDEXED_BASELINE_LEN = 31
+#def SQLITE_INDEXED_BUILD_LEN = 28
+#def SQLITE_INDEXED_APPEND_LEN = 29
+#def SQLITE_INDEXED_VERIFY_LEN = 29
+#def ORDER_ROW_TOTAL_LEN = 19
+#def LINE_ROW_TOTAL_LEN = 18
+#def INVOICE_ROW_TOTAL_LEN = 21
+
+[MACRO] PRINT_U64_LINE %label, %label_len, %value
+    __fmt_buf_%value = stack_alloc FMT_BUF_BYTES
+    __fmt_len_slot_%value = stack_alloc 8
+    __fmt_status_%value = call @sa_fmt_u64_into(%value, 10, __fmt_buf_%value, FMT_BUF_BYTES, &__fmt_len_slot_%value)
+    __fmt_len_%value = load __fmt_len_slot_%value+0 as u64
+    call @sa_print_bytes(&%label, %label_len)
+    call @sa_print_bytes(&__fmt_buf_%value, __fmt_len_%value)
+    call @sa_print_bytes(&NL, 1)
+    !__fmt_status_%value
+    !__fmt_len_%value
+[END_MACRO]
+
+[MACRO] SQLITE_COUNT_QUERY %out_ok, %out_value, %db, %null_ptr, %sql
+    __count_stmt_slot_%out_value = stack_alloc 8
+    __count_prepare_%out_value = call @sqlite3_prepare_v2(*%db, *%sql, -1, *__count_stmt_slot_%out_value, *%null_ptr)
+    __count_stmt_%out_value = load __count_stmt_slot_%out_value+0 as ptr
+    __count_step_%out_value = call @sqlite3_step(*__count_stmt_%out_value)
+    %out_value = call @sqlite3_column_int64(*__count_stmt_%out_value, 0)
+    __count_finalize_%out_value = call @sqlite3_finalize(*__count_stmt_%out_value)
+    __count_ok_prepare_%out_value = eq __count_prepare_%out_value, SQLITE_OK
+    __count_ok_step_%out_value = eq __count_step_%out_value, SQLITE_ROW
+    __count_ok_finalize_%out_value = eq __count_finalize_%out_value, SQLITE_OK
+    __count_ok01_%out_value = and __count_ok_prepare_%out_value, __count_ok_step_%out_value
+    %out_ok = and __count_ok01_%out_value, __count_ok_finalize_%out_value
+    !__count_prepare_%out_value
+    !__count_stmt_%out_value
+    !__count_step_%out_value
+    !__count_finalize_%out_value
+    !__count_ok_prepare_%out_value
+    !__count_ok_step_%out_value
+    !__count_ok_finalize_%out_value
+    !__count_ok01_%out_value
+[END_MACRO]
+
+@insert_orders(db: ptr, null_ptr: ptr, start_base: u64, rows: u64) -> u64:
+L_ENTRY:
+    stmt_slot = stack_alloc 8
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    prepare_status = call @sqlite3_prepare_v2(*db, *SQL_INSERT_ORDERS, -1, *stmt_slot, *null_ptr)
+    stmt = load stmt_slot+0 as ptr
+    ok_prepare = eq prepare_status, SQLITE_OK
+    store ok_slot+0, ok_prepare as u64
+    store i_slot+0, 0 as u64
+    jmp L_COND
+
+L_COND:
+    i = load i_slot+0 as u64
+    cond = ult i, rows
+    br cond -> L_BODY, L_DONE
+
+L_BODY:
+    global_i = add start_base, i
+    id_value = add global_i, 1
+    customer_low = and global_i, 1023
+    customer_value = add customer_low, 1
+    status_low = and global_i, 1
+    status_value = add status_low, 1
+    day_low = and global_i, 63
+    day_value = add day_low, BASE_DAY
+    bind1 = call @sqlite3_bind_int64(*stmt, 1, id_value)
+    bind2 = call @sqlite3_bind_int64(*stmt, 2, customer_value)
+    bind3 = call @sqlite3_bind_int64(*stmt, 3, status_value)
+    bind4 = call @sqlite3_bind_int64(*stmt, 4, day_value)
+    step_status = call @sqlite3_step(*stmt)
+    reset_status = call @sqlite3_reset(*stmt)
+    clear_status = call @sqlite3_clear_bindings(*stmt)
+    ok_bind1 = eq bind1, SQLITE_OK
+    ok_bind2 = eq bind2, SQLITE_OK
+    ok_bind3 = eq bind3, SQLITE_OK
+    ok_bind4 = eq bind4, SQLITE_OK
+    ok_step = eq step_status, SQLITE_DONE
+    ok_reset = eq reset_status, SQLITE_OK
+    ok_clear = eq clear_status, SQLITE_OK
+    ok01 = and ok_bind1, ok_bind2
+    ok02 = and ok01, ok_bind3
+    ok03 = and ok02, ok_bind4
+    ok04 = and ok03, ok_step
+    ok05 = and ok04, ok_reset
+    ok_row = and ok05, ok_clear
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_row
+    next_i = add i, 1
+    store ok_slot+0, ok_next as u64
+    store i_slot+0, next_i as u64
+    !i
+    !cond
+    !global_i
+    !id_value
+    !customer_low
+    !customer_value
+    !status_low
+    !status_value
+    !day_low
+    !day_value
+    !bind1
+    !bind2
+    !bind3
+    !bind4
+    !step_status
+    !reset_status
+    !clear_status
+    !ok_bind1
+    !ok_bind2
+    !ok_bind3
+    !ok_bind4
+    !ok_step
+    !ok_reset
+    !ok_clear
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok_row
+    !ok_acc
+    !ok_next
+    !next_i
+    jmp L_COND
+
+L_DONE:
+    finalize_status = call @sqlite3_finalize(*stmt)
+    ok_finalize = eq finalize_status, SQLITE_OK
+    ok_acc = load ok_slot+0 as u64
+    ok = and ok_acc, ok_finalize
+    !i
+    !cond
+    !prepare_status
+    !stmt
+    !ok_prepare
+    !finalize_status
+    !ok_finalize
+    !ok_acc
+    !db
+    !null_ptr
+    !start_base
+    !rows
+    return ok
+
+@insert_lines(db: ptr, null_ptr: ptr, start_base: u64, rows: u64) -> u64:
+L_ENTRY:
+    stmt_slot = stack_alloc 8
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    prepare_status = call @sqlite3_prepare_v2(*db, *SQL_INSERT_LINES, -1, *stmt_slot, *null_ptr)
+    stmt = load stmt_slot+0 as ptr
+    ok_prepare = eq prepare_status, SQLITE_OK
+    store ok_slot+0, ok_prepare as u64
+    store i_slot+0, 0 as u64
+    jmp L_COND
+
+L_COND:
+    i = load i_slot+0 as u64
+    cond = ult i, rows
+    br cond -> L_BODY, L_DONE
+
+L_BODY:
+    global_i = add start_base, i
+    order_base = lshr global_i, 2
+    order_value = add order_base, 1
+    line_low = and global_i, 3
+    line_value = add line_low, 1
+    product_low = and global_i, 511
+    product_value = add product_low, 1
+    qty_low = and global_i, 7
+    qty_value = add qty_low, 1
+    net_value = mul qty_value, 250
+    bind1 = call @sqlite3_bind_int64(*stmt, 1, order_value)
+    bind2 = call @sqlite3_bind_int64(*stmt, 2, line_value)
+    bind3 = call @sqlite3_bind_int64(*stmt, 3, product_value)
+    bind4 = call @sqlite3_bind_int64(*stmt, 4, qty_value)
+    bind5 = call @sqlite3_bind_int64(*stmt, 5, net_value)
+    step_status = call @sqlite3_step(*stmt)
+    reset_status = call @sqlite3_reset(*stmt)
+    clear_status = call @sqlite3_clear_bindings(*stmt)
+    ok_bind1 = eq bind1, SQLITE_OK
+    ok_bind2 = eq bind2, SQLITE_OK
+    ok_bind3 = eq bind3, SQLITE_OK
+    ok_bind4 = eq bind4, SQLITE_OK
+    ok_bind5 = eq bind5, SQLITE_OK
+    ok_step = eq step_status, SQLITE_DONE
+    ok_reset = eq reset_status, SQLITE_OK
+    ok_clear = eq clear_status, SQLITE_OK
+    ok01 = and ok_bind1, ok_bind2
+    ok02 = and ok01, ok_bind3
+    ok03 = and ok02, ok_bind4
+    ok04 = and ok03, ok_bind5
+    ok05 = and ok04, ok_step
+    ok06 = and ok05, ok_reset
+    ok_row = and ok06, ok_clear
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_row
+    next_i = add i, 1
+    store ok_slot+0, ok_next as u64
+    store i_slot+0, next_i as u64
+    !i
+    !cond
+    !global_i
+    !order_base
+    !order_value
+    !line_low
+    !line_value
+    !product_low
+    !product_value
+    !qty_low
+    !qty_value
+    !net_value
+    !bind1
+    !bind2
+    !bind3
+    !bind4
+    !bind5
+    !step_status
+    !reset_status
+    !clear_status
+    !ok_bind1
+    !ok_bind2
+    !ok_bind3
+    !ok_bind4
+    !ok_bind5
+    !ok_step
+    !ok_reset
+    !ok_clear
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok_row
+    !ok_acc
+    !ok_next
+    !next_i
+    jmp L_COND
+
+L_DONE:
+    finalize_status = call @sqlite3_finalize(*stmt)
+    ok_finalize = eq finalize_status, SQLITE_OK
+    ok_acc = load ok_slot+0 as u64
+    ok = and ok_acc, ok_finalize
+    !i
+    !cond
+    !prepare_status
+    !stmt
+    !ok_prepare
+    !finalize_status
+    !ok_finalize
+    !ok_acc
+    !db
+    !null_ptr
+    !start_base
+    !rows
+    return ok
+
+@insert_invoices(db: ptr, null_ptr: ptr, start_base: u64, rows: u64) -> u64:
+L_ENTRY:
+    stmt_slot = stack_alloc 8
+    i_slot = stack_alloc 8
+    ok_slot = stack_alloc 8
+    prepare_status = call @sqlite3_prepare_v2(*db, *SQL_INSERT_INVOICES, -1, *stmt_slot, *null_ptr)
+    stmt = load stmt_slot+0 as ptr
+    ok_prepare = eq prepare_status, SQLITE_OK
+    store ok_slot+0, ok_prepare as u64
+    store i_slot+0, 0 as u64
+    jmp L_COND
+
+L_COND:
+    i = load i_slot+0 as u64
+    cond = ult i, rows
+    br cond -> L_BODY, L_DONE
+
+L_BODY:
+    global_i = add start_base, i
+    id_value = add global_i, 1
+    order_value = add global_i, 1
+    status_low = and global_i, 1
+    status_value = add status_low, 1
+    day_low = and global_i, 63
+    due_value = add day_low, BASE_DAY
+    amount_value = mul id_value, 100
+    bind1 = call @sqlite3_bind_int64(*stmt, 1, id_value)
+    bind2 = call @sqlite3_bind_int64(*stmt, 2, order_value)
+    bind3 = call @sqlite3_bind_int64(*stmt, 3, status_value)
+    bind4 = call @sqlite3_bind_int64(*stmt, 4, due_value)
+    bind5 = call @sqlite3_bind_int64(*stmt, 5, amount_value)
+    step_status = call @sqlite3_step(*stmt)
+    reset_status = call @sqlite3_reset(*stmt)
+    clear_status = call @sqlite3_clear_bindings(*stmt)
+    ok_bind1 = eq bind1, SQLITE_OK
+    ok_bind2 = eq bind2, SQLITE_OK
+    ok_bind3 = eq bind3, SQLITE_OK
+    ok_bind4 = eq bind4, SQLITE_OK
+    ok_bind5 = eq bind5, SQLITE_OK
+    ok_step = eq step_status, SQLITE_DONE
+    ok_reset = eq reset_status, SQLITE_OK
+    ok_clear = eq clear_status, SQLITE_OK
+    ok01 = and ok_bind1, ok_bind2
+    ok02 = and ok01, ok_bind3
+    ok03 = and ok02, ok_bind4
+    ok04 = and ok03, ok_bind5
+    ok05 = and ok04, ok_step
+    ok06 = and ok05, ok_reset
+    ok_row = and ok06, ok_clear
+    ok_acc = load ok_slot+0 as u64
+    ok_next = and ok_acc, ok_row
+    next_i = add i, 1
+    store ok_slot+0, ok_next as u64
+    store i_slot+0, next_i as u64
+    !i
+    !cond
+    !global_i
+    !id_value
+    !order_value
+    !status_low
+    !status_value
+    !day_low
+    !due_value
+    !amount_value
+    !bind1
+    !bind2
+    !bind3
+    !bind4
+    !bind5
+    !step_status
+    !reset_status
+    !clear_status
+    !ok_bind1
+    !ok_bind2
+    !ok_bind3
+    !ok_bind4
+    !ok_bind5
+    !ok_step
+    !ok_reset
+    !ok_clear
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok_row
+    !ok_acc
+    !ok_next
+    !next_i
+    jmp L_COND
+
+L_DONE:
+    finalize_status = call @sqlite3_finalize(*stmt)
+    ok_finalize = eq finalize_status, SQLITE_OK
+    ok_acc = load ok_slot+0 as u64
+    ok = and ok_acc, ok_finalize
+    !i
+    !cond
+    !prepare_status
+    !stmt
+    !ok_prepare
+    !finalize_status
+    !ok_finalize
+    !ok_acc
+    !db
+    !null_ptr
+    !start_base
+    !rows
+    return ok
+
+@ffi_wrapper sqlite_erp_indexed_write_bench_impl() -> i32:
+L_ENTRY:
+    db_slot = stack_alloc 8
+    stmt_slot = stack_alloc 8
+    null_slot = stack_alloc 8
+    store null_slot+0, 0 as ptr
+    null_ptr = load null_slot+0 as ptr
+    remove_file_status = call @sa_fs_remove_file(&DB_PATH_FS, DB_PATH_FS_LEN)
+    !remove_file_status
+
+    t_init0 = call @sa_time_instant_ns()
+    open_status = call @sqlite3_open_v2(*DB_PATH_C, *db_slot, SQLITE_OPEN_READWRITE_CREATE, *null_ptr)
+    db = load db_slot+0 as ptr
+    pragma_status = call @sqlite3_exec(*db, *SQL_PRAGMA, *null_ptr, *null_ptr, *null_ptr)
+    create_status = call @sqlite3_exec(*db, *SQL_CREATE, *null_ptr, *null_ptr, *null_ptr)
+    t_init1 = call @sa_time_instant_ns()
+    sqlite_erp_indexed_init_ns = sub t_init1, t_init0
+
+    t_base0 = call @sa_time_instant_ns()
+    begin_status = call @sqlite3_exec(*db, *SQL_BEGIN, *null_ptr, *null_ptr, *null_ptr)
+    baseline_orders_ok = call @insert_orders(db, null_ptr, 0, BASE_ORDER_ROWS)
+    baseline_lines_ok = call @insert_lines(db, null_ptr, 0, BASE_LINE_ROWS)
+    baseline_invoices_ok = call @insert_invoices(db, null_ptr, 0, BASE_INVOICE_ROWS)
+    commit_status = call @sqlite3_exec(*db, *SQL_COMMIT, *null_ptr, *null_ptr, *null_ptr)
+    t_base1 = call @sa_time_instant_ns()
+    sqlite_erp_indexed_baseline_ns = sub t_base1, t_base0
+
+    t_index0 = call @sa_time_instant_ns()
+    index_status = call @sqlite3_exec(*db, *SQL_INDEX, *null_ptr, *null_ptr, *null_ptr)
+    t_index1 = call @sa_time_instant_ns()
+    sqlite_erp_indexed_build_ns = sub t_index1, t_index0
+
+    t_append0 = call @sa_time_instant_ns()
+    begin_append_status = call @sqlite3_exec(*db, *SQL_BEGIN, *null_ptr, *null_ptr, *null_ptr)
+    append_orders_ok = call @insert_orders(db, null_ptr, BASE_ORDER_ROWS, APPEND_ORDER_ROWS)
+    append_lines_ok = call @insert_lines(db, null_ptr, BASE_LINE_ROWS, APPEND_LINE_ROWS)
+    append_invoices_ok = call @insert_invoices(db, null_ptr, BASE_INVOICE_ROWS, APPEND_INVOICE_ROWS)
+    append_commit_status = call @sqlite3_exec(*db, *SQL_COMMIT, *null_ptr, *null_ptr, *null_ptr)
+    t_append1 = call @sa_time_instant_ns()
+    sqlite_erp_indexed_append_ns = sub t_append1, t_append0
+
+    t_verify0 = call @sa_time_instant_ns()
+    EXPAND SQLITE_COUNT_QUERY order_rows_ok, order_rows, db, null_ptr, SQL_COUNT_ORDERS
+    EXPAND SQLITE_COUNT_QUERY line_rows_ok, line_rows, db, null_ptr, SQL_COUNT_LINES
+    EXPAND SQLITE_COUNT_QUERY invoice_rows_ok, invoice_rows, db, null_ptr, SQL_COUNT_INVOICES
+    check_prepare_status = call @sqlite3_prepare_v2(*db, *SQL_CHECK, -1, *stmt_slot, *null_ptr)
+    check_stmt = load stmt_slot+0 as ptr
+    check_step_status = call @sqlite3_step(*check_stmt)
+    check_finalize_status = call @sqlite3_finalize(*check_stmt)
+    t_verify1 = call @sa_time_instant_ns()
+    sqlite_erp_indexed_verify_ns = sub t_verify1, t_verify0
+    close_status = call @sqlite3_close(*db)
+
+    EXPAND PRINT_U64_LINE SQLITE_INDEXED_INIT, SQLITE_INDEXED_INIT_LEN, sqlite_erp_indexed_init_ns
+    EXPAND PRINT_U64_LINE SQLITE_INDEXED_BASELINE, SQLITE_INDEXED_BASELINE_LEN, sqlite_erp_indexed_baseline_ns
+    EXPAND PRINT_U64_LINE SQLITE_INDEXED_BUILD, SQLITE_INDEXED_BUILD_LEN, sqlite_erp_indexed_build_ns
+    EXPAND PRINT_U64_LINE SQLITE_INDEXED_APPEND, SQLITE_INDEXED_APPEND_LEN, sqlite_erp_indexed_append_ns
+    EXPAND PRINT_U64_LINE SQLITE_INDEXED_VERIFY, SQLITE_INDEXED_VERIFY_LEN, sqlite_erp_indexed_verify_ns
+    EXPAND PRINT_U64_LINE ORDER_ROW_TOTAL, ORDER_ROW_TOTAL_LEN, order_rows
+    EXPAND PRINT_U64_LINE LINE_ROW_TOTAL, LINE_ROW_TOTAL_LEN, line_rows
+    EXPAND PRINT_U64_LINE INVOICE_ROW_TOTAL, INVOICE_ROW_TOTAL_LEN, invoice_rows
+
+    ok_open = eq open_status, SQLITE_OK
+    ok_pragma = eq pragma_status, SQLITE_OK
+    ok_create = eq create_status, SQLITE_OK
+    ok_begin = eq begin_status, SQLITE_OK
+    ok_base_orders = eq baseline_orders_ok, 1
+    ok_base_lines = eq baseline_lines_ok, 1
+    ok_base_invoices = eq baseline_invoices_ok, 1
+    ok_commit = eq commit_status, SQLITE_OK
+    ok_index = eq index_status, SQLITE_OK
+    ok_append_begin = eq begin_append_status, SQLITE_OK
+    ok_append_orders = eq append_orders_ok, 1
+    ok_append_lines = eq append_lines_ok, 1
+    ok_append_invoices = eq append_invoices_ok, 1
+    ok_append_commit = eq append_commit_status, SQLITE_OK
+    ok_order_rows = eq order_rows_ok, 1
+    ok_line_rows = eq line_rows_ok, 1
+    ok_invoice_rows = eq invoice_rows_ok, 1
+    ok_order_total = eq order_rows, EXPECTED_ORDER_ROWS
+    ok_line_total = eq line_rows, EXPECTED_LINE_ROWS
+    ok_invoice_total = eq invoice_rows, EXPECTED_INVOICE_ROWS
+    ok_check_prepare = eq check_prepare_status, SQLITE_OK
+    ok_check_step = eq check_step_status, SQLITE_ROW
+    ok_check_finalize = eq check_finalize_status, SQLITE_OK
+    ok_close = eq close_status, SQLITE_OK
+
+    ok01 = and ok_open, ok_pragma
+    ok02 = and ok01, ok_create
+    ok03 = and ok02, ok_begin
+    ok04 = and ok03, ok_base_orders
+    ok05 = and ok04, ok_base_lines
+    ok06 = and ok05, ok_base_invoices
+    ok07 = and ok06, ok_commit
+    ok08 = and ok07, ok_index
+    ok09 = and ok08, ok_append_begin
+    ok10 = and ok09, ok_append_orders
+    ok11 = and ok10, ok_append_lines
+    ok12 = and ok11, ok_append_invoices
+    ok13 = and ok12, ok_append_commit
+    ok14 = and ok13, ok_order_rows
+    ok15 = and ok14, ok_line_rows
+    ok16 = and ok15, ok_invoice_rows
+    ok17 = and ok16, ok_order_total
+    ok18 = and ok17, ok_line_total
+    ok19 = and ok18, ok_invoice_total
+    ok20 = and ok19, ok_check_prepare
+    ok21 = and ok20, ok_check_step
+    ok22 = and ok21, ok_check_finalize
+    ok = and ok22, ok_close
+
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9402)
+
+@main() -> i32:
+L_MAIN:
+    code = call @sqlite_erp_indexed_write_bench_impl()
+    return code

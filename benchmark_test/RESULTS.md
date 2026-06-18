@@ -193,6 +193,21 @@ raw，对应中位数如下：
 
 相对 2026-06-18 此前那组顺序重跑的 db 中位数（`build ~= 166.1 ms`、`tx ~= 66.4 ms`、`coltx ~= 66.5 ms`），这次 `mmap` 读取旧 index 文件后，db 侧 `tx` append 中位数降到 `52.465 ms`，约改善 `20.9%`；`coltx` append 中位数降到 `48.921 ms`，约改善 `26.4%`。`build` 中位数也回到 `132.000 ms`，接近 2026-06-17 那轮较好的基线。这个收益和当前 workload 是对得上的，因为 ERP indexed append 路径的热点之一就是每个增量 merge 前先把既有 index 文件完整读入 heap。
 
+2026-06-18 继续把“同表多索引创建”从 5 次独立 `sa_db_create_*_index` 调用收敛为按表批量 `sa_db_create_indexes` 调用后，重新构建 dev 插件并顺序各跑 1 次 db / SQLite indexed ERP append benchmark。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 129.715 ms | 1.976 ms | SQLite 约 65.6x |
+| baseline ingest before indexes | 77.508 ms | 68.214 ms | SQLite 约 1.1x |
+| build baseline indexes | 92.848 ms | 20.900 ms | SQLite 约 4.4x |
+| append with tx + incremental indexes | 37.086 ms | 3.932 ms | SQLite 约 9.4x |
+| append with coltx + incremental indexes | 42.406 ms | 3.932 ms* | SQLite 约 10.8x |
+| verify/integrity | 71.480 ms | 32.456 ms | SQLite 约 2.2x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态。
+
+这一步的收益比前两轮更直接：相对前一组 db 单轮数据（`build ~= 133.5 ms`、`tx ~= 49.7 ms`、`coltx ~= 55.3 ms`、`verify ~= 137.6 ms`），批量建索引把 `build` 再压低约 `30.5%`，`tx` append 压低约 `25.4%`，`coltx` append 压低约 `23.3%`，`verify` 压低约 `48.1%`。原因也和 benchmark 结构一致：`orders`、`lines`、`invoices` 三张表现在只需要 3 次建索引事务，而不是为 `lines` 和 `invoices` 各自重复 load meta、写 manifest、刷新 epoch 两次。即便如此，SQLite 在 indexed ERP 写入链路上仍然全面领先，说明后续还要继续压缩 init/verify 常数开销，以及 append merge 内部 pair-index 维护的成本。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

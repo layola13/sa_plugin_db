@@ -87,6 +87,32 @@
 #def SaDbColumnInput_data = +0
 #def SaDbColumnInput_len = +8
 
+#def SaDbCreateIndexRequest_SIZE = 48
+#def SaDbCreateIndexRequest_kind = +0
+#def SaDbCreateIndexRequest_unique = +4
+#def SaDbCreateIndexRequest_reserved = +8
+#def SaDbCreateIndexRequest_column_index = +16
+#def SaDbCreateIndexRequest_column_index2 = +24
+#def SaDbCreateIndexRequest_store_name_ptr = +32
+#def SaDbCreateIndexRequest_store_name_len = +40
+
+#def SA_DB_INDEX_KIND_U64 = 1
+#def SA_DB_INDEX_KIND_I64 = 2
+#def SA_DB_INDEX_KIND_U32 = 3
+#def SA_DB_INDEX_KIND_I32 = 4
+#def SA_DB_INDEX_KIND_U8 = 5
+#def SA_DB_INDEX_KIND_I8 = 6
+#def SA_DB_INDEX_KIND_U16 = 7
+#def SA_DB_INDEX_KIND_I16 = 8
+#def SA_DB_INDEX_KIND_F32 = 9
+#def SA_DB_INDEX_KIND_F64 = 10
+#def SA_DB_INDEX_KIND_U64_PAIR = 11
+#def SA_DB_INDEX_KIND_U64_I64_PAIR = 12
+#def SA_DB_INDEX_KIND_BLOB_EQ = 13
+#def SA_DB_INDEX_KIND_BLOB_TOKEN = 14
+#def SA_DB_INDEX_KIND_BLOB_PREFIX = 15
+#def SA_DB_INDEX_KIND_BLOB_CONTAINS = 16
+
 [MACRO] DB_STATUS_IS_OK %out_bool, %status
     %out_bool = eq %status, SA_DB_OK
 [END_MACRO]
@@ -190,6 +216,20 @@
     store __db_col_ptr_%columns_%index+SaDbColumnInput_len, %len as u64
     !__db_col_ptr_%columns_%index
     !__db_col_off_%columns_%index
+[END_MACRO]
+
+[MACRO] DB_CREATE_INDEX_REQUEST_SET %requests, %index, %kind, %column_index, %column_index2, %unique, %store_name, %store_name_len
+    __db_create_index_off_%requests_%index = mul %index, SaDbCreateIndexRequest_SIZE
+    __db_create_index_ptr_%requests_%index = ptr_add %requests, __db_create_index_off_%requests_%index
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_kind, %kind as u32
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_unique, %unique as u32
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_reserved, 0 as u64
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_column_index, %column_index as u64
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_column_index2, %column_index2 as u64
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_store_name_ptr, %store_name as ptr
+    store __db_create_index_ptr_%requests_%index+SaDbCreateIndexRequest_store_name_len, %store_name_len as u64
+    !__db_create_index_ptr_%requests_%index
+    !__db_create_index_off_%requests_%index
 [END_MACRO]
 
 [MACRO] DB_INFO_ROW_COUNT %out_rows, %info
@@ -600,6 +640,10 @@
 
 [MACRO] DB_CREATE_BLOB_CONTAINS_INDEX %out_status, %root, %root_len, %table_name, %table_name_len, %column_index, %store_name, %store_name_len, %out_info
     %out_status = call @sa_db_create_blob_contains_index(&%root, %root_len, &%table_name, %table_name_len, %column_index, &%store_name, %store_name_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_CREATE_INDEXES %out_status, %root, %root_len, %table_name, %table_name_len, %requests, %requests_len, %out_info
+    %out_status = call @sa_db_create_indexes(&%root, %root_len, &%table_name, %table_name_len, %requests, %requests_len, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_DICT_INTERN %out_status, %out_id, %out_inserted, %root, %root_len, %table_name, %table_name_len, %dict_name, %dict_name_len, %value, %value_len, %out_info
