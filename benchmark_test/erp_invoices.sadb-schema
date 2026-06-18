@@ -1,0 +1,6 @@
+#def MAX_ROWS = 8192
+#def COL_ID_STRIDE = 8 // u64
+#def COL_ORDER_ID_STRIDE = 8 // u64
+#def COL_STATUS_STRIDE = 8 // u64
+#def COL_DUE_DAY_STRIDE = 8 // i64 date
+#def COL_AMOUNT_CENTS_STRIDE = 8 // i64 decimal(2)

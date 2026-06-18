@@ -439,101 +439,11 @@ L_ENTRY:
 
     t_tx0 = call @sa_time_instant_ns()
     EXPAND DB_TX_BEGIN orders_tx_begin_status, orders_tx, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN
-    order_row = stack_alloc 32
-    invoice_row = stack_alloc 40
-    i_slot = stack_alloc 8
-    store i_slot+0, 0 as u64
-    jmp L_ORDER_TX_LOOP_COND
-
-L_ORDER_TX_LOOP_COND:
-    i = load i_slot+0 as u64
-    cond = ult i, APPEND_ORDER_ROWS
-    br cond -> L_ORDER_TX_LOOP_BODY, L_ORDER_TX_LOOP_DONE
-
-L_ORDER_TX_LOOP_BODY:
-    off = shl i, 3
-    a0 = ptr_add append_order_id_col, off
-    a1 = ptr_add append_order_customer_col, off
-    a2 = ptr_add append_order_status_col, off
-    a3 = ptr_add append_order_day_col, off
-    v0 = load a0+0 as u64
-    v1 = load a1+0 as u64
-    v2 = load a2+0 as u64
-    v3 = load a3+0 as i64
-    store order_row+0, v0 as u64
-    store order_row+8, v1 as u64
-    store order_row+16, v2 as u64
-    store order_row+24, v3 as i64
-    EXPAND DB_TX_INSERT_ROW orders_tx_insert_status, orders_tx, order_row, 32, info
-
-    next_i = add i, 1
-    store i_slot+0, next_i as u64
-    !i
-    !cond
-    !off
-    !a0
-    !a1
-    !a2
-    !a3
-    !v0
-    !v1
-    !v2
-    !v3
-    !orders_tx_insert_status
-    !next_i
-    jmp L_ORDER_TX_LOOP_COND
-
-L_ORDER_TX_LOOP_DONE:
+    EXPAND DB_TX_ADD_COLUMNS orders_tx_insert_status, orders_tx, APPEND_ORDER_ROWS, append_order_columns, 4, info
     EXPAND DB_TX_COMMIT orders_tx_commit_status, orders_tx, info
 
     EXPAND DB_TX_BEGIN invoices_tx_begin_status, invoices_tx, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN
-    store i_slot+0, 0 as u64
-    jmp L_INVOICE_TX_LOOP_COND
-
-L_INVOICE_TX_LOOP_COND:
-    i2 = load i_slot+0 as u64
-    cond2 = ult i2, APPEND_INVOICE_ROWS
-    br cond2 -> L_INVOICE_TX_LOOP_BODY, L_INVOICE_TX_LOOP_DONE
-
-L_INVOICE_TX_LOOP_BODY:
-    off2 = shl i2, 3
-    b0 = ptr_add append_invoice_id_col, off2
-    b1 = ptr_add append_invoice_order_col, off2
-    b2 = ptr_add append_invoice_status_col, off2
-    b3 = ptr_add append_invoice_due_col, off2
-    b4 = ptr_add append_invoice_amount_col, off2
-    w0 = load b0+0 as u64
-    w1 = load b1+0 as u64
-    w2 = load b2+0 as u64
-    w3 = load b3+0 as i64
-    w4 = load b4+0 as i64
-    store invoice_row+0, w0 as u64
-    store invoice_row+8, w1 as u64
-    store invoice_row+16, w2 as u64
-    store invoice_row+24, w3 as i64
-    store invoice_row+32, w4 as i64
-    EXPAND DB_TX_INSERT_ROW invoices_tx_insert_status, invoices_tx, invoice_row, 40, info
-
-    next_i2 = add i2, 1
-    store i_slot+0, next_i2 as u64
-    !i2
-    !cond2
-    !off2
-    !b0
-    !b1
-    !b2
-    !b3
-    !b4
-    !w0
-    !w1
-    !w2
-    !w3
-    !w4
-    !invoices_tx_insert_status
-    !next_i2
-    jmp L_INVOICE_TX_LOOP_COND
-
-L_INVOICE_TX_LOOP_DONE:
+    EXPAND DB_TX_ADD_COLUMNS invoices_tx_insert_status, invoices_tx, APPEND_INVOICE_ROWS, append_invoice_columns, 5, info
     EXPAND DB_TX_COMMIT invoices_tx_commit_status, invoices_tx, info
     t_tx1 = call @sa_time_instant_ns()
     db_erp_indexed_tx_append_ns = sub t_tx1, t_tx0

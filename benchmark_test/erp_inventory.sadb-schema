@@ -1,0 +1,4 @@
+#def MAX_ROWS = 16384
+#def COL_PRODUCT_ID_STRIDE = 8 // u64
+#def COL_MOVE_SEQ_STRIDE = 8 // u64
+#def COL_QTY_DELTA_STRIDE = 8 // i64

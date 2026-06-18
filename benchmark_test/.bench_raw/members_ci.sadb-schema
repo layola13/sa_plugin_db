@@ -1,0 +1,5 @@
+#def MAX_ROWS = 50000
+#def COL_ID_STRIDE = 8 // u64
+#def COL_PLAN_STRIDE = 8 // u64
+#def COL_STATUS_STRIDE = 8 // u64
+#def COL_POINTS_STRIDE = 8 // u64

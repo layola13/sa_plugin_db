@@ -1,0 +1,4 @@
+#def MAX_ROWS = 512
+#def COL_ID_STRIDE = 8 // u64
+#def COL_CATEGORY_STRIDE = 8 // u64
+#def COL_PRICE_CENTS_STRIDE = 8 // i64 decimal(2)

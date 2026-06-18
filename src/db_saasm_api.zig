@@ -20,7 +20,7 @@ var mutation_mutex = std.Thread.Mutex{};
 var read_handle_lock = std.Thread.RwLock{};
 var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
 var tx_handle_mutex = std.Thread.Mutex{};
-var tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
+var active_write_tx: ?*table.WriteTransaction = null;
 var coltx_handle_lock = std.Thread.RwLock{};
 var coltx_handles = std.AutoHashMap(usize, ColtxHandleEntry).init(std.heap.page_allocator);
 var empty_output_bytes: [0]u8 = .{};
@@ -335,11 +335,24 @@ fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapsh
 }
 
 fn registerWriteTransaction(tx: *table.WriteTransaction) bool {
-    const key = @intFromPtr(tx);
     tx_handle_mutex.lock();
     defer tx_handle_mutex.unlock();
-    tx_handles.put(key, tx) catch return false;
+    if (active_write_tx != null) return false;
+    active_write_tx = tx;
     return true;
+}
+
+fn lockWriteTransaction(handle: ?*anyopaque) ?*table.WriteTransaction {
+    tx_handle_mutex.lock();
+    const tx = active_write_tx orelse {
+        tx_handle_mutex.unlock();
+        return null;
+    };
+    if (handle != @as(?*anyopaque, @ptrCast(tx))) {
+        tx_handle_mutex.unlock();
+        return null;
+    }
+    return tx;
 }
 
 fn registerColumnIngestSession(session: *table.ColumnIngestSession) bool {
@@ -371,12 +384,12 @@ fn releaseColumnIngestSession(session: *table.ColumnIngestSession) void {
 
 fn unregisterWriteTransaction(handle: ?*anyopaque, out_tx: *?*table.WriteTransaction) u32 {
     out_tx.* = null;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     tx_handle_mutex.lock();
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const tx = active_write_tx orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (handle != @as(?*anyopaque, @ptrCast(tx))) return SA_DB_ERR_INVALID_ARGUMENT;
     out_tx.* = tx;
-    _ = tx_handles.remove(key);
+    active_write_tx = null;
     return SA_DB_OK;
 }
 
@@ -1399,12 +1412,52 @@ pub export fn sa_db_tx_insert_row(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionInsertRawRow(tx, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
+}
+
+pub export fn sa_db_tx_insert_rows(
+    handle: ?*anyopaque,
+    rows_ptr: ?[*]const u8,
+    rows_len: u64,
+    row_count: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (row_count == 0) return SA_DB_ERR_INVALID_ARGUMENT;
+    const rows = requiredBytes(rows_ptr, rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer tx_handle_mutex.unlock();
+    const info = table.writeTransactionInsertRawRows(tx, rows, row_count) catch |err| return tableStatus(err);
+    return fillInfo(info_slot, info);
+}
+
+pub export fn sa_db_tx_add_columns(
+    handle: ?*anyopaque,
+    row_count: u64,
+    columns_ptr: ?[*]const SaDbColumnInput,
+    columns_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (row_count == 0) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (columns_len > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const n: usize = @intCast(columns_len);
+    const columns_in = if (n == 0) return SA_DB_ERR_INVALID_ARGUMENT else (columns_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
+
+    var raw_columns = std.heap.page_allocator.alloc(table.RawColumnBytes, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    defer std.heap.page_allocator.free(raw_columns);
+    for (columns_in, 0..) |column, idx| {
+        const bytes = inputBytes(column.data, column.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+        raw_columns[idx] = .{ .bytes = bytes };
+    }
+
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    defer tx_handle_mutex.unlock();
+    const info = table.writeTransactionInsertRawColumns(tx, row_count, raw_columns) catch |err| return tableStatus(err);
+    return fillInfo(info_slot, info);
 }
 
 pub export fn sa_db_tx_dict_intern(
@@ -1424,10 +1477,8 @@ pub export fn sa_db_tx_dict_intern(
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     id_slot.* = 0;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
     const result = table.writeTransactionInternStringDict(std.heap.page_allocator, tx, dict_name, value) catch |err| return tableStatus(err);
     id_slot.* = result.id;
@@ -1448,10 +1499,8 @@ pub export fn sa_db_tx_blob_put(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
     id_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
     const result = table.writeTransactionPutBlobValue(std.heap.page_allocator, tx, store_name, value) catch |err| return tableStatus(err);
     id_slot.* = result.id;
@@ -1472,10 +1521,8 @@ pub export fn sa_db_tx_upsert_row_u64_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowU64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1491,10 +1538,8 @@ pub export fn sa_db_tx_update_row_u64_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowU64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1513,10 +1558,8 @@ pub export fn sa_db_tx_upsert_row_u32_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowU32Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1532,10 +1575,8 @@ pub export fn sa_db_tx_update_row_u32_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowU32Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1554,10 +1595,8 @@ pub export fn sa_db_tx_upsert_row_i32_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowI32Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1573,10 +1612,8 @@ pub export fn sa_db_tx_update_row_i32_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowI32Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1595,10 +1632,8 @@ pub export fn sa_db_tx_upsert_row_u8_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowU8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1614,10 +1649,8 @@ pub export fn sa_db_tx_update_row_u8_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowU8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1636,10 +1669,8 @@ pub export fn sa_db_tx_upsert_row_i8_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowI8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1655,10 +1686,8 @@ pub export fn sa_db_tx_update_row_i8_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowI8Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1677,10 +1706,8 @@ pub export fn sa_db_tx_upsert_row_u16_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowU16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1696,10 +1723,8 @@ pub export fn sa_db_tx_update_row_u16_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowU16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1718,10 +1743,8 @@ pub export fn sa_db_tx_upsert_row_i16_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowI16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1737,10 +1760,8 @@ pub export fn sa_db_tx_update_row_i16_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowI16Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1759,10 +1780,8 @@ pub export fn sa_db_tx_upsert_row_i64_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowI64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1778,10 +1797,8 @@ pub export fn sa_db_tx_update_row_i64_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowI64Key(tx, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1803,10 +1820,8 @@ pub export fn sa_db_tx_upsert_row_u64_pair_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowU64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1825,10 +1840,8 @@ pub export fn sa_db_tx_update_row_u64_pair_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowU64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1850,10 +1863,8 @@ pub export fn sa_db_tx_upsert_row_u64_i64_pair_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowU64I64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1872,10 +1883,8 @@ pub export fn sa_db_tx_update_row_u64_i64_pair_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowU64I64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1899,10 +1908,8 @@ pub export fn sa_db_tx_upsert_row_blob_eq_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const result = table.writeTransactionUpsertRawRowBlobEqKey(std.heap.page_allocator, tx, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1923,10 +1930,8 @@ pub export fn sa_db_tx_update_row_blob_eq_key(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionUpdateRawRowBlobEqKey(std.heap.page_allocator, tx, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1938,10 +1943,8 @@ pub export fn sa_db_tx_delete_u64_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU64Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1953,10 +1956,8 @@ pub export fn sa_db_tx_delete_u32_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU32Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1968,10 +1969,8 @@ pub export fn sa_db_tx_delete_i32_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteI32Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1983,10 +1982,8 @@ pub export fn sa_db_tx_delete_u8_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU8Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1998,10 +1995,8 @@ pub export fn sa_db_tx_delete_i8_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteI8Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2013,10 +2008,8 @@ pub export fn sa_db_tx_delete_u16_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU16Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2028,10 +2021,8 @@ pub export fn sa_db_tx_delete_i16_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteI16Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2043,10 +2034,8 @@ pub export fn sa_db_tx_delete_i64_key(
     out_info: ?*SaDbTableInfo,
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteI64Key(tx, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2061,10 +2050,8 @@ pub export fn sa_db_tx_delete_u64_pair_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2079,10 +2066,8 @@ pub export fn sa_db_tx_delete_u64_i64_pair_key(
 ) u32 {
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteU64I64PairKey(tx, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2099,10 +2084,8 @@ pub export fn sa_db_tx_delete_blob_eq_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    tx_handle_mutex.lock();
+    const tx = lockWriteTransaction(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer tx_handle_mutex.unlock();
-    const tx = tx_handles.get(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info = table.writeTransactionDeleteBlobEqKey(std.heap.page_allocator, tx, @intCast(column_index), store_name, value) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -9705,6 +9688,111 @@ test "db SA ABI commits and rolls back write transactions" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "tx_members".ptr, "tx_members".len, &info));
 }
 
+test "db SA ABI inserts batched rows in a write transaction" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_batch_members.sadb-schema".ptr, "tx_batch_members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_index(root.ptr, root.len, "tx_batch_members".ptr, "tx_batch_members".len, 0, 1, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_batch_members".ptr, "tx_batch_members".len, &tx_handle));
+
+    var rows: [32]u8 = undefined;
+    std.mem.writeInt(u64, rows[0..8], 1, .little);
+    std.mem.writeInt(u64, rows[8..16], 10, .little);
+    std.mem.writeInt(u64, rows[16..24], 2, .little);
+    std.mem.writeInt(u64, rows[24..32], 20, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_insert_rows(tx_handle, &rows, rows.len, 2, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "tx_batch_members".ptr, "tx_batch_members".len, &read_handle));
+    defer _ = sa_db_close_read_table(read_handle);
+
+    var sum: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 30), sum);
+}
+
+test "db SA ABI inserts raw columns in a write transaction" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_columns_members.sadb-schema".ptr, "tx_columns_members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_index(root.ptr, root.len, "tx_columns_members".ptr, "tx_columns_members".len, 0, 1, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_columns_members".ptr, "tx_columns_members".len, &tx_handle));
+
+    var ids = [_]u64{ 1, 2 };
+    var points = [_]u64{ 10, 20 };
+    var columns = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&points), .len = @sizeOf(@TypeOf(points)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_add_columns(tx_handle, ids.len, &columns, columns.len, &info));
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "tx_columns_members".ptr, "tx_columns_members".len, &read_handle));
+    defer _ = sa_db_close_read_table(read_handle);
+
+    var sum: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 30), sum);
+}
+
+test "db SA ABI rejects invalid batched write transaction inserts" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_batch_invalid.sadb-schema".ptr, "tx_batch_invalid.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_batch_invalid".ptr, "tx_batch_invalid".len, &tx_handle));
+
+    var rows: [8]u8 = undefined;
+    std.mem.writeInt(u64, rows[0..8], 1, .little);
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_tx_insert_rows(tx_handle, &rows, rows.len, 0, &info));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_FORMAT, sa_db_tx_insert_rows(tx_handle, &rows, rows.len, 2, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(tx_handle));
+}
+
 test "db SA ABI commits and rolls back transaction blob handles" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();
@@ -10452,4 +10540,35 @@ test "db SA ABI rejects nested tx begin with locked status instead of deadlockin
     try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_nested_lock".ptr, "tx_nested_lock".len, &second_tx));
     try std.testing.expect(second_tx != null);
     try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(second_tx));
+}
+
+test "db SA ABI rejects stale write transaction handles after close" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "tx_stale_handle.sadb-schema".ptr, "tx_stale_handle.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_stale_handle".ptr, "tx_stale_handle".len, &tx_handle));
+    const stale_after_commit = tx_handle;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_tx_insert_row(stale_after_commit, "x".ptr, 1, &info));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_tx_rollback(stale_after_commit));
+
+    tx_handle = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "tx_stale_handle".ptr, "tx_stale_handle".len, &tx_handle));
+    const stale_after_rollback = tx_handle;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_rollback(tx_handle));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_tx_insert_row(stale_after_rollback, "x".ptr, 1, &info));
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_tx_commit(stale_after_rollback, &info));
 }

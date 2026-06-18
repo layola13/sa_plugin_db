@@ -384,6 +384,14 @@
     %out_status = call @sa_db_tx_insert_row(%handle, &%row, %row_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_TX_INSERT_ROWS %out_status, %handle, %rows, %rows_len, %row_count, %out_info
+    %out_status = call @sa_db_tx_insert_rows(%handle, &%rows, %rows_len, %row_count, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_TX_ADD_COLUMNS %out_status, %handle, %row_count, %columns, %columns_len, %out_info
+    %out_status = call @sa_db_tx_add_columns(%handle, %row_count, %columns, %columns_len, &%out_info)
+[END_MACRO]
+
 [MACRO] DB_TX_DICT_INTERN %out_status, %out_id, %out_inserted, %handle, %dict_name, %dict_name_len, %value, %value_len, %out_info
     __db_tx_dict_id_slot_%out_id = stack_alloc 8
     __db_tx_dict_inserted_slot_%out_inserted = stack_alloc 8

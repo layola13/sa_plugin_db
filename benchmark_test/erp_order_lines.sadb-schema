@@ -1,0 +1,6 @@
+#def MAX_ROWS = 32768
+#def COL_ORDER_ID_STRIDE = 8 // u64
+#def COL_LINE_NO_STRIDE = 8 // u64
+#def COL_PRODUCT_ID_STRIDE = 8 // u64
+#def COL_QTY_STRIDE = 8 // u64
+#def COL_NET_CENTS_STRIDE = 8 // i64 decimal(2)
