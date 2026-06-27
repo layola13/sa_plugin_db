@@ -1328,38 +1328,41 @@ maintenance, buffered transaction dictionary writes, batched dictionary intern,
 deferred unsafe-init bootstrap materialization, first-write bootstrap cache
 reuse, the unsafe-init cache ownership fix, direct bootstrap-meta consumption on
 first true write, in-place unsafe bootstrap dict updates, and removal of
-unsafe-path `.write.lock` file creation:
+unsafe-path `.write.lock` file creation. The same day, the unsafe empty-table
+bootstrap path was extended to direct unindexed blob-store writes and the remove
+fast path dropped a redundant recovered-meta scan:
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.347-1.651 ms, median 1.380 ms | 0.836-1.100 ms, median 1.007 ms | SQLite |
-| ingest ERP rows | 4.663-5.785 ms, median 5.497 ms | 63.965-84.495 ms, median 73.188 ms | db plugin |
-| build ERP indexes | 8.756-10.066 ms, median 9.881 ms | 18.993-31.826 ms, median 23.711 ms | db plugin |
-| tx append, orders + invoices | 2.089-3.425 ms, median 2.632 ms | 3.860-10.414 ms, median 4.180 ms* | db plugin |
-| coltx append, order lines | 1.610-2.209 ms, median 1.817 ms | 3.860-10.414 ms, median 4.180 ms* | db plugin |
-| total append chain | 3.956-5.634 ms, median 4.399 ms | 3.860-10.414 ms, median 4.180 ms | SQLite |
-| verify/integrity | 0.903-1.469 ms, median 1.069 ms | 33.110-42.917 ms, median 40.774 ms | db plugin |
+| init 3 ERP tables + dicts | 1.498-2.040 ms, median 1.624 ms | 0.886-1.272 ms, median 0.969 ms | SQLite |
+| ingest ERP rows | 5.158-5.867 ms, median 5.316 ms | 65.976-99.599 ms, median 67.145 ms | db plugin |
+| build ERP indexes | 9.281-11.353 ms, median 10.167 ms | 19.654-22.335 ms, median 21.119 ms | db plugin |
+| tx append, orders + invoices | 2.344-3.480 ms, median 2.806 ms | 4.046-6.188 ms, median 4.487 ms* | db plugin |
+| coltx append, order lines | 1.635-2.043 ms, median 1.887 ms | 4.046-6.188 ms, median 4.487 ms* | db plugin |
+| total append chain | 4.005-5.524 ms, median 4.441 ms | 4.046-6.188 ms, median 4.487 ms | db plugin, essentially tied |
+| verify/integrity | 1.047-1.315 ms, median 1.256 ms | 33.154-39.109 ms, median 36.584 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
 
 This rerun matters for three reasons. First, the empty-table unsafe bootstrap
-now defers `meta`, `schema`, and dict artifact materialization until the first
-real persisting write, while still serving dictionary lookups from cache before
-that point. Second, the benchmark-driven unsafe-init cache lifetime fix remains
-in place: the cache now owns its own copy of `TableMeta`, pending dict bytes,
-and schema source, and regression coverage includes the allocator-teardown
-case. Third, empty bootstrap dictionary writes no longer duplicate `TableMeta`
-out of the cache and back in again; they now update the cache entry in place,
-which reduced the fixed `init_dict` component again.
+now defers `meta`, `schema`, dict artifacts, and direct unindexed blob-store
+artifacts until the first real persisting write, while still serving cached dict
+and blob reads before that point. Second, the benchmark-driven unsafe-init cache
+lifetime fix remains in place: the cache owns its own copy of `TableMeta`,
+pending dict/blob bytes, and schema source, with regression coverage for
+allocator teardown and latest-epoch blob materialization. Third, the remove fast
+path no longer performs a second recovered-meta scan after `loadActiveMeta()` has
+already exhausted active, unsafe-cache, compat, and recovered metadata sources.
 
 The remaining gaps are now narrower and more specific:
 
 - init median still trails SQLite even after the latest bootstrap reductions;
-- this sample set no longer shows db ahead on the full append chain median,
-  because SQLite came back to `4.180 ms` while db landed at `4.399 ms`;
+- this sample set puts db barely ahead on full append-chain median
+  (`4.441 ms` vs. `4.487 ms`), but the ranges overlap too much to call it a
+  stable lead;
 - there is still no basis to claim全面领先 across every benchmark category while
-  init remains behind SQLite and the total append chain is not stably ahead.
+  init remains behind SQLite.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 

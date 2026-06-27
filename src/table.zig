@@ -190,6 +190,7 @@ const UnsafeInitMetaCacheEntry = struct {
     schema_source: []u8,
     meta: TableMeta,
     pending_dict_writes: []PendingDictWrite = &.{},
+    pending_blob_writes: []PendingBlobWrite = &.{},
 };
 
 const UnsafeInitTemplateCacheEntry = struct {
@@ -256,6 +257,12 @@ pub const DictLookupResult = struct {
 };
 
 const PendingDictWrite = struct {
+    name: []const u8,
+    path: []const u8,
+    bytes: []u8,
+};
+
+const PendingBlobWrite = struct {
     name: []const u8,
     path: []const u8,
     bytes: []u8,
@@ -1485,16 +1492,24 @@ fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_
         break :blk try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
     };
     defer allocator.free(schema_source);
-    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, &.{});
+    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, &.{}, &.{});
 }
 
 fn unsafeInitCachePutOwned(root_dir: []const u8, table_name: []const u8, schema_source: []const u8, meta: TableMeta) TableError!void {
     if (!skipDurabilitySync()) return;
 
-    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, &.{});
+    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, &.{}, &.{});
 }
 
 fn duplicatePendingDictWrite(allocator: std.mem.Allocator, write: PendingDictWrite) TableError!PendingDictWrite {
+    return .{
+        .name = try allocator.dupe(u8, write.name),
+        .path = try allocator.dupe(u8, write.path),
+        .bytes = try allocator.dupe(u8, write.bytes),
+    };
+}
+
+fn duplicatePendingBlobWrite(allocator: std.mem.Allocator, write: PendingBlobWrite) TableError!PendingBlobWrite {
     return .{
         .name = try allocator.dupe(u8, write.name),
         .path = try allocator.dupe(u8, write.path),
@@ -1539,12 +1554,50 @@ fn mergePendingDictWritesOwned(
     return merged[0..count];
 }
 
+fn hasPendingBlobWriteNamed(writes: []const PendingBlobWrite, name: []const u8) bool {
+    for (writes) |write| {
+        if (std.mem.eql(u8, write.name, name)) return true;
+    }
+    return false;
+}
+
+fn findPendingBlobWriteIndexInWrites(writes: []const PendingBlobWrite, name: []const u8) ?usize {
+    for (writes, 0..) |write, idx| {
+        if (std.mem.eql(u8, write.name, name)) return idx;
+    }
+    return null;
+}
+
+fn mergePendingBlobWritesOwned(
+    allocator: std.mem.Allocator,
+    existing: []const PendingBlobWrite,
+    additions: []const PendingBlobWrite,
+) TableError![]PendingBlobWrite {
+    if (existing.len == 0 and additions.len == 0) return try allocator.alloc(PendingBlobWrite, 0);
+
+    const merged = try allocator.alloc(PendingBlobWrite, existing.len + additions.len);
+    var count: usize = 0;
+
+    for (existing) |write| {
+        if (hasPendingBlobWriteNamed(additions, write.name)) continue;
+        merged[count] = try duplicatePendingBlobWrite(allocator, write);
+        count += 1;
+    }
+    for (additions) |write| {
+        merged[count] = try duplicatePendingBlobWrite(allocator, write);
+        count += 1;
+    }
+
+    return merged[0..count];
+}
+
 fn unsafeInitCachePutOwnedWithPending(
     root_dir: []const u8,
     table_name: []const u8,
     schema_source: []const u8,
     meta: TableMeta,
     additions: []const PendingDictWrite,
+    blob_additions: []const PendingBlobWrite,
 ) TableError!void {
     if (!skipDurabilitySync()) return;
 
@@ -1562,6 +1615,7 @@ fn unsafeInitCachePutOwnedWithPending(
         if (slot.*) |*entry| {
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             const owned_pending = try mergePendingDictWritesOwned(arena.allocator(), entry.pending_dict_writes, additions);
+            const owned_pending_blobs = try mergePendingBlobWritesOwned(arena.allocator(), entry.pending_blob_writes, blob_additions);
             freeUnsafeInitCacheEntry(entry);
             slot.* = .{
                 .arena = arena,
@@ -1570,12 +1624,14 @@ fn unsafeInitCachePutOwnedWithPending(
                 .schema_source = owned_schema,
                 .meta = owned_meta,
                 .pending_dict_writes = owned_pending,
+                .pending_blob_writes = owned_pending_blobs,
             };
             return;
         }
     }
 
     const owned_pending = try mergePendingDictWritesOwned(arena.allocator(), &.{}, additions);
+    const owned_pending_blobs = try mergePendingBlobWritesOwned(arena.allocator(), &.{}, blob_additions);
 
     for (&unsafe_init_meta_cache) |*slot| {
         if (slot.* == null) {
@@ -1586,6 +1642,7 @@ fn unsafeInitCachePutOwnedWithPending(
                 .schema_source = owned_schema,
                 .meta = owned_meta,
                 .pending_dict_writes = owned_pending,
+                .pending_blob_writes = owned_pending_blobs,
             };
             return;
         }
@@ -1600,6 +1657,7 @@ fn unsafeInitCachePutOwnedWithPending(
         .schema_source = owned_schema,
         .meta = owned_meta,
         .pending_dict_writes = owned_pending,
+        .pending_blob_writes = owned_pending_blobs,
     };
     unsafe_init_meta_cache_next_slot = (unsafe_init_meta_cache_next_slot + 1) % unsafe_init_meta_cache.len;
 }
@@ -1683,6 +1741,7 @@ fn unsafeInitCacheBuildInitialMetaOwned(
                 .schema_source = owned_schema,
                 .meta = owned_meta,
                 .pending_dict_writes = try arena.allocator().alloc(PendingDictWrite, 0),
+                .pending_blob_writes = try arena.allocator().alloc(PendingBlobWrite, 0),
             };
             return info;
         }
@@ -1697,6 +1756,7 @@ fn unsafeInitCacheBuildInitialMetaOwned(
                 .schema_source = owned_schema,
                 .meta = owned_meta,
                 .pending_dict_writes = try arena.allocator().alloc(PendingDictWrite, 0),
+                .pending_blob_writes = try arena.allocator().alloc(PendingBlobWrite, 0),
             };
             return info;
         }
@@ -1711,6 +1771,7 @@ fn unsafeInitCacheBuildInitialMetaOwned(
         .schema_source = owned_schema,
         .meta = owned_meta,
         .pending_dict_writes = try arena.allocator().alloc(PendingDictWrite, 0),
+        .pending_blob_writes = try arena.allocator().alloc(PendingBlobWrite, 0),
     };
     unsafe_init_meta_cache_next_slot = (unsafe_init_meta_cache_next_slot + 1) % unsafe_init_meta_cache.len;
     return info;
@@ -1749,6 +1810,24 @@ fn unsafeInitCachePendingDictBytes(allocator: std.mem.Allocator, root_dir: []con
     return null;
 }
 
+fn unsafeInitCachePendingBlobBytes(allocator: std.mem.Allocator, root_dir: []const u8, blob_path: []const u8) TableError!?[]u8 {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir)) continue;
+            for (entry.pending_blob_writes) |write| {
+                if (!std.mem.eql(u8, write.path, blob_path)) continue;
+                return try allocator.dupe(u8, write.bytes);
+            }
+        }
+    }
+    return null;
+}
+
 fn unsafeInitCachePendingDictWritesForTable(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -1768,9 +1847,35 @@ fn unsafeInitCachePendingDictWritesForTable(
     return try allocator.alloc(PendingDictWrite, 0);
 }
 
+fn unsafeInitCachePendingBlobWritesForTable(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError![]PendingBlobWrite {
+    if (!skipDurabilitySync()) return try allocator.alloc(PendingBlobWrite, 0);
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return try mergePendingBlobWritesOwned(allocator, entry.pending_blob_writes, &.{});
+        }
+    }
+    return try allocator.alloc(PendingBlobWrite, 0);
+}
+
 fn unsafeInitCachePendingDictBytesForEntry(entry: *const UnsafeInitMetaCacheEntry, dict_path: []const u8) ?[]const u8 {
     for (entry.pending_dict_writes) |write| {
         if (std.mem.eql(u8, write.path, dict_path)) return write.bytes;
+    }
+    return null;
+}
+
+fn unsafeInitCachePendingBlobBytesForEntry(entry: *const UnsafeInitMetaCacheEntry, blob_path: []const u8) ?[]const u8 {
+    for (entry.pending_blob_writes) |write| {
+        if (std.mem.eql(u8, write.path, blob_path)) return write.bytes;
     }
     return null;
 }
@@ -2865,6 +2970,15 @@ fn freePendingDictWrites(allocator: std.mem.Allocator, writes: []PendingDictWrit
     allocator.free(writes);
 }
 
+fn freePendingBlobWrites(allocator: std.mem.Allocator, writes: []PendingBlobWrite) void {
+    for (writes) |write| {
+        allocator.free(write.name);
+        allocator.free(write.path);
+        allocator.free(write.bytes);
+    }
+    allocator.free(writes);
+}
+
 fn findPendingDictWriteIndex(tx: *const WriteTransaction, dict_name: []const u8) ?usize {
     for (tx.pending_dict_writes, 0..) |write, idx| {
         if (std.mem.eql(u8, write.name, dict_name)) return idx;
@@ -3177,12 +3291,13 @@ fn cacheUnsafeBootstrapMeta(
     table_name: []const u8,
     meta: TableMeta,
     additions: []const PendingDictWrite,
+    blob_additions: []const PendingBlobWrite,
 ) TableError!void {
     if (!skipDurabilitySync()) return TableError.InvalidFormat;
 
     const schema_source = (try unsafeInitCacheSchemaSource(allocator, root_dir, table_name)) orelse return TableError.NotFound;
     defer allocator.free(schema_source);
-    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, additions);
+    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, additions, blob_additions);
 }
 
 fn loadCurrentMeta(
@@ -3707,6 +3822,16 @@ fn findBlobStoreMetaIndex(meta: TableMeta, store_name: []const u8) ?usize {
 }
 
 fn readBlobStoreBytes(allocator: std.mem.Allocator, root_dir: []const u8, blob: BlobStoreMeta) TableError![]u8 {
+    if (try unsafeInitCachePendingBlobBytes(allocator, root_dir, blob.path)) |bytes| {
+        errdefer allocator.free(bytes);
+        if (bytes.len != blob.bytes) return TableError.VerifyFailed;
+        const count = try blobEntryCount(bytes);
+        if (count != blob.entries) return TableError.VerifyFailed;
+        try validateOptionalSha256(blob.sha256, bytes);
+        try validateBlobStoreBlockHashes(blob, bytes);
+        return bytes;
+    }
+
     const path = try activePath(allocator, root_dir, blob.path);
     defer allocator.free(path);
     const bytes = try readFileAlloc(allocator, path, 1 << 30);
@@ -3717,6 +3842,14 @@ fn readBlobStoreBytes(allocator: std.mem.Allocator, root_dir: []const u8, blob: 
     try validateOptionalSha256(blob.sha256, bytes);
     try validateBlobStoreBlockHashes(blob, bytes);
     return bytes;
+}
+
+fn hasBlobIndexesForStore(meta: TableMeta, store_name: []const u8) bool {
+    for (meta.indexes) |index| {
+        if (index.store_name == null) continue;
+        if (std.mem.eql(u8, index.store_name.?, store_name)) return true;
+    }
+    return false;
 }
 
 fn validateBlobStoreFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
@@ -4076,18 +4209,6 @@ fn deleteTableArtifactsFast(allocator: std.mem.Allocator, root_dir: []const u8, 
     } else |err| switch (err) {
         TableError.NotFound => {},
         else => return err,
-    }
-
-    if (!removed_targeted) {
-        if (loadRecoveredActiveMetaSource(allocator, root_dir, table_name)) |source| {
-            defer allocator.free(source);
-            var owned = try parseOwnedTableMeta(allocator, source, table_name);
-            defer owned.deinit(allocator);
-            try deleteActiveMetaArtifacts(allocator, root_dir, owned);
-        } else |err| switch (err) {
-            TableError.NotFound => {},
-            else => return err,
-        }
     }
 
     if (!removed_targeted) {
@@ -4505,6 +4626,13 @@ fn writeCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
         const pending_dict_writes = try unsafeInitCachePendingDictWritesForTable(allocator, root_dir, table_name);
         defer freePendingDictWrites(allocator, pending_dict_writes);
         for (pending_dict_writes) |write| {
+            const path = try activePath(allocator, root_dir, write.path);
+            defer allocator.free(path);
+            try writeFile(allocator, path, write.bytes);
+        }
+        const pending_blob_writes = try unsafeInitCachePendingBlobWritesForTable(allocator, root_dir, table_name);
+        defer freePendingBlobWrites(allocator, pending_blob_writes);
+        for (pending_blob_writes) |write| {
             const path = try activePath(allocator, root_dir, write.path);
             defer allocator.free(path);
             try writeFile(allocator, path, write.bytes);
@@ -6479,7 +6607,7 @@ pub fn internStringDict(
     meta.epoch = next_epoch;
     if (canDeferUnsafeBootstrapMeta(meta)) {
         const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = @constCast(new_bytes) }};
-        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending);
+        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending, &.{});
         return .{ .info = tableInfo(meta), .id = new_count, .inserted = true };
     }
     const path = try activePath(allocator, root_dir, basename);
@@ -6578,7 +6706,7 @@ pub fn internStringDictMany(
     meta.epoch = next_epoch;
     if (canDeferUnsafeBootstrapMeta(meta)) {
         const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = @constCast(new_bytes) }};
-        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending);
+        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending, &.{});
         return .{ .info = tableInfo(meta), .inserted_count = inserted_count };
     }
     const path = try activePath(allocator, root_dir, basename);
@@ -6678,9 +6806,6 @@ pub fn putBlobValue(
     const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try blobStoreFileName(allocator, table_name, store_name, next_epoch);
     defer allocator.free(basename);
-    const path = try activePath(allocator, root_dir, basename);
-    defer allocator.free(path);
-    try writeFile(allocator, path, new_bytes);
 
     const new_meta = try makeBlobStoreMeta(allocator, store_name, basename, new_bytes, new_count);
     var consumed = false;
@@ -6688,6 +6813,16 @@ pub fn putBlobValue(
     try putBlobStoreMeta(allocator, &meta, new_meta);
     consumed = true;
     meta.epoch = next_epoch;
+
+    if (canDeferUnsafeBootstrapMeta(meta) and !hasBlobIndexesForStore(meta, store_name)) {
+        const pending = [_]PendingBlobWrite{.{ .name = store_name, .path = basename, .bytes = @constCast(new_bytes) }};
+        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &.{}, &pending);
+        return .{ .info = tableInfo(meta), .id = new_count };
+    }
+
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
     try rebuildBlobIndexesForStore(allocator, root_dir, &meta, store_name);
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .id = new_count };
@@ -19894,6 +20029,108 @@ test "table unsafe init cache serves first direct row insert bootstrap" {
     const found = try snapshotFindU64(snapshot, 0, 7);
     try std.testing.expect(found.found);
     try std.testing.expectEqual(@as(u64, 0), found.row_index);
+}
+
+test "table unsafe init defers empty blob store until first persisting write" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_blob_bootstrap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_blob_bootstrap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    const blob_path = try activePath(std.testing.allocator, ".", "unsafe_blob_bootstrap.blob.notes.1.dat");
+    defer std.testing.allocator.free(blob_path);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists(blob_path));
+
+    const first = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+    try std.testing.expectEqual(@as(u64, 1), first.id);
+    try std.testing.expectEqual(@as(u64, 1), first.info.epoch);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists(blob_path));
+
+    const len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", first.id);
+    try std.testing.expect(len.found);
+    try std.testing.expectEqual(@as(u64, 10), len.len);
+    var buf: [16]u8 = undefined;
+    const copied = try copyBlobValue(std.testing.allocator, ".", table_name, "notes", first.id, &buf);
+    try std.testing.expect(copied.found);
+    try std.testing.expectEqual(@as(u64, 10), copied.written);
+    try std.testing.expectEqualStrings("first note", buf[0..@intCast(copied.written)]);
+
+    var row = [_]u64{ 1, first.id };
+    const inserted = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expectEqual(@as(u64, 1), inserted.row_count);
+    try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(fileExists(blob_path));
+
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+}
+
+test "table unsafe init blob bootstrap persists latest pending blob epoch" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_blob_batches";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_blob_batches.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const epoch1_path = try activePath(std.testing.allocator, ".", "unsafe_blob_batches.blob.notes.1.dat");
+    defer std.testing.allocator.free(epoch1_path);
+    const epoch2_path = try activePath(std.testing.allocator, ".", "unsafe_blob_batches.blob.notes.2.dat");
+    defer std.testing.allocator.free(epoch2_path);
+
+    const first = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+    const second = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "second note");
+    try std.testing.expectEqual(@as(u64, 1), first.id);
+    try std.testing.expectEqual(@as(u64, 2), second.id);
+    try std.testing.expectEqual(@as(u64, 2), second.info.epoch);
+    try std.testing.expect(!fileExists(epoch1_path));
+    try std.testing.expect(!fileExists(epoch2_path));
+
+    var meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), meta.epoch);
+    try std.testing.expectEqual(@as(usize, 1), meta.blobs.len);
+    try std.testing.expectEqual(@as(u64, 2), meta.blobs[0].entries);
+    try std.testing.expectEqualStrings("unsafe_blob_batches.blob.notes.2.dat", meta.blobs[0].path);
+
+    var row = [_]u64{ 1, second.id };
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expect(fileExists(epoch2_path));
+    try std.testing.expect(!fileExists(epoch1_path));
+
+    const second_len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", second.id);
+    try std.testing.expect(second_len.found);
+    try std.testing.expectEqual(@as(u64, 11), second_len.len);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
 }
 
 test "table unsafe init dict bootstrap reuses cache across batches without materialization" {
