@@ -1345,11 +1345,12 @@ ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
 maintenance, buffered transaction dictionary writes, batched dictionary intern,
 deferred unsafe-init bootstrap materialization, first-write bootstrap cache
 reuse, the unsafe-init cache ownership fix, direct bootstrap-meta consumption on
-first true write, in-place unsafe bootstrap dict updates, and removal of
-unsafe-path `.write.lock` file creation. The same day, the unsafe empty-table
-bootstrap path was extended to direct unindexed blob-store writes and the remove
-fast path dropped redundant recovered-meta scans and merged the unsafe not-found
-remove cleanup into one directory pass:
+first true write, in-place unsafe bootstrap dict updates, removal of unsafe-path
+`.write.lock` file creation, and delayed empty-index bootstrap artifacts. The
+same day, the unsafe empty-table bootstrap path was extended to direct
+unindexed blob-store writes and the remove fast path dropped redundant
+recovered-meta scans and merged the unsafe not-found remove cleanup into one
+directory pass:
 The next pass deferred the empty-bootstrap `schema_path` string as well; the
 path is filled only when the first real persisting write materializes meta. The
 init-fast schema compiler now keeps duplicate-def tracking in a fixed inline
@@ -1358,13 +1359,13 @@ that capacity.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.290-1.478 ms, median 1.379 ms | 0.875-1.095 ms, median 0.968 ms | SQLite |
-| ingest ERP rows | 4.611-5.287 ms, median 4.964 ms | 57.738-69.982 ms, median 63.373 ms | db plugin |
-| build ERP indexes | 8.667-9.300 ms, median 8.825 ms | 19.711-21.575 ms, median 20.691 ms | db plugin |
-| tx append, orders + invoices | 2.133-2.613 ms, median 2.397 ms | 4.297-4.731 ms, median 4.406 ms* | db plugin |
-| coltx append, order lines | 1.589-1.821 ms, median 1.819 ms | 4.297-4.731 ms, median 4.406 ms* | db plugin |
-| total append chain | 3.722-4.432 ms, median 4.216 ms | 4.297-4.731 ms, median 4.406 ms | db plugin |
-| verify/integrity | 0.935-1.385 ms, median 1.071 ms | 33.348-39.911 ms, median 33.788 ms | db plugin |
+| init 3 ERP tables + dicts | 1.246-1.647 ms, median 1.345 ms | 0.732-0.905 ms, median 0.824 ms | SQLite |
+| ingest ERP rows | 4.721-5.411 ms, median 5.211 ms | 60.221-77.626 ms, median 69.391 ms | db plugin |
+| build ERP indexes | 8.457-9.419 ms, median 8.912 ms | 19.933-31.352 ms, median 21.009 ms | db plugin |
+| tx append, orders + invoices | 2.085-2.799 ms, median 2.338 ms | 4.036-5.053 ms, median 4.638 ms* | db plugin |
+| coltx append, order lines | 1.523-1.912 ms, median 1.553 ms | 4.036-5.053 ms, median 4.638 ms* | db plugin |
+| total append chain | 3.697-4.711 ms, median 3.862 ms | 4.036-5.053 ms, median 4.638 ms | db plugin |
+| verify/integrity | 0.919-1.073 ms, median 0.961 ms | 34.095-38.241 ms, median 36.382 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
@@ -1382,15 +1383,18 @@ and latest-epoch blob materialization. Third, the remove fast
 path no longer performs a second recovered-meta scan after `loadActiveMeta()` has
 already exhausted active, unsafe-cache, compat, and recovered metadata sources;
 the unsafe not-found remove path now uses one root scan for recovered metadata
-and stale artifact cleanup. In this sample, `db_erp_indexed_init_remove_ns`
-dropped to `0.349-0.585 ms`, median `0.400 ms`, and the schema component
-landed at `0.945-0.986 ms`, median `0.968 ms`.
+and stale artifact cleanup. In this latest sample,
+`db_erp_indexed_init_remove_ns` landed at `0.325-0.614 ms`, median `0.431 ms`,
+and the schema component landed at `0.855-1.153 ms`, median `0.916 ms`. The
+schema component improved from the previous `0.968 ms` median and total init
+improved from `1.379 ms` to `1.345 ms`, but SQLite init still leads at
+`0.824 ms`.
 
 The remaining gaps are now narrower and more specific:
 
 - init median still trails SQLite even after the latest bootstrap reductions;
 - this sample set puts db ahead on full append-chain median
-  (`4.216 ms` vs. `4.406 ms`), but init is still the gating gap;
+  (`3.862 ms` vs. `4.638 ms`), but init is still the gating gap;
 - there is still no basis to claim全面领先 across every benchmark category while
   init remains behind SQLite.
 

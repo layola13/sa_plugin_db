@@ -333,6 +333,24 @@ raw，对应中位数如下：
 
 同日转入下一项 memory mode 稳定性：memory root 的 read snapshot 不再直接引用全局 `mem://` map 中的 artifact bytes，而是在打开 snapshot 时复制一份由 snapshot 自己释放的 bytes。这样 `:memory:name` 或精确 `:memory:` 里删除、重建、复用同名表时，旧 read handle 仍保持打开时的行数据。随后继续修正 memory snapshot cleanup 的路径匹配：删除表 `foo` 的 snapshot 目录时只删除精确路径或 `/` 子路径，不会误删 `foo_extra` 这类前缀邻居表的 snapshot artifact。再往后，missing-table remove 在 memory root 下也改为纯内存处理，不再进入磁盘 recovered-meta / root artifact 扫描，也不会探测或创建真实 `:memory:*` 目录。之后 memory recover 也切到当前 in-memory active meta 的直接校验和重新发布路径，不再对 `:memory:name` 做真实目录遍历；missing recover 返回 `NotFound`，同样不触碰文件系统。lock、unlock、compact 生命周期也补了 memory root 回归，覆盖 locked 状态拒写、unlock 后校验、compact 合并内存 segment 以及无真实目录副作用。空表 bootstrap 随后继续扩到“先建索引、后首写”的路径：unsafe 空表创建空索引时只更新缓存 metadata，不写空 index artifact 或 meta 文件，首个 indexed write 再 materialize 真实 index 文件并保持唯一约束。接口侧也同步了 `benchmark_test/db.sai` 和 `benchmark_test/db.sal`，恢复 `DB_TX_INSERT_ROWS` 的测试副本声明和宏，并让 `db_tx_smoke.sa` 实际通过公开宏批量插入两行后用 read handle 校验结果。新增回归测试覆盖 memory read snapshot 在 remove + reuse 后仍读到旧行、新 snapshot 读到新行，前缀邻居表 snapshot 互不影响，missing remove 不触碰文件系统，memory recover active 表不创建目录，missing recover 不触碰文件系统，memory lock/unlock/compact 全程留在内存里，以及 unsafe empty-index bootstrap 延迟到第一批真实行写入。这是内存模式隔离语义、空表自举和接口同步修正，不更新 indexed ERP vs SQLite 性能表。
 
+随后基于延迟空索引 bootstrap artifact 的代码重新 `zig build`，再顺序跑 5 次 db 和 5 次 SQLite indexed ERP append benchmark。两侧正确性输出仍一致：`8448 / 33792 / 8448`。这轮衡量的是“先建空索引、首批真实 indexed write 再 materialize index 文件”的固定成本影响；db init 继续小幅改善，但 SQLite init 仍领先。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 1.246-1.647 ms, 中位数 1.345 ms | 0.732-0.905 ms, 中位数 0.824 ms | SQLite |
+| init remove component | 0.325-0.614 ms, 中位数 0.431 ms | n/a | db 内部仍低于旧样本 |
+| init schema component | 0.855-1.153 ms, 中位数 0.916 ms | n/a | db 内部改善 |
+| baseline ingest before indexes | 4.721-5.411 ms, 中位数 5.211 ms | 60.221-77.626 ms, 中位数 69.391 ms | db 插件约 13.3x |
+| build baseline indexes | 8.457-9.419 ms, 中位数 8.912 ms | 19.933-31.352 ms, 中位数 21.009 ms | db 插件约 2.4x |
+| append with tx + incremental indexes | 2.085-2.799 ms, 中位数 2.338 ms | 4.036-5.053 ms, 中位数 4.638 ms* | db 插件约 2.0x |
+| append with coltx + incremental indexes | 1.523-1.912 ms, 中位数 1.553 ms | 4.036-5.053 ms, 中位数 4.638 ms* | db 插件约 3.0x |
+| total append chain | 3.697-4.711 ms, 中位数 3.862 ms | 4.036-5.053 ms, 中位数 4.638 ms | db 插件约 1.2x |
+| verify/integrity | 0.919-1.073 ms, 中位数 0.961 ms | 34.095-38.241 ms, 中位数 36.382 ms | db 插件约 37.9x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这轮 schema component 中位数从前一组 `0.968 ms` 降到 `0.916 ms`，总 init 中位数从 `1.379 ms` 降到 `1.345 ms`。不过 SQLite init 中位数这轮是 `0.824 ms`，所以仍不能声明“全部领先”。当前可确认的是：db 在 baseline ingest、build indexes、tx append、coltx append、total append chain、verify/integrity 的中位数均领先；init 仍是下一轮优化目标。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
