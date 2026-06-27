@@ -1242,6 +1242,9 @@ sa build-exe db_concurrent_bench.sa -o db_concurrent_bench.out --no-incremental
 
 sa build-exe db_erp_workflow_bench.sa -o db_erp_workflow_bench.out --no-incremental
 ./db_erp_workflow_bench.out
+
+sa build-exe db_erp_indexed_memory_bench.sa -o db_erp_indexed_memory_bench.out --no-incremental
+env SA_DB_UNSAFE_NO_SYNC=1 ./db_erp_indexed_memory_bench.out
 ```
 
 Run SQLite comparisons:
@@ -1274,6 +1277,12 @@ zig cc -O1 sqlite_erp_workflow_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.
   /lib/x86_64-linux-gnu/libsqlite3.so.0 \
   -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_erp_workflow_bench.out
 ./sqlite_erp_workflow_bench.out
+
+sa build-obj sqlite_erp_indexed_memory_bench.sa -o sqlite_erp_indexed_memory_bench.o --no-incremental
+zig cc -O1 sqlite_erp_indexed_memory_bench.o sqlite_link_std/libsa_std_no_sqlite_stub.a \
+  /lib/x86_64-linux-gnu/libsqlite3.so.0 \
+  -Wl,-rpath,/lib/x86_64-linux-gnu -o sqlite_erp_indexed_memory_bench.out
+./sqlite_erp_indexed_memory_bench.out
 ```
 
 Latest verified concurrent rerun results. Each benchmark now runs in its own
@@ -1390,6 +1399,33 @@ index build, `tx` append, `coltx` append, total append chain, and verify. Scope
 is still limited to this benchmark and unsafe/no-sync measurement mode; SQLite
 remains stronger for general SQL, mature ACID/WAL behavior, crash recovery,
 vacuum/compaction semantics, and broad operational tooling.
+
+ERP indexed memory 5-run rerun results on 2026-06-27 compare named db memory
+root `:memory:erp_indexed` against SQLite `:memory:` with the same three-table
+workload and correctness totals (`8448 / 33792 / 8448`). This pass extends the
+unsafe/no-sync append fast path to `mem://` artifacts: in-memory column and index
+artifact append/merge first try allocator `remap`, so append no longer defaults
+to copying the existing full artifact before writing the appended tail.
+
+| Operation | db `:memory:` plugin | SQLite `:memory:` | Fastest |
+| --- | ---: | ---: | --- |
+| init 3 ERP tables + dicts | 0.144-0.171 ms, median 0.148 ms | 0.475-0.653 ms, median 0.493 ms | db plugin |
+| init missing-root remove component | 0.195-0.273 ms, median 0.231 ms | n/a | db internal |
+| init schema component | 0.069-0.096 ms, median 0.079 ms | n/a | db internal |
+| init dict component | 0.056-0.071 ms, median 0.065 ms | n/a | db internal |
+| ingest ERP rows | 2.782-2.999 ms, median 2.832 ms | 63.846-77.623 ms, median 70.231 ms | db plugin |
+| build ERP indexes | 6.815-7.543 ms, median 7.146 ms | 20.450-25.008 ms, median 20.957 ms | db plugin |
+| tx append, orders + invoices | 1.374-1.484 ms, median 1.400 ms | 3.138-5.758 ms, median 3.790 ms* | db plugin |
+| coltx append, order lines | 0.913-1.030 ms, median 0.952 ms | 3.138-5.758 ms, median 3.790 ms* | db plugin |
+| total append chain | 2.292-2.437 ms, median 2.420 ms | 3.138-5.758 ms, median 3.790 ms | db plugin |
+| verify/integrity | 0.262-0.376 ms, median 0.292 ms | 35.426-50.123 ms, median 41.635 ms | db plugin |
+
+`*` SQLite `:memory:` side still exposes one append transaction path, so the
+same sample is shown against the db plugin's split `tx` and `coltx` subpaths.
+This benchmark confirms real memory-mode coverage for ERP numeric/date/decimal
+columns, dictionary ids, indexes, transactions, `coltx`, verify, and no real
+`:memory:*` directory side effects; it does not claim SQLite feature parity for
+general SQL or durable ACID/WAL behavior.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 

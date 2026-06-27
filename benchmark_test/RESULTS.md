@@ -415,6 +415,29 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 
 这轮改变 indexed ERP write benchmark 的当前结论：在已安装插件和源码一致后，db 插件已经在该 benchmark 的 init、baseline ingest、index build、`tx` append、`coltx` append、total append chain、verify/integrity 中位数上全部领先 SQLite。这个结论只覆盖这组 unsafe/no-sync indexed ERP 写入 benchmark，不等价于 SQL 功能、ACID/WAL、崩溃恢复、compact/vacuum 或通用运维能力全面超过 SQLite。
 
+随后进入真正的内存模式目标：新增 `db_erp_indexed_memory_bench.sa`，用 named root `:memory:erp_indexed` 跑同一组三表 indexed ERP write workload；同时新增 `sqlite_erp_indexed_memory_bench.sa`，用 SQLite `:memory:` 作为对照。第一轮完整 memory benchmark 已确认功能覆盖真实 workload：init、dict、baseline ingest、批量建索引、`tx` append、`coltx` append、verify 全部跑通，且 db 侧不创建真实 `:memory:` 或 `:memory:erp_indexed` 目录。
+
+这轮实现继续把 memory root 纳入 unsafe/no-sync indexed append fast path：`mem://` index artifact 的 merge/append 不再被排除在增量索引 in-place 路径之外；随后把 memory index artifact 和 segment column artifact 的扩容改为优先 allocator `remap`，只写新增尾部，避免默认 `alloc + copy old + copy appended`。新增回归测试覆盖 `:memory:` root 在 unsafe fast path 下追加唯一单列索引和唯一 pair 索引，verify/query 正确且没有真实目录副作用。
+
+最终同轮 5 次 db memory / 5 次 SQLite `:memory:` indexed ERP append benchmark 如下。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+
+| 操作 | db `:memory:` 插件 | SQLite `:memory:` | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 0.144-0.171 ms, 中位数 0.148 ms | 0.475-0.653 ms, 中位数 0.493 ms | db 插件约 3.3x |
+| init remove component | 0.195-0.273 ms, 中位数 0.231 ms | n/a | db 内部分量 |
+| init schema component | 0.069-0.096 ms, 中位数 0.079 ms | n/a | db 内部分量 |
+| init dict component | 0.056-0.071 ms, 中位数 0.065 ms | n/a | db 内部分量 |
+| baseline ingest before indexes | 2.782-2.999 ms, 中位数 2.832 ms | 63.846-77.623 ms, 中位数 70.231 ms | db 插件约 24.8x |
+| build baseline indexes | 6.815-7.543 ms, 中位数 7.146 ms | 20.450-25.008 ms, 中位数 20.957 ms | db 插件约 2.9x |
+| append with tx + incremental indexes | 1.374-1.484 ms, 中位数 1.400 ms | 3.138-5.758 ms, 中位数 3.790 ms* | db 插件约 2.7x |
+| append with coltx + incremental indexes | 0.913-1.030 ms, 中位数 0.952 ms | 3.138-5.758 ms, 中位数 3.790 ms* | db 插件约 4.0x |
+| total append chain | 2.292-2.437 ms, 中位数 2.420 ms | 3.138-5.758 ms, 中位数 3.790 ms | db 插件约 1.6x |
+| verify/integrity | 0.262-0.376 ms, 中位数 0.292 ms | 35.426-50.123 ms, 中位数 41.635 ms | db 插件约 142.6x |
+
+`*` SQLite `:memory:` 对照这里只有一条追加事务路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这轮 memory benchmark 的当前结论：对于这组 unsafe/no-sync indexed ERP 写入工作负载，db 的 named `:memory:` 模式已经在 init、baseline ingest、index build、`tx` append、`coltx` append、total append chain、verify/integrity 中位数上全部领先 SQLite `:memory:`。这不是 SQL 功能或持久化 ACID/WAL 能力的等价声明，但说明内存模式已经不只是 smoke 覆盖，而是可承载完整 ERP 类型、索引和事务路径。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
@@ -424,6 +447,7 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 - 新增的 ABI 修复把 `sa_db_coltx_add_columns` 从“持有全局 handle mutex 执行整段 staging I/O”改成了带引用计数的共享获取，直接改善了多 session 并发追加。
 - 批量写入和全量列更新：db 插件更快，主要受益于列式 raw column ingest。
 - 当前 indexed ERP write benchmark 在安装当前开发插件后，db 插件的 init、建索引、append 链路和 verify/integrity 中位数都领先 SQLite；旧 ERP workflow 和非 indexed 写入历史样本仍按各自表格解释。
+- 当前 indexed ERP memory benchmark 中，named `:memory:` db root 对 SQLite `:memory:` 也在 init、建索引、append 链路和 verify/integrity 中位数上全部领先。
 - SQLite 在通用 SQL、ACID/WAL、崩溃恢复、compact/vacuum、成熟运维工具和广泛兼容性上仍更完整。
 - 带二级索引的 ERP append-only 写入现在已经走增量索引维护，db 不再为这条路径付出整表 `rebuildIndexes()` 的成本；相对旧 ERP workflow 里的全量建索引阶段，db 侧建索引成本已经明显下降。
 - 之前出现的并发失败，主要是 benchmark 工件共享导致的污染，不是当前这轮隔离结果里的稳定行为。

@@ -943,18 +943,45 @@ fn memoryAppendFile(allocator: std.mem.Allocator, path: []const u8, appended_byt
     memory_fs_mutex.lock();
     defer memory_fs_mutex.unlock();
 
-    const existing = memory_fs_files.get(path) orelse return TableError.NotFound;
+    const entry = memory_fs_files.getPtr(path) orelse return TableError.NotFound;
+    const existing = entry.*;
     const next_len = std.math.add(usize, existing.len, appended_bytes.len) catch return TableError.CursorOverflow;
+    if (unsafe_init_cache_allocator.remap(existing, next_len)) |expanded| {
+        @memcpy(expanded[existing.len..], appended_bytes);
+        entry.* = expanded;
+        _ = allocator;
+        return;
+    }
+
     const combined = try unsafe_init_cache_allocator.alloc(u8, next_len);
     errdefer unsafe_init_cache_allocator.free(combined);
 
     @memcpy(combined[0..existing.len], existing);
     @memcpy(combined[existing.len..], appended_bytes);
 
-    const entry = memory_fs_files.getPtr(path) orelse return TableError.NotFound;
-    unsafe_init_cache_allocator.free(entry.*);
+    unsafe_init_cache_allocator.free(existing);
     entry.* = combined;
     _ = allocator;
+}
+
+fn memoryExpandedFileBuffer(path: []const u8, old_len: usize, new_len: usize) TableError![]u8 {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+
+    const entry = memory_fs_files.getPtr(path) orelse return TableError.NotFound;
+    const existing = entry.*;
+    if (existing.len != old_len) return TableError.VerifyFailed;
+    if (unsafe_init_cache_allocator.remap(existing, new_len)) |expanded| {
+        entry.* = expanded;
+        return expanded;
+    }
+
+    const combined = try unsafe_init_cache_allocator.alloc(u8, new_len);
+    errdefer unsafe_init_cache_allocator.free(combined);
+    @memcpy(combined[0..existing.len], existing);
+    unsafe_init_cache_allocator.free(existing);
+    entry.* = combined;
+    return combined;
 }
 
 fn memoryDeleteIfExists(path: []const u8) void {
@@ -9547,18 +9574,15 @@ fn detectUniquePairMergeConflict(existing_bytes: []const u8, appended_bytes: []c
     }
 }
 
-fn unsafeMergeSingleIndexFileInPlace(
-    allocator: std.mem.Allocator,
-    root_dir: []const u8,
-    index: *IndexMeta,
+fn mergeSingleIndexBytesInPlace(
+    writable: []u8,
+    existing_len: usize,
     appended_bytes: []const u8,
     unique: bool,
     validate_variable_shape: bool,
     total_row_count: u64,
 ) TableError!void {
     if (appended_bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
-
-    const existing_len: usize = @intCast(index.bytes);
     if (existing_len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
     const appended_len = appended_bytes.len;
     if (appended_len == 0) return;
@@ -9567,18 +9591,9 @@ fn unsafeMergeSingleIndexFileInPlace(
     const appended_count = appended_len / INDEX_RECORD_BYTES;
     const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
     const total_len = std.math.mul(usize, total_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    if (writable.len != total_len) return TableError.VerifyFailed;
 
-    const path = try activePath(allocator, root_dir, index.path);
-    defer allocator.free(path);
-
-    var mapped_file = try mapExpandedFileReadWrite(path, existing_len, total_len);
-    defer mapped_file.file.close();
-    defer releaseMappedRegion(allocator, mapped_file.mapped);
-
-    const bytes = mappedRegionBytes(mapped_file.mapped);
-    var writable = @as([]u8, @constCast(bytes));
-    if (unique) try detectUniqueSingleMergeConflict(bytes[0..existing_len], appended_bytes);
-
+    if (unique) try detectUniqueSingleMergeConflict(writable[0..existing_len], appended_bytes);
     @memcpy(writable[existing_len..total_len], appended_bytes);
 
     var existing_idx: isize = @intCast(existing_count);
@@ -9629,20 +9644,16 @@ fn unsafeMergeSingleIndexFileInPlace(
     } else {
         try validateIndexBytesShape(writable, total_row_count, unique);
     }
-    try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
 }
 
-fn unsafeMergeU64PairIndexFileInPlace(
-    allocator: std.mem.Allocator,
-    root_dir: []const u8,
-    index: *IndexMeta,
+fn mergeU64PairIndexBytesInPlace(
+    writable: []u8,
+    existing_len: usize,
     appended_bytes: []const u8,
     unique: bool,
     total_row_count: u64,
 ) TableError!void {
     if (appended_bytes.len % U64_PAIR_INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
-
-    const existing_len: usize = @intCast(index.bytes);
     if (existing_len % U64_PAIR_INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
     const appended_len = appended_bytes.len;
     if (appended_len == 0) return;
@@ -9651,18 +9662,9 @@ fn unsafeMergeU64PairIndexFileInPlace(
     const appended_count = appended_len / U64_PAIR_INDEX_RECORD_BYTES;
     const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
     const total_len = std.math.mul(usize, total_count, U64_PAIR_INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    if (writable.len != total_len) return TableError.VerifyFailed;
 
-    const path = try activePath(allocator, root_dir, index.path);
-    defer allocator.free(path);
-
-    var mapped_file = try mapExpandedFileReadWrite(path, existing_len, total_len);
-    defer mapped_file.file.close();
-    defer releaseMappedRegion(allocator, mapped_file.mapped);
-
-    const bytes = mappedRegionBytes(mapped_file.mapped);
-    var writable = @as([]u8, @constCast(bytes));
-    if (unique) try detectUniquePairMergeConflict(bytes[0..existing_len], appended_bytes);
-
+    if (unique) try detectUniquePairMergeConflict(writable[0..existing_len], appended_bytes);
     @memcpy(writable[existing_len..total_len], appended_bytes);
 
     var existing_idx: isize = @intCast(existing_count);
@@ -9713,6 +9715,84 @@ fn unsafeMergeU64PairIndexFileInPlace(
     }
 
     try validateU64PairIndexBytesShape(writable, total_row_count, unique);
+}
+
+fn unsafeMergeSingleIndexFileInPlace(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    index: *IndexMeta,
+    appended_bytes: []const u8,
+    unique: bool,
+    validate_variable_shape: bool,
+    total_row_count: u64,
+) TableError!void {
+    if (appended_bytes.len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+
+    const existing_len: usize = @intCast(index.bytes);
+    if (existing_len % INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+    const appended_len = appended_bytes.len;
+    if (appended_len == 0) return;
+
+    const existing_count = existing_len / INDEX_RECORD_BYTES;
+    const appended_count = appended_len / INDEX_RECORD_BYTES;
+    const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
+    const total_len = std.math.mul(usize, total_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+
+    const path = try activePath(allocator, root_dir, index.path);
+    defer allocator.free(path);
+
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        const writable = try memoryExpandedFileBuffer(path, existing_len, total_len);
+        try mergeSingleIndexBytesInPlace(writable, existing_len, appended_bytes, unique, validate_variable_shape, total_row_count);
+        try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
+        return;
+    }
+
+    var mapped_file = try mapExpandedFileReadWrite(path, existing_len, total_len);
+    defer mapped_file.file.close();
+    defer releaseMappedRegion(allocator, mapped_file.mapped);
+
+    const writable = @as([]u8, @constCast(mappedRegionBytes(mapped_file.mapped)));
+    try mergeSingleIndexBytesInPlace(writable, existing_len, appended_bytes, unique, validate_variable_shape, total_row_count);
+    try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
+}
+
+fn unsafeMergeU64PairIndexFileInPlace(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    index: *IndexMeta,
+    appended_bytes: []const u8,
+    unique: bool,
+    total_row_count: u64,
+) TableError!void {
+    if (appended_bytes.len % U64_PAIR_INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+
+    const existing_len: usize = @intCast(index.bytes);
+    if (existing_len % U64_PAIR_INDEX_RECORD_BYTES != 0) return TableError.VerifyFailed;
+    const appended_len = appended_bytes.len;
+    if (appended_len == 0) return;
+
+    const existing_count = existing_len / U64_PAIR_INDEX_RECORD_BYTES;
+    const appended_count = appended_len / U64_PAIR_INDEX_RECORD_BYTES;
+    const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
+    const total_len = std.math.mul(usize, total_count, U64_PAIR_INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+
+    const path = try activePath(allocator, root_dir, index.path);
+    defer allocator.free(path);
+
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        const writable = try memoryExpandedFileBuffer(path, existing_len, total_len);
+        try mergeU64PairIndexBytesInPlace(writable, existing_len, appended_bytes, unique, total_row_count);
+        try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
+        return;
+    }
+
+    var mapped_file = try mapExpandedFileReadWrite(path, existing_len, total_len);
+    defer mapped_file.file.close();
+    defer releaseMappedRegion(allocator, mapped_file.mapped);
+
+    const writable = @as([]u8, @constCast(mappedRegionBytes(mapped_file.mapped)));
+    try mergeU64PairIndexBytesInPlace(writable, existing_len, appended_bytes, unique, total_row_count);
     try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
 }
 
@@ -9762,7 +9842,7 @@ fn tryAppendIndexesForAppendedRows(
         }
     }
 
-    const allow_unsafe_index_io = skipDurabilitySync() and !isMemoryRoot(root_dir);
+    const allow_unsafe_index_io = skipDurabilitySync();
 
     for (0..meta.indexes.len) |idx| {
         const index = &meta.indexes[idx];
@@ -19649,6 +19729,85 @@ test "table write transaction raw columns append unique indexes in place in unsa
         try std.testing.expectEqual(@as(u64, 10), readU64LE(&fetched_row, 8));
         try std.testing.expectEqual(@as(u64, 3), readU64LE(&fetched_row, 16));
     }
+}
+
+test "table memory write transaction appends unique indexes through unsafe fast path" {
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const root = ":memory:test_index_append_unsafe";
+    const table_name = "mem_tx_append_unique_unsafe";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_tx_append_unique_unsafe.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_INVOICE_ID_STRIDE = 8 // u64
+        \\#def COL_ORDER_ID_STRIDE = 8 // u64
+        \\#def COL_LINE_NO_STRIDE = 8 // u64
+    );
+
+    var invoice_ids = [_]u64{ 100, 103 };
+    var order_ids = [_]u64{ 10, 11 };
+    var line_nos = [_]u64{ 1, 1 };
+    const initial_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(invoice_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(order_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(line_nos[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, root, table_name, invoice_ids.len, &initial_columns);
+    _ = try createU64Index(std.testing.allocator, root, table_name, 0, true);
+    _ = try createU64PairIndex(std.testing.allocator, root, table_name, 1, 2, true);
+
+    var before = try loadActiveMeta(std.testing.allocator, root, table_name);
+    defer before.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), before.indexes.len);
+
+    const before_u64_path = try std.testing.allocator.dupe(u8, before.indexes[0].path);
+    defer std.testing.allocator.free(before_u64_path);
+    const before_pair_path = try std.testing.allocator.dupe(u8, before.indexes[1].path);
+    defer std.testing.allocator.free(before_pair_path);
+    const before_u64_bytes = before.indexes[0].bytes;
+    const before_pair_bytes = before.indexes[1].bytes;
+
+    const tx = try beginWriteTransaction(std.testing.allocator, root, table_name);
+    defer destroyWriteTransaction(std.testing.allocator, tx);
+
+    var appended_invoice_ids = [_]u64{ 101, 102 };
+    var appended_order_ids = [_]u64{ 10, 10 };
+    var appended_line_nos = [_]u64{ 2, 3 };
+    const appended_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(appended_invoice_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(appended_order_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(appended_line_nos[0..]) },
+    };
+    _ = try writeTransactionInsertRawColumns(tx, appended_invoice_ids.len, &appended_columns);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 4), committed.row_count);
+
+    const verified = try verifyTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 4), verified.row_count);
+
+    var after = try loadActiveMeta(std.testing.allocator, root, table_name);
+    defer after.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), after.indexes.len);
+    try std.testing.expectEqualStrings(before_u64_path, after.indexes[0].path);
+    try std.testing.expectEqualStrings(before_pair_path, after.indexes[1].path);
+    try std.testing.expectEqual(before_u64_bytes + 2 * INDEX_RECORD_BYTES, after.indexes[0].bytes);
+    try std.testing.expectEqual(before_pair_bytes + 2 * U64_PAIR_INDEX_RECORD_BYTES, after.indexes[1].bytes);
+    try std.testing.expectEqual(@as(usize, 0), after.indexes[0].sha256.len);
+    try std.testing.expectEqual(@as(usize, 0), after.indexes[1].sha256.len);
+    try std.testing.expectEqual(@as(u64, 0), after.indexes[0].block_size);
+    try std.testing.expectEqual(@as(u64, 0), after.indexes[1].block_size);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer snapshot.destroy();
+    const invoice = try snapshotFindU64(snapshot, 0, 102);
+    try std.testing.expect(invoice.found);
+    try std.testing.expectEqual(@as(u64, 3), invoice.row_index);
+    const line = try snapshotFindU64Pair(snapshot, 1, 2, 10, 3);
+    try std.testing.expect(line.found);
+    try std.testing.expectEqual(@as(u64, 3), line.row_index);
+
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(root, .{}));
 }
 
 test "table write transaction raw columns rewrite merged indexes in place in unsafe mode" {
