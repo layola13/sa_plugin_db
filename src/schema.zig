@@ -75,6 +75,53 @@ const CompileOptions = struct {
     collect_defs: bool = true,
 };
 
+const InlineSeenDefSet = struct {
+    const capacity = 64;
+
+    allocator: std.mem.Allocator,
+    names: [capacity]?[]const u8 = [_]?[]const u8{null} ** capacity,
+    fallback: ?std.StringHashMap(void) = null,
+
+    fn init(allocator: std.mem.Allocator) InlineSeenDefSet {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *InlineSeenDefSet) void {
+        if (self.fallback) |*map| map.deinit();
+    }
+
+    fn containsOrPut(self: *InlineSeenDefSet, name: []const u8) !bool {
+        if (self.fallback) |*map| {
+            if (map.contains(name)) return true;
+            try map.put(name, {});
+            return false;
+        }
+
+        var idx: usize = @intCast(std.hash.Wyhash.hash(0, name) & (capacity - 1));
+        var probes: usize = 0;
+        while (probes < capacity) : (probes += 1) {
+            if (self.names[idx]) |existing| {
+                if (std.mem.eql(u8, existing, name)) return true;
+            } else {
+                self.names[idx] = name;
+                return false;
+            }
+            idx = (idx + 1) & (capacity - 1);
+        }
+
+        var map = std.StringHashMap(void).init(self.allocator);
+        errdefer map.deinit();
+        try map.ensureTotalCapacity(capacity + 1);
+        for (self.names) |existing| {
+            if (existing) |seen_name| try map.put(seen_name, {});
+        }
+        if (map.contains(name)) return true;
+        try map.put(name, {});
+        self.fallback = map;
+        return false;
+    }
+};
+
 pub fn ifaceFilePath(allocator: std.mem.Allocator, source_path: []const u8) ![]u8 {
     const basename = std.fs.path.basename(source_path);
     const stem = if (std.mem.endsWith(u8, basename, ".sadb-schema"))
@@ -348,6 +395,8 @@ fn compileWithOptions(
 
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
+    var init_seen = InlineSeenDefSet.init(allocator);
+    defer init_seen.deinit();
 
     var line_it = std.mem.splitScalar(u8, source, '\n');
     while (line_it.next()) |raw_line| {
@@ -355,10 +404,12 @@ fn compileWithOptions(
         if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
 
         const def = parseDef(line) orelse return ParseError.InvalidFormat;
-        if (seen.contains(def.name)) return ParseError.DuplicateDef;
-        try seen.put(def.name, {});
         if (options.collect_defs) {
+            if (seen.contains(def.name)) return ParseError.DuplicateDef;
+            try seen.put(def.name, {});
             try appendDef(&defs, allocator, def.name, def.value);
+        } else if (try init_seen.containsOrPut(def.name)) {
+            return ParseError.DuplicateDef;
         }
 
         if (std.mem.eql(u8, def.name, "MAX_ROWS")) {
@@ -550,4 +601,28 @@ test "schema init fast compiler preserves init metadata without defs" {
         try std.testing.expectEqual(expected.logical_scale, actual.logical_scale);
         try std.testing.expectEqual(expected.nullable, actual.nullable);
     }
+}
+
+test "schema init fast compiler rejects duplicate defs" {
+    const source =
+        \\#def MAX_ROWS = 16
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_ID_STRIDE = 8 // u64
+    ;
+
+    try std.testing.expectError(ParseError.DuplicateDef, compileInitFast(std.testing.allocator, source, "dup_fast.sadb-schema"));
+}
+
+test "schema init fast compiler duplicate check falls back past inline capacity" {
+    var source = std.ArrayList(u8).init(std.testing.allocator);
+    defer source.deinit();
+
+    try source.appendSlice("#def MAX_ROWS = 16\n");
+    var idx: usize = 0;
+    while (idx < InlineSeenDefSet.capacity + 1) : (idx += 1) {
+        try source.writer().print("#def COL_C{d}_STRIDE = 8 // u64\n", .{idx});
+    }
+    try source.appendSlice("#def COL_C0_STRIDE = 8 // u64\n");
+
+    try std.testing.expectError(ParseError.DuplicateDef, compileInitFast(std.testing.allocator, source.items, "dup_fallback_fast.sadb-schema"));
 }

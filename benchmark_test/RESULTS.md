@@ -311,6 +311,26 @@ raw，对应中位数如下：
 
 这轮把总 init 中位数继续压到 `1.424 ms`，schema component 中位数为 `1.002 ms`；但 SQLite init 中位数仍为 `1.052 ms`，db 还没有达到“init 稳定领先”。下一步应继续压 schema parser / column meta 构建固定成本，而不是扩大接口表面。
 
+随后继续压 `compileInitFast()` 的 fixed cost：常见小 schema 的 duplicate-def 检查不再立刻创建 heap `StringHashMap`，而是先走固定容量 inline hash set；超过容量时再 fallback 到 `StringHashMap`。这保持哈希查重，不退化成线性 duplicate scan。新增回归测试覆盖 init-fast duplicate rejection，以及超过 inline 容量后的 fallback duplicate rejection。
+
+重新 `zig build` 后顺序跑 5 次 db 和 5 次 SQLite indexed ERP append benchmark。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 1.290-1.478 ms, 中位数 1.379 ms | 0.875-1.095 ms, 中位数 0.968 ms | SQLite |
+| init remove component | 0.309-0.480 ms, 中位数 0.441 ms | n/a | db 内部仍低于旧样本 |
+| init schema component | 0.945-0.986 ms, 中位数 0.968 ms | n/a | db 内部改善 |
+| baseline ingest before indexes | 4.611-5.287 ms, 中位数 4.964 ms | 57.738-69.982 ms, 中位数 63.373 ms | db 插件约 12.8x |
+| build baseline indexes | 8.667-9.300 ms, 中位数 8.825 ms | 19.711-21.575 ms, 中位数 20.691 ms | db 插件约 2.3x |
+| append with tx + incremental indexes | 2.133-2.613 ms, 中位数 2.397 ms | 4.297-4.731 ms, 中位数 4.406 ms* | db 插件约 1.8x |
+| append with coltx + incremental indexes | 1.589-1.821 ms, 中位数 1.819 ms | 4.297-4.731 ms, 中位数 4.406 ms* | db 插件约 2.4x |
+| total append chain | 3.722-4.432 ms, 中位数 4.216 ms | 4.297-4.731 ms, 中位数 4.406 ms | db 插件约 1.0x |
+| verify/integrity | 0.935-1.385 ms, 中位数 1.071 ms | 33.348-39.911 ms, 中位数 33.788 ms | db 插件约 31.5x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这轮 schema component 中位数继续降到 `0.968 ms`，但 db 总 init 中位数仍是 `1.379 ms`，SQLite init 中位数是 `0.968 ms`。init 目标还没完成。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
