@@ -1064,7 +1064,10 @@ snapshot cleanup also treats table snapshot paths as path components, so removin
 one table does not delete snapshot artifacts for another table whose name shares
 the same prefix. Removing a missing table from a memory root is also handled
 entirely in the in-memory namespace and does not probe or create a real
-`:memory:*` filesystem directory.
+`:memory:*` filesystem directory. Recovering a memory-root table now validates
+and republishes the current in-memory active metadata directly; it does not scan
+the host filesystem for versioned metadata, and a missing memory table returns
+`NotFound` without touching a real `:memory:*` directory.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2

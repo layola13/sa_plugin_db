@@ -17444,6 +17444,14 @@ pub fn recoverTable(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
+    if (isMemoryRoot(root_dir)) {
+        var active = try loadActiveMeta(allocator, root_dir, table_name);
+        defer active.deinit(allocator);
+        try validateRecoverCandidate(allocator, root_dir, table_name, active);
+        try writeMeta(allocator, root_dir, table_name, active);
+        return tableInfo(active);
+    }
+
     var best: ?TableMeta = null;
     defer if (best) |*meta| meta.deinit(allocator);
 
@@ -20581,6 +20589,53 @@ test "table memory remove missing table does not touch filesystem" {
     try std.testing.expectEqual(@as(u64, 0), info.epoch);
     try std.testing.expect(!info.locked);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_remove", .{}));
+}
+
+test "table memory recover validates active meta without filesystem directories" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ":memory:test_recover_active";
+    const table_name = "mem_recover_members";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_recover_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var row = [_]u64{ 7, 70 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(row[0..]));
+
+    const recovered = try recoverTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 1), recovered.row_count);
+    try std.testing.expectEqual(@as(u64, 1), recovered.epoch);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 7), try snapshotGetU64(snapshot, 0, 0));
+    try std.testing.expectEqual(@as(u64, 70), try snapshotGetU64(snapshot, 1, 0));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_recover_active", .{}));
+}
+
+test "table memory recover missing table does not touch filesystem" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ":memory:test_missing_recover";
+    try std.testing.expectError(TableError.NotFound, recoverTable(std.testing.allocator, root, "missing_table"));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_recover", .{}));
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {
