@@ -1067,7 +1067,9 @@ entirely in the in-memory namespace and does not probe or create a real
 `:memory:*` filesystem directory. Recovering a memory-root table now validates
 and republishes the current in-memory active metadata directly; it does not scan
 the host filesystem for versioned metadata, and a missing memory table returns
-`NotFound` without touching a real `:memory:*` directory.
+`NotFound` without touching a real `:memory:*` directory. Lock, unlock, and
+compact also run against the same in-memory artifacts; compact merges memory
+segments and preserves read-handle results without creating host directories.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2

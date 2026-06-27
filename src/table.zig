@@ -20638,6 +20638,54 @@ test "table memory recover missing table does not touch filesystem" {
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_recover", .{}));
 }
 
+test "table memory lock unlock and compact stay in memory" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ":memory:test_lifecycle";
+    const table_name = "mem_lifecycle_members";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_lifecycle_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var first = [_]u64{ 1, 10 };
+    var second = [_]u64{ 2, 20 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(first[0..]));
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(second[0..]));
+
+    const before = try verifyTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 2), before.row_count);
+    try std.testing.expectEqual(@as(usize, 2), before.segment_count);
+
+    const locked = try lockTable(std.testing.allocator, root, table_name);
+    try std.testing.expect(locked.locked);
+
+    var rejected = [_]u64{ 3, 30 };
+    try std.testing.expectError(TableError.Locked, insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(rejected[0..])));
+
+    const unlocked = try unlockTable(std.testing.allocator, root, table_name);
+    try std.testing.expect(!unlocked.locked);
+
+    const compacted = try compactTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 2), compacted.row_count);
+    try std.testing.expectEqual(@as(usize, 1), compacted.segment_count);
+    try std.testing.expect(!compacted.locked);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_lifecycle", .{}));
+}
+
 test "table persistent u64 index tracks ingest update and corruption" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();
