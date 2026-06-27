@@ -2635,8 +2635,16 @@ pub export fn sa_db_dict_intern_many(
     var arena = tempArenaAllocator();
     defer arena.deinit();
     const allocator = arena.allocator();
-    const values = allocator.alloc([]const u8, values_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
-    const inserted = allocator.alloc(bool, values_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    var inline_values: [8][]const u8 = undefined;
+    var inline_inserted: [8]bool = undefined;
+    const values = if (values_in.len <= inline_values.len)
+        inline_values[0..values_in.len]
+    else
+        allocator.alloc([]const u8, values_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    const inserted = if (values_in.len <= inline_inserted.len)
+        inline_inserted[0..values_in.len]
+    else
+        allocator.alloc(bool, values_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
     for (values_in, 0..) |input, idx| {
         values[idx] = requiredBytes(input.data, input.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     }

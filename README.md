@@ -1358,17 +1358,19 @@ hash set for common small schemas and falls back to `StringHashMap` only past
 that capacity. The latest pass adds an O(1) unsafe missing-root remove path:
 when a non-memory root directory does not exist, missing-table remove skips
 compat-meta probing, recovered-meta directory scans, stale-artifact scans, and
-snapshot tree deletion while still clearing any in-process bootstrap cache.
+snapshot tree deletion while still clearing any in-process bootstrap cache. The
+next pass keeps small `sa_db_dict_intern_many` batches on inline ABI buffers,
+avoiding two temporary arena allocations for the ERP status-dict init batches.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.322-1.637 ms, median 1.489 ms | 0.940-1.609 ms, median 1.129 ms | SQLite |
-| ingest ERP rows | 5.110-6.367 ms, median 5.196 ms | 62.266-105.283 ms, median 78.473 ms | db plugin |
-| build ERP indexes | 8.822-11.155 ms, median 9.841 ms | 22.414-27.335 ms, median 22.813 ms | db plugin |
-| tx append, orders + invoices | 2.320-2.611 ms, median 2.560 ms | 4.659-7.260 ms, median 5.023 ms* | db plugin |
-| coltx append, order lines | 1.833-2.100 ms, median 1.895 ms | 4.659-7.260 ms, median 5.023 ms* | db plugin |
-| total append chain | 4.156-4.660 ms, median 4.443 ms | 4.659-7.260 ms, median 5.023 ms | db plugin |
-| verify/integrity | 0.971-1.123 ms, median 1.062 ms | 34.858-51.751 ms, median 38.965 ms | db plugin |
+| init 3 ERP tables + dicts | 1.360-1.884 ms, median 1.517 ms | 0.920-1.110 ms, median 0.949 ms | SQLite |
+| ingest ERP rows | 4.630-5.585 ms, median 5.555 ms | 65.730-82.277 ms, median 67.873 ms | db plugin |
+| build ERP indexes | 8.175-10.536 ms, median 9.121 ms | 23.561-27.322 ms, median 24.881 ms | db plugin |
+| tx append, orders + invoices | 2.165-2.716 ms, median 2.285 ms | 4.051-5.433 ms, median 4.983 ms* | db plugin |
+| coltx append, order lines | 1.683-2.459 ms, median 2.146 ms | 4.051-5.433 ms, median 4.983 ms* | db plugin |
+| total append chain | 3.847-5.175 ms, median 4.432 ms | 4.051-5.433 ms, median 4.983 ms | db plugin |
+| verify/integrity | 0.937-1.949 ms, median 1.192 ms | 34.751-41.753 ms, median 38.336 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
@@ -1388,16 +1390,17 @@ already exhausted active, unsafe-cache, compat, and recovered metadata sources;
 the unsafe not-found remove path now uses one root scan for recovered metadata
 and stale artifact cleanup. In the latest sample, the missing-root remove fast
 path put `db_erp_indexed_init_remove_ns` at `0.327-0.501 ms`, median
-`0.396 ms`, down from the previous `0.431 ms` median. The schema component was
-`0.865-1.158 ms`, median `0.986 ms`, and total db init was `1.322-1.637 ms`,
-median `1.489 ms`; SQLite init still leads at `0.940-1.609 ms`, median
-`1.129 ms`.
+`0.396 ms`, down from the previous `0.431 ms` median. The inline dict ABI
+buffer pass put `db_erp_indexed_init_dict_ns` at `0.383-0.522 ms`, median
+`0.445 ms`, down from the previous stable `0.462 ms` median. Total db init was
+`1.360-1.884 ms`, median `1.517 ms`; SQLite init still leads at
+`0.920-1.110 ms`, median `0.949 ms`.
 
 The remaining gaps are now narrower and more specific:
 
 - init median still trails SQLite even after the latest bootstrap reductions;
 - this sample set puts db ahead on full append-chain median
-  (`4.443 ms` vs. `5.023 ms`), but init is still the gating gap;
+  (`4.432 ms` vs. `4.983 ms`), but init is still the gating gap;
 - there is still no basis to claim全面领先 across every benchmark category while
   init remains behind SQLite.
 

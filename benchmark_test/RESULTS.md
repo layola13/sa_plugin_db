@@ -371,6 +371,25 @@ raw，对应中位数如下：
 
 这轮只能证明 missing-root remove fast path 的局部分量收益：`db_erp_indexed_init_remove_ns` 中位数从上一组 `0.431 ms` 到 `0.396 ms`。总 init 这轮为 db `1.489 ms` 对 SQLite `1.129 ms`，所以仍不能声明“全部领先”。下一步继续压 schema/dict init 固定成本，而不是扩大接口表面。
 
+随后压 `sa_db_dict_intern_many` 的小批量 ABI 入口：8 项以内的 values / inserted 临时数组改用栈上 inline buffer，超过容量仍回退到 arena 分配。ERP indexed init 的两个状态字典批次都是 2 项，正好命中这条路径；接口语义和大批量行为不变。先跑一组 db 5-run 出现明显系统噪声，随后用第二组稳定 db 5-run 和同轮 SQLite 5-run 记录如下。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 1.360-1.884 ms, 中位数 1.517 ms | 0.920-1.110 ms, 中位数 0.949 ms | SQLite |
+| init remove component | 0.334-0.498 ms, 中位数 0.422 ms | n/a | db 内部波动 |
+| init schema component | 0.935-1.351 ms, 中位数 1.064 ms | n/a | db 内部波动 |
+| init dict component | 0.383-0.522 ms, 中位数 0.445 ms | n/a | db 内部改善 |
+| baseline ingest before indexes | 4.630-5.585 ms, 中位数 5.555 ms | 65.730-82.277 ms, 中位数 67.873 ms | db 插件约 12.2x |
+| build baseline indexes | 8.175-10.536 ms, 中位数 9.121 ms | 23.561-27.322 ms, 中位数 24.881 ms | db 插件约 2.7x |
+| append with tx + incremental indexes | 2.165-2.716 ms, 中位数 2.285 ms | 4.051-5.433 ms, 中位数 4.983 ms* | db 插件约 2.2x |
+| append with coltx + incremental indexes | 1.683-2.459 ms, 中位数 2.146 ms | 4.051-5.433 ms, 中位数 4.983 ms* | db 插件约 2.3x |
+| total append chain | 3.847-5.175 ms, 中位数 4.432 ms | 4.051-5.433 ms, 中位数 4.983 ms | db 插件约 1.1x |
+| verify/integrity | 0.937-1.949 ms, 中位数 1.192 ms | 34.751-41.753 ms, 中位数 38.336 ms | db 插件约 32.2x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这轮只作为 dict init 固定成本的小幅收益记录：`db_erp_indexed_init_dict_ns` 中位数从上一组稳定样本约 `0.462 ms` 降到 `0.445 ms`。总 init 仍是 db `1.517 ms` 对 SQLite `0.949 ms`，schema/remove 波动仍然主导初始化差距。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
