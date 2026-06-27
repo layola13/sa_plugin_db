@@ -230,6 +230,30 @@ raw，对应中位数如下：
 - 把 `tx + coltx` 两段合并成 ERP 整条 append 链路后，db 的中位数已经进一步压到 `3.986 ms`，继续领先 SQLite 的 `5.141 ms`；
 - init 中位数这次仍然没有领先 SQLite，而且 db 侧样本波动比 SQLite 更大，说明初始化固定成本还需要继续压，当前还不能宣称全面领先。
 
+2026-06-27 同日晚些时候，继续把 unsafe 空表首写路径再压了一轮：
+- `internStringDictMany()` 在 `skipDurabilitySync()` 且空表 bootstrap 时，直接原地更新 `unsafe_init_meta_cache`，不再走“拷出一份 `TableMeta` -> 修改 -> 再整份拷回 cache”的往返；
+- `acquireTableWriteLock()` 在 unsafe / `:memory:` 路径下只保留进程内锁，不再额外落 `.write.lock` 文件；
+- `:memory:name` 重新修正为真正按 name 分桶的共享内存 root，同时保留当前精确 `:memory:` 的 thread-local unnamed root 行为；
+- 新增回归测试覆盖：unsafe dict bootstrap 多批次不落盘、unsafe 写路径不生成 lock 文件、named memory root 共享与 exact memory root 本地隔离。
+
+随后再次顺序重跑 5 次 db 和 5 次 SQLite indexed ERP append benchmark。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 1.347-1.651 ms, 中位数 1.380 ms | 0.836-1.100 ms, 中位数 1.007 ms | SQLite |
+| baseline ingest before indexes | 4.663-5.785 ms, 中位数 5.497 ms | 63.965-84.495 ms, 中位数 73.188 ms | db 插件约 13.3x |
+| build baseline indexes | 8.756-10.066 ms, 中位数 9.881 ms | 18.993-31.826 ms, 中位数 23.711 ms | db 插件约 2.4x |
+| append with tx + incremental indexes | 2.089-3.425 ms, 中位数 2.632 ms | 3.860-10.414 ms, 中位数 4.180 ms* | db 插件约 1.6x |
+| append with coltx + incremental indexes | 1.610-2.209 ms, 中位数 1.817 ms | 3.860-10.414 ms, 中位数 4.180 ms* | db 插件约 2.3x |
+| total append chain | 3.956-5.634 ms, 中位数 4.399 ms | 3.860-10.414 ms, 中位数 4.180 ms | SQLite |
+| verify/integrity | 0.903-1.469 ms, 中位数 1.069 ms | 33.110-42.917 ms, 中位数 40.774 ms | db 插件约 38.1x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这一组新样本说明两件事：
+- 空表 bootstrap 的字典首写常数成本又降了一截，`db_erp_indexed_init_dict_ns` 已压到 `0.353-0.499 ms`；
+- 但在“整条 append chain = tx append + coltx append”这个口径下，这一组 5-run 中位数里 SQLite 回到了 `4.180 ms`，略快于 db 的 `4.399 ms`。因此当前仍然不能宣称“全部领先”。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

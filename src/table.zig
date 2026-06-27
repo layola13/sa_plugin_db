@@ -14,6 +14,8 @@ var process_write_locks_mutex: std.Thread.Mutex = .{};
 var process_write_locks: std.StringHashMapUnmanaged(void) = .{};
 var memory_fs_mutex: std.Thread.Mutex = .{};
 var memory_fs_files: std.StringHashMapUnmanaged([]u8) = .{};
+var exact_memory_namespace_counter = std.atomic.Value(u64).init(0);
+threadlocal var exact_memory_namespace: ?[]u8 = null;
 const unsafe_init_cache_allocator = std.heap.page_allocator;
 const UNSAFE_NO_SYNC_ENV = "SA_DB_UNSAFE_NO_SYNC";
 const MEMORY_ROOT_PREFIX = ":memory:";
@@ -611,18 +613,26 @@ fn isMemoryRoot(root_dir: []const u8) bool {
     return std.mem.startsWith(u8, trim(root_dir), MEMORY_ROOT_PREFIX);
 }
 
-fn memoryNamespace(root_dir: []const u8) []const u8 {
+fn isExactMemoryRoot(root_dir: []const u8) bool {
+    return std.mem.eql(u8, trim(root_dir), MEMORY_ROOT_PREFIX);
+}
+
+fn resolveMemoryNamespace(root_dir: []const u8) TableError![]const u8 {
     const trimmed = trim(root_dir);
     if (!std.mem.startsWith(u8, trimmed, MEMORY_ROOT_PREFIX)) return "";
-    if (trimmed.len == MEMORY_ROOT_PREFIX.len) return trimmed[0..MEMORY_ROOT_PREFIX.len];
-    if (trimmed[MEMORY_ROOT_PREFIX.len] != ':') return trimmed[0..MEMORY_ROOT_PREFIX.len];
-    const suffix = trimmed[MEMORY_ROOT_PREFIX.len + 1 ..];
-    if (suffix.len == 0) return trimmed[0..MEMORY_ROOT_PREFIX.len];
+    if (trimmed.len == MEMORY_ROOT_PREFIX.len) {
+        if (exact_memory_namespace) |ns| return ns;
+        const ns = try std.fmt.allocPrint(unsafe_init_cache_allocator, "exact-{d}", .{exact_memory_namespace_counter.fetchAdd(1, .monotonic)});
+        exact_memory_namespace = ns;
+        return ns;
+    }
+    const suffix = trimmed[MEMORY_ROOT_PREFIX.len..];
+    if (suffix.len == 0) return MEMORY_ROOT_PREFIX;
     return suffix;
 }
 
 fn memoryPath(allocator: std.mem.Allocator, root_dir: []const u8, basename: []const u8) TableError![]u8 {
-    return allocPrintPath(allocator, "{s}{s}/{s}", .{ MEMORY_PATH_PREFIX, memoryNamespace(root_dir), basename });
+    return allocPrintPath(allocator, "{s}{s}/{s}", .{ MEMORY_PATH_PREFIX, try resolveMemoryNamespace(root_dir), basename });
 }
 
 fn rootPrefix(root_dir: []const u8) []const u8 {
@@ -774,15 +784,6 @@ pub fn acquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8,
     if (isMemoryRoot(root_dir) or skipDurabilitySync()) {
         const path = try tableWriteLockPath(allocator, root_dir, table_name);
         defer allocator.free(path);
-
-        if (!isMemoryRoot(root_dir)) {
-            try ensureParentDir(path);
-            const file = std.fs.cwd().createFile(path, .{
-                .read = true,
-                .truncate = false,
-            }) catch |err| return mapFileError(err);
-            file.close();
-        }
 
         process_write_locks_mutex.lock();
         defer process_write_locks_mutex.unlock();
@@ -1508,6 +1509,13 @@ fn hasPendingDictWriteNamed(writes: []const PendingDictWrite, name: []const u8) 
     return false;
 }
 
+fn findPendingDictWriteIndexInWrites(writes: []const PendingDictWrite, name: []const u8) ?usize {
+    for (writes, 0..) |write, idx| {
+        if (std.mem.eql(u8, write.name, name)) return idx;
+    }
+    return null;
+}
+
 fn mergePendingDictWritesOwned(
     allocator: std.mem.Allocator,
     existing: []const PendingDictWrite,
@@ -1758,6 +1766,117 @@ fn unsafeInitCachePendingDictWritesForTable(
         }
     }
     return try allocator.alloc(PendingDictWrite, 0);
+}
+
+fn unsafeInitCachePendingDictBytesForEntry(entry: *const UnsafeInitMetaCacheEntry, dict_path: []const u8) ?[]const u8 {
+    for (entry.pending_dict_writes) |write| {
+        if (std.mem.eql(u8, write.path, dict_path)) return write.bytes;
+    }
+    return null;
+}
+
+fn unsafeInitCacheInternStringDictMany(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    dict_name: []const u8,
+    values: []const []const u8,
+    out_ids: []u64,
+    out_inserted: []bool,
+) TableError!?DictInternManyResult {
+    _ = allocator;
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!canDeferUnsafeBootstrapMeta(entry.meta)) return null;
+
+            const owned_allocator = entry.arena.allocator();
+            var old_bytes: []const u8 = &.{};
+            var old_count: u64 = 0;
+            if (findDictMetaIndex(entry.meta, dict_name)) |idx| {
+                const dict = entry.meta.dicts[idx];
+                old_bytes = unsafeInitCachePendingDictBytesForEntry(entry, dict.path) orelse return TableError.NotFound;
+                if (old_bytes.len != dict.bytes) return TableError.VerifyFailed;
+                old_count = try dictEntryCount(old_bytes);
+                if (old_count != dict.entries) return TableError.VerifyFailed;
+            }
+
+            const pending_values = try owned_allocator.alloc([]const u8, values.len);
+            var pending_count: usize = 0;
+            var inserted_count: u64 = 0;
+            var next_id = old_count;
+
+            for (values, 0..) |value, idx| {
+                if (old_bytes.len != 0) {
+                    if (try dictFindValueId(old_bytes, value)) |id| {
+                        out_ids[idx] = id;
+                        out_inserted[idx] = false;
+                        continue;
+                    }
+                }
+
+                var existing_pending: ?u64 = null;
+                for (pending_values[0..pending_count], 0..) |pending_value, pending_idx| {
+                    if (std.mem.eql(u8, pending_value, value)) {
+                        existing_pending = old_count + @as(u64, pending_idx) + 1;
+                        break;
+                    }
+                }
+                if (existing_pending) |id| {
+                    out_ids[idx] = id;
+                    out_inserted[idx] = false;
+                    continue;
+                }
+
+                next_id = std.math.add(u64, next_id, 1) catch return TableError.CursorOverflow;
+                out_ids[idx] = next_id;
+                out_inserted[idx] = true;
+                pending_values[pending_count] = value;
+                pending_count += 1;
+                inserted_count = std.math.add(u64, inserted_count, 1) catch return TableError.CursorOverflow;
+            }
+
+            if (pending_count == 0) {
+                return .{ .info = tableInfo(entry.meta), .inserted_count = 0 };
+            }
+
+            const new_bytes = try buildDictBytesWithValues(owned_allocator, old_bytes, old_count, pending_values[0..pending_count]);
+            const new_count = std.math.add(u64, old_count, pending_count) catch return TableError.CursorOverflow;
+            const next_epoch = std.math.add(u64, entry.meta.epoch, 1) catch return TableError.CursorOverflow;
+            const basename = try dictFileName(owned_allocator, table_name, dict_name, next_epoch);
+            const new_meta = try makeDictMeta(owned_allocator, dict_name, basename, new_bytes, new_count);
+            try putDictMeta(owned_allocator, &entry.meta, new_meta);
+
+            const owned_name = try owned_allocator.dupe(u8, dict_name);
+            const owned_path = try owned_allocator.dupe(u8, basename);
+            if (findPendingDictWriteIndexInWrites(entry.pending_dict_writes, dict_name)) |pending_idx| {
+                entry.pending_dict_writes[pending_idx] = .{
+                    .name = owned_name,
+                    .path = owned_path,
+                    .bytes = new_bytes,
+                };
+            } else {
+                const old_writes = entry.pending_dict_writes;
+                const new_writes = try owned_allocator.alloc(PendingDictWrite, old_writes.len + 1);
+                @memcpy(new_writes[0..old_writes.len], old_writes);
+                new_writes[old_writes.len] = .{
+                    .name = owned_name,
+                    .path = owned_path,
+                    .bytes = new_bytes,
+                };
+                entry.pending_dict_writes = new_writes;
+            }
+
+            entry.meta.epoch = next_epoch;
+            return .{ .info = tableInfo(entry.meta), .inserted_count = inserted_count };
+        }
+    }
+    return null;
 }
 
 fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?TableMeta {
@@ -6315,6 +6434,17 @@ pub fn internStringDict(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
+    var bootstrap_ids = [_]u64{0};
+    var bootstrap_inserted = [_]bool{false};
+    const bootstrap_values = [_][]const u8{value};
+    if (try unsafeInitCacheInternStringDictMany(allocator, root_dir, table_name, dict_name, &bootstrap_values, &bootstrap_ids, &bootstrap_inserted)) |bootstrap| {
+        return .{
+            .info = bootstrap.info,
+            .id = bootstrap_ids[0],
+            .inserted = bootstrap_inserted[0],
+        };
+    }
+
     var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
@@ -6374,6 +6504,10 @@ pub fn internStringDictMany(
 
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
+
+    if (try unsafeInitCacheInternStringDictMany(allocator, root_dir, table_name, dict_name, values, out_ids, out_inserted)) |bootstrap| {
+        return bootstrap;
+    }
 
     var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
@@ -19760,6 +19894,144 @@ test "table unsafe init cache serves first direct row insert bootstrap" {
     const found = try snapshotFindU64(snapshot, 0, 7);
     try std.testing.expect(found.found);
     try std.testing.expectEqual(@as(u64, 0), found.row_index);
+}
+
+test "table unsafe init dict bootstrap reuses cache across batches without materialization" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_dict_batches";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_dict_batches.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    const dict_epoch1_path = try activePath(std.testing.allocator, ".", "unsafe_dict_batches.dict.status.1.dat");
+    defer std.testing.allocator.free(dict_epoch1_path);
+    const dict_epoch2_path = try activePath(std.testing.allocator, ".", "unsafe_dict_batches.dict.status.2.dat");
+    defer std.testing.allocator.free(dict_epoch2_path);
+
+    const first_values = [_][]const u8{ "active", "paused" };
+    var first_ids: [first_values.len]u64 = undefined;
+    var first_inserted: [first_values.len]bool = undefined;
+    const first = try internStringDictMany(std.testing.allocator, ".", table_name, "status", &first_values, &first_ids, &first_inserted);
+    try std.testing.expectEqual(@as(u64, 2), first.inserted_count);
+    try std.testing.expectEqual(@as(u64, 1), first.info.epoch);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, &first_ids);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists(dict_epoch1_path));
+
+    const second_values = [_][]const u8{ "paused", "closed", "open", "closed" };
+    var second_ids: [second_values.len]u64 = undefined;
+    var second_inserted: [second_values.len]bool = undefined;
+    const second = try internStringDictMany(std.testing.allocator, ".", table_name, "status", &second_values, &second_ids, &second_inserted);
+    try std.testing.expectEqual(@as(u64, 2), second.inserted_count);
+    try std.testing.expectEqual(@as(u64, 2), second.info.epoch);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3, 4, 3 }, &second_ids);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true, false }, &second_inserted);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists(dict_epoch1_path));
+    try std.testing.expect(!fileExists(dict_epoch2_path));
+
+    const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "open");
+    try std.testing.expect(visible.found);
+    try std.testing.expectEqual(@as(u64, 4), visible.id);
+
+    var bootstrap = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer bootstrap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), bootstrap.epoch);
+    try std.testing.expectEqual(@as(usize, 1), bootstrap.dicts.len);
+    try std.testing.expectEqual(@as(u64, 4), bootstrap.dicts[0].entries);
+    try std.testing.expectEqualStrings("unsafe_dict_batches.dict.status.2.dat", bootstrap.dicts[0].path);
+
+    var row = [_]u64{ 7, visible.id };
+    const inserted = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expectEqual(@as(u64, 1), inserted.row_count);
+    try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(fileExists(dict_epoch2_path));
+
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+}
+
+test "table unsafe writes do not create write lock files" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_lockless";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_lockless.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+
+    const lock_path = try tableWriteLockPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(lock_path);
+    try std.testing.expect(!fileExists(lock_path));
+
+    const values = [_][]const u8{ "active" };
+    var ids: [values.len]u64 = undefined;
+    var inserted_flags: [values.len]bool = undefined;
+    _ = try internStringDictMany(std.testing.allocator, ".", table_name, "status", &values, &ids, &inserted_flags);
+    try std.testing.expect(!fileExists(lock_path));
+
+    var row = [_]u64{1};
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expect(!fileExists(lock_path));
+}
+
+test "table named memory roots share state while exact memory root stays local" {
+    const named_root = ":memory:test_shared";
+    const table_name = "mem_shared_members";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, named_root, "mem_shared_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+
+    var row = [_]u64{11};
+    _ = try insertRawRow(std.testing.allocator, named_root, table_name, std.mem.sliceAsBytes(row[0..]));
+
+    const shared_snapshot = try openReadSnapshot(std.testing.allocator, ":memory:test_shared", table_name);
+    defer shared_snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), shared_snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 11), try snapshotGetU64(shared_snapshot, 0, 0));
+
+    const exact_root = ":memory:";
+    const exact_table = "mem_exact_members";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, exact_root, "mem_exact_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+    var exact_row = [_]u64{21};
+    _ = try insertRawRow(std.testing.allocator, exact_root, exact_table, std.mem.sliceAsBytes(exact_row[0..]));
+
+    const exact_snapshot = try openReadSnapshot(std.testing.allocator, ":memory:", exact_table);
+    defer exact_snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), exact_snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 21), try snapshotGetU64(exact_snapshot, 0, 0));
+
+    try std.testing.expectError(TableError.NotFound, openReadSnapshot(std.testing.allocator, ":memory:other_shared", table_name));
+    try std.testing.expectError(TableError.NotFound, openReadSnapshot(std.testing.allocator, ":memory:test_shared", exact_table));
 }
 
 test "table memory root supports init ingest and snapshot reads" {

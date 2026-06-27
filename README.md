@@ -1054,6 +1054,8 @@ directly with business parameters such as decimal parts or Y-M-D dates.
 When null state is stored as a logical `u8 null_bitmap` column, use
 `sa_db_export_null_bitmap_handle` / `DB_EXPORT_NULL_BITMAP_HANDLE` to materialize
 the packed bitmap for `*_NULL_BITMAP_HANDLE` range/filter calls.
+Memory roots are also available now: `:memory:name` is a shared named in-process
+root, while exact `:memory:` resolves to the current thread-local unnamed root.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
@@ -1324,38 +1326,40 @@ Summary:
 ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
 maintenance, buffered transaction dictionary writes, batched dictionary intern,
 deferred unsafe-init bootstrap materialization, first-write bootstrap cache
-reuse, the unsafe-init cache ownership fix, and a follow-up fix so first true
-write paths consume bootstrap metadata directly instead of peek-copying it
-first:
+reuse, the unsafe-init cache ownership fix, direct bootstrap-meta consumption on
+first true write, in-place unsafe bootstrap dict updates, and removal of
+unsafe-path `.write.lock` file creation:
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.461-2.482 ms, median 1.545 ms | 0.791-1.312 ms, median 1.065 ms | SQLite |
-| ingest ERP rows | 4.659-6.454 ms, median 5.313 ms | 63.791-110.798 ms, median 70.704 ms | db plugin |
-| build ERP indexes | 8.518-12.136 ms, median 9.845 ms | 22.207-29.889 ms, median 23.896 ms | db plugin |
-| tx append, orders + invoices | 2.188-2.562 ms, median 2.350 ms | 4.628-7.226 ms, median 5.141 ms* | db plugin |
-| coltx append, order lines | 1.604-1.943 ms, median 1.741 ms | 4.628-7.226 ms, median 5.141 ms* | db plugin |
-| total append chain | 3.931-4.505 ms, median 3.986 ms | 4.628-7.226 ms, median 5.141 ms | db plugin |
-| verify/integrity | 0.932-1.080 ms, median 1.062 ms | 34.593-46.971 ms, median 35.797 ms | db plugin |
+| init 3 ERP tables + dicts | 1.347-1.651 ms, median 1.380 ms | 0.836-1.100 ms, median 1.007 ms | SQLite |
+| ingest ERP rows | 4.663-5.785 ms, median 5.497 ms | 63.965-84.495 ms, median 73.188 ms | db plugin |
+| build ERP indexes | 8.756-10.066 ms, median 9.881 ms | 18.993-31.826 ms, median 23.711 ms | db plugin |
+| tx append, orders + invoices | 2.089-3.425 ms, median 2.632 ms | 3.860-10.414 ms, median 4.180 ms* | db plugin |
+| coltx append, order lines | 1.610-2.209 ms, median 1.817 ms | 3.860-10.414 ms, median 4.180 ms* | db plugin |
+| total append chain | 3.956-5.634 ms, median 4.399 ms | 3.860-10.414 ms, median 4.180 ms | SQLite |
+| verify/integrity | 0.903-1.469 ms, median 1.069 ms | 33.110-42.917 ms, median 40.774 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
 
-This rerun matters for two reasons. First, the empty-table unsafe bootstrap now
-defers `meta`, `schema`, and dict artifact materialization until the first real
-persisting write, while still serving dictionary lookups from cache before that
-point. Second, the benchmark-driven unsafe-init cache lifetime fix remains in
-place: the cache now owns its own copy of `TableMeta`, pending dict bytes, and
-schema source, and regression coverage includes the allocator-teardown case.
+This rerun matters for three reasons. First, the empty-table unsafe bootstrap
+now defers `meta`, `schema`, and dict artifact materialization until the first
+real persisting write, while still serving dictionary lookups from cache before
+that point. Second, the benchmark-driven unsafe-init cache lifetime fix remains
+in place: the cache now owns its own copy of `TableMeta`, pending dict bytes,
+and schema source, and regression coverage includes the allocator-teardown
+case. Third, empty bootstrap dictionary writes no longer duplicate `TableMeta`
+out of the cache and back in again; they now update the cache entry in place,
+which reduced the fixed `init_dict` component again.
 
 The remaining gaps are now narrower and more specific:
 
-- init median still trails SQLite, and this sample set also shows a wider db
-  spread than SQLite because one run still paid extra bootstrap fixed cost;
-- this benchmark is now ahead on the indexed write chain itself, but that does
-  not generalize to all startup-sensitive workloads;
+- init median still trails SQLite even after the latest bootstrap reductions;
+- this sample set no longer shows db ahead on the full append chain median,
+  because SQLite came back to `4.180 ms` while db landed at `4.399 ms`;
 - there is still no basis to claim全面领先 across every benchmark category while
-  init remains behind SQLite.
+  init remains behind SQLite and the total append chain is not stably ahead.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 
