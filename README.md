@@ -1369,9 +1369,10 @@ materialization, first-write bootstrap cache reuse, the unsafe-init cache
 ownership fix, direct bootstrap-meta consumption on first true write, in-place
 unsafe bootstrap dict updates, removal of unsafe-path `.write.lock` file
 creation, delayed empty-index bootstrap artifacts, direct unindexed blob-store
-bootstrap, deferred bootstrap `schema_path`, the inline duplicate-def hash set
-inside `compileInitFast()`, the O(1) unsafe missing-root remove path, inline ABI
-buffers for small `sa_db_dict_intern_many` batches, and the exact schema-source
+bootstrap, indexed blob-store bootstrap before the first row write, deferred
+bootstrap `schema_path`, the inline duplicate-def hash set inside
+`compileInitFast()`, the O(1) unsafe missing-root remove path, inline ABI buffers
+for small `sa_db_dict_intern_many` batches, and the exact schema-source
 unsafe-init template cache for repeated same-schema init/remove/reinit paths. The
 reinstall step is important: SA benchmark executables call the installed plugin
 `libdb.so`, so a fresh Zig build alone is not enough to benchmark the current

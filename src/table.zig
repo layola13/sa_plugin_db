@@ -4039,14 +4039,6 @@ fn readBlobStoreBytes(allocator: std.mem.Allocator, root_dir: []const u8, blob: 
     return bytes;
 }
 
-fn hasBlobIndexesForStore(meta: TableMeta, store_name: []const u8) bool {
-    for (meta.indexes) |index| {
-        if (index.store_name == null) continue;
-        if (std.mem.eql(u8, index.store_name.?, store_name)) return true;
-    }
-    return false;
-}
-
 fn validateBlobStoreFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
     for (meta.blobs, 0..) |blob, idx| {
         try validateBlobStoreName(blob.name);
@@ -7105,7 +7097,7 @@ pub fn putBlobValue(
     consumed = true;
     meta.epoch = next_epoch;
 
-    if (canDeferUnsafeBootstrapMeta(meta) and !hasBlobIndexesForStore(meta, store_name)) {
+    if (canDeferUnsafeBootstrapMeta(meta)) {
         const pending = [_]PendingBlobWrite{.{ .name = store_name, .path = basename, .bytes = @constCast(new_bytes) }};
         try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &.{}, &pending);
         return .{ .info = tableInfo(meta), .id = new_count };
@@ -20709,6 +20701,73 @@ test "table unsafe init blob bootstrap persists latest pending blob epoch" {
     const second_len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", second.id);
     try std.testing.expect(second_len.found);
     try std.testing.expectEqual(@as(u64, 11), second_len.len);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+}
+
+test "table unsafe init defers indexed blob store until first row write" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_indexed_blob_bootstrap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_indexed_blob_bootstrap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    const blob_path = try activePath(std.testing.allocator, ".", "unsafe_indexed_blob_bootstrap.blob.notes.2.dat");
+    defer std.testing.allocator.free(blob_path);
+    try std.testing.expect(!fileExists(meta_path));
+
+    _ = try createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "notes", true);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists(blob_path));
+
+    const first = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "indexed note");
+    try std.testing.expectEqual(@as(u64, 1), first.id);
+    try std.testing.expectEqual(@as(u64, 2), first.info.epoch);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists(blob_path));
+
+    var bootstrap = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer bootstrap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), bootstrap.blobs.len);
+    try std.testing.expectEqual(@as(usize, 1), bootstrap.indexes.len);
+    try std.testing.expectEqual(@as(u64, 0), bootstrap.row_count);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap.indexes[0].path.len);
+
+    var row = [_]u64{ 7, first.id };
+    const inserted = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expectEqual(@as(u64, 1), inserted.row_count);
+    try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(fileExists(blob_path));
+
+    var persisted = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer persisted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), persisted.indexes.len);
+    try std.testing.expect(persisted.indexes[0].path.len != 0);
+    const index_path = try activePath(std.testing.allocator, ".", persisted.indexes[0].path);
+    defer std.testing.allocator.free(index_path);
+    try std.testing.expect(fileExists(index_path));
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    var fetched_row: [16]u8 = undefined;
+    try snapshotGetRowBlobEqKey(std.testing.allocator, snapshot, 1, "notes", "indexed note", &fetched_row);
+    try std.testing.expectEqual(@as(u64, 7), readU64LE(&fetched_row, 0));
+    try std.testing.expectEqual(first.id, readU64LE(&fetched_row, 8));
+
     _ = try verifyTable(std.testing.allocator, ".", table_name);
 }
 

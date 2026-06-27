@@ -400,6 +400,8 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 
 2026-06-27 继续把 unsafe init template cache 扩到 schema-source 路径：重复同一 schema 的 init/remove/reinit 现在先用 `schema_path_hint + schema_source` 的快速指纹做固定槽位缓存查询，并且命中后仍精确比较 schema source，避免碰撞误复用。新增回归测试覆盖 v1 schema 命中、v2 schema 不误命中，以及 remove/reinit 后列布局正确。这项收益主要作用于同进程重复初始化同一 schema 的路径；下面 ERP 三表 benchmark 每个 schema 只 init 一次，因此作为端到端无回归和 SQLite 当前对照样本，而不是把该 cache 归因到 one-shot schema component。
 
+随后继续扩展空表首写自举：空表先创建 blob eq 索引、再调用 `putBlobValue()` 时，不再因为存在 blob index 就提前 materialize meta/blob/index artifact；只要表仍是 row_count=0 且没有 segment，就继续保留在 unsafe bootstrap cache。首个真实行写入会用 pending blob bytes 构建并落地 blob index。新增回归测试覆盖 meta/blob/index 均延迟到第一行写入、之后可通过唯一 blob eq key 读取整行并通过 verify。这是首写入口覆盖扩展，不单独更新下面的 ERP 5-run 性能表。
+
 | 操作 | db 插件 | SQLite | 最快 |
 | --- | ---: | ---: | --- |
 | init indexed ERP tables | 0.166-0.226 ms, 中位数 0.217 ms | 1.033-3.603 ms, 中位数 1.583 ms | db 插件约 7.3x |
