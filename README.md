@@ -1059,7 +1059,10 @@ root, while exact `:memory:` resolves to the current thread-local unnamed root.
 Snapshot and restore artifacts for memory roots stay inside that same in-memory
 namespace instead of creating `:memory:*` directories on disk. Open read handles
 over memory roots keep their own artifact bytes, so removing or reusing a table
-in the same memory namespace does not mutate an already-open snapshot.
+in the same memory namespace does not mutate an already-open snapshot. Memory
+snapshot cleanup also treats table snapshot paths as path components, so removing
+one table does not delete snapshot artifacts for another table whose name shares
+the same prefix.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2

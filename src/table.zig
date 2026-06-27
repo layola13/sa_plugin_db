@@ -975,7 +975,9 @@ fn memoryDeleteTreeIfExists(path: []const u8) void {
 
     var it = memory_fs_files.iterator();
     while (it.next()) |entry| {
-        if (!std.mem.startsWith(u8, entry.key_ptr.*, path)) continue;
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, path) and
+            !(key.len > path.len and std.mem.startsWith(u8, key, path) and key[path.len] == '/')) continue;
         to_remove.append(entry.key_ptr.*) catch return;
     }
 
@@ -20494,6 +20496,41 @@ test "table memory root snapshots and restores without filesystem directories" {
     try std.testing.expectEqual(@as(u64, 1), try snapshotGetU64(after_restore, 0, 0));
     try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(after_restore, 1, 0));
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_snapshot_restore", .{}));
+}
+
+test "table memory snapshot cleanup keeps prefix-neighbor tables isolated" {
+    const root = ":memory:test_snapshot_prefix";
+    const short_table = "mem_prefix";
+    const long_table = "mem_prefix_extra";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_prefix.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_prefix_extra.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+
+    var short_row = [_]u64{1};
+    var long_row = [_]u64{10};
+    _ = try insertRawRow(std.testing.allocator, root, short_table, std.mem.sliceAsBytes(short_row[0..]));
+    _ = try insertRawRow(std.testing.allocator, root, long_table, std.mem.sliceAsBytes(long_row[0..]));
+
+    _ = try snapshotTable(std.testing.allocator, root, short_table);
+    const long_snap = try snapshotTable(std.testing.allocator, root, long_table);
+
+    _ = try removeTable(std.testing.allocator, root, short_table);
+
+    long_row[0] = 20;
+    _ = try insertRawRow(std.testing.allocator, root, long_table, std.mem.sliceAsBytes(long_row[0..]));
+    const restored = try restoreTable(std.testing.allocator, root, long_table, long_snap.epoch);
+    try std.testing.expectEqual(@as(u64, 1), restored.row_count);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, root, long_table);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(snapshot, 0, 0));
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {
