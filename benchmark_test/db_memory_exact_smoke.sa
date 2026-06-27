@@ -1,0 +1,269 @@
+@import "db.sal"
+
+@const ROOT_EXACT = utf8:":memory:"
+@const ROOT_NAMED = utf8:":memory:sa_exact_peer"
+@const TABLE = utf8:"mem_exact_public"
+@const SCHEMA_PATH = utf8:"mem_exact_public.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+
+#def ROOT_EXACT_LEN = 8
+#def ROOT_NAMED_LEN = 21
+#def TABLE_LEN = 16
+#def SCHEMA_PATH_LEN = 28
+#def SCHEMA_LEN = 82
+#def ROW_BYTES = 16
+
+@main() -> i32:
+L_ENTRY:
+    exact_info = stack_alloc SaDbTableInfo_SIZE
+    named_info = stack_alloc SaDbTableInfo_SIZE
+    snapshot_info = stack_alloc SaDbSnapshotInfo_SIZE
+    row = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE exact_remove_status, ROOT_EXACT, ROOT_EXACT_LEN, TABLE, TABLE_LEN, exact_info
+    EXPAND DB_REMOVE_TABLE named_remove_status, ROOT_NAMED, ROOT_NAMED_LEN, TABLE, TABLE_LEN, named_info
+
+    EXPAND DB_INIT_SCHEMA exact_init_status, ROOT_EXACT, ROOT_EXACT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, exact_info
+    EXPAND DB_CREATE_U64_INDEX exact_index_status, ROOT_EXACT, ROOT_EXACT_LEN, TABLE, TABLE_LEN, 0, 1, exact_info
+
+    EXPAND DB_TX_BEGIN exact_tx_begin_status, exact_tx, ROOT_EXACT, ROOT_EXACT_LEN, TABLE, TABLE_LEN
+    store row+0, 7 as u64
+    store row+8, 70 as u64
+    EXPAND DB_TX_INSERT_ROW exact_insert_status, exact_tx, row, ROW_BYTES, exact_info
+    EXPAND DB_TX_COMMIT exact_commit_status, exact_tx, exact_info
+    EXPAND DB_INFO_ROW_COUNT exact_rows_after_commit, exact_info
+
+    EXPAND DB_OPEN_READ_TABLE exact_open_status, exact_read, ROOT_EXACT, ROOT_EXACT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SNAPSHOT_INFO_HANDLE exact_shape_status, exact_read, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_COUNT exact_shape_rows, snapshot_info
+    EXPAND DB_FIND_U64_HANDLE exact_find_status, exact_found, exact_row_index, exact_read, 0, 7
+    EXPAND DB_GET_U64_HANDLE exact_get_status, exact_points, exact_read, 1, exact_row_index
+    EXPAND DB_CLOSE_READ_TABLE exact_close_status, exact_read
+
+    EXPAND DB_OPEN_READ_TABLE named_missing_status, named_missing_read, ROOT_NAMED, ROOT_NAMED_LEN, TABLE, TABLE_LEN
+
+    EXPAND DB_INIT_SCHEMA named_init_status, ROOT_NAMED, ROOT_NAMED_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, named_info
+    EXPAND DB_CREATE_U64_INDEX named_index_status, ROOT_NAMED, ROOT_NAMED_LEN, TABLE, TABLE_LEN, 0, 1, named_info
+    EXPAND DB_TX_BEGIN named_tx_begin_status, named_tx, ROOT_NAMED, ROOT_NAMED_LEN, TABLE, TABLE_LEN
+    store row+0, 7 as u64
+    store row+8, 700 as u64
+    EXPAND DB_TX_INSERT_ROW named_insert_status, named_tx, row, ROW_BYTES, named_info
+    EXPAND DB_TX_COMMIT named_commit_status, named_tx, named_info
+    EXPAND DB_INFO_ROW_COUNT named_rows_after_commit, named_info
+
+    EXPAND DB_OPEN_READ_TABLE named_open_status, named_read, ROOT_NAMED, ROOT_NAMED_LEN, TABLE, TABLE_LEN
+    EXPAND DB_FIND_U64_HANDLE named_find_status, named_found, named_row_index, named_read, 0, 7
+    EXPAND DB_GET_U64_HANDLE named_get_status, named_points, named_read, 1, named_row_index
+    EXPAND DB_CLOSE_READ_TABLE named_close_status, named_read
+
+    EXPAND DB_OPEN_READ_TABLE exact_reopen_status, exact_read2, ROOT_EXACT, ROOT_EXACT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_FIND_U64_HANDLE exact_reopen_find_status, exact_reopen_found, exact_reopen_row_index, exact_read2, 0, 7
+    EXPAND DB_GET_U64_HANDLE exact_reopen_get_status, exact_reopen_points, exact_read2, 1, exact_reopen_row_index
+    EXPAND DB_CLOSE_READ_TABLE exact_reopen_close_status, exact_read2
+
+    EXPAND DB_VERIFY exact_verify_status, ROOT_EXACT, ROOT_EXACT_LEN, TABLE, TABLE_LEN, exact_info
+    EXPAND DB_VERIFY named_verify_status, ROOT_NAMED, ROOT_NAMED_LEN, TABLE, TABLE_LEN, named_info
+
+    ok_exact_remove = eq exact_remove_status, SA_DB_OK
+    ok_named_remove = eq named_remove_status, SA_DB_OK
+    ok_exact_init = eq exact_init_status, SA_DB_OK
+    ok_exact_index = eq exact_index_status, SA_DB_OK
+    ok_exact_tx_begin = eq exact_tx_begin_status, SA_DB_OK
+    ok_exact_insert = eq exact_insert_status, SA_DB_OK
+    ok_exact_commit = eq exact_commit_status, SA_DB_OK
+    ok_exact_rows = eq exact_rows_after_commit, 1
+    ok_exact_open = eq exact_open_status, SA_DB_OK
+    ok_exact_shape = eq exact_shape_status, SA_DB_OK
+    ok_exact_shape_rows = eq exact_shape_rows, 1
+    ok_exact_find_status = eq exact_find_status, SA_DB_OK
+    ok_exact_found = eq exact_found, 1
+    ok_exact_get_status = eq exact_get_status, SA_DB_OK
+    ok_exact_points = eq exact_points, 70
+    ok_exact_close = eq exact_close_status, SA_DB_OK
+    ok_named_missing = eq named_missing_status, SA_DB_ERR_NOT_FOUND
+    ok_named_init = eq named_init_status, SA_DB_OK
+    ok_named_index = eq named_index_status, SA_DB_OK
+    ok_named_tx_begin = eq named_tx_begin_status, SA_DB_OK
+    ok_named_insert = eq named_insert_status, SA_DB_OK
+    ok_named_commit = eq named_commit_status, SA_DB_OK
+    ok_named_rows = eq named_rows_after_commit, 1
+    ok_named_open = eq named_open_status, SA_DB_OK
+    ok_named_find_status = eq named_find_status, SA_DB_OK
+    ok_named_found = eq named_found, 1
+    ok_named_get_status = eq named_get_status, SA_DB_OK
+    ok_named_points = eq named_points, 700
+    ok_named_close = eq named_close_status, SA_DB_OK
+    ok_exact_reopen = eq exact_reopen_status, SA_DB_OK
+    ok_exact_reopen_find_status = eq exact_reopen_find_status, SA_DB_OK
+    ok_exact_reopen_found = eq exact_reopen_found, 1
+    ok_exact_reopen_get_status = eq exact_reopen_get_status, SA_DB_OK
+    ok_exact_reopen_points = eq exact_reopen_points, 70
+    ok_exact_reopen_close = eq exact_reopen_close_status, SA_DB_OK
+    ok_exact_verify = eq exact_verify_status, SA_DB_OK
+    ok_named_verify = eq named_verify_status, SA_DB_OK
+
+    ok01 = and ok_exact_remove, ok_named_remove
+    ok02 = and ok01, ok_exact_init
+    ok03 = and ok02, ok_exact_index
+    ok04 = and ok03, ok_exact_tx_begin
+    ok05 = and ok04, ok_exact_insert
+    ok06 = and ok05, ok_exact_commit
+    ok07 = and ok06, ok_exact_rows
+    ok08 = and ok07, ok_exact_open
+    ok09 = and ok08, ok_exact_shape
+    ok10 = and ok09, ok_exact_shape_rows
+    ok11 = and ok10, ok_exact_find_status
+    ok12 = and ok11, ok_exact_found
+    ok13 = and ok12, ok_exact_get_status
+    ok14 = and ok13, ok_exact_points
+    ok15 = and ok14, ok_exact_close
+    ok16 = and ok15, ok_named_missing
+    ok17 = and ok16, ok_named_init
+    ok18 = and ok17, ok_named_index
+    ok19 = and ok18, ok_named_tx_begin
+    ok20 = and ok19, ok_named_insert
+    ok21 = and ok20, ok_named_commit
+    ok22 = and ok21, ok_named_rows
+    ok23 = and ok22, ok_named_open
+    ok24 = and ok23, ok_named_find_status
+    ok25 = and ok24, ok_named_found
+    ok26 = and ok25, ok_named_get_status
+    ok27 = and ok26, ok_named_points
+    ok28 = and ok27, ok_named_close
+    ok29 = and ok28, ok_exact_reopen
+    ok30 = and ok29, ok_exact_reopen_find_status
+    ok31 = and ok30, ok_exact_reopen_found
+    ok32 = and ok31, ok_exact_reopen_get_status
+    ok33 = and ok32, ok_exact_reopen_points
+    ok34 = and ok33, ok_exact_reopen_close
+    ok35 = and ok34, ok_exact_verify
+    ok = and ok35, ok_named_verify
+
+    !exact_remove_status
+    !named_remove_status
+    !exact_init_status
+    !exact_index_status
+    !exact_tx_begin_status
+    !exact_tx
+    !exact_insert_status
+    !exact_commit_status
+    !exact_rows_after_commit
+    !exact_open_status
+    !exact_read
+    !exact_shape_status
+    !exact_shape_rows
+    !exact_find_status
+    !exact_found
+    !exact_row_index
+    !exact_get_status
+    !exact_points
+    !exact_close_status
+    !named_missing_status
+    !named_missing_read
+    !named_init_status
+    !named_index_status
+    !named_tx_begin_status
+    !named_tx
+    !named_insert_status
+    !named_commit_status
+    !named_rows_after_commit
+    !named_open_status
+    !named_read
+    !named_find_status
+    !named_found
+    !named_row_index
+    !named_get_status
+    !named_points
+    !named_close_status
+    !exact_reopen_status
+    !exact_read2
+    !exact_reopen_find_status
+    !exact_reopen_found
+    !exact_reopen_row_index
+    !exact_reopen_get_status
+    !exact_reopen_points
+    !exact_reopen_close_status
+    !exact_verify_status
+    !named_verify_status
+    !ok_exact_remove
+    !ok_named_remove
+    !ok_exact_init
+    !ok_exact_index
+    !ok_exact_tx_begin
+    !ok_exact_insert
+    !ok_exact_commit
+    !ok_exact_rows
+    !ok_exact_open
+    !ok_exact_shape
+    !ok_exact_shape_rows
+    !ok_exact_find_status
+    !ok_exact_found
+    !ok_exact_get_status
+    !ok_exact_points
+    !ok_exact_close
+    !ok_named_missing
+    !ok_named_init
+    !ok_named_index
+    !ok_named_tx_begin
+    !ok_named_insert
+    !ok_named_commit
+    !ok_named_rows
+    !ok_named_open
+    !ok_named_find_status
+    !ok_named_found
+    !ok_named_get_status
+    !ok_named_points
+    !ok_named_close
+    !ok_exact_reopen
+    !ok_exact_reopen_find_status
+    !ok_exact_reopen_found
+    !ok_exact_reopen_get_status
+    !ok_exact_reopen_points
+    !ok_exact_reopen_close
+    !ok_exact_verify
+    !ok_named_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !ok29
+    !ok30
+    !ok31
+    !ok32
+    !ok33
+    !ok34
+    !ok35
+    !row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9004)

@@ -442,6 +442,15 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 
 这轮 memory benchmark 的当前结论：对于这组 unsafe/no-sync indexed ERP 写入工作负载，db 的 named `:memory:` 模式已经在 init、baseline ingest、index build、`tx` append、`coltx` append、total append chain、verify/integrity 中位数上全部领先 SQLite `:memory:`。这不是 SQL 功能或持久化 ACID/WAL 能力的等价声明，但说明内存模式已经不只是 smoke 覆盖，而是可承载完整 ERP 类型、索引和事务路径。
 
+随后补充公开接口层 exact memory smoke：新增 `db_memory_exact_smoke.sa`，使用精确 root `:memory:` 通过 `db.sal` 宏完成 remove/init、唯一 `u64` index、事务插入、read-handle find/get、verify；再用同名表验证 named root `:memory:sa_exact_peer` 初始打开返回 `SA_DB_ERR_NOT_FOUND`，写入不同值后不会污染 exact `:memory:` 的重新打开结果。这条 smoke 证明 SQLite 常见的精确 `:memory:` 入口已经从公开 `.sal` 层可用，并和 named memory root 隔离。实际验证命令：
+
+```bash
+sa build-exe benchmark_test/db_memory_exact_smoke.sa -o benchmark_test/db_memory_exact_smoke.out --no-incremental
+./benchmark_test/db_memory_exact_smoke.out
+```
+
+该补充是接口覆盖和隔离语义证据，不改变上面的 indexed ERP memory 性能表。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

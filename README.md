@@ -1153,9 +1153,12 @@ Run db benchmarks. `db_tx_smoke.sa` covers the public transaction macros,
 including `DB_TX_INSERT_ROWS`; `db_memory_smoke.sa` covers public `.sal` macros
 against a named `:memory:` root, including init, index creation before first
 write, `tx`, `coltx`, read handles, verify, and no real `:memory:` directory
-creation. The checked-in `benchmark_test/db.sai` and `benchmark_test/db.sal`
-copies are kept byte-for-byte synchronized with the published root `db.sai` and
-`db.sal` interface files.
+creation. `db_memory_exact_smoke.sa` covers the SQLite-style exact `:memory:`
+entry through the same public macros and verifies it stays isolated from a named
+memory root while preserving indexed lookup and verify behavior. The checked-in
+`benchmark_test/db.sai` and `benchmark_test/db.sal` copies are kept
+byte-for-byte synchronized with the published root `db.sai` and `db.sal`
+interface files.
 
 ```bash
 cd /home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test
@@ -1218,6 +1221,9 @@ sa build-exe db_tx_smoke.sa -o db_tx_smoke.out --no-incremental
 
 sa build-exe db_memory_smoke.sa -o db_memory_smoke.out --no-incremental
 ./db_memory_smoke.out
+
+sa build-exe db_memory_exact_smoke.sa -o db_memory_exact_smoke.out --no-incremental
+./db_memory_exact_smoke.out
 
 sa build-exe db_tx_blob_smoke.sa -o db_tx_blob_smoke.out --no-incremental
 ./db_tx_blob_smoke.out
