@@ -7,8 +7,17 @@ var unsafe_no_sync_state = std.atomic.Value(u8).init(0);
 var unsafe_init_meta_cache_mutex: std.Thread.Mutex = .{};
 var unsafe_init_meta_cache_next_slot: usize = 0;
 var unsafe_init_meta_cache = [_]?UnsafeInitMetaCacheEntry{null} ** 4;
+var unsafe_init_template_cache_mutex: std.Thread.Mutex = .{};
+var unsafe_init_template_cache_next_slot: usize = 0;
+var unsafe_init_template_cache = [_]?UnsafeInitTemplateCacheEntry{null} ** 4;
+var process_write_locks_mutex: std.Thread.Mutex = .{};
+var process_write_locks: std.StringHashMapUnmanaged(void) = .{};
+var memory_fs_mutex: std.Thread.Mutex = .{};
+var memory_fs_files: std.StringHashMapUnmanaged([]u8) = .{};
 const unsafe_init_cache_allocator = std.heap.page_allocator;
 const UNSAFE_NO_SYNC_ENV = "SA_DB_UNSAFE_NO_SYNC";
+const MEMORY_ROOT_PREFIX = ":memory:";
+const MEMORY_PATH_PREFIX = "mem://";
 const FILE_BLOCK_BYTES: usize = 64 * 1024;
 const COLTX_INLINE_BYTES_LIMIT: usize = 128 * 1024;
 
@@ -173,8 +182,19 @@ pub const BlobStoreMeta = struct {
 };
 
 const UnsafeInitMetaCacheEntry = struct {
+    arena: std.heap.ArenaAllocator,
     root_dir: []u8,
     table_name: []u8,
+    schema_source: []u8,
+    meta: TableMeta,
+    pending_dict_writes: []PendingDictWrite = &.{},
+};
+
+const UnsafeInitTemplateCacheEntry = struct {
+    arena: std.heap.ArenaAllocator,
+    root_dir: []u8,
+    table_name: []u8,
+    schema_hash: []u8,
     meta: TableMeta,
 };
 
@@ -284,11 +304,21 @@ pub const I64RowsStats = struct {
 };
 
 pub const TableWriteLock = struct {
-    file: std.fs.File,
+    file: ?std.fs.File = null,
+    memory_path: ?[]u8 = null,
 
     pub fn release(self: *TableWriteLock) void {
-        self.file.unlock();
-        self.file.close();
+        if (self.file) |file| {
+            var owned = file;
+            owned.unlock();
+            owned.close();
+        }
+        if (self.memory_path) |path| {
+            process_write_locks_mutex.lock();
+            defer process_write_locks_mutex.unlock();
+            _ = process_write_locks.remove(path);
+            unsafe_init_cache_allocator.free(path);
+        }
         self.* = undefined;
     }
 };
@@ -400,7 +430,12 @@ pub const ReadColumnSnapshot = struct {
 
 const MappedReadRegion = struct {
     memory: []align(std.heap.page_size_min) const u8,
+    owned_by_mmap: bool = true,
 };
+
+fn releaseMappedRegion(region: MappedReadRegion) void {
+    if (region.owned_by_mmap and region.memory.len != 0) std.posix.munmap(region.memory);
+}
 
 pub const ReadSegmentSnapshot = struct {
     rows: u64,
@@ -554,7 +589,7 @@ pub const ReadSnapshot = struct {
     pub fn destroy(self: *ReadSnapshot) void {
         const backing_allocator = self.backing_allocator;
         for (self.mapped_regions) |region| {
-            if (region.memory.len != 0) std.posix.munmap(region.memory);
+            if (region.owned_by_mmap and region.memory.len != 0) std.posix.munmap(region.memory);
         }
         backing_allocator.free(self.mapped_regions);
         self.arena.deinit();
@@ -564,6 +599,30 @@ pub const ReadSnapshot = struct {
 
 fn trim(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n");
+}
+
+fn schemaHintTableName(schema_path_hint: []const u8) []const u8 {
+    const basename = std.fs.path.basename(schema_path_hint);
+    if (std.mem.endsWith(u8, basename, ".sadb-schema")) return basename[0 .. basename.len - ".sadb-schema".len];
+    return basename;
+}
+
+fn isMemoryRoot(root_dir: []const u8) bool {
+    return std.mem.startsWith(u8, trim(root_dir), MEMORY_ROOT_PREFIX);
+}
+
+fn memoryNamespace(root_dir: []const u8) []const u8 {
+    const trimmed = trim(root_dir);
+    if (!std.mem.startsWith(u8, trimmed, MEMORY_ROOT_PREFIX)) return "";
+    if (trimmed.len == MEMORY_ROOT_PREFIX.len) return trimmed[0..MEMORY_ROOT_PREFIX.len];
+    if (trimmed[MEMORY_ROOT_PREFIX.len] != ':') return trimmed[0..MEMORY_ROOT_PREFIX.len];
+    const suffix = trimmed[MEMORY_ROOT_PREFIX.len + 1 ..];
+    if (suffix.len == 0) return trimmed[0..MEMORY_ROOT_PREFIX.len];
+    return suffix;
+}
+
+fn memoryPath(allocator: std.mem.Allocator, root_dir: []const u8, basename: []const u8) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}{s}/{s}", .{ MEMORY_PATH_PREFIX, memoryNamespace(root_dir), basename });
 }
 
 fn rootPrefix(root_dir: []const u8) []const u8 {
@@ -641,6 +700,7 @@ fn allocPrintPath(allocator: std.mem.Allocator, comptime fmt: []const u8, args: 
 }
 
 fn activePath(allocator: std.mem.Allocator, root_dir: []const u8, basename: []const u8) TableError![]u8 {
+    if (isMemoryRoot(root_dir)) return memoryPath(allocator, root_dir, basename);
     const prefix = rootPrefix(root_dir);
     if (prefix.len == 0) return allocator.dupe(u8, basename) catch TableError.OutOfMemory;
     return joinPath(allocator, &.{ prefix, basename });
@@ -711,6 +771,27 @@ fn tableWriteLockPath(allocator: std.mem.Allocator, root_dir: []const u8, table_
 }
 
 pub fn acquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!TableWriteLock {
+    if (isMemoryRoot(root_dir) or skipDurabilitySync()) {
+        const path = try tableWriteLockPath(allocator, root_dir, table_name);
+        defer allocator.free(path);
+
+        if (!isMemoryRoot(root_dir)) {
+            try ensureParentDir(path);
+            const file = std.fs.cwd().createFile(path, .{
+                .read = true,
+                .truncate = false,
+            }) catch |err| return mapFileError(err);
+            file.close();
+        }
+
+        process_write_locks_mutex.lock();
+        defer process_write_locks_mutex.unlock();
+        const entry = try process_write_locks.getOrPut(unsafe_init_cache_allocator, path);
+        if (entry.found_existing) return TableError.Locked;
+        entry.key_ptr.* = try unsafe_init_cache_allocator.dupe(u8, path);
+        return .{ .memory_path = @constCast(entry.key_ptr.*) };
+    }
+
     const path = try tableWriteLockPath(allocator, root_dir, table_name);
     defer allocator.free(path);
     try ensureParentDir(path);
@@ -798,7 +879,127 @@ fn createFileEnsuringParent(path: []const u8, flags: std.fs.File.CreateFlags) Ta
     };
 }
 
+fn memoryFileExists(path: []const u8) bool {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+    return memory_fs_files.contains(path);
+}
+
+fn memoryReadFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) TableError![]u8 {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+    const bytes = memory_fs_files.get(path) orelse return TableError.NotFound;
+    if (bytes.len > max_bytes) return TableError.InvalidFormat;
+    return allocator.dupe(u8, bytes) catch TableError.OutOfMemory;
+}
+
+fn memoryFileSlice(path: []const u8) TableError![]u8 {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+    return memory_fs_files.get(path) orelse TableError.NotFound;
+}
+
+fn memoryWriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+
+    const owned = try unsafe_init_cache_allocator.dupe(u8, bytes);
+    errdefer unsafe_init_cache_allocator.free(owned);
+
+    const entry = try memory_fs_files.getOrPut(unsafe_init_cache_allocator, path);
+    if (entry.found_existing) {
+        unsafe_init_cache_allocator.free(entry.value_ptr.*);
+    } else {
+        entry.key_ptr.* = try unsafe_init_cache_allocator.dupe(u8, path);
+    }
+    entry.value_ptr.* = owned;
+    _ = allocator;
+}
+
+fn memoryAppendFile(allocator: std.mem.Allocator, path: []const u8, appended_bytes: []const u8) TableError!void {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+
+    const existing = memory_fs_files.get(path) orelse return TableError.NotFound;
+    const next_len = std.math.add(usize, existing.len, appended_bytes.len) catch return TableError.CursorOverflow;
+    const combined = try unsafe_init_cache_allocator.alloc(u8, next_len);
+    errdefer unsafe_init_cache_allocator.free(combined);
+
+    @memcpy(combined[0..existing.len], existing);
+    @memcpy(combined[existing.len..], appended_bytes);
+
+    const entry = memory_fs_files.getPtr(path) orelse return TableError.NotFound;
+    unsafe_init_cache_allocator.free(entry.*);
+    entry.* = combined;
+    _ = allocator;
+}
+
+fn memoryDeleteIfExists(path: []const u8) void {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+    if (memory_fs_files.fetchRemove(path)) |entry| {
+        unsafe_init_cache_allocator.free(entry.key);
+        unsafe_init_cache_allocator.free(entry.value);
+    }
+}
+
+fn memoryDeleteTreeIfExists(path: []const u8) void {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+
+    var to_remove = std.ArrayList([]const u8).init(unsafe_init_cache_allocator);
+    defer to_remove.deinit();
+
+    var it = memory_fs_files.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.key_ptr.*, path)) continue;
+        to_remove.append(entry.key_ptr.*) catch return;
+    }
+
+    for (to_remove.items) |key| {
+        if (memory_fs_files.fetchRemove(key)) |entry| {
+            unsafe_init_cache_allocator.free(entry.key);
+            unsafe_init_cache_allocator.free(entry.value);
+        }
+    }
+}
+
+fn memoryRename(old_path: []const u8, new_path: []const u8) TableError!void {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+
+    const removed = memory_fs_files.fetchRemove(old_path) orelse return TableError.NotFound;
+    errdefer {
+        const restore = memory_fs_files.getOrPut(unsafe_init_cache_allocator, removed.key) catch unreachable;
+        if (!restore.found_existing) restore.key_ptr.* = removed.key;
+        restore.value_ptr.* = removed.value;
+    }
+
+    if (memory_fs_files.fetchRemove(new_path)) |existing| {
+        unsafe_init_cache_allocator.free(existing.key);
+        unsafe_init_cache_allocator.free(existing.value);
+    }
+
+    const entry = try memory_fs_files.getOrPut(unsafe_init_cache_allocator, new_path);
+    if (!entry.found_existing) {
+        entry.key_ptr.* = try unsafe_init_cache_allocator.dupe(u8, new_path);
+    }
+    entry.value_ptr.* = removed.value;
+    unsafe_init_cache_allocator.free(removed.key);
+}
+
+fn renamePath(old_path: []const u8, new_path: []const u8) TableError!void {
+    if (std.mem.startsWith(u8, old_path, MEMORY_PATH_PREFIX) or std.mem.startsWith(u8, new_path, MEMORY_PATH_PREFIX)) {
+        return memoryRename(old_path, new_path);
+    }
+    std.fs.cwd().rename(old_path, new_path) catch |err| return mapFileError(err);
+}
+
 fn deleteIfExists(path: []const u8) TableError!void {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        memoryDeleteIfExists(path);
+        return;
+    }
     std.fs.cwd().deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return mapFileError(err),
@@ -806,10 +1007,15 @@ fn deleteIfExists(path: []const u8) TableError!void {
 }
 
 fn deleteTreeIfExists(path: []const u8) TableError!void {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        memoryDeleteTreeIfExists(path);
+        return;
+    }
     std.fs.cwd().deleteTree(path) catch return;
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) TableError![]u8 {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return memoryReadFileAlloc(allocator, path, max_bytes);
     var file = std.fs.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
     defer file.close();
     return file.readToEndAlloc(allocator, max_bytes) catch |err| return mapFileError(err);
@@ -817,6 +1023,11 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usiz
 
 fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRegion {
     if (expected_len == 0) return .{ .memory = &[_]u8{} };
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        const bytes = try memoryFileSlice(path);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        return .{ .memory = @alignCast(bytes), .owned_by_mmap = false };
+    }
     var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
     defer file.close();
     const stat = file.stat() catch |err| return mapFileError(err);
@@ -826,12 +1037,19 @@ fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRe
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
         else => return TableError.InvalidFormat,
     };
-    return .{ .memory = mapped };
+    return .{ .memory = mapped, .owned_by_mmap = true };
 }
 
 fn readFileTail(path: []const u8, expected_len: usize, tail: []u8) TableError!void {
     if (tail.len == 0) return;
     if (expected_len < tail.len) return TableError.VerifyFailed;
+
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        const bytes = try memoryFileSlice(path);
+        if (bytes.len != expected_len) return TableError.VerifyFailed;
+        @memcpy(tail, bytes[bytes.len - tail.len ..]);
+        return;
+    }
 
     var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
     defer file.close();
@@ -907,6 +1125,9 @@ fn syncFile(path: []const u8) TableError!void {
 }
 
 fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8, sync_parent: bool) TableError!void {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        return memoryWriteFile(allocator, path, bytes);
+    }
     if (skipDurabilitySync()) {
         var file = try createFileEnsuringParent(path, .{ .truncate = true });
         defer file.close();
@@ -931,7 +1152,7 @@ fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes
         }
     }
 
-    std.fs.cwd().rename(temp_path, path) catch |err| return mapFileError(err);
+    try renamePath(temp_path, path);
     if (sync_parent) syncParentDirBestEffort(path);
 }
 
@@ -954,7 +1175,7 @@ fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []cons
 
     std.fs.Dir.copyFile(std.fs.cwd(), src_path, std.fs.cwd(), temp_path, .{}) catch |err| return mapFileError(err);
     try syncFile(temp_path);
-    std.fs.cwd().rename(temp_path, dst_path) catch |err| return mapFileError(err);
+    try renamePath(temp_path, dst_path);
     syncParentDirBestEffort(dst_path);
 }
 
@@ -963,6 +1184,10 @@ fn appendFileBytesUnsafe(allocator: std.mem.Allocator, root_dir: []const u8, rel
 
     const path = try activePath(allocator, root_dir, relative_path);
     defer allocator.free(path);
+
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        return memoryAppendFile(allocator, path, appended_bytes);
+    }
 
     var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| return mapFileError(err);
     defer file.close();
@@ -1014,6 +1239,7 @@ fn parseTxCommitMarker(allocator: std.mem.Allocator, source: []const u8) TableEr
 }
 
 fn fileExists(path: []const u8) bool {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return memoryFileExists(path);
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
 }
@@ -1239,24 +1465,87 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
 }
 
 fn freeUnsafeInitCacheEntry(entry: *UnsafeInitMetaCacheEntry) void {
-    unsafe_init_cache_allocator.free(entry.root_dir);
-    unsafe_init_cache_allocator.free(entry.table_name);
-    entry.meta.deinit(unsafe_init_cache_allocator);
+    entry.arena.deinit();
+}
+
+fn freeUnsafeInitTemplateCacheEntry(entry: *UnsafeInitTemplateCacheEntry) void {
+    entry.arena.deinit();
 }
 
 fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
     if (!skipDurabilitySync()) return;
 
-    _ = allocator;
-    const owned_root = try unsafe_init_cache_allocator.dupe(u8, root_dir);
-    errdefer unsafe_init_cache_allocator.free(owned_root);
-    const owned_table = try unsafe_init_cache_allocator.dupe(u8, table_name);
-    errdefer unsafe_init_cache_allocator.free(owned_table);
-    const owned_meta = try duplicateTableMeta(unsafe_init_cache_allocator, meta);
-    errdefer {
-        var cleanup_meta = owned_meta;
-        cleanup_meta.deinit(unsafe_init_cache_allocator);
+    const schema_source = if (meta.schema_path.len == 0) blk: {
+        break :blk try allocator.alloc(u8, 0);
+    } else blk: {
+        const schema_path = try activePath(allocator, root_dir, meta.schema_path);
+        defer allocator.free(schema_path);
+        if (!fileExists(schema_path)) break :blk try allocator.alloc(u8, 0);
+        break :blk try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
+    };
+    defer allocator.free(schema_source);
+    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, &.{});
+}
+
+fn unsafeInitCachePutOwned(root_dir: []const u8, table_name: []const u8, schema_source: []const u8, meta: TableMeta) TableError!void {
+    if (!skipDurabilitySync()) return;
+
+    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, &.{});
+}
+
+fn duplicatePendingDictWrite(allocator: std.mem.Allocator, write: PendingDictWrite) TableError!PendingDictWrite {
+    return .{
+        .name = try allocator.dupe(u8, write.name),
+        .path = try allocator.dupe(u8, write.path),
+        .bytes = try allocator.dupe(u8, write.bytes),
+    };
+}
+
+fn hasPendingDictWriteNamed(writes: []const PendingDictWrite, name: []const u8) bool {
+    for (writes) |write| {
+        if (std.mem.eql(u8, write.name, name)) return true;
     }
+    return false;
+}
+
+fn mergePendingDictWritesOwned(
+    allocator: std.mem.Allocator,
+    existing: []const PendingDictWrite,
+    additions: []const PendingDictWrite,
+) TableError![]PendingDictWrite {
+    if (existing.len == 0 and additions.len == 0) return try allocator.alloc(PendingDictWrite, 0);
+
+    const merged = try allocator.alloc(PendingDictWrite, existing.len + additions.len);
+    var count: usize = 0;
+
+    for (existing) |write| {
+        if (hasPendingDictWriteNamed(additions, write.name)) continue;
+        merged[count] = try duplicatePendingDictWrite(allocator, write);
+        count += 1;
+    }
+    for (additions) |write| {
+        merged[count] = try duplicatePendingDictWrite(allocator, write);
+        count += 1;
+    }
+
+    return merged[0..count];
+}
+
+fn unsafeInitCachePutOwnedWithPending(
+    root_dir: []const u8,
+    table_name: []const u8,
+    schema_source: []const u8,
+    meta: TableMeta,
+    additions: []const PendingDictWrite,
+) TableError!void {
+    if (!skipDurabilitySync()) return;
+
+    var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
+    errdefer arena.deinit();
+    const owned_root = try arena.allocator().dupe(u8, root_dir);
+    const owned_table = try arena.allocator().dupe(u8, table_name);
+    const owned_schema = try arena.allocator().dupe(u8, schema_source);
+    const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
 
     unsafe_init_meta_cache_mutex.lock();
     defer unsafe_init_meta_cache_mutex.unlock();
@@ -1264,23 +1553,211 @@ fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_
     for (&unsafe_init_meta_cache) |*slot| {
         if (slot.*) |*entry| {
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            const owned_pending = try mergePendingDictWritesOwned(arena.allocator(), entry.pending_dict_writes, additions);
             freeUnsafeInitCacheEntry(entry);
-            slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
+            slot.* = .{
+                .arena = arena,
+                .root_dir = owned_root,
+                .table_name = owned_table,
+                .schema_source = owned_schema,
+                .meta = owned_meta,
+                .pending_dict_writes = owned_pending,
+            };
             return;
         }
     }
 
+    const owned_pending = try mergePendingDictWritesOwned(arena.allocator(), &.{}, additions);
+
     for (&unsafe_init_meta_cache) |*slot| {
         if (slot.* == null) {
-            slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
+            slot.* = .{
+                .arena = arena,
+                .root_dir = owned_root,
+                .table_name = owned_table,
+                .schema_source = owned_schema,
+                .meta = owned_meta,
+                .pending_dict_writes = owned_pending,
+            };
             return;
         }
     }
 
     const slot = &unsafe_init_meta_cache[unsafe_init_meta_cache_next_slot];
     freeUnsafeInitCacheEntry(&(slot.*.?));
-    slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
+    slot.* = .{
+        .arena = arena,
+        .root_dir = owned_root,
+        .table_name = owned_table,
+        .schema_source = owned_schema,
+        .meta = owned_meta,
+        .pending_dict_writes = owned_pending,
+    };
     unsafe_init_meta_cache_next_slot = (unsafe_init_meta_cache_next_slot + 1) % unsafe_init_meta_cache.len;
+}
+
+fn buildInitialMetaOwnedFromSchema(
+    allocator: std.mem.Allocator,
+    schema_path: []u8,
+    schema_hash: []u8,
+    schema_obj: *schema.Schema,
+) TableError!TableMeta {
+    const columns = try allocator.alloc(ColumnMeta, schema_obj.columns.len);
+    errdefer allocator.free(columns);
+
+    for (schema_obj.columns, 0..) |column, idx| {
+        const ty = try effectivePrimType(column);
+        columns[idx] = .{
+            .name = column.name,
+            .stride = column.stride,
+            .ty = try allocator.dupe(u8, schema.primTypeName(ty)),
+            .logical_type = column.logical_type,
+            .logical_scale = column.logical_scale,
+            .nullable = column.nullable,
+        };
+    }
+
+    return .{
+        .magic = try allocator.dupe(u8, "sa-db-table-meta"),
+        .version = 1,
+        .table_name = schema_obj.table_name,
+        .schema_path = schema_path,
+        .schema_hash = schema_hash,
+        .locked = false,
+        .epoch = 0,
+        .row_count = 0,
+        .max_rows = schema_obj.max_rows,
+        .row_bytes = schema_obj.row_bytes,
+        .next_segment_id = 0,
+        .columns = columns,
+        .segments = try allocator.alloc(SegmentMeta, 0),
+        .indexes = try allocator.alloc(IndexMeta, 0),
+        .dicts = try allocator.alloc(DictMeta, 0),
+        .blobs = try allocator.alloc(BlobStoreMeta, 0),
+    };
+}
+
+fn unsafeInitCacheBuildInitialMetaOwned(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    schema_path_hint: []const u8,
+    schema_source: []const u8,
+) TableError!TableInfo {
+    if (!skipDurabilitySync()) return TableError.InvalidFormat;
+
+    var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
+    errdefer arena.deinit();
+
+    var schema_obj = schema.compileInitFast(arena.allocator(), schema_source, schema_path_hint) catch |err| return mapSchemaError(err);
+    const schema_hash = try arena.allocator().alloc(u8, 0);
+    const schema_path = try schemaMetaPath(arena.allocator(), root_dir, schema_obj.table_name);
+
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, schema_obj.table_name);
+    defer write_lock.release();
+
+    const owned_root = try arena.allocator().dupe(u8, root_dir);
+    const owned_table = @constCast(schema_obj.table_name);
+    const owned_schema = try arena.allocator().dupe(u8, schema_source);
+    const owned_meta = try buildInitialMetaOwnedFromSchema(arena.allocator(), schema_path, schema_hash, &schema_obj);
+    const info = tableInfo(owned_meta);
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, schema_obj.table_name)) continue;
+            freeUnsafeInitCacheEntry(entry);
+            slot.* = .{
+                .arena = arena,
+                .root_dir = owned_root,
+                .table_name = owned_table,
+                .schema_source = owned_schema,
+                .meta = owned_meta,
+                .pending_dict_writes = try arena.allocator().alloc(PendingDictWrite, 0),
+            };
+            return info;
+        }
+    }
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{
+                .arena = arena,
+                .root_dir = owned_root,
+                .table_name = owned_table,
+                .schema_source = owned_schema,
+                .meta = owned_meta,
+                .pending_dict_writes = try arena.allocator().alloc(PendingDictWrite, 0),
+            };
+            return info;
+        }
+    }
+
+    const slot = &unsafe_init_meta_cache[unsafe_init_meta_cache_next_slot];
+    freeUnsafeInitCacheEntry(&(slot.*.?));
+    slot.* = .{
+        .arena = arena,
+        .root_dir = owned_root,
+        .table_name = owned_table,
+        .schema_source = owned_schema,
+        .meta = owned_meta,
+        .pending_dict_writes = try arena.allocator().alloc(PendingDictWrite, 0),
+    };
+    unsafe_init_meta_cache_next_slot = (unsafe_init_meta_cache_next_slot + 1) % unsafe_init_meta_cache.len;
+    return info;
+}
+
+fn unsafeInitCacheSchemaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?[]u8 {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return try allocator.dupe(u8, entry.schema_source);
+        }
+    }
+    return null;
+}
+
+fn unsafeInitCachePendingDictBytes(allocator: std.mem.Allocator, root_dir: []const u8, dict_path: []const u8) TableError!?[]u8 {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir)) continue;
+            for (entry.pending_dict_writes) |write| {
+                if (!std.mem.eql(u8, write.path, dict_path)) continue;
+                return try allocator.dupe(u8, write.bytes);
+            }
+        }
+    }
+    return null;
+}
+
+fn unsafeInitCachePendingDictWritesForTable(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) TableError![]PendingDictWrite {
+    if (!skipDurabilitySync()) return try allocator.alloc(PendingDictWrite, 0);
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return try mergePendingDictWritesOwned(allocator, entry.pending_dict_writes, &.{});
+        }
+    }
+    return try allocator.alloc(PendingDictWrite, 0);
 }
 
 fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?TableMeta {
@@ -1326,6 +1803,73 @@ fn unsafeInitCacheDelete(allocator: std.mem.Allocator, root_dir: []const u8, tab
         if (slot.*) |*entry| {
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             freeUnsafeInitCacheEntry(entry);
+            slot.* = null;
+        }
+    }
+}
+
+fn unsafeInitTemplateCachePut(root_dir: []const u8, table_name: []const u8, schema_hash: []const u8, meta: TableMeta) TableError!void {
+    if (!skipDurabilitySync()) return;
+
+    var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
+    errdefer arena.deinit();
+    const owned_root = try arena.allocator().dupe(u8, root_dir);
+    const owned_table = try arena.allocator().dupe(u8, table_name);
+    const owned_hash = try arena.allocator().dupe(u8, schema_hash);
+    const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
+
+    unsafe_init_template_cache_mutex.lock();
+    defer unsafe_init_template_cache_mutex.unlock();
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                !std.mem.eql(u8, entry.schema_hash, schema_hash)) continue;
+            freeUnsafeInitTemplateCacheEntry(entry);
+            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .meta = owned_meta };
+            return;
+        }
+    }
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .meta = owned_meta };
+            return;
+        }
+    }
+
+    const slot = &unsafe_init_template_cache[unsafe_init_template_cache_next_slot];
+    freeUnsafeInitTemplateCacheEntry(&(slot.*.?));
+    slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .meta = owned_meta };
+    unsafe_init_template_cache_next_slot = (unsafe_init_template_cache_next_slot + 1) % unsafe_init_template_cache.len;
+}
+
+fn unsafeInitTemplateCachePeek(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, schema_hash: []const u8) TableError!?TableMeta {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_template_cache_mutex.lock();
+    defer unsafe_init_template_cache_mutex.unlock();
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                !std.mem.eql(u8, entry.schema_hash, schema_hash)) continue;
+            return try duplicateTableMeta(allocator, entry.meta);
+        }
+    }
+    return null;
+}
+
+fn unsafeInitTemplateCacheDelete(root_dir: []const u8, table_name: []const u8) void {
+    unsafe_init_template_cache_mutex.lock();
+    defer unsafe_init_template_cache_mutex.unlock();
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            freeUnsafeInitTemplateCacheEntry(entry);
             slot.* = null;
         }
     }
@@ -1646,7 +2190,7 @@ fn validateFileMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, file
     const path = try activePath(allocator, root_dir, file.path);
     defer allocator.free(path);
     const mapped = try mappedReadFile(path, @intCast(file.bytes));
-    defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+    defer releaseMappedRegion(mapped);
     try validateFileMetaBytes(file, mappedRegionBytes(mapped));
 }
 
@@ -1663,7 +2207,7 @@ fn validateDictMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, dict
     const path = try activePath(allocator, root_dir, dict.path);
     defer allocator.free(path);
     const mapped = try mappedReadFile(path, @intCast(dict.bytes));
-    defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+    defer releaseMappedRegion(mapped);
     const bytes = mappedRegionBytes(mapped);
     const count = try dictEntryCount(bytes);
     if (count != dict.entries) return TableError.VerifyFailed;
@@ -1674,7 +2218,7 @@ fn validateBlobStoreMetaPath(allocator: std.mem.Allocator, root_dir: []const u8,
     const path = try activePath(allocator, root_dir, blob.path);
     defer allocator.free(path);
     const mapped = try mappedReadFile(path, @intCast(blob.bytes));
-    defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+    defer releaseMappedRegion(mapped);
     const bytes = mappedRegionBytes(mapped);
     const count = try blobEntryCount(bytes);
     if (count != blob.entries) return TableError.VerifyFailed;
@@ -2423,7 +2967,7 @@ fn publishStagedSegmentToMeta(
         errdefer allocator.free(basename);
         const final_path = try activePath(allocator, root_dir, basename);
         defer allocator.free(final_path);
-        std.fs.cwd().rename(staged_file.staged_path, final_path) catch |err| return mapFileError(err);
+        try renamePath(staged_file.staged_path, final_path);
 
         allocator.free(staged_file.staged_path);
         staged_file.staged_path = &.{};
@@ -2504,6 +3048,24 @@ fn tableInfo(meta: TableMeta) TableInfo {
     };
 }
 
+fn canDeferUnsafeBootstrapMeta(meta: TableMeta) bool {
+    return skipDurabilitySync() and meta.row_count == 0 and meta.segments.len == 0;
+}
+
+fn cacheUnsafeBootstrapMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: TableMeta,
+    additions: []const PendingDictWrite,
+) TableError!void {
+    if (!skipDurabilitySync()) return TableError.InvalidFormat;
+
+    const schema_source = (try unsafeInitCacheSchemaSource(allocator, root_dir, table_name)) orelse return TableError.NotFound;
+    defer allocator.free(schema_source);
+    try unsafeInitCachePutOwnedWithPending(root_dir, table_name, schema_source, meta, additions);
+}
+
 fn loadCurrentMeta(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -2530,7 +3092,7 @@ fn loadWritableMeta(
     if (skipDurabilitySync()) {
         return loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
             TableError.NotFound => {
-                if (try unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
+                if (try unsafeInitCachePeek(allocator, root_dir, table_name)) |meta| return meta;
                 const source = loadRecoveredActiveMetaSource(allocator, root_dir, table_name) catch |recover_err| switch (recover_err) {
                     TableError.NotFound => return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name),
                     else => return recover_err,
@@ -2544,7 +3106,7 @@ fn loadWritableMeta(
 
     return loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
         TableError.NotFound => {
-            if (try unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
+            if (try unsafeInitCachePeek(allocator, root_dir, table_name)) |meta| return meta;
             return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name);
         },
         else => return err,
@@ -2825,7 +3387,7 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
         }
         if (index.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
         const mapped = try validateIndexMetaPath(allocator, root_dir, index);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         if (std.mem.eql(u8, index.kind, "u64_pair") or std.mem.eql(u8, index.kind, "u64_i64_pair")) {
             try validateU64PairIndexBytesShape(bytes, meta.row_count, index.unique);
@@ -2949,6 +3511,16 @@ fn findDictMetaIndex(meta: TableMeta, dict_name: []const u8) ?usize {
 }
 
 fn readDictBytes(allocator: std.mem.Allocator, root_dir: []const u8, dict: DictMeta) TableError![]u8 {
+    if (try unsafeInitCachePendingDictBytes(allocator, root_dir, dict.path)) |bytes| {
+        errdefer allocator.free(bytes);
+        if (bytes.len != dict.bytes) return TableError.VerifyFailed;
+        const count = try dictEntryCount(bytes);
+        if (count != dict.entries) return TableError.VerifyFailed;
+        try validateOptionalSha256(dict.sha256, bytes);
+        try validateDictBlockHashes(dict, bytes);
+        return bytes;
+    }
+
     const path = try activePath(allocator, root_dir, dict.path);
     defer allocator.free(path);
     const bytes = try readFileAlloc(allocator, path, 1 << 30);
@@ -3040,6 +3612,8 @@ fn validateBlobStoreFiles(allocator: std.mem.Allocator, root_dir: []const u8, me
 }
 
 fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    if (isMemoryRoot(root_dir)) return;
+
     const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(schema_path);
     if (std.fs.cwd().openFile(schema_path, .{})) |file| {
@@ -3253,7 +3827,158 @@ fn deleteRootTableArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
     }
 }
 
+fn deleteRelativeArtifactPath(allocator: std.mem.Allocator, root_dir: []const u8, relative_path: []const u8) TableError!void {
+    const path = try activePath(allocator, root_dir, relative_path);
+    defer allocator.free(path);
+    try deleteIfExists(path);
+}
+
+fn deleteHistoricalIndexArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta, index: IndexMeta) TableError!void {
+    const column_index2 = if (std.mem.eql(u8, index.kind, "u64_pair") or std.mem.eql(u8, index.kind, "u64_i64_pair")) try indexColumnIndex2(index) else null;
+    const store_name = if (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) or
+        std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND) or
+        std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND) or
+        std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND)) try indexBlobStoreName(index) else null;
+
+    var epoch: u64 = 0;
+    while (epoch <= meta.epoch) : (epoch += 1) {
+        const basename = if (store_name) |name|
+            if (std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND))
+                try blobTokenIndexFileName(allocator, meta.table_name, index.column_index, name, epoch)
+            else if (std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND))
+                try blobPrefixIndexFileName(allocator, meta.table_name, index.column_index, name, epoch)
+            else if (std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND))
+                try blobContainsIndexFileName(allocator, meta.table_name, index.column_index, name, epoch)
+            else
+                try blobEqIndexFileName(allocator, meta.table_name, index.column_index, name, epoch)
+        else if (column_index2) |c2|
+            try pairIndexFileName(allocator, meta.table_name, index.kind, index.column_index, @intCast(c2), epoch)
+        else
+            try indexFileName(allocator, meta.table_name, index.kind, index.column_index, epoch);
+        defer allocator.free(basename);
+        try deleteRelativeArtifactPath(allocator, root_dir, basename);
+    }
+}
+
+fn deleteHistoricalDictArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta, dict: DictMeta) TableError!void {
+    var epoch: u64 = 0;
+    while (epoch <= meta.epoch) : (epoch += 1) {
+        const basename = try dictFileName(allocator, meta.table_name, dict.name, epoch);
+        defer allocator.free(basename);
+        try deleteRelativeArtifactPath(allocator, root_dir, basename);
+    }
+}
+
+fn deleteHistoricalBlobArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta, blob: BlobStoreMeta) TableError!void {
+    var epoch: u64 = 0;
+    while (epoch <= meta.epoch) : (epoch += 1) {
+        const basename = try blobStoreFileName(allocator, meta.table_name, blob.name, epoch);
+        defer allocator.free(basename);
+        try deleteRelativeArtifactPath(allocator, root_dir, basename);
+    }
+}
+
+fn deleteActiveMetaArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(schema_path);
+    try deleteIfExists(schema_path);
+
+    const compat_meta_path = try tableMetaPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(compat_meta_path);
+    try deleteIfExists(compat_meta_path);
+
+    const manifest_path = try tableManifestPath(allocator, root_dir, meta.table_name);
+    defer allocator.free(manifest_path);
+    try deleteIfExists(manifest_path);
+
+    var epoch: u64 = 0;
+    while (epoch <= meta.epoch) : (epoch += 1) {
+        const versioned_meta_path = try tableVersionedMetaPath(allocator, root_dir, meta.table_name, epoch);
+        defer allocator.free(versioned_meta_path);
+        try deleteIfExists(versioned_meta_path);
+
+        const pending_path = try txPendingMarkerPath(allocator, root_dir, meta.table_name, epoch);
+        defer allocator.free(pending_path);
+        try deleteIfExists(pending_path);
+
+        const commit_path = try txCommitMarkerPath(allocator, root_dir, meta.table_name, epoch);
+        defer allocator.free(commit_path);
+        try deleteIfExists(commit_path);
+    }
+
+    for (meta.segments) |segment| {
+        for (segment.files) |file_meta| {
+            const path = try activePath(allocator, root_dir, file_meta.path);
+            defer allocator.free(path);
+            try deleteIfExists(path);
+        }
+    }
+
+    for (meta.indexes) |index| {
+        try deleteHistoricalIndexArtifacts(allocator, root_dir, meta, index);
+    }
+
+    for (meta.dicts) |dict| {
+        try deleteHistoricalDictArtifacts(allocator, root_dir, meta, dict);
+    }
+
+    for (meta.blobs) |blob| {
+        try deleteHistoricalBlobArtifacts(allocator, root_dir, meta, blob);
+    }
+
+    var seg_id: u64 = 0;
+    while (seg_id < meta.next_segment_id) : (seg_id += 1) {
+        for (meta.columns, 0..) |_, column_index| {
+            const basename = try segmentFileName(allocator, meta.table_name, seg_id, column_index);
+            defer allocator.free(basename);
+            const path = try activePath(allocator, root_dir, basename);
+            defer allocator.free(path);
+            try deleteIfExists(path);
+
+            var rewrite_epoch: u64 = 1;
+            while (rewrite_epoch <= meta.epoch) : (rewrite_epoch += 1) {
+                const rewritten = try allocPrintPath(allocator, "{s}.e{d}", .{ basename, rewrite_epoch });
+                defer allocator.free(rewritten);
+                const rewritten_path = try activePath(allocator, root_dir, rewritten);
+                defer allocator.free(rewritten_path);
+                try deleteIfExists(rewritten_path);
+            }
+        }
+    }
+}
+
+fn deleteTableArtifactsFast(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    var removed_targeted = false;
+    if (loadActiveMeta(allocator, root_dir, table_name)) |meta| {
+        var owned = meta;
+        defer owned.deinit(allocator);
+        try deleteActiveMetaArtifacts(allocator, root_dir, owned);
+        removed_targeted = true;
+    } else |err| switch (err) {
+        TableError.NotFound => {},
+        else => return err,
+    }
+
+    if (!removed_targeted) {
+        if (loadRecoveredActiveMetaSource(allocator, root_dir, table_name)) |source| {
+            defer allocator.free(source);
+            var owned = try parseOwnedTableMeta(allocator, source, table_name);
+            defer owned.deinit(allocator);
+            try deleteActiveMetaArtifacts(allocator, root_dir, owned);
+        } else |err| switch (err) {
+            TableError.NotFound => {},
+            else => return err,
+        }
+    }
+
+    if (!removed_targeted) {
+        try deleteRootTableArtifacts(allocator, root_dir, table_name);
+    }
+}
+
 fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError!void {
+    if (isMemoryRoot(root_dir)) return;
+
     const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(schema_path);
     if (std.fs.cwd().openFile(schema_path, .{})) |file| {
@@ -3656,7 +4381,33 @@ fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
 }
 
 fn writeCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
-    const json = std.json.stringifyAlloc(allocator, meta, .{}) catch |err| return mapJsonError(err);
+    if (skipDurabilitySync()) {
+        try ensureUnsafeSchemaMaterialized(allocator, root_dir, table_name);
+        const pending_dict_writes = try unsafeInitCachePendingDictWritesForTable(allocator, root_dir, table_name);
+        defer freePendingDictWrites(allocator, pending_dict_writes);
+        for (pending_dict_writes) |write| {
+            const path = try activePath(allocator, root_dir, write.path);
+            defer allocator.free(path);
+            try writeFile(allocator, path, write.bytes);
+        }
+    }
+
+    var persisted = meta;
+    var owned_hash: ?[]u8 = null;
+    defer if (owned_hash) |hash| allocator.free(hash);
+    if (persisted.schema_hash.len == 0) {
+        const schema_source = (try unsafeInitCacheSchemaSource(allocator, root_dir, table_name)) orelse blk: {
+            const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
+            defer allocator.free(schema_path);
+            break :blk try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
+        };
+        defer allocator.free(schema_source);
+        const schema_hash = try hashHexAlloc(allocator, schema_source);
+        owned_hash = schema_hash;
+        persisted.schema_hash = schema_hash;
+    }
+
+    const json = std.json.stringifyAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(json);
 
     const meta_path = try tableMetaPath(allocator, root_dir, table_name);
@@ -3800,6 +4551,18 @@ fn writeGeneratedIface(allocator: std.mem.Allocator, root_dir: []const u8, schem
     try writeFile(allocator, path, iface.items);
 }
 
+fn ensureUnsafeSchemaMaterialized(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    if (!skipDurabilitySync()) return;
+
+    const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
+    defer allocator.free(schema_path);
+    if (fileExists(schema_path)) return;
+
+    const schema_source = (try unsafeInitCacheSchemaSource(allocator, root_dir, table_name)) orelse return TableError.NotFound;
+    defer allocator.free(schema_source);
+    try writeFile(allocator, schema_path, schema_source);
+}
+
 pub fn initTableFromSchemaBytes(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -3807,6 +4570,13 @@ pub fn initTableFromSchemaBytes(
     schema_source: []const u8,
 ) TableError!TableInfo {
     if (schema_path_hint.len == 0 or schema_source.len == 0) return TableError.InvalidFormat;
+
+    if (skipDurabilitySync()) {
+        return try unsafeInitCacheBuildInitialMetaOwned(allocator, root_dir, schema_path_hint, schema_source);
+    }
+
+    const schema_hash = try hashHexAlloc(allocator, schema_source);
+    defer allocator.free(schema_hash);
 
     var schema_obj = schema.compile(allocator, schema_source, schema_path_hint) catch |err| return mapSchemaError(err);
     defer schema_obj.deinit();
@@ -3816,23 +4586,10 @@ pub fn initTableFromSchemaBytes(
 
     const schema_path = try schemaMetaPath(allocator, root_dir, schema_obj.table_name);
     defer allocator.free(schema_path);
-    try writeFile(allocator, schema_path, schema_source);
     if (!skipDurabilitySync()) {
+        try writeFile(allocator, schema_path, schema_source);
         try writeGeneratedIface(allocator, root_dir, schema_obj);
     }
-
-    if (skipDurabilitySync()) {
-        const schema_hash = try hashHexAlloc(allocator, schema_source);
-        defer allocator.free(schema_hash);
-        var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
-        defer meta.deinit(allocator);
-        const info = tableInfo(meta);
-        try unsafeInitCachePut(allocator, root_dir, schema_obj.table_name, meta);
-        return info;
-    }
-
-    const schema_hash = try hashHexAlloc(allocator, schema_source);
-    defer allocator.free(schema_hash);
 
     var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
     defer meta.deinit(allocator);
@@ -3844,7 +4601,7 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    try deleteRootTableArtifacts(allocator, root_dir, table_name);
+    try deleteTableArtifactsFast(allocator, root_dir, table_name);
 
     const prefix = rootPrefix(root_dir);
     const snapshot_path = if (prefix.len == 0)
@@ -5584,16 +6341,20 @@ pub fn internStringDict(
     const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try dictFileName(allocator, table_name, dict_name, next_epoch);
     defer allocator.free(basename);
-    const path = try activePath(allocator, root_dir, basename);
-    defer allocator.free(path);
-    try writeFile(allocator, path, new_bytes);
-
     const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
     var consumed = false;
     errdefer if (!consumed) freeDictMeta(allocator, new_meta);
     try putDictMeta(allocator, &meta, new_meta);
     consumed = true;
     meta.epoch = next_epoch;
+    if (canDeferUnsafeBootstrapMeta(meta)) {
+        const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = @constCast(new_bytes) }};
+        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending);
+        return .{ .info = tableInfo(meta), .id = new_count, .inserted = true };
+    }
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .id = new_count, .inserted = true };
 }
@@ -5675,16 +6436,20 @@ pub fn internStringDictMany(
     const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try dictFileName(allocator, table_name, dict_name, next_epoch);
     defer allocator.free(basename);
-    const path = try activePath(allocator, root_dir, basename);
-    defer allocator.free(path);
-    try writeFile(allocator, path, new_bytes);
-
     const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
     var consumed = false;
     errdefer if (!consumed) freeDictMeta(allocator, new_meta);
     try putDictMeta(allocator, &meta, new_meta);
     consumed = true;
     meta.epoch = next_epoch;
+    if (canDeferUnsafeBootstrapMeta(meta)) {
+        const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = @constCast(new_bytes) }};
+        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending);
+        return .{ .info = tableInfo(meta), .inserted_count = inserted_count };
+    }
+    const path = try activePath(allocator, root_dir, basename);
+    defer allocator.free(path);
+    try writeFile(allocator, path, new_bytes);
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .inserted_count = inserted_count };
 }
@@ -6935,7 +7700,7 @@ fn buildU64IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -6982,7 +7747,7 @@ fn buildI64IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -7029,7 +7794,7 @@ fn buildU32IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 4);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -7076,7 +7841,7 @@ fn buildI32IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 4);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -7148,7 +7913,7 @@ fn buildSmallIntegerIndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, stride);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -7220,9 +7985,9 @@ fn buildU64PairIndexBytes(
     var previous_entry: U64PairIndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped1 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer if (mapped1.memory.len != 0) std.posix.munmap(mapped1.memory);
+        defer releaseMappedRegion(mapped1);
         const mapped2 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8);
-        defer if (mapped2.memory.len != 0) std.posix.munmap(mapped2.memory);
+        defer releaseMappedRegion(mapped2);
         const bytes1 = mappedRegionBytes(mapped1);
         const bytes2 = mappedRegionBytes(mapped2);
         var i: u64 = 0;
@@ -7276,9 +8041,9 @@ fn buildU64I64PairIndexBytes(
     var previous_entry: U64PairIndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped1 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer if (mapped1.memory.len != 0) std.posix.munmap(mapped1.memory);
+        defer releaseMappedRegion(mapped1);
         const mapped2 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8);
-        defer if (mapped2.memory.len != 0) std.posix.munmap(mapped2.memory);
+        defer releaseMappedRegion(mapped2);
         const bytes1 = mappedRegionBytes(mapped1);
         const bytes2 = mappedRegionBytes(mapped2);
         var i: u64 = 0;
@@ -7345,7 +8110,7 @@ fn buildBlobEqIndexBytes(
     var entry_idx: usize = 0;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer if (mapped.memory.len != 0) std.posix.munmap(mapped.memory);
+        defer releaseMappedRegion(mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -8560,6 +9325,8 @@ fn tryAppendIndexesForAppendedRows(
         }
     }
 
+    const allow_unsafe_index_io = skipDurabilitySync() and !isMemoryRoot(root_dir);
+
     for (0..meta.indexes.len) |idx| {
         const index = &meta.indexes[idx];
 
@@ -8577,7 +9344,7 @@ fn tryAppendIndexesForAppendedRows(
             const kind = singleIndexKindFromName(index.kind) orelse return TableError.InvalidFormat;
             const appended = try buildSingleIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), kind, index.unique, in_memory_columns, column_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key = readIndexKey(appended, 0);
@@ -8591,9 +9358,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, index.unique, false, meta.row_count);
             } else {
                 const merged = try mergeIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
@@ -8607,7 +9374,7 @@ fn tryAppendIndexesForAppendedRows(
             const column_index2 = try indexColumnIndex2(index.*);
             const appended = try buildU64PairIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), column_index2, index.unique, in_memory_columns, column_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readU64PairIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key1 = readU64PairIndexKey1(appended, 0);
@@ -8622,9 +9389,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeU64PairIndexFileInPlace(allocator, root_dir, index, appended, index.unique, meta.row_count);
             } else {
                 const merged = try mergeU64PairIndexBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
@@ -8638,7 +9405,7 @@ fn tryAppendIndexesForAppendedRows(
             const column_index2 = try indexColumnIndex2(index.*);
             const appended = try buildU64I64PairIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), column_index2, index.unique, in_memory_columns, column_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readU64PairIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key1 = readU64PairIndexKey1(appended, 0);
@@ -8653,9 +9420,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeU64PairIndexFileInPlace(allocator, root_dir, index, appended, index.unique, meta.row_count);
             } else {
                 const merged = try mergeU64PairIndexBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
@@ -8669,7 +9436,7 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobEqIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, index.unique, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key = readIndexKey(appended, 0);
@@ -8683,9 +9450,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, index.unique, false, meta.row_count);
             } else {
                 const merged = try mergeIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
@@ -8699,7 +9466,7 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobTokenIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key = readIndexKey(appended, 0);
@@ -8713,9 +9480,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
             } else {
                 const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
@@ -8729,7 +9496,7 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobPrefixIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key = readIndexKey(appended, 0);
@@ -8743,9 +9510,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
             } else {
                 const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
@@ -8759,7 +9526,7 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobContainsIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
-            if (skipDurabilitySync() and index.bytes != 0) {
+            if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
                     const appended_first_key = readIndexKey(appended, 0);
@@ -8773,9 +9540,9 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer if (mapped_existing.memory.len != 0) std.posix.munmap(mapped_existing.memory);
+            defer releaseMappedRegion(mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
-            if (skipDurabilitySync()) {
+            if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
             } else {
                 const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
@@ -18751,7 +19518,15 @@ test "table unsafe init defers empty meta until first write" {
 
     const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
     defer std.testing.allocator.free(meta_path);
+    const dict_path = try activePath(std.testing.allocator, ".", "unsafe_init_members.dict.status.1.dat");
+    defer std.testing.allocator.free(dict_path);
     try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists("unsafe_init_members.sadb-schema"));
+    try std.testing.expect(!fileExists(dict_path));
+
+    var bootstrap = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer bootstrap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap.schema_hash.len);
 
     const values = [_][]const u8{ "active", "paused" };
     var ids: [values.len]u64 = undefined;
@@ -18761,10 +19536,20 @@ test "table unsafe init defers empty meta until first write" {
     try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, &ids);
     try std.testing.expectEqualSlices(bool, &.{ true, true }, &inserted);
 
-    try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists("unsafe_init_members.sadb-schema"));
+    try std.testing.expect(!fileExists(dict_path));
     const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "paused");
     try std.testing.expect(visible.found);
     try std.testing.expectEqual(@as(u64, 2), visible.id);
+
+    var row = [_]u64{ 7, ids[1] };
+    const inserted_row = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expectEqual(@as(u64, 1), inserted_row.row_count);
+    try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(fileExists("unsafe_init_members.sadb-schema"));
+    try std.testing.expect(fileExists(dict_path));
+
     _ = try verifyTable(std.testing.allocator, ".", table_name);
 }
 
@@ -18791,6 +19576,11 @@ test "table unsafe init cache serves first write transaction bootstrap" {
     const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
     defer std.testing.allocator.free(meta_path);
     try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists("unsafe_tx_bootstrap.sadb-schema"));
+
+    var bootstrap = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer bootstrap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap.schema_hash.len);
 
     const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
     defer destroyWriteTransaction(std.testing.allocator, tx);
@@ -18800,6 +19590,11 @@ test "table unsafe init cache serves first write transaction bootstrap" {
     const committed = try commitWriteTransaction(std.testing.allocator, tx);
     try std.testing.expectEqual(@as(u64, 1), committed.epoch);
     try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(fileExists("unsafe_tx_bootstrap.sadb-schema"));
+
+    var persisted = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer persisted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 64), persisted.schema_hash.len);
 
     const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
     try std.testing.expect(visible.found);
@@ -18965,6 +19760,36 @@ test "table unsafe init cache serves first direct row insert bootstrap" {
     const found = try snapshotFindU64(snapshot, 0, 7);
     try std.testing.expect(found.found);
     try std.testing.expectEqual(@as(u64, 0), found.row_index);
+}
+
+test "table memory root supports init ingest and snapshot reads" {
+    const root = ":memory:test_basic";
+    const table_name = "mem_members";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    var ids = [_]u64{ 1, 2 };
+    var statuses = [_]u64{ 10, 20 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(statuses[0..]) },
+    };
+    const info = try ingestRawColumns(std.testing.allocator, root, table_name, ids.len, &columns);
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer snapshot.destroy();
+    const found = try snapshotFindU64(snapshot, 0, 2);
+    try std.testing.expect(found.found);
+    try std.testing.expectEqual(@as(u64, 1), found.row_index);
+    try std.testing.expectEqual(@as(u64, 20), try snapshotGetU64(snapshot, 1, found.row_index));
+
+    const verified = try verifyTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.row_count);
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {
@@ -20826,6 +21651,55 @@ test "table remove clears stale versioned files before reuse" {
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 900), try snapshotSumU64(snapshot, 1));
+}
+
+test "table remove clears rewritten epoch column artifacts before reuse" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "reused_adjustments";
+    const schema_source =
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "reused_adjustments.sadb-schema", schema_source);
+
+    var ids = [_]u64{1};
+    var points = [_]u64{10};
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(points[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+    _ = try updateU64ColumnAdd(std.testing.allocator, ".", table_name, 1, 0, 1, 5);
+
+    const rewritten_path = try activePath(std.testing.allocator, ".", "reused_adjustments.col1.0.dat.e3");
+    defer std.testing.allocator.free(rewritten_path);
+    try std.testing.expect(fileExists(rewritten_path));
+
+    _ = try removeTable(std.testing.allocator, ".", table_name);
+    try std.testing.expect(!fileExists(rewritten_path));
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "reused_adjustments.sadb-schema", schema_source);
+    var new_ids = [_]u64{9};
+    var new_points = [_]u64{90};
+    const new_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(new_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(new_points[0..]) },
+    };
+    _ = try ingestRawColumns(std.testing.allocator, ".", table_name, new_ids.len, &new_columns);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 90), try snapshotSumU64(snapshot, 1));
 }
 
 test "table remove preserves write lock file" {

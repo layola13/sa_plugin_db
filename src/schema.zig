@@ -71,6 +71,10 @@ pub const Schema = struct {
     }
 };
 
+const CompileOptions = struct {
+    collect_defs: bool = true,
+};
+
 pub fn ifaceFilePath(allocator: std.mem.Allocator, source_path: []const u8) ![]u8 {
     const basename = std.fs.path.basename(source_path);
     const stem = if (std.mem.endsWith(u8, basename, ".sadb-schema"))
@@ -310,10 +314,11 @@ fn parseLogicalAnnotations(comment_tail: []const u8, ty: PrimType) ParseError!st
     return .{ .logical_type = logical_type, .logical_scale = logical_scale, .nullable = nullable };
 }
 
-pub fn compile(
+fn compileWithOptions(
     allocator: std.mem.Allocator,
     source: []const u8,
     source_path: []const u8,
+    options: CompileOptions,
 ) ParseError!Schema {
     const table_name = try allocator.dupe(u8, parseTableName(source_path));
     errdefer allocator.free(table_name);
@@ -332,13 +337,14 @@ pub fn compile(
     }
 
     var defs = std.ArrayList(Def).init(allocator);
-    errdefer {
+    defer if (!options.collect_defs) defs.deinit();
+    errdefer if (options.collect_defs) {
         for (defs.items) |def| {
             allocator.free(def.name);
             allocator.free(def.value);
         }
         defs.deinit();
-    }
+    };
 
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
@@ -351,7 +357,9 @@ pub fn compile(
         const def = parseDef(line) orelse return ParseError.InvalidFormat;
         if (seen.contains(def.name)) return ParseError.DuplicateDef;
         try seen.put(def.name, {});
-        try appendDef(&defs, allocator, def.name, def.value);
+        if (options.collect_defs) {
+            try appendDef(&defs, allocator, def.name, def.value);
+        }
 
         if (std.mem.eql(u8, def.name, "MAX_ROWS")) {
             max_rows = std.fmt.parseInt(u64, def.value, 10) catch return ParseError.InvalidFormat;
@@ -411,14 +419,35 @@ pub fn compile(
         if (cap > 64 * 1024 * 1024 * 1024) return ParseError.CapacityOverflow;
     }
 
+    const owned_defs = if (options.collect_defs)
+        try defs.toOwnedSlice()
+    else
+        try allocator.alloc(Def, 0);
+
     return .{
         .allocator = allocator,
         .table_name = table_name,
         .max_rows = max_rows_value,
         .columns = try columns.toOwnedSlice(),
         .row_bytes = final_row_bytes,
-        .defs = try defs.toOwnedSlice(),
+        .defs = owned_defs,
     };
+}
+
+pub fn compile(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    source_path: []const u8,
+) ParseError!Schema {
+    return compileWithOptions(allocator, source, source_path, .{});
+}
+
+pub fn compileInitFast(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    source_path: []const u8,
+) ParseError!Schema {
+    return compileWithOptions(allocator, source, source_path, .{ .collect_defs = false });
 }
 
 fn hasDef(defs: []const Def, name: []const u8) bool {
@@ -492,4 +521,33 @@ test "schema compiler rejects incompatible logical annotations" {
         \\#def COL_AMOUNT_STRIDE = 8 // u64 decimal(2)
     ;
     try std.testing.expectError(ParseError.InvalidFormat, compile(std.testing.allocator, source, "bad.sadb-schema"));
+}
+
+test "schema init fast compiler preserves init metadata without defs" {
+    const source =
+        \\#def MAX_ROWS = 16
+        \\#def COL_AMOUNT_STRIDE = 8 // i64 decimal(2) nullable
+        \\#def COL_DUE_DATE_STRIDE = 8 // i64 date
+        \\#def COL_ACTIVE_STRIDE = 1 // u8 bool
+        \\#def TABLE_ROW_BYTES = 17
+    ;
+
+    var fast = try compileInitFast(std.testing.allocator, source, "erp_init_fast.sadb-schema");
+    defer fast.deinit();
+    var full = try compile(std.testing.allocator, source, "erp_init_fast.sadb-schema");
+    defer full.deinit();
+
+    try std.testing.expectEqualStrings(full.table_name, fast.table_name);
+    try std.testing.expectEqual(full.max_rows, fast.max_rows);
+    try std.testing.expectEqual(full.row_bytes, fast.row_bytes);
+    try std.testing.expectEqual(@as(usize, 0), fast.defs.len);
+    try std.testing.expectEqual(full.columns.len, fast.columns.len);
+    for (full.columns, fast.columns) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqual(expected.stride, actual.stride);
+        try std.testing.expectEqual(expected.ty, actual.ty);
+        try std.testing.expectEqual(expected.logical_type, actual.logical_type);
+        try std.testing.expectEqual(expected.logical_scale, actual.logical_scale);
+        try std.testing.expectEqual(expected.nullable, actual.nullable);
+    }
 }

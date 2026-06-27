@@ -10362,6 +10362,75 @@ test "db SA ABI creates ingests updates and scans raw columns" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(handle));
 }
 
+test "db SA ABI memory root supports index write tx and coltx flows" {
+    const root = ":memory:abi_tx_coltx";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    ;
+
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "mem_members.sadb-schema".ptr, "mem_members.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    var ids = [_]u64{ 1, 2 };
+    var points = [_]u64{ 10, 20 };
+    const cols = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids), .len = @sizeOf(@TypeOf(ids)) },
+        .{ .data = @ptrCast(&points), .len = @sizeOf(@TypeOf(points)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_ingest_columns(root.ptr, root.len, "mem_members".ptr, "mem_members".len, ids.len, &cols, cols.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_create_u64_index(root.ptr, root.len, "mem_members".ptr, "mem_members".len, 0, 1, &info));
+
+    var read_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &read_handle));
+    var found: u64 = 0;
+    var row_index: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(read_handle, 0, 2, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 1), row_index);
+    var value: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(read_handle, 1, row_index, &value));
+    try std.testing.expectEqual(@as(u64, 20), value);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+
+    var tx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_begin(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &tx_handle));
+    var row: [16]u8 = undefined;
+    std.mem.writeInt(u64, row[0..8], 3, .little);
+    std.mem.writeInt(u64, row[8..16], 30, .little);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_insert_row(tx_handle, &row, row.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_tx_commit(tx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 3), info.row_count);
+
+    var coltx_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_begin(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &coltx_handle));
+    var ids2 = [_]u64{4};
+    var points2 = [_]u64{40};
+    const cols2 = [_]SaDbColumnInput{
+        .{ .data = @ptrCast(&ids2), .len = @sizeOf(@TypeOf(ids2)) },
+        .{ .data = @ptrCast(&points2), .len = @sizeOf(@TypeOf(points2)) },
+    };
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_add_columns(coltx_handle, ids2.len, &cols2, cols2.len));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_coltx_commit(coltx_handle, &info));
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
+
+    read_handle = null;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_open_read_table(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &read_handle));
+    var sum: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_sum_u64_handle(read_handle, 1, &sum));
+    try std.testing.expectEqual(@as(u64, 100), sum);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_find_u64_handle(read_handle, 0, 4, &found, &row_index));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 3), row_index);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_get_u64_handle(read_handle, 1, row_index, &value));
+    try std.testing.expectEqual(@as(u64, 40), value);
+    try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
+
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &info));
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
+}
+
 test "db SA ABI exports packed null bitmap from logical null_bitmap column" {
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();

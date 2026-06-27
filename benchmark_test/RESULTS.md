@@ -214,21 +214,21 @@ raw，对应中位数如下：
 
 | 操作 | db 插件 | SQLite | 最快 |
 | --- | ---: | ---: | --- |
-| init indexed ERP tables | 1.250-1.542 ms, 中位数 1.373 ms | 0.749-1.002 ms, 中位数 0.976 ms | SQLite |
-| baseline ingest before indexes | 4.692-5.796 ms, 中位数 4.916 ms | 63.531-78.677 ms, 中位数 69.191 ms | db 插件约 14.1x |
-| build baseline indexes | 8.661-9.740 ms, 中位数 9.182 ms | 19.983-29.090 ms, 中位数 21.688 ms | db 插件约 2.4x |
-| append with tx + incremental indexes | 2.089-2.685 ms, 中位数 2.364 ms | 3.978-5.300 ms, 中位数 4.573 ms* | db 插件约 1.9x |
-| append with coltx + incremental indexes | 1.615-2.220 ms, 中位数 1.968 ms | 3.978-5.300 ms, 中位数 4.573 ms* | db 插件约 2.3x |
-| total append chain | 3.803-4.905 ms, 中位数 4.331 ms | 3.978-5.300 ms, 中位数 4.573 ms | db 插件约 1.1x |
-| verify/integrity | 0.945-1.433 ms, 中位数 1.054 ms | 32.360-44.293 ms, 中位数 35.214 ms | db 插件约 33.4x |
+| init indexed ERP tables | 1.461-2.482 ms, 中位数 1.545 ms | 0.791-1.312 ms, 中位数 1.065 ms | SQLite |
+| baseline ingest before indexes | 4.659-6.454 ms, 中位数 5.313 ms | 63.791-110.798 ms, 中位数 70.704 ms | db 插件约 13.3x |
+| build baseline indexes | 8.518-12.136 ms, 中位数 9.845 ms | 22.207-29.889 ms, 中位数 23.896 ms | db 插件约 2.4x |
+| append with tx + incremental indexes | 2.188-2.562 ms, 中位数 2.350 ms | 4.628-7.226 ms, 中位数 5.141 ms* | db 插件约 2.2x |
+| append with coltx + incremental indexes | 1.604-1.943 ms, 中位数 1.741 ms | 4.628-7.226 ms, 中位数 5.141 ms* | db 插件约 3.0x |
+| total append chain | 3.931-4.505 ms, 中位数 3.986 ms | 4.628-7.226 ms, 中位数 5.141 ms | db 插件约 1.3x |
+| verify/integrity | 0.932-1.080 ms, 中位数 1.062 ms | 34.593-46.971 ms, 中位数 35.797 ms | db 插件约 33.7x |
 
 `*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
 
 这一轮比前一版更进一步：
 - db 仍然稳定领先 baseline ingest、index build、单段 `tx` append、单段 `coltx` append 和 verify；
-- init 中位数这次仍然没有领先 SQLite，说明初始化固定成本还需要继续压；
-- 把 `tx + coltx` 两段合并成 ERP 整条 append 链路后，db 的中位数已经从 `5.083 ms` 进一步降到 `4.331 ms`，反超 SQLite 的 `4.573 ms`；
-- 最重要的是，这个收益是在保留前面 arena 生命周期崩溃修复和新增回归测试的前提下拿到的，不是以牺牲稳定性换数字。
+- empty unsafe bootstrap 现在把 `meta`、`schema`、dict artifact 都延迟到第一次真实持久化写入，同时在那之前仍然能从 cache 正确完成 dict lookup；
+- 把 `tx + coltx` 两段合并成 ERP 整条 append 链路后，db 的中位数已经进一步压到 `3.986 ms`，继续领先 SQLite 的 `5.141 ms`；
+- init 中位数这次仍然没有领先 SQLite，而且 db 侧样本波动比 SQLite 更大，说明初始化固定成本还需要继续压，当前还不能宣称全面领先。
 
 ## 结论
 
