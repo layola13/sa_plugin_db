@@ -1370,12 +1370,15 @@ that capacity.
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
 
 This rerun matters for three reasons. First, the empty-table unsafe bootstrap
-now defers `meta`, `schema`, dict artifacts, and direct unindexed blob-store
-artifacts until the first real persisting write, while still serving cached dict
-and blob reads before that point. Second, the benchmark-driven unsafe-init cache
-lifetime fix remains in place: the cache owns its own copy of `TableMeta`,
-pending dict/blob bytes, and schema source, with regression coverage for
-allocator teardown and latest-epoch blob materialization. Third, the remove fast
+now defers `meta`, `schema`, dict artifacts, empty index artifacts, and direct
+unindexed blob-store artifacts until the first real persisting write, while
+still serving cached dict and blob reads before that point. Empty indexes created
+before the first row stay in the bootstrap metadata and materialize their index
+files when the first indexed write publishes rows. Second, the
+benchmark-driven unsafe-init cache lifetime fix remains in place: the cache owns
+its own copy of `TableMeta`, pending dict/blob bytes, and schema source, with
+regression coverage for allocator teardown, first indexed write materialization,
+and latest-epoch blob materialization. Third, the remove fast
 path no longer performs a second recovered-meta scan after `loadActiveMeta()` has
 already exhausted active, unsafe-cache, compat, and recovered metadata sources;
 the unsafe not-found remove path now uses one root scan for recovered metadata

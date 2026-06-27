@@ -2926,6 +2926,11 @@ fn createIndexesForTableLocked(
     assigned_indexes = true;
     meta.epoch += 1;
 
+    if (canDeferUnsafeBootstrapMeta(meta.*)) {
+        try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta.*, &.{}, &.{});
+        return tableInfo(meta.*);
+    }
+
     for (old_indexes.len..meta.indexes.len) |idx| {
         try rebuildIndexAt(allocator, root_dir, meta, idx);
     }
@@ -9760,6 +9765,10 @@ fn tryAppendIndexesForAppendedRows(
             const kind = singleIndexKindFromName(index.kind) orelse return TableError.InvalidFormat;
             const appended = try buildSingleIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), kind, index.unique, in_memory_columns, column_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
@@ -9790,6 +9799,10 @@ fn tryAppendIndexesForAppendedRows(
             const column_index2 = try indexColumnIndex2(index.*);
             const appended = try buildU64PairIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), column_index2, index.unique, in_memory_columns, column_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readU64PairIndexTailEntry(allocator, root_dir, index.*);
@@ -9821,6 +9834,10 @@ fn tryAppendIndexesForAppendedRows(
             const column_index2 = try indexColumnIndex2(index.*);
             const appended = try buildU64I64PairIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), column_index2, index.unique, in_memory_columns, column_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readU64PairIndexTailEntry(allocator, root_dir, index.*);
@@ -9852,6 +9869,10 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobEqIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, index.unique, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
@@ -9882,6 +9903,10 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobTokenIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
@@ -9912,6 +9937,10 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobPrefixIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
@@ -9942,6 +9971,10 @@ fn tryAppendIndexesForAppendedRows(
             const store_name = try indexBlobStoreName(index.*);
             const appended = try buildBlobContainsIndexBytesForSegment(allocator, root_dir, meta.*, segment, previous_row_count, @intCast(index.column_index), store_name, in_memory_columns, column_cache, &blob_cache);
             defer allocator.free(appended);
+            if (index.bytes == 0) {
+                try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, appended);
+                continue;
+            }
             if (allow_unsafe_index_io and index.bytes != 0) {
                 if (appended.len != 0) {
                     const existing_tail = try readSingleIndexTailEntry(allocator, root_dir, index.*);
@@ -20186,6 +20219,68 @@ test "table unsafe init cache serves first direct row insert bootstrap" {
     const found = try snapshotFindU64(snapshot, 0, 7);
     try std.testing.expect(found.found);
     try std.testing.expectEqual(@as(u64, 0), found.row_index);
+}
+
+test "table unsafe init defers empty index artifacts until first indexed write" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_index_bootstrap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_index_bootstrap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists("unsafe_index_bootstrap.sadb-schema"));
+
+    const indexed = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+    try std.testing.expectEqual(@as(u64, 0), indexed.row_count);
+    try std.testing.expectEqual(@as(u64, 1), indexed.epoch);
+    try std.testing.expect(!fileExists(meta_path));
+    try std.testing.expect(!fileExists("unsafe_index_bootstrap.sadb-schema"));
+
+    var bootstrap = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer bootstrap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), bootstrap.indexes.len);
+    try std.testing.expectEqual(@as(u64, 0), bootstrap.indexes[0].bytes);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap.indexes[0].path.len);
+
+    var row = [_]u64{ 7, 70 };
+    const inserted = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expectEqual(@as(u64, 1), inserted.row_count);
+    try std.testing.expectEqual(@as(u64, 2), inserted.epoch);
+    try std.testing.expect(fileExists(meta_path));
+    try std.testing.expect(fileExists("unsafe_index_bootstrap.sadb-schema"));
+
+    var persisted = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer persisted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), persisted.indexes.len);
+    try std.testing.expectEqual(@as(u64, 16), persisted.indexes[0].bytes);
+    try std.testing.expect(persisted.indexes[0].path.len != 0);
+    const index_path = try activePath(std.testing.allocator, ".", persisted.indexes[0].path);
+    defer std.testing.allocator.free(index_path);
+    try std.testing.expect(fileExists(index_path));
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    const found = try snapshotFindU64(snapshot, 0, 7);
+    try std.testing.expect(found.found);
+    try std.testing.expectEqual(@as(u64, 0), found.row_index);
+
+    try std.testing.expectError(TableError.ConstraintViolation, insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..])));
 }
 
 test "table unsafe init defers empty blob store until first persisting write" {
