@@ -2527,6 +2527,21 @@ fn loadWritableMeta(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableMeta {
+    if (skipDurabilitySync()) {
+        return loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
+            TableError.NotFound => {
+                if (try unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
+                const source = loadRecoveredActiveMetaSource(allocator, root_dir, table_name) catch |recover_err| switch (recover_err) {
+                    TableError.NotFound => return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name),
+                    else => return recover_err,
+                };
+                defer allocator.free(source);
+                return parseOwnedTableMeta(allocator, source, table_name);
+            },
+            else => return err,
+        };
+    }
+
     return loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
         TableError.NotFound => {
             if (try unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
@@ -2534,6 +2549,45 @@ fn loadWritableMeta(
         },
         else => return err,
     };
+}
+
+fn appendRawColumnsWithLoadedMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    row_count: u64,
+    columns: []const RawColumnBytes,
+) TableError!TableInfo {
+    if (meta.locked) return TableError.Locked;
+    if (columns.len != meta.columns.len) return TableError.InvalidFormat;
+    const total_rows = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
+    if (total_rows > meta.max_rows) return TableError.CursorOverflow;
+
+    for (columns, 0..) |column, idx| {
+        const expected_len = std.math.mul(u64, row_count, meta.columns[idx].stride) catch return TableError.CursorOverflow;
+        if (column.bytes.len != expected_len) return TableError.InvalidFormat;
+    }
+
+    const previous_row_count = meta.row_count;
+    if (skipDurabilitySync() and meta.segments.len != 0) {
+        const base_segment = meta.segments[meta.segments.len - 1];
+        const appended_segment = SegmentMeta{
+            .id = base_segment.id,
+            .rows = row_count,
+            .files = base_segment.files,
+        };
+        try appendRawColumnsToLastSegmentUnsafe(allocator, root_dir, meta, columns, row_count);
+        const incremental_ok = try tryAppendIndexesForAppendedRows(allocator, root_dir, meta, appended_segment, previous_row_count, row_count, columns);
+        if (!incremental_ok) try rebuildIndexes(allocator, root_dir, meta);
+    } else {
+        try appendRawSegmentToMeta(allocator, root_dir, table_name, meta, columns, row_count);
+        const incremental_ok = try tryAppendIndexesForSegment(allocator, root_dir, meta, meta.segments.len - 1, previous_row_count, columns);
+        if (!incremental_ok) try rebuildIndexes(allocator, root_dir, meta);
+    }
+
+    try writeMeta(allocator, root_dir, table_name, meta.*);
+    return tableInfo(meta.*);
 }
 
 fn verifySchemaAgainstMeta(schema_obj: schema.Schema, meta: TableMeta) TableError!void {
@@ -3767,16 +3821,21 @@ pub fn initTableFromSchemaBytes(
         try writeGeneratedIface(allocator, root_dir, schema_obj);
     }
 
+    if (skipDurabilitySync()) {
+        const schema_hash = try hashHexAlloc(allocator, schema_source);
+        defer allocator.free(schema_hash);
+        var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
+        defer meta.deinit(allocator);
+        const info = tableInfo(meta);
+        try unsafeInitCachePut(allocator, root_dir, schema_obj.table_name, meta);
+        return info;
+    }
+
     const schema_hash = try hashHexAlloc(allocator, schema_source);
     defer allocator.free(schema_hash);
 
     var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
     defer meta.deinit(allocator);
-    if (skipDurabilitySync()) {
-        const info = tableInfo(meta);
-        try unsafeInitCachePut(allocator, root_dir, schema_obj.table_name, meta);
-        return info;
-    }
     try writeMeta(allocator, root_dir, schema_obj.table_name, meta);
     return tableInfo(meta);
 }
@@ -3808,22 +3867,7 @@ fn ingestRawColumnsUnlocked(
 ) TableError!TableInfo {
     var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
-
-    if (meta.locked) return TableError.Locked;
-    if (columns.len != meta.columns.len) return TableError.InvalidFormat;
-    const total_rows = std.math.add(u64, meta.row_count, row_count) catch return TableError.CursorOverflow;
-    if (total_rows > meta.max_rows) return TableError.CursorOverflow;
-
-    for (columns, 0..) |column, idx| {
-        const expected_len = std.math.mul(u64, row_count, meta.columns[idx].stride) catch return TableError.CursorOverflow;
-        if (column.bytes.len != expected_len) return TableError.InvalidFormat;
-    }
-
-    try appendRawSegmentToMeta(allocator, root_dir, table_name, &meta, columns, row_count);
-    try rebuildIndexes(allocator, root_dir, &meta);
-    try writeMeta(allocator, root_dir, table_name, meta);
-
-    return tableInfo(meta);
+    return appendRawColumnsWithLoadedMeta(allocator, root_dir, table_name, &meta, row_count, columns);
 }
 
 pub fn ingestRawColumns(
@@ -3992,12 +4036,12 @@ pub fn insertRawRow(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const columns = try splitRawRowColumns(allocator, meta, row_bytes);
     defer allocator.free(columns);
 
-    return try ingestRawColumnsUnlocked(allocator, root_dir, table_name, 1, columns);
+    return try appendRawColumnsWithLoadedMeta(allocator, root_dir, table_name, &meta, 1, columns);
 }
 
 fn fixedRowBytes(meta: TableMeta) TableError!usize {
@@ -18884,6 +18928,43 @@ test "table unsafe init cache survives init allocator teardown before ingest" {
 
     const verified = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+}
+
+test "table unsafe init cache serves first direct row insert bootstrap" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_insert_row_bootstrap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_insert_row_bootstrap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    try std.testing.expect(!fileExists(meta_path));
+
+    var row = [_]u64{ 7, 11 };
+    const inserted = try insertRawRow(std.testing.allocator, ".", table_name, std.mem.sliceAsBytes(row[0..]));
+    try std.testing.expectEqual(@as(u64, 1), inserted.row_count);
+    try std.testing.expectEqual(@as(u64, 1), inserted.epoch);
+    try std.testing.expect(fileExists(meta_path));
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    const found = try snapshotFindU64(snapshot, 0, 7);
+    try std.testing.expect(found.found);
+    try std.testing.expectEqual(@as(u64, 0), found.row_index);
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {

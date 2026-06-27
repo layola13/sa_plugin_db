@@ -210,25 +210,25 @@ raw，对应中位数如下：
 
 2026-06-27 在 lazy append index maintenance、事务字典缓冲、批量 `dict intern many` 之后，继续加入 unsafe init 延迟空 meta 持久化，以及“同进程 init 后首次写入”直接复用内存里的初始 `TableMeta`。随后在 indexed ERP benchmark 中撞出一个真实稳定性问题：`sa_db_init_schema` 用临时 arena 初始化时，unsafe init cache 直接保存了 arena 生命周期内的 `TableMeta`，首个写入路径可能在 `unsafeInitCacheDelete()` 比较缓存 key 时踩到悬垂内存并崩溃。修正后，cache 现在统一复制到独立长期 allocator 上，并新增了“init allocator teardown 后再 ingest”回归测试。
 
-修正后重新顺序跑了 5 次 db 和 5 次 SQLite 对照。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+同日继续把真正的首写路径再顺了一次：unsafe 模式下 `loadWritableMeta()` 不再先经 `loadActiveMeta()` 做一次 `unsafeInitCachePeek()`，而是优先直接 `unsafeInitCacheTake()`；`insertRawRow()` 也改成一次 writable meta 装载后直接落到共享 append helper，避免首写前额外重复装载 meta。随后重新顺序跑了 5 次 db 和 5 次 SQLite 对照。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
 
 | 操作 | db 插件 | SQLite | 最快 |
 | --- | ---: | ---: | --- |
-| init indexed ERP tables | 0.938-1.295 ms, 中位数 1.179 ms | 0.750-1.092 ms, 中位数 0.864 ms | SQLite |
-| baseline ingest before indexes | 4.978-9.314 ms, 中位数 6.148 ms | 61.414-97.454 ms, 中位数 77.166 ms | db 插件约 12.6x |
-| build baseline indexes | 9.181-14.401 ms, 中位数 10.941 ms | 18.911-33.148 ms, 中位数 20.417 ms | db 插件约 1.9x |
-| append with tx + incremental indexes | 2.695-3.309 ms, 中位数 2.953 ms | 4.273-7.182 ms, 中位数 4.594 ms* | db 插件约 1.6x |
-| append with coltx + incremental indexes | 1.795-2.328 ms, 中位数 2.092 ms | 4.273-7.182 ms, 中位数 4.594 ms* | db 插件约 2.2x |
-| total append chain | 4.765-5.360 ms, 中位数 5.083 ms | 4.273-7.182 ms, 中位数 4.594 ms | SQLite 约 1.1x |
-| verify/integrity | 1.219-1.354 ms, 中位数 1.296 ms | 33.031-52.130 ms, 中位数 34.846 ms | db 插件约 26.9x |
+| init indexed ERP tables | 1.250-1.542 ms, 中位数 1.373 ms | 0.749-1.002 ms, 中位数 0.976 ms | SQLite |
+| baseline ingest before indexes | 4.692-5.796 ms, 中位数 4.916 ms | 63.531-78.677 ms, 中位数 69.191 ms | db 插件约 14.1x |
+| build baseline indexes | 8.661-9.740 ms, 中位数 9.182 ms | 19.983-29.090 ms, 中位数 21.688 ms | db 插件约 2.4x |
+| append with tx + incremental indexes | 2.089-2.685 ms, 中位数 2.364 ms | 3.978-5.300 ms, 中位数 4.573 ms* | db 插件约 1.9x |
+| append with coltx + incremental indexes | 1.615-2.220 ms, 中位数 1.968 ms | 3.978-5.300 ms, 中位数 4.573 ms* | db 插件约 2.3x |
+| total append chain | 3.803-4.905 ms, 中位数 4.331 ms | 3.978-5.300 ms, 中位数 4.573 ms | db 插件约 1.1x |
+| verify/integrity | 0.945-1.433 ms, 中位数 1.054 ms | 32.360-44.293 ms, 中位数 35.214 ms | db 插件约 33.4x |
 
 `*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
 
-这一轮比前一版结论更严谨：
+这一轮比前一版更进一步：
 - db 仍然稳定领先 baseline ingest、index build、单段 `tx` append、单段 `coltx` append 和 verify；
-- init 中位数这次没有领先 SQLite，说明首写 bootstrap 优化虽然把量级压下来了，但初始化固定成本还没完全压平；
-- 把 `tx + coltx` 两段合并成 ERP 整条 append 链路后，SQLite 的中位数仍然更低，因此现在还不能声称 indexed ERP 写入已经“全部领先”；
-- 最重要的是，这轮修掉了一个 benchmark 实打实打出来的 arena 生命周期崩溃，而不是只改善了性能数字。
+- init 中位数这次仍然没有领先 SQLite，说明初始化固定成本还需要继续压；
+- 把 `tx + coltx` 两段合并成 ERP 整条 append 链路后，db 的中位数已经从 `5.083 ms` 进一步降到 `4.331 ms`，反超 SQLite 的 `4.573 ms`；
+- 最重要的是，这个收益是在保留前面 arena 生命周期崩溃修复和新增回归测试的前提下拿到的，不是以牺牲稳定性换数字。
 
 ## 结论
 

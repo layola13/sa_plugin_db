@@ -1323,36 +1323,38 @@ Summary:
 
 ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
 maintenance, buffered transaction dictionary writes, batched dictionary intern,
-deferred unsafe-init meta persistence, first-write bootstrap cache reuse, and a
-follow-up fix for the unsafe-init cache ownership bug exposed by the benchmark:
+deferred unsafe-init meta persistence, first-write bootstrap cache reuse, the
+unsafe-init cache ownership fix, and a follow-up fix so first true write paths
+consume bootstrap metadata directly instead of peek-copying it first:
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 0.938-1.295 ms, median 1.179 ms | 0.750-1.092 ms, median 0.864 ms | SQLite |
-| ingest ERP rows | 4.978-9.314 ms, median 6.148 ms | 61.414-97.454 ms, median 77.166 ms | db plugin |
-| build ERP indexes | 9.181-14.401 ms, median 10.941 ms | 18.911-33.148 ms, median 20.417 ms | db plugin |
-| tx append, orders + invoices | 2.695-3.309 ms, median 2.953 ms | 4.273-7.182 ms, median 4.594 ms* | db plugin |
-| coltx append, order lines | 1.795-2.328 ms, median 2.092 ms | 4.273-7.182 ms, median 4.594 ms* | db plugin |
-| total append chain | 4.765-5.360 ms, median 5.083 ms | 4.273-7.182 ms, median 4.594 ms | SQLite |
-| verify/integrity | 1.219-1.354 ms, median 1.296 ms | 33.031-52.130 ms, median 34.846 ms | db plugin |
+| init 3 ERP tables + dicts | 1.250-1.542 ms, median 1.373 ms | 0.749-1.002 ms, median 0.976 ms | SQLite |
+| ingest ERP rows | 4.692-5.796 ms, median 4.916 ms | 63.531-78.677 ms, median 69.191 ms | db plugin |
+| build ERP indexes | 8.661-9.740 ms, median 9.182 ms | 19.983-29.090 ms, median 21.688 ms | db plugin |
+| tx append, orders + invoices | 2.089-2.685 ms, median 2.364 ms | 3.978-5.300 ms, median 4.573 ms* | db plugin |
+| coltx append, order lines | 1.615-2.220 ms, median 1.968 ms | 3.978-5.300 ms, median 4.573 ms* | db plugin |
+| total append chain | 3.803-4.905 ms, median 4.331 ms | 3.978-5.300 ms, median 4.573 ms | db plugin |
+| verify/integrity | 0.945-1.433 ms, median 1.054 ms | 32.360-44.293 ms, median 35.214 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
 
-This rerun matters for two reasons. First, steady-state indexed write costs are
-still where the db plugin is strongest: baseline ingest, batched index build,
-individual `tx` append, individual `coltx` append, and verify all remain ahead
-of SQLite. Second, the benchmark found a real stability bug: unsafe init cached
-`TableMeta` using allocator-owned memory from `sa_db_init_schema`'s temporary
-arena, which could crash on the next first-write path. The cache now owns its
-own copy, and regression coverage includes the allocator-teardown case.
+This rerun matters for two reasons. First, the first-write bootstrap path is no
+longer paying an extra peek-copy before a real mutation, and that is enough to
+move the full ERP append chain median ahead of SQLite while also improving
+baseline ingest, index build, both append subpaths, and verify. Second, the
+benchmark-driven unsafe-init cache lifetime fix remains in place: the cache now
+owns its own copy of `TableMeta`, and regression coverage includes the
+allocator-teardown case.
 
 The remaining gaps are now narrower and more specific:
 
 - init median still trails SQLite;
-- the combined append wall clock for the whole ERP chain still trails SQLite,
-  even though each db subpath is individually faster;
-- there is still no basis to claim全面领先 on the indexed ERP write benchmark.
+- this benchmark is now ahead on the indexed write chain itself, but that does
+  not generalize to all startup-sensitive workloads;
+- there is still no basis to claim全面领先 across every benchmark category while
+  init remains behind SQLite.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 
