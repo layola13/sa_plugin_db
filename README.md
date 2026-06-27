@@ -1334,16 +1334,18 @@ unsafe-path `.write.lock` file creation. The same day, the unsafe empty-table
 bootstrap path was extended to direct unindexed blob-store writes and the remove
 fast path dropped redundant recovered-meta scans and merged the unsafe not-found
 remove cleanup into one directory pass:
+The next pass deferred the empty-bootstrap `schema_path` string as well; the
+path is filled only when the first real persisting write materializes meta.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.407-1.569 ms, median 1.507 ms | 0.840-1.348 ms, median 0.966 ms | SQLite |
-| ingest ERP rows | 4.911-5.519 ms, median 5.212 ms | 59.753-75.525 ms, median 70.698 ms | db plugin |
-| build ERP indexes | 8.573-10.291 ms, median 9.611 ms | 19.998-24.267 ms, median 21.246 ms | db plugin |
-| tx append, orders + invoices | 2.573-3.115 ms, median 2.577 ms | 4.474-9.344 ms, median 5.059 ms* | db plugin |
-| coltx append, order lines | 1.675-1.892 ms, median 1.742 ms | 4.474-9.344 ms, median 5.059 ms* | db plugin |
-| total append chain | 4.309-4.790 ms, median 4.469 ms | 4.474-9.344 ms, median 5.059 ms | db plugin |
-| verify/integrity | 1.001-1.328 ms, median 1.113 ms | 33.446-39.843 ms, median 36.915 ms | db plugin |
+| init 3 ERP tables + dicts | 1.322-1.968 ms, median 1.424 ms | 1.028-1.313 ms, median 1.052 ms | SQLite |
+| ingest ERP rows | 4.968-6.312 ms, median 6.065 ms | 77.038-145.649 ms, median 101.117 ms | db plugin |
+| build ERP indexes | 9.368-10.980 ms, median 9.484 ms | 24.123-101.663 ms, median 30.403 ms | db plugin |
+| tx append, orders + invoices | 2.302-2.851 ms, median 2.718 ms | 3.972-89.651 ms, median 6.474 ms* | db plugin |
+| coltx append, order lines | 1.787-2.154 ms, median 2.096 ms | 3.972-89.651 ms, median 6.474 ms* | db plugin |
+| total append chain | 4.184-4.872 ms, median 4.846 ms | 3.972-89.651 ms, median 6.474 ms | db plugin |
+| verify/integrity | 1.076-1.338 ms, median 1.203 ms | 36.269-119.048 ms, median 46.887 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
@@ -1359,13 +1361,14 @@ path no longer performs a second recovered-meta scan after `loadActiveMeta()` ha
 already exhausted active, unsafe-cache, compat, and recovered metadata sources;
 the unsafe not-found remove path now uses one root scan for recovered metadata
 and stale artifact cleanup. In this sample, `db_erp_indexed_init_remove_ns`
-dropped to `0.342-0.547 ms`, median `0.366 ms`.
+dropped to `0.349-0.585 ms`, median `0.400 ms`, and the schema component
+landed at `0.955-1.335 ms`, median `1.002 ms`.
 
 The remaining gaps are now narrower and more specific:
 
 - init median still trails SQLite even after the latest bootstrap reductions;
 - this sample set puts db ahead on full append-chain median
-  (`4.469 ms` vs. `5.059 ms`), but init is still the gating gap;
+  (`4.846 ms` vs. `6.474 ms`), but init is still the gating gap;
 - there is still no basis to claim全面领先 across every benchmark category while
   init remains behind SQLite.
 

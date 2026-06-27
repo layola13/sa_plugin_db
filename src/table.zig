@@ -1736,7 +1736,7 @@ fn unsafeInitCacheBuildInitialMetaOwned(
 
     var schema_obj = schema.compileInitFast(arena.allocator(), schema_source, schema_path_hint) catch |err| return mapSchemaError(err);
     const schema_hash = try arena.allocator().alloc(u8, 0);
-    const schema_path = try schemaMetaPath(arena.allocator(), root_dir, schema_obj.table_name);
+    const schema_path = try arena.allocator().alloc(u8, 0);
 
     var write_lock = try acquireTableWriteLock(allocator, root_dir, schema_obj.table_name);
     defer write_lock.release();
@@ -4730,7 +4730,14 @@ fn writeCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
 
     var persisted = meta;
     var owned_hash: ?[]u8 = null;
+    var owned_schema_path: ?[]u8 = null;
     defer if (owned_hash) |hash| allocator.free(hash);
+    defer if (owned_schema_path) |path| allocator.free(path);
+    if (persisted.schema_path.len == 0) {
+        const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
+        owned_schema_path = schema_path;
+        persisted.schema_path = schema_path;
+    }
     if (persisted.schema_hash.len == 0) {
         const schema_source = (try unsafeInitCacheSchemaSource(allocator, root_dir, table_name)) orelse blk: {
             const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
@@ -19890,6 +19897,7 @@ test "table unsafe init defers empty meta until first write" {
 
     var bootstrap = try loadActiveMeta(std.testing.allocator, ".", table_name);
     defer bootstrap.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), bootstrap.schema_path.len);
     try std.testing.expectEqual(@as(usize, 0), bootstrap.schema_hash.len);
 
     const values = [_][]const u8{ "active", "paused" };
@@ -19958,6 +19966,7 @@ test "table unsafe init cache serves first write transaction bootstrap" {
 
     var persisted = try loadActiveMeta(std.testing.allocator, ".", table_name);
     defer persisted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("unsafe_tx_bootstrap.sadb-schema", std.fs.path.basename(persisted.schema_path));
     try std.testing.expectEqual(@as(usize, 64), persisted.schema_hash.len);
 
     const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
