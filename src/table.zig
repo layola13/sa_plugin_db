@@ -7,6 +7,7 @@ var unsafe_no_sync_state = std.atomic.Value(u8).init(0);
 var unsafe_init_meta_cache_mutex: std.Thread.Mutex = .{};
 var unsafe_init_meta_cache_next_slot: usize = 0;
 var unsafe_init_meta_cache = [_]?UnsafeInitMetaCacheEntry{null} ** 4;
+const unsafe_init_cache_allocator = std.heap.page_allocator;
 const UNSAFE_NO_SYNC_ENV = "SA_DB_UNSAFE_NO_SYNC";
 const FILE_BLOCK_BYTES: usize = 64 * 1024;
 const COLTX_INLINE_BYTES_LIMIT: usize = 128 * 1024;
@@ -1101,7 +1102,7 @@ pub fn loadActiveMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     if (skipDurabilitySync()) {
         return loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
             TableError.NotFound => {
-                if (unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
+                if (try unsafeInitCachePeek(allocator, root_dir, table_name)) |meta| return meta;
                 const source = loadRecoveredActiveMetaSource(allocator, root_dir, table_name) catch |recover_err| switch (recover_err) {
                     TableError.NotFound => return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name),
                     else => return recover_err,
@@ -1237,23 +1238,24 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
     };
 }
 
-fn freeUnsafeInitCacheEntry(allocator: std.mem.Allocator, entry: *UnsafeInitMetaCacheEntry) void {
-    allocator.free(entry.root_dir);
-    allocator.free(entry.table_name);
-    entry.meta.deinit(allocator);
+fn freeUnsafeInitCacheEntry(entry: *UnsafeInitMetaCacheEntry) void {
+    unsafe_init_cache_allocator.free(entry.root_dir);
+    unsafe_init_cache_allocator.free(entry.table_name);
+    entry.meta.deinit(unsafe_init_cache_allocator);
 }
 
 fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
     if (!skipDurabilitySync()) return;
 
-    const owned_root = try allocator.dupe(u8, root_dir);
-    errdefer allocator.free(owned_root);
-    const owned_table = try allocator.dupe(u8, table_name);
-    errdefer allocator.free(owned_table);
-    const owned_meta = try duplicateTableMeta(allocator, meta);
+    _ = allocator;
+    const owned_root = try unsafe_init_cache_allocator.dupe(u8, root_dir);
+    errdefer unsafe_init_cache_allocator.free(owned_root);
+    const owned_table = try unsafe_init_cache_allocator.dupe(u8, table_name);
+    errdefer unsafe_init_cache_allocator.free(owned_table);
+    const owned_meta = try duplicateTableMeta(unsafe_init_cache_allocator, meta);
     errdefer {
         var cleanup_meta = owned_meta;
-        cleanup_meta.deinit(allocator);
+        cleanup_meta.deinit(unsafe_init_cache_allocator);
     }
 
     unsafe_init_meta_cache_mutex.lock();
@@ -1262,7 +1264,7 @@ fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_
     for (&unsafe_init_meta_cache) |*slot| {
         if (slot.*) |*entry| {
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            freeUnsafeInitCacheEntry(allocator, entry);
+            freeUnsafeInitCacheEntry(entry);
             slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
             return;
         }
@@ -1276,12 +1278,12 @@ fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_
     }
 
     const slot = &unsafe_init_meta_cache[unsafe_init_meta_cache_next_slot];
-    freeUnsafeInitCacheEntry(allocator, &(slot.*.?));
+    freeUnsafeInitCacheEntry(&(slot.*.?));
     slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
     unsafe_init_meta_cache_next_slot = (unsafe_init_meta_cache_next_slot + 1) % unsafe_init_meta_cache.len;
 }
 
-fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) ?TableMeta {
+fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?TableMeta {
     if (!skipDurabilitySync()) return null;
 
     unsafe_init_meta_cache_mutex.lock();
@@ -1291,9 +1293,8 @@ fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table
         if (slot.*) |*entry| {
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
 
-            const meta = entry.meta;
-            allocator.free(entry.root_dir);
-            allocator.free(entry.table_name);
+            const meta = try duplicateTableMeta(allocator, entry.meta);
+            freeUnsafeInitCacheEntry(entry);
             slot.* = null;
             return meta;
         }
@@ -1301,14 +1302,30 @@ fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table
     return null;
 }
 
+fn unsafeInitCachePeek(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?TableMeta {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            return try duplicateTableMeta(allocator, entry.meta);
+        }
+    }
+    return null;
+}
+
 fn unsafeInitCacheDelete(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    _ = allocator;
     unsafe_init_meta_cache_mutex.lock();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
         if (slot.*) |*entry| {
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            freeUnsafeInitCacheEntry(allocator, entry);
+            freeUnsafeInitCacheEntry(entry);
             slot.* = null;
         }
     }
@@ -2101,7 +2118,7 @@ pub fn createIndexes(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     return createIndexesForTableLocked(allocator, root_dir, table_name, &meta, requests);
 }
@@ -2512,7 +2529,7 @@ fn loadWritableMeta(
 ) TableError!TableMeta {
     return loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
         TableError.NotFound => {
-            if (unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
+            if (try unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
             return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name);
         },
         else => return err,
@@ -3756,8 +3773,9 @@ pub fn initTableFromSchemaBytes(
     var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
     defer meta.deinit(allocator);
     if (skipDurabilitySync()) {
+        const info = tableInfo(meta);
         try unsafeInitCachePut(allocator, root_dir, schema_obj.table_name, meta);
-        return tableInfo(meta);
+        return info;
     }
     try writeMeta(allocator, root_dir, schema_obj.table_name, meta);
     return tableInfo(meta);
@@ -4748,7 +4766,7 @@ pub fn beginWriteTransaction(
     var write_lock_transferred = false;
     errdefer if (!write_lock_transferred) write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     var meta_transferred = false;
     errdefer if (!meta_transferred) meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
@@ -5325,6 +5343,7 @@ pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransactio
     try flushPendingDictWrites(allocator, tx);
     if (unsafe_no_sync) {
         try writeCompatMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
+        unsafeInitCacheDelete(allocator, tx.root_dir, tx.table_name);
     } else {
         var written = try writeVersionedMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
         defer written.deinit(allocator);
@@ -5495,7 +5514,7 @@ pub fn internStringDict(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
 
@@ -5551,7 +5570,7 @@ pub fn internStringDictMany(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
 
@@ -5695,7 +5714,7 @@ pub fn putBlobValue(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     if (meta.locked) return TableError.Locked;
 
@@ -5778,7 +5797,7 @@ pub fn createU64Index(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const request = [_]CreateIndexRequest{.{
         .kind = .u64,
@@ -5798,7 +5817,7 @@ pub fn createI64Index(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const request = [_]CreateIndexRequest{.{
         .kind = .i64,
@@ -5839,7 +5858,7 @@ fn createSmallIntegerIndex(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const request_kind: CreateIndexKind = switch (kind) {
         .u8 => .u8,
@@ -5932,7 +5951,7 @@ pub fn createU64PairIndex(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const request = [_]CreateIndexRequest{.{
         .kind = .u64_pair,
@@ -5954,7 +5973,7 @@ pub fn createU64I64PairIndex(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var meta = try loadActiveMeta(allocator, root_dir, table_name);
+    var meta = try loadWritableMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const request = [_]CreateIndexRequest{.{
         .kind = .u64_i64_pair,
@@ -11734,7 +11753,7 @@ pub fn deleteU64Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11752,7 +11771,7 @@ pub fn deleteI64Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11770,7 +11789,7 @@ pub fn deleteU32Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueU32KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11788,7 +11807,7 @@ pub fn deleteI32Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueI32KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11806,7 +11825,7 @@ pub fn deleteU8Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueU8KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11824,7 +11843,7 @@ pub fn deleteI8Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueI8KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11842,7 +11861,7 @@ pub fn deleteU16Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueU16KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11860,7 +11879,7 @@ pub fn deleteI16Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueI16KeyRow(allocator, root_dir, owned, column_index, expected);
@@ -11880,7 +11899,7 @@ pub fn deleteU64PairKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueU64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
@@ -11900,7 +11919,7 @@ pub fn deleteU64I64PairKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueU64I64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
@@ -11919,7 +11938,7 @@ pub fn deleteBlobEqKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
@@ -11938,7 +11957,7 @@ pub fn updateRawRowU64Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU64KeyValue(owned, column_index, row_bytes);
@@ -11960,7 +11979,7 @@ pub fn updateRawRowI64Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI64KeyValue(owned, column_index, row_bytes);
@@ -11982,7 +12001,7 @@ pub fn updateRawRowU32Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU32KeyValue(owned, column_index, row_bytes);
@@ -12004,7 +12023,7 @@ pub fn updateRawRowI32Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI32KeyValue(owned, column_index, row_bytes);
@@ -12026,7 +12045,7 @@ pub fn updateRawRowU8Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU8KeyValue(owned, column_index, row_bytes);
@@ -12048,7 +12067,7 @@ pub fn updateRawRowI8Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI8KeyValue(owned, column_index, row_bytes);
@@ -12070,7 +12089,7 @@ pub fn updateRawRowU16Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU16KeyValue(owned, column_index, row_bytes);
@@ -12092,7 +12111,7 @@ pub fn updateRawRowI16Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI16KeyValue(owned, column_index, row_bytes);
@@ -12116,7 +12135,7 @@ pub fn updateRawRowU64PairKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU64PairKeyValue(owned, column_index, column_index2, row_bytes);
@@ -12140,7 +12159,7 @@ pub fn updateRawRowU64I64PairKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU64I64PairKeyValue(owned, column_index, column_index2, row_bytes);
@@ -12163,7 +12182,7 @@ pub fn updateRawRowBlobEqKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     try ensureRowBlobEqKeyValue(allocator, root_dir, owned, column_index, store_name, value, row_bytes);
@@ -12184,7 +12203,7 @@ pub fn upsertRawRowU64Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU64KeyValue(owned, column_index, row_bytes);
@@ -12221,7 +12240,7 @@ pub fn upsertRawRowI64Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI64KeyValue(owned, column_index, row_bytes);
@@ -12258,7 +12277,7 @@ pub fn upsertRawRowU32Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU32KeyValue(owned, column_index, row_bytes);
@@ -12295,7 +12314,7 @@ pub fn upsertRawRowI32Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI32KeyValue(owned, column_index, row_bytes);
@@ -12332,7 +12351,7 @@ pub fn upsertRawRowU8Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU8KeyValue(owned, column_index, row_bytes);
@@ -12369,7 +12388,7 @@ pub fn upsertRawRowI8Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI8KeyValue(owned, column_index, row_bytes);
@@ -12406,7 +12425,7 @@ pub fn upsertRawRowU16Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU16KeyValue(owned, column_index, row_bytes);
@@ -12443,7 +12462,7 @@ pub fn upsertRawRowI16Key(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowI16KeyValue(owned, column_index, row_bytes);
@@ -12482,7 +12501,7 @@ pub fn upsertRawRowU64PairKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU64PairKeyValue(owned, column_index, column_index2, row_bytes);
@@ -12521,7 +12540,7 @@ pub fn upsertRawRowU64I64PairKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     const key_value = try rowU64I64PairKeyValue(owned, column_index, column_index2, row_bytes);
@@ -12559,7 +12578,7 @@ pub fn upsertRawRowBlobEqKey(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     try ensureRowBlobEqKeyValue(allocator, root_dir, owned, column_index, store_name, value, row_bytes);
@@ -16034,7 +16053,7 @@ pub fn updateU64ColumnAdd(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     try ensureU64Column(owned, column_index);
@@ -16235,7 +16254,7 @@ pub fn lockTable(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     owned.locked = true;
     owned.epoch += 1;
@@ -16252,7 +16271,7 @@ pub fn unlockTable(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, owned);
     try validateIndexFiles(allocator, root_dir, owned);
@@ -16275,7 +16294,7 @@ pub fn compactTable(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
-    var owned = try loadActiveMeta(allocator, root_dir, table_name);
+    var owned = try loadWritableMeta(allocator, root_dir, table_name);
     defer owned.deinit(allocator);
     if (owned.locked) return TableError.Locked;
     if (owned.segments.len == 0) return tableInfo(owned);
@@ -18741,6 +18760,130 @@ test "table unsafe init cache serves first write transaction bootstrap" {
     const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
     try std.testing.expect(visible.found);
     try std.testing.expectEqual(@as(u64, 1), visible.id);
+}
+
+test "table unsafe init cache serves first coltx bootstrap" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_coltx_bootstrap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_coltx_bootstrap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    try std.testing.expect(!fileExists(meta_path));
+
+    const session = try beginColumnIngestSession(std.testing.allocator, ".", table_name);
+    defer destroyColumnIngestSession(std.testing.allocator, session);
+
+    var ids = [_]u64{1, 2};
+    var statuses = [_]u64{10, 20};
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(statuses[0..]) },
+    };
+    try columnIngestSessionAddRawColumns(std.testing.allocator, session, ids.len, &columns);
+    const committed = try commitColumnIngestSession(std.testing.allocator, session);
+    try std.testing.expectEqual(@as(u64, 2), committed.row_count);
+    try std.testing.expectEqual(@as(u64, 1), committed.epoch);
+    try std.testing.expect(fileExists(meta_path));
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+}
+
+test "table unsafe init cache survives read before first write bootstrap" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_read_then_write";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_read_then_write.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    try std.testing.expect(!fileExists(meta_path));
+
+    var peeked = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer peeked.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 0), peeked.row_count);
+    try std.testing.expect(!fileExists(meta_path));
+
+    const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    defer destroyWriteTransaction(std.testing.allocator, tx);
+    const interned = try writeTransactionInternStringDict(std.testing.allocator, tx, "status", "active");
+    try std.testing.expectEqual(@as(u64, 1), interned.id);
+    try std.testing.expect(interned.inserted);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 1), committed.epoch);
+    try std.testing.expect(fileExists(meta_path));
+
+    const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    try std.testing.expect(visible.found);
+    try std.testing.expectEqual(@as(u64, 1), visible.id);
+}
+
+test "table unsafe init cache survives init allocator teardown before ingest" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_arena_teardown_ingest";
+    {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        _ = try initTableFromSchemaBytes(arena.allocator(), ".", "unsafe_arena_teardown_ingest.sadb-schema",
+            \\#def MAX_ROWS = 8
+            \\#def COL_ID_STRIDE = 8 // u64
+            \\#def COL_STATUS_STRIDE = 8 // u64
+        );
+    }
+
+    var ids = [_]u64{ 1, 2 };
+    var statuses = [_]u64{ 10, 20 };
+    const columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(statuses[0..]) },
+    };
+    const info = try ingestRawColumns(std.testing.allocator, ".", table_name, ids.len, &columns);
+    try std.testing.expectEqual(@as(u64, 2), info.row_count);
+    try std.testing.expectEqual(@as(u64, 1), info.epoch);
+
+    const verified = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 2), verified.row_count);
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {

@@ -1323,27 +1323,36 @@ Summary:
 
 ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
 maintenance, buffered transaction dictionary writes, batched dictionary intern,
-deferred unsafe-init meta persistence, and first-write bootstrap cache reuse:
+deferred unsafe-init meta persistence, first-write bootstrap cache reuse, and a
+follow-up fix for the unsafe-init cache ownership bug exposed by the benchmark:
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 0.790-1.224 ms | 0.995-1.502 ms | db plugin median / mixed range |
-| ingest ERP rows | 5.582-6.564 ms | 72.138-87.125 ms | db plugin |
-| build ERP indexes | 9.708-12.164 ms | 23.139-33.717 ms | db plugin |
-| append ERP rows | 4.419-5.902 ms* | 4.614-5.880 ms | db plugin median / mixed range |
-| verify/integrity | 1.061-1.338 ms | 34.285-48.280 ms | db plugin |
+| init 3 ERP tables + dicts | 0.938-1.295 ms, median 1.179 ms | 0.750-1.092 ms, median 0.864 ms | SQLite |
+| ingest ERP rows | 4.978-9.314 ms, median 6.148 ms | 61.414-97.454 ms, median 77.166 ms | db plugin |
+| build ERP indexes | 9.181-14.401 ms, median 10.941 ms | 18.911-33.148 ms, median 20.417 ms | db plugin |
+| tx append, orders + invoices | 2.695-3.309 ms, median 2.953 ms | 4.273-7.182 ms, median 4.594 ms* | db plugin |
+| coltx append, order lines | 1.795-2.328 ms, median 2.092 ms | 4.273-7.182 ms, median 4.594 ms* | db plugin |
+| total append chain | 4.765-5.360 ms, median 5.083 ms | 4.273-7.182 ms, median 4.594 ms | SQLite |
+| verify/integrity | 1.219-1.354 ms, median 1.296 ms | 33.031-52.130 ms, median 34.846 ms | db plugin |
 
-`*` db append is split into indexed row-transaction append (`2.576-3.753 ms`)
-for orders/invoices and indexed column-transaction append (`1.842-2.360 ms`)
-for order lines. The summed append path stays ahead on median, while the sample
-range still overlaps SQLite.
+`*` SQLite side still exposes only one append benchmark path, so the same
+sample is shown against the db plugin's split `tx` and `coltx` subpaths.
 
-This rerun matters because the write path no longer falls back to O(N) index
-rebuilds for dictionary-only transactions, append-only indexed commits update
-existing index files incrementally in unsafe mode, and dictionary bootstrap now
-has a real batched API surfaced through both `.sai` and `.sal`. The remaining
-fixed-cost gap is concentrated in init variance rather than steady-state index
-build, append maintenance, or verify.
+This rerun matters for two reasons. First, steady-state indexed write costs are
+still where the db plugin is strongest: baseline ingest, batched index build,
+individual `tx` append, individual `coltx` append, and verify all remain ahead
+of SQLite. Second, the benchmark found a real stability bug: unsafe init cached
+`TableMeta` using allocator-owned memory from `sa_db_init_schema`'s temporary
+arena, which could crash on the next first-write path. The cache now owns its
+own copy, and regression coverage includes the allocator-teardown case.
+
+The remaining gaps are now narrower and more specific:
+
+- init median still trails SQLite;
+- the combined append wall clock for the whole ERP chain still trails SQLite,
+  even though each db subpath is individually faster;
+- there is still no basis to claim全面领先 on the indexed ERP write benchmark.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 
