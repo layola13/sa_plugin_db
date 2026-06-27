@@ -1370,28 +1370,30 @@ ownership fix, direct bootstrap-meta consumption on first true write, in-place
 unsafe bootstrap dict updates, removal of unsafe-path `.write.lock` file
 creation, delayed empty-index bootstrap artifacts, direct unindexed blob-store
 bootstrap, deferred bootstrap `schema_path`, the inline duplicate-def hash set
-inside `compileInitFast()`, the O(1) unsafe missing-root remove path, and inline
-ABI buffers for small `sa_db_dict_intern_many` batches. The reinstall step is
-important: SA benchmark executables call the installed plugin `libdb.so`, so a
-fresh Zig build alone is not enough to benchmark the current source tree.
+inside `compileInitFast()`, the O(1) unsafe missing-root remove path, inline ABI
+buffers for small `sa_db_dict_intern_many` batches, and the exact schema-source
+unsafe-init template cache for repeated same-schema init/remove/reinit paths. The
+reinstall step is important: SA benchmark executables call the installed plugin
+`libdb.so`, so a fresh Zig build alone is not enough to benchmark the current
+source tree. The ERP benchmark initializes each table schema once per process, so
+the template cache is covered by targeted regression tests and repeated-init
+paths; this table is the end-to-end no-regression and SQLite comparison sample.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 0.135-0.190 ms, median 0.173 ms | 0.725-1.067 ms, median 0.965 ms | db plugin |
-| init missing-root remove component | 0.211-0.303 ms, median 0.277 ms | n/a | db internal |
-| init schema component | 0.075-0.106 ms, median 0.097 ms | n/a | db internal |
-| init dict component | 0.053-0.074 ms, median 0.068 ms | n/a | db internal |
-| ingest ERP rows | 4.764-5.145 ms, median 5.098 ms | median 66.708 ms | db plugin |
-| build ERP indexes | 9.039-9.820 ms, median 9.210 ms | median 22.246 ms | db plugin |
-| tx append, orders + invoices | 2.152-2.547 ms, median 2.378 ms | median 4.622 ms* | db plugin |
-| coltx append, order lines | 1.586-2.050 ms, median 1.909 ms | median 4.622 ms* | db plugin |
-| total append chain | 3.738-4.469 ms, median 4.287 ms | median 4.622 ms | db plugin |
-| verify/integrity | 0.935-1.348 ms, median 1.173 ms | median 34.882 ms | db plugin |
+| init 3 ERP tables + dicts | 0.166-0.226 ms, median 0.217 ms | 1.033-3.603 ms, median 1.583 ms | db plugin |
+| init missing-root remove component | 0.218-0.259 ms, median 0.239 ms | n/a | db internal |
+| init schema component | 0.094-0.153 ms, median 0.114 ms | n/a | db internal |
+| init dict component | 0.058-0.067 ms, median 0.060 ms | n/a | db internal |
+| ingest ERP rows | 4.745-5.716 ms, median 5.159 ms | 94.176-115.508 ms, median 100.015 ms | db plugin |
+| build ERP indexes | 9.375-11.896 ms, median 9.576 ms | 25.721-35.446 ms, median 32.151 ms | db plugin |
+| tx append, orders + invoices | 2.258-2.852 ms, median 2.513 ms | 5.800-11.919 ms, median 6.674 ms* | db plugin |
+| coltx append, order lines | 1.768-2.134 ms, median 2.003 ms | 5.800-11.919 ms, median 6.674 ms* | db plugin |
+| total append chain | 4.198-4.882 ms, median 4.441 ms | 5.800-11.919 ms, median 6.674 ms | db plugin |
+| verify/integrity | 0.950-2.983 ms, median 1.203 ms | 43.697-51.121 ms, median 44.948 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
-Only SQLite init raw samples were preserved for this rerun; the other SQLite
-cells record the preserved median values.
 
 This current installed-plugin sample puts the db plugin ahead of SQLite on every
 listed indexed ERP write category in this benchmark: init, baseline ingest,
@@ -1409,16 +1411,16 @@ to copying the existing full artifact before writing the appended tail.
 
 | Operation | db `:memory:` plugin | SQLite `:memory:` | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 0.144-0.171 ms, median 0.148 ms | 0.475-0.653 ms, median 0.493 ms | db plugin |
-| init missing-root remove component | 0.195-0.273 ms, median 0.231 ms | n/a | db internal |
-| init schema component | 0.069-0.096 ms, median 0.079 ms | n/a | db internal |
-| init dict component | 0.056-0.071 ms, median 0.065 ms | n/a | db internal |
-| ingest ERP rows | 2.782-2.999 ms, median 2.832 ms | 63.846-77.623 ms, median 70.231 ms | db plugin |
-| build ERP indexes | 6.815-7.543 ms, median 7.146 ms | 20.450-25.008 ms, median 20.957 ms | db plugin |
-| tx append, orders + invoices | 1.374-1.484 ms, median 1.400 ms | 3.138-5.758 ms, median 3.790 ms* | db plugin |
-| coltx append, order lines | 0.913-1.030 ms, median 0.952 ms | 3.138-5.758 ms, median 3.790 ms* | db plugin |
-| total append chain | 2.292-2.437 ms, median 2.420 ms | 3.138-5.758 ms, median 3.790 ms | db plugin |
-| verify/integrity | 0.262-0.376 ms, median 0.292 ms | 35.426-50.123 ms, median 41.635 ms | db plugin |
+| init 3 ERP tables + dicts | 0.158-0.186 ms, median 0.161 ms | 0.498-0.650 ms, median 0.628 ms | db plugin |
+| init missing-root remove component | 0.183-0.228 ms, median 0.199 ms | n/a | db internal |
+| init schema component | 0.097-0.120 ms, median 0.099 ms | n/a | db internal |
+| init dict component | 0.056-0.063 ms, median 0.058 ms | n/a | db internal |
+| ingest ERP rows | 2.659-3.172 ms, median 2.888 ms | 71.975-92.521 ms, median 84.496 ms | db plugin |
+| build ERP indexes | 7.360-9.020 ms, median 8.074 ms | 22.431-26.772 ms, median 23.628 ms | db plugin |
+| tx append, orders + invoices | 1.331-1.919 ms, median 1.421 ms | 3.879-4.871 ms, median 3.936 ms* | db plugin |
+| coltx append, order lines | 0.945-1.352 ms, median 1.105 ms | 3.879-4.871 ms, median 3.936 ms* | db plugin |
+| total append chain | 2.276-3.271 ms, median 2.705 ms | 3.879-4.871 ms, median 3.936 ms | db plugin |
+| verify/integrity | 0.271-0.456 ms, median 0.394 ms | 36.099-54.805 ms, median 41.082 ms | db plugin |
 
 `*` SQLite `:memory:` side still exposes one append transaction path, so the
 same sample is shown against the db plugin's split `tx` and `coltx` subpaths.

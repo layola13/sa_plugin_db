@@ -198,6 +198,9 @@ const UnsafeInitTemplateCacheEntry = struct {
     root_dir: []u8,
     table_name: []u8,
     schema_hash: []u8,
+    schema_path_hint: []u8,
+    schema_source: []u8,
+    schema_source_fingerprint: u64,
     meta: TableMeta,
 };
 
@@ -656,6 +659,11 @@ fn hashBytes(bytes: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     hasher.final(&out);
     return out;
+}
+
+fn schemaSourceFingerprint(schema_path_hint: []const u8, schema_source: []const u8) u64 {
+    const hint_hash = std.hash.Wyhash.hash(0, schema_path_hint);
+    return std.hash.Wyhash.hash(hint_hash, schema_source);
 }
 
 fn hashHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) TableError![]u8 {
@@ -1805,6 +1813,17 @@ fn unsafeInitCacheBuildInitialMetaOwned(
 ) TableError!TableInfo {
     if (!skipDurabilitySync()) return TableError.InvalidFormat;
 
+    const table_name_hint = schemaHintTableName(schema_path_hint);
+    const source_fingerprint = schemaSourceFingerprint(schema_path_hint, schema_source);
+    if (try unsafeInitTemplateCachePeekSource(allocator, root_dir, table_name_hint, schema_path_hint, schema_source, source_fingerprint)) |cached_meta| {
+        var template_meta = cached_meta;
+        defer template_meta.deinit(allocator);
+        var write_lock = try acquireTableWriteLock(allocator, root_dir, template_meta.table_name);
+        defer write_lock.release();
+        try unsafeInitCachePutOwned(root_dir, template_meta.table_name, schema_source, template_meta);
+        return tableInfo(template_meta);
+    }
+
     var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
     errdefer arena.deinit();
 
@@ -1819,6 +1838,7 @@ fn unsafeInitCacheBuildInitialMetaOwned(
     const owned_table = @constCast(schema_obj.table_name);
     const owned_schema = try arena.allocator().dupe(u8, schema_source);
     const owned_meta = try buildInitialMetaOwnedFromSchema(arena.allocator(), schema_path, schema_hash, &schema_obj);
+    try unsafeInitTemplateCachePutSource(root_dir, schema_obj.table_name, schema_path_hint, schema_source, source_fingerprint, owned_meta);
     const info = tableInfo(owned_meta);
 
     unsafe_init_meta_cache_mutex.lock();
@@ -2134,6 +2154,8 @@ fn unsafeInitTemplateCachePut(root_dir: []const u8, table_name: []const u8, sche
     const owned_root = try arena.allocator().dupe(u8, root_dir);
     const owned_table = try arena.allocator().dupe(u8, table_name);
     const owned_hash = try arena.allocator().dupe(u8, schema_hash);
+    const owned_hint = try arena.allocator().alloc(u8, 0);
+    const owned_source = try arena.allocator().alloc(u8, 0);
     const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
 
     unsafe_init_template_cache_mutex.lock();
@@ -2145,21 +2167,69 @@ fn unsafeInitTemplateCachePut(root_dir: []const u8, table_name: []const u8, sche
                 !std.mem.eql(u8, entry.table_name, table_name) or
                 !std.mem.eql(u8, entry.schema_hash, schema_hash)) continue;
             freeUnsafeInitTemplateCacheEntry(entry);
-            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .meta = owned_meta };
+            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .schema_path_hint = owned_hint, .schema_source = owned_source, .schema_source_fingerprint = 0, .meta = owned_meta };
             return;
         }
     }
 
     for (&unsafe_init_template_cache) |*slot| {
         if (slot.* == null) {
-            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .meta = owned_meta };
+            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .schema_path_hint = owned_hint, .schema_source = owned_source, .schema_source_fingerprint = 0, .meta = owned_meta };
             return;
         }
     }
 
     const slot = &unsafe_init_template_cache[unsafe_init_template_cache_next_slot];
     freeUnsafeInitTemplateCacheEntry(&(slot.*.?));
-    slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .meta = owned_meta };
+    slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .schema_path_hint = owned_hint, .schema_source = owned_source, .schema_source_fingerprint = 0, .meta = owned_meta };
+    unsafe_init_template_cache_next_slot = (unsafe_init_template_cache_next_slot + 1) % unsafe_init_template_cache.len;
+}
+
+fn unsafeInitTemplateCachePutSource(
+    root_dir: []const u8,
+    table_name: []const u8,
+    schema_path_hint: []const u8,
+    schema_source: []const u8,
+    fingerprint: u64,
+    meta: TableMeta,
+) TableError!void {
+    if (!skipDurabilitySync()) return;
+
+    var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
+    errdefer arena.deinit();
+    const owned_root = try arena.allocator().dupe(u8, root_dir);
+    const owned_table = try arena.allocator().dupe(u8, table_name);
+    const owned_hash = try arena.allocator().alloc(u8, 0);
+    const owned_hint = try arena.allocator().dupe(u8, schema_path_hint);
+    const owned_source = try arena.allocator().dupe(u8, schema_source);
+    const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
+
+    unsafe_init_template_cache_mutex.lock();
+    defer unsafe_init_template_cache_mutex.unlock();
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                entry.schema_source_fingerprint != fingerprint or
+                !std.mem.eql(u8, entry.schema_path_hint, schema_path_hint) or
+                !std.mem.eql(u8, entry.schema_source, schema_source)) continue;
+            freeUnsafeInitTemplateCacheEntry(entry);
+            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .schema_path_hint = owned_hint, .schema_source = owned_source, .schema_source_fingerprint = fingerprint, .meta = owned_meta };
+            return;
+        }
+    }
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .schema_path_hint = owned_hint, .schema_source = owned_source, .schema_source_fingerprint = fingerprint, .meta = owned_meta };
+            return;
+        }
+    }
+
+    const slot = &unsafe_init_template_cache[unsafe_init_template_cache_next_slot];
+    freeUnsafeInitTemplateCacheEntry(&(slot.*.?));
+    slot.* = .{ .arena = arena, .root_dir = owned_root, .table_name = owned_table, .schema_hash = owned_hash, .schema_path_hint = owned_hint, .schema_source = owned_source, .schema_source_fingerprint = fingerprint, .meta = owned_meta };
     unsafe_init_template_cache_next_slot = (unsafe_init_template_cache_next_slot + 1) % unsafe_init_template_cache.len;
 }
 
@@ -2174,6 +2244,32 @@ fn unsafeInitTemplateCachePeek(allocator: std.mem.Allocator, root_dir: []const u
             if (!std.mem.eql(u8, entry.root_dir, root_dir) or
                 !std.mem.eql(u8, entry.table_name, table_name) or
                 !std.mem.eql(u8, entry.schema_hash, schema_hash)) continue;
+            return try duplicateTableMeta(allocator, entry.meta);
+        }
+    }
+    return null;
+}
+
+fn unsafeInitTemplateCachePeekSource(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    schema_path_hint: []const u8,
+    schema_source: []const u8,
+    fingerprint: u64,
+) TableError!?TableMeta {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_template_cache_mutex.lock();
+    defer unsafe_init_template_cache_mutex.unlock();
+
+    for (&unsafe_init_template_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or
+                !std.mem.eql(u8, entry.table_name, table_name) or
+                entry.schema_source_fingerprint != fingerprint or
+                !std.mem.eql(u8, entry.schema_path_hint, schema_path_hint) or
+                !std.mem.eql(u8, entry.schema_source, schema_source)) continue;
             return try duplicateTableMeta(allocator, entry.meta);
         }
     }
@@ -7657,8 +7753,8 @@ fn u64PairIndexEntrySortedAfter(previous: U64PairIndexEntry, current: U64PairInd
 fn u64PairIndexCanAppendTail(unique: bool, existing_last_key1: u64, existing_last_key2: u64, existing_last_row: u64, appended_first_key1: u64, appended_first_key2: u64, appended_first_row: u64) bool {
     return existing_last_key1 < appended_first_key1 or
         (existing_last_key1 == appended_first_key1 and
-        (existing_last_key2 < appended_first_key2 or
-        (existing_last_key2 == appended_first_key2 and !unique and existing_last_row <= appended_first_row)));
+            (existing_last_key2 < appended_first_key2 or
+                (existing_last_key2 == appended_first_key2 and !unique and existing_last_row <= appended_first_row)));
 }
 
 fn variableIndexCanAppendTail(existing_last_key: u64, existing_last_row: u64, appended_first_key: u64, appended_first_row: u64) bool {
@@ -9024,8 +9120,8 @@ fn mergeU64PairIndexBytes(
     const appended_first_row = readU64PairIndexRow(appended_bytes, 0);
     const can_append_tail = existing_last_key1 < appended_first_key1 or
         (existing_last_key1 == appended_first_key1 and
-        (existing_last_key2 < appended_first_key2 or
-        (existing_last_key2 == appended_first_key2 and !unique and existing_last_row <= appended_first_row)));
+            (existing_last_key2 < appended_first_key2 or
+                (existing_last_key2 == appended_first_key2 and !unique and existing_last_row <= appended_first_row)));
     if (can_append_tail) {
         const out = try allocator.alloc(u8, total_count * U64_PAIR_INDEX_RECORD_BYTES);
         errdefer allocator.free(out);
@@ -20262,8 +20358,8 @@ test "table unsafe init cache serves first coltx bootstrap" {
     const session = try beginColumnIngestSession(std.testing.allocator, ".", table_name);
     defer destroyColumnIngestSession(std.testing.allocator, session);
 
-    var ids = [_]u64{1, 2};
-    var statuses = [_]u64{10, 20};
+    var ids = [_]u64{ 1, 2 };
+    var statuses = [_]u64{ 10, 20 };
     const columns = [_]RawColumnBytes{
         .{ .bytes = std.mem.sliceAsBytes(ids[0..]) },
         .{ .bytes = std.mem.sliceAsBytes(statuses[0..]) },
@@ -20357,6 +20453,62 @@ test "table unsafe init cache survives init allocator teardown before ingest" {
 
     const verified = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+}
+
+test "table unsafe init template cache reuses exact schema source" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_template_reinit";
+    const schema_path = "unsafe_template_reinit.sadb-schema";
+    const schema_v1 =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    ;
+    const schema_v2 =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+        \\#def COL_AMOUNT_STRIDE = 8 // u64
+    ;
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", schema_path, schema_v1);
+
+    const fingerprint_v1 = schemaSourceFingerprint(schema_path, schema_v1);
+    var cached = (try unsafeInitTemplateCachePeekSource(std.testing.allocator, ".", table_name, schema_path, schema_v1, fingerprint_v1)).?;
+    defer cached.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), cached.columns.len);
+    try std.testing.expectEqual(@as(u64, 16), cached.row_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cached.schema_hash.len);
+
+    const fingerprint_v2 = schemaSourceFingerprint(schema_path, schema_v2);
+    const missed = try unsafeInitTemplateCachePeekSource(std.testing.allocator, ".", table_name, schema_path, schema_v2, fingerprint_v2);
+    try std.testing.expect(missed == null);
+
+    _ = try removeTable(std.testing.allocator, ".", table_name);
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", schema_path, schema_v1);
+    var reinit = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer reinit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), reinit.columns.len);
+    try std.testing.expectEqual(@as(u64, 16), reinit.row_bytes);
+    try std.testing.expectEqual(@as(usize, 0), reinit.schema_hash.len);
+
+    _ = try removeTable(std.testing.allocator, ".", table_name);
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", schema_path, schema_v2);
+    var changed = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer changed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), changed.columns.len);
+    try std.testing.expectEqual(@as(u64, 24), changed.row_bytes);
 }
 
 test "table unsafe init cache serves first direct row insert bootstrap" {
@@ -20652,7 +20804,7 @@ test "table unsafe writes do not create write lock files" {
     defer std.testing.allocator.free(lock_path);
     try std.testing.expect(!fileExists(lock_path));
 
-    const values = [_][]const u8{ "active" };
+    const values = [_][]const u8{"active"};
     var ids: [values.len]u64 = undefined;
     var inserted_flags: [values.len]bool = undefined;
     _ = try internStringDictMany(std.testing.allocator, ".", table_name, "status", &values, &ids, &inserted_flags);

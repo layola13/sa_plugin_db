@@ -398,20 +398,22 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 
 两侧正确性输出仍一致：`8448 / 33792 / 8448`。这轮是当前代码和当前已安装插件一致时的有效对比样本；之后重跑 SA benchmark 前必须先更新安装插件，否则会测到旧实现。
 
+2026-06-27 继续把 unsafe init template cache 扩到 schema-source 路径：重复同一 schema 的 init/remove/reinit 现在先用 `schema_path_hint + schema_source` 的快速指纹做固定槽位缓存查询，并且命中后仍精确比较 schema source，避免碰撞误复用。新增回归测试覆盖 v1 schema 命中、v2 schema 不误命中，以及 remove/reinit 后列布局正确。这项收益主要作用于同进程重复初始化同一 schema 的路径；下面 ERP 三表 benchmark 每个 schema 只 init 一次，因此作为端到端无回归和 SQLite 当前对照样本，而不是把该 cache 归因到 one-shot schema component。
+
 | 操作 | db 插件 | SQLite | 最快 |
 | --- | ---: | ---: | --- |
-| init indexed ERP tables | 0.135-0.190 ms, 中位数 0.173 ms | 0.725-1.067 ms, 中位数 0.965 ms | db 插件约 5.6x |
-| init remove component | 0.211-0.303 ms, 中位数 0.277 ms | n/a | db 内部分量 |
-| init schema component | 0.075-0.106 ms, 中位数 0.097 ms | n/a | db 内部分量 |
-| init dict component | 0.053-0.074 ms, 中位数 0.068 ms | n/a | db 内部分量 |
-| baseline ingest before indexes | 4.764-5.145 ms, 中位数 5.098 ms | 中位数 66.708 ms | db 插件约 13.1x |
-| build baseline indexes | 9.039-9.820 ms, 中位数 9.210 ms | 中位数 22.246 ms | db 插件约 2.4x |
-| append with tx + incremental indexes | 2.152-2.547 ms, 中位数 2.378 ms | 中位数 4.622 ms* | db 插件约 1.9x |
-| append with coltx + incremental indexes | 1.586-2.050 ms, 中位数 1.909 ms | 中位数 4.622 ms* | db 插件约 2.4x |
-| total append chain | 3.738-4.469 ms, 中位数 4.287 ms | 中位数 4.622 ms | db 插件约 1.1x |
-| verify/integrity | 0.935-1.348 ms, 中位数 1.173 ms | 中位数 34.882 ms | db 插件约 29.7x |
+| init indexed ERP tables | 0.166-0.226 ms, 中位数 0.217 ms | 1.033-3.603 ms, 中位数 1.583 ms | db 插件约 7.3x |
+| init remove component | 0.218-0.259 ms, 中位数 0.239 ms | n/a | db 内部分量 |
+| init schema component | 0.094-0.153 ms, 中位数 0.114 ms | n/a | db 内部分量 |
+| init dict component | 0.058-0.067 ms, 中位数 0.060 ms | n/a | db 内部分量 |
+| baseline ingest before indexes | 4.745-5.716 ms, 中位数 5.159 ms | 94.176-115.508 ms, 中位数 100.015 ms | db 插件约 19.4x |
+| build baseline indexes | 9.375-11.896 ms, 中位数 9.576 ms | 25.721-35.446 ms, 中位数 32.151 ms | db 插件约 3.4x |
+| append with tx + incremental indexes | 2.258-2.852 ms, 中位数 2.513 ms | 5.800-11.919 ms, 中位数 6.674 ms* | db 插件约 2.7x |
+| append with coltx + incremental indexes | 1.768-2.134 ms, 中位数 2.003 ms | 5.800-11.919 ms, 中位数 6.674 ms* | db 插件约 3.3x |
+| total append chain | 4.198-4.882 ms, 中位数 4.441 ms | 5.800-11.919 ms, 中位数 6.674 ms | db 插件约 1.5x |
+| verify/integrity | 0.950-2.983 ms, 中位数 1.203 ms | 43.697-51.121 ms, 中位数 44.948 ms | db 插件约 37.4x |
 
-`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。当前记录只保留了 SQLite init 原始样本；其余 SQLite 单元格记录保留下来的中位数。
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
 
 这轮改变 indexed ERP write benchmark 的当前结论：在已安装插件和源码一致后，db 插件已经在该 benchmark 的 init、baseline ingest、index build、`tx` append、`coltx` append、total append chain、verify/integrity 中位数上全部领先 SQLite。这个结论只覆盖这组 unsafe/no-sync indexed ERP 写入 benchmark，不等价于 SQL 功能、ACID/WAL、崩溃恢复、compact/vacuum 或通用运维能力全面超过 SQLite。
 
@@ -423,16 +425,16 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 
 | 操作 | db `:memory:` 插件 | SQLite `:memory:` | 最快 |
 | --- | ---: | ---: | --- |
-| init indexed ERP tables | 0.144-0.171 ms, 中位数 0.148 ms | 0.475-0.653 ms, 中位数 0.493 ms | db 插件约 3.3x |
-| init remove component | 0.195-0.273 ms, 中位数 0.231 ms | n/a | db 内部分量 |
-| init schema component | 0.069-0.096 ms, 中位数 0.079 ms | n/a | db 内部分量 |
-| init dict component | 0.056-0.071 ms, 中位数 0.065 ms | n/a | db 内部分量 |
-| baseline ingest before indexes | 2.782-2.999 ms, 中位数 2.832 ms | 63.846-77.623 ms, 中位数 70.231 ms | db 插件约 24.8x |
-| build baseline indexes | 6.815-7.543 ms, 中位数 7.146 ms | 20.450-25.008 ms, 中位数 20.957 ms | db 插件约 2.9x |
-| append with tx + incremental indexes | 1.374-1.484 ms, 中位数 1.400 ms | 3.138-5.758 ms, 中位数 3.790 ms* | db 插件约 2.7x |
-| append with coltx + incremental indexes | 0.913-1.030 ms, 中位数 0.952 ms | 3.138-5.758 ms, 中位数 3.790 ms* | db 插件约 4.0x |
-| total append chain | 2.292-2.437 ms, 中位数 2.420 ms | 3.138-5.758 ms, 中位数 3.790 ms | db 插件约 1.6x |
-| verify/integrity | 0.262-0.376 ms, 中位数 0.292 ms | 35.426-50.123 ms, 中位数 41.635 ms | db 插件约 142.6x |
+| init indexed ERP tables | 0.158-0.186 ms, 中位数 0.161 ms | 0.498-0.650 ms, 中位数 0.628 ms | db 插件约 3.9x |
+| init remove component | 0.183-0.228 ms, 中位数 0.199 ms | n/a | db 内部分量 |
+| init schema component | 0.097-0.120 ms, 中位数 0.099 ms | n/a | db 内部分量 |
+| init dict component | 0.056-0.063 ms, 中位数 0.058 ms | n/a | db 内部分量 |
+| baseline ingest before indexes | 2.659-3.172 ms, 中位数 2.888 ms | 71.975-92.521 ms, 中位数 84.496 ms | db 插件约 29.3x |
+| build baseline indexes | 7.360-9.020 ms, 中位数 8.074 ms | 22.431-26.772 ms, 中位数 23.628 ms | db 插件约 2.9x |
+| append with tx + incremental indexes | 1.331-1.919 ms, 中位数 1.421 ms | 3.879-4.871 ms, 中位数 3.936 ms* | db 插件约 2.8x |
+| append with coltx + incremental indexes | 0.945-1.352 ms, 中位数 1.105 ms | 3.879-4.871 ms, 中位数 3.936 ms* | db 插件约 3.6x |
+| total append chain | 2.276-3.271 ms, 中位数 2.705 ms | 3.879-4.871 ms, 中位数 3.936 ms | db 插件约 1.5x |
+| verify/integrity | 0.271-0.456 ms, 中位数 0.394 ms | 36.099-54.805 ms, 中位数 41.082 ms | db 插件约 104.3x |
 
 `*` SQLite `:memory:` 对照这里只有一条追加事务路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
 
