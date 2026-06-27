@@ -351,6 +351,26 @@ raw，对应中位数如下：
 
 这轮 schema component 中位数从前一组 `0.968 ms` 降到 `0.916 ms`，总 init 中位数从 `1.379 ms` 降到 `1.345 ms`。不过 SQLite init 中位数这轮是 `0.824 ms`，所以仍不能声明“全部领先”。当前可确认的是：db 在 baseline ingest、build indexes、tx append、coltx append、total append chain、verify/integrity 的中位数均领先；init 仍是下一轮优化目标。
 
+随后继续收窄 missing-table remove 的固定成本：unsafe 模式下，如果非 memory root 目录本身不存在，`removeTable` 现在直接跳过 compat meta 探测、recovered-meta 目录扫描、stale artifact 扫描和 snapshot tree 删除，同时仍清理同进程 unsafe bootstrap cache。这个路径是 O(1)，并保留已有 root 存在时的 stale artifact cleanup / lock preservation 行为。新增回归测试覆盖 missing root 不被创建、bootstrap cache 被 remove 清掉、之后 `loadActiveMeta` 返回 `NotFound`。
+
+重新 `zig build` 后顺序跑 5 次 db 和 5 次 SQLite indexed ERP append benchmark。两侧正确性输出仍一致：`8448 / 33792 / 8448`。这轮 `init_remove` 分量下降，但 schema/dict 分量有波动，总 init 中位数仍落后 SQLite。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 1.322-1.637 ms, 中位数 1.489 ms | 0.940-1.609 ms, 中位数 1.129 ms | SQLite |
+| init remove component | 0.327-0.501 ms, 中位数 0.396 ms | n/a | db 内部改善 |
+| init schema component | 0.865-1.158 ms, 中位数 0.986 ms | n/a | db 内部波动 |
+| baseline ingest before indexes | 5.110-6.367 ms, 中位数 5.196 ms | 62.266-105.283 ms, 中位数 78.473 ms | db 插件约 15.1x |
+| build baseline indexes | 8.822-11.155 ms, 中位数 9.841 ms | 22.414-27.335 ms, 中位数 22.813 ms | db 插件约 2.3x |
+| append with tx + incremental indexes | 2.320-2.611 ms, 中位数 2.560 ms | 4.659-7.260 ms, 中位数 5.023 ms* | db 插件约 2.0x |
+| append with coltx + incremental indexes | 1.833-2.100 ms, 中位数 1.895 ms | 4.659-7.260 ms, 中位数 5.023 ms* | db 插件约 2.7x |
+| total append chain | 4.156-4.660 ms, 中位数 4.443 ms | 4.659-7.260 ms, 中位数 5.023 ms | db 插件约 1.1x |
+| verify/integrity | 0.971-1.123 ms, 中位数 1.062 ms | 34.858-51.751 ms, 中位数 38.965 ms | db 插件约 36.7x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这轮只能证明 missing-root remove fast path 的局部分量收益：`db_erp_indexed_init_remove_ns` 中位数从上一组 `0.431 ms` 到 `0.396 ms`。总 init 这轮为 db `1.489 ms` 对 SQLite `1.129 ms`，所以仍不能声明“全部领先”。下一步继续压 schema/dict init 固定成本，而不是扩大接口表面。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

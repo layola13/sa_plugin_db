@@ -1306,6 +1306,17 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn diskRootMissing(root_dir: []const u8) bool {
+    if (isMemoryRoot(root_dir)) return false;
+    const prefix = rootPrefix(root_dir);
+    if (prefix.len == 0) return false;
+    std.fs.cwd().access(prefix, .{}) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return false,
+    };
+    return false;
+}
+
 fn loadRecoveredActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
     if (isMemoryRoot(root_dir)) return TableError.NotFound;
 
@@ -4327,6 +4338,8 @@ fn deleteActiveMetaArtifacts(allocator: std.mem.Allocator, root_dir: []const u8,
 
 fn deleteTableArtifactsFast(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
     var removed_targeted = false;
+    if (skipDurabilitySync() and diskRootMissing(root_dir)) return;
+
     const meta_result = if (skipDurabilitySync()) blk: {
         break :blk loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
             TableError.NotFound => {
@@ -4994,21 +5007,24 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
+    const missing_disk_root = skipDurabilitySync() and diskRootMissing(root_dir);
     try deleteTableArtifactsFast(allocator, root_dir, table_name);
 
-    const snapshot_path = if (isMemoryRoot(root_dir)) blk: {
-        const relative = try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name });
-        defer allocator.free(relative);
-        break :blk try activePath(allocator, root_dir, relative);
-    } else blk: {
-        const prefix = rootPrefix(root_dir);
-        break :blk if (prefix.len == 0)
-            try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name })
-        else
-            try joinPath(allocator, &.{ prefix, ".sa", "db", "snapshots", table_name });
-    };
-    defer allocator.free(snapshot_path);
-    try deleteTreeIfExists(snapshot_path);
+    if (!missing_disk_root) {
+        const snapshot_path = if (isMemoryRoot(root_dir)) blk: {
+            const relative = try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name });
+            defer allocator.free(relative);
+            break :blk try activePath(allocator, root_dir, relative);
+        } else blk: {
+            const prefix = rootPrefix(root_dir);
+            break :blk if (prefix.len == 0)
+                try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name })
+            else
+                try joinPath(allocator, &.{ prefix, ".sa", "db", "snapshots", table_name });
+        };
+        defer allocator.free(snapshot_path);
+        try deleteTreeIfExists(snapshot_path);
+    }
     unsafeInitCacheDelete(allocator, root_dir, table_name);
 
     return .{ .row_count = 0, .segment_count = 0, .epoch = 0, .locked = false };
@@ -22755,6 +22771,32 @@ test "table unsafe remove not found clears stale artifacts and preserves lock" {
     try std.testing.expect(!fileExists(stale_data));
     try std.testing.expect(!fileExists(stale_meta));
     try std.testing.expect(fileExists(lock_name));
+}
+
+test "table unsafe remove missing root is O(1) and clears bootstrap cache" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const root = "missing_fast_root";
+    const table_name = "unsafe_missing_root";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "unsafe_missing_root.sadb-schema",
+        \\#def MAX_ROWS = 4
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+    try std.testing.expect(!fileExists(root));
+
+    _ = try removeTable(std.testing.allocator, root, table_name);
+    try std.testing.expect(!fileExists(root));
+    try std.testing.expectError(TableError.NotFound, loadActiveMeta(std.testing.allocator, root, table_name));
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {

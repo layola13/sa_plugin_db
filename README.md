@@ -1355,17 +1355,20 @@ The next pass deferred the empty-bootstrap `schema_path` string as well; the
 path is filled only when the first real persisting write materializes meta. The
 init-fast schema compiler now keeps duplicate-def tracking in a fixed inline
 hash set for common small schemas and falls back to `StringHashMap` only past
-that capacity.
+that capacity. The latest pass adds an O(1) unsafe missing-root remove path:
+when a non-memory root directory does not exist, missing-table remove skips
+compat-meta probing, recovered-meta directory scans, stale-artifact scans, and
+snapshot tree deletion while still clearing any in-process bootstrap cache.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.246-1.647 ms, median 1.345 ms | 0.732-0.905 ms, median 0.824 ms | SQLite |
-| ingest ERP rows | 4.721-5.411 ms, median 5.211 ms | 60.221-77.626 ms, median 69.391 ms | db plugin |
-| build ERP indexes | 8.457-9.419 ms, median 8.912 ms | 19.933-31.352 ms, median 21.009 ms | db plugin |
-| tx append, orders + invoices | 2.085-2.799 ms, median 2.338 ms | 4.036-5.053 ms, median 4.638 ms* | db plugin |
-| coltx append, order lines | 1.523-1.912 ms, median 1.553 ms | 4.036-5.053 ms, median 4.638 ms* | db plugin |
-| total append chain | 3.697-4.711 ms, median 3.862 ms | 4.036-5.053 ms, median 4.638 ms | db plugin |
-| verify/integrity | 0.919-1.073 ms, median 0.961 ms | 34.095-38.241 ms, median 36.382 ms | db plugin |
+| init 3 ERP tables + dicts | 1.322-1.637 ms, median 1.489 ms | 0.940-1.609 ms, median 1.129 ms | SQLite |
+| ingest ERP rows | 5.110-6.367 ms, median 5.196 ms | 62.266-105.283 ms, median 78.473 ms | db plugin |
+| build ERP indexes | 8.822-11.155 ms, median 9.841 ms | 22.414-27.335 ms, median 22.813 ms | db plugin |
+| tx append, orders + invoices | 2.320-2.611 ms, median 2.560 ms | 4.659-7.260 ms, median 5.023 ms* | db plugin |
+| coltx append, order lines | 1.833-2.100 ms, median 1.895 ms | 4.659-7.260 ms, median 5.023 ms* | db plugin |
+| total append chain | 4.156-4.660 ms, median 4.443 ms | 4.659-7.260 ms, median 5.023 ms | db plugin |
+| verify/integrity | 0.971-1.123 ms, median 1.062 ms | 34.858-51.751 ms, median 38.965 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
@@ -1383,18 +1386,18 @@ and latest-epoch blob materialization. Third, the remove fast
 path no longer performs a second recovered-meta scan after `loadActiveMeta()` has
 already exhausted active, unsafe-cache, compat, and recovered metadata sources;
 the unsafe not-found remove path now uses one root scan for recovered metadata
-and stale artifact cleanup. In this latest sample,
-`db_erp_indexed_init_remove_ns` landed at `0.325-0.614 ms`, median `0.431 ms`,
-and the schema component landed at `0.855-1.153 ms`, median `0.916 ms`. The
-schema component improved from the previous `0.968 ms` median and total init
-improved from `1.379 ms` to `1.345 ms`, but SQLite init still leads at
-`0.824 ms`.
+and stale artifact cleanup. In the latest sample, the missing-root remove fast
+path put `db_erp_indexed_init_remove_ns` at `0.327-0.501 ms`, median
+`0.396 ms`, down from the previous `0.431 ms` median. The schema component was
+`0.865-1.158 ms`, median `0.986 ms`, and total db init was `1.322-1.637 ms`,
+median `1.489 ms`; SQLite init still leads at `0.940-1.609 ms`, median
+`1.129 ms`.
 
 The remaining gaps are now narrower and more specific:
 
 - init median still trails SQLite even after the latest bootstrap reductions;
 - this sample set puts db ahead on full append-chain median
-  (`3.862 ms` vs. `4.638 ms`), but init is still the gating gap;
+  (`4.443 ms` vs. `5.023 ms`), but init is still the gating gap;
 - there is still no basis to claim全面领先 across every benchmark category while
   init remains behind SQLite.
 
