@@ -1056,6 +1056,8 @@ When null state is stored as a logical `u8 null_bitmap` column, use
 the packed bitmap for `*_NULL_BITMAP_HANDLE` range/filter calls.
 Memory roots are also available now: `:memory:name` is a shared named in-process
 root, while exact `:memory:` resolves to the current thread-local unnamed root.
+Snapshot and restore artifacts for memory roots stay inside that same in-memory
+namespace instead of creating `:memory:*` directories on disk.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2

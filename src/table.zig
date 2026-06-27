@@ -858,6 +858,13 @@ fn blobStoreFileName(allocator: std.mem.Allocator, table_name: []const u8, store
 fn snapshotDir(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, epoch: u64) TableError![]u8 {
     const epoch_text = try allocPrintPath(allocator, "{d}", .{epoch});
     errdefer allocator.free(epoch_text);
+    if (isMemoryRoot(root_dir)) {
+        const relative = try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name, epoch_text });
+        defer allocator.free(relative);
+        const path = try activePath(allocator, root_dir, relative);
+        allocator.free(epoch_text);
+        return path;
+    }
     const prefix = rootPrefix(root_dir);
     const path = if (prefix.len == 0)
         try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name, epoch_text })
@@ -868,11 +875,17 @@ fn snapshotDir(allocator: std.mem.Allocator, root_dir: []const u8, table_name: [
 }
 
 fn ensureParentDir(path: []const u8) TableError!void {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return;
     if (std.fs.path.dirname(path)) |dir| {
         if (dir.len != 0) {
             std.fs.cwd().makePath(dir) catch |err| return mapFileError(err);
         }
     }
+}
+
+fn ensureDirPath(path: []const u8) TableError!void {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return;
+    std.fs.cwd().makePath(path) catch |err| return mapFileError(err);
 }
 
 fn isParentMissing(err: anyerror) bool {
@@ -1175,6 +1188,13 @@ fn writeArtifactFile(allocator: std.mem.Allocator, path: []const u8, bytes: []co
 }
 
 fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) TableError!void {
+    if (std.mem.startsWith(u8, src_path, MEMORY_PATH_PREFIX) or std.mem.startsWith(u8, dst_path, MEMORY_PATH_PREFIX)) {
+        const bytes = try readFileAlloc(allocator, src_path, 1 << 30);
+        defer allocator.free(bytes);
+        try writeFile(allocator, dst_path, bytes);
+        return;
+    }
+
     const temp_path = try tempWritePath(allocator, dst_path);
     defer allocator.free(temp_path);
     errdefer deleteIfExists(temp_path) catch {};
@@ -3403,7 +3423,7 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
     const snapshot_dir_path = try snapshotDir(allocator, root_dir, table_name, meta.epoch);
     defer allocator.free(snapshot_dir_path);
     try deleteTreeIfExists(snapshot_dir_path);
-    std.fs.cwd().makePath(snapshot_dir_path) catch |err| return mapFileError(err);
+    try ensureDirPath(snapshot_dir_path);
 
     const snapshot_meta_name = try allocPrintPath(allocator, "{s}.meta", .{table_name});
     defer allocator.free(snapshot_meta_name);
@@ -4850,11 +4870,17 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
 
     try deleteTableArtifactsFast(allocator, root_dir, table_name);
 
-    const prefix = rootPrefix(root_dir);
-    const snapshot_path = if (prefix.len == 0)
-        try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name })
-    else
-        try joinPath(allocator, &.{ prefix, ".sa", "db", "snapshots", table_name });
+    const snapshot_path = if (isMemoryRoot(root_dir)) blk: {
+        const relative = try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name });
+        defer allocator.free(relative);
+        break :blk try activePath(allocator, root_dir, relative);
+    } else blk: {
+        const prefix = rootPrefix(root_dir);
+        break :blk if (prefix.len == 0)
+            try joinPath(allocator, &.{ ".sa", "db", "snapshots", table_name })
+        else
+            try joinPath(allocator, &.{ prefix, ".sa", "db", "snapshots", table_name });
+    };
     defer allocator.free(snapshot_path);
     try deleteTreeIfExists(snapshot_path);
     unsafeInitCacheDelete(allocator, root_dir, table_name);
@@ -20299,6 +20325,48 @@ test "table memory root supports init ingest and snapshot reads" {
 
     const verified = try verifyTable(std.testing.allocator, root, table_name);
     try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+}
+
+test "table memory root snapshots and restores without filesystem directories" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ":memory:test_snapshot_restore";
+    const table_name = "mem_snapshot_members";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_snapshot_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var first_row = [_]u64{ 1, 10 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(first_row[0..]));
+
+    const snap = try snapshotTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 1), snap.row_count);
+
+    var second_row = [_]u64{ 2, 20 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(second_row[0..]));
+
+    var before_restore = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer before_restore.destroy();
+    try std.testing.expectEqual(@as(u64, 2), before_restore.row_count);
+
+    const restored = try restoreTable(std.testing.allocator, root, table_name, snap.epoch);
+    try std.testing.expectEqual(@as(u64, 1), restored.row_count);
+
+    var after_restore = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer after_restore.destroy();
+    try std.testing.expectEqual(@as(u64, 1), after_restore.row_count);
+    try std.testing.expectEqual(@as(u64, 1), try snapshotGetU64(after_restore, 0, 0));
+    try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(after_restore, 1, 0));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_snapshot_restore", .{}));
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {
