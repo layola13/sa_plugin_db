@@ -331,7 +331,7 @@ raw，对应中位数如下：
 
 这轮 schema component 中位数继续降到 `0.968 ms`，但 db 总 init 中位数仍是 `1.379 ms`，SQLite init 中位数是 `0.968 ms`。init 目标还没完成。
 
-同日转入下一项 memory mode 稳定性：memory root 的 read snapshot 不再直接引用全局 `mem://` map 中的 artifact bytes，而是在打开 snapshot 时复制一份由 snapshot 自己释放的 bytes。这样 `:memory:name` 或精确 `:memory:` 里删除、重建、复用同名表时，旧 read handle 仍保持打开时的行数据。随后继续修正 memory snapshot cleanup 的路径匹配：删除表 `foo` 的 snapshot 目录时只删除精确路径或 `/` 子路径，不会误删 `foo_extra` 这类前缀邻居表的 snapshot artifact。新增回归测试覆盖 memory read snapshot 在 remove + reuse 后仍读到旧行、新 snapshot 读到新行，以及前缀邻居表 snapshot 互不影响。这是内存模式隔离语义修正，不更新 indexed ERP vs SQLite 性能表。
+同日转入下一项 memory mode 稳定性：memory root 的 read snapshot 不再直接引用全局 `mem://` map 中的 artifact bytes，而是在打开 snapshot 时复制一份由 snapshot 自己释放的 bytes。这样 `:memory:name` 或精确 `:memory:` 里删除、重建、复用同名表时，旧 read handle 仍保持打开时的行数据。随后继续修正 memory snapshot cleanup 的路径匹配：删除表 `foo` 的 snapshot 目录时只删除精确路径或 `/` 子路径，不会误删 `foo_extra` 这类前缀邻居表的 snapshot artifact。再往后，missing-table remove 在 memory root 下也改为纯内存处理，不再进入磁盘 recovered-meta / root artifact 扫描，也不会探测或创建真实 `:memory:*` 目录。新增回归测试覆盖 memory read snapshot 在 remove + reuse 后仍读到旧行、新 snapshot 读到新行，前缀邻居表 snapshot 互不影响，以及 missing remove 不触碰文件系统。这是内存模式隔离语义修正，不更新 indexed ERP vs SQLite 性能表。
 
 ## 结论
 

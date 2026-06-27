@@ -989,6 +989,27 @@ fn memoryDeleteTreeIfExists(path: []const u8) void {
     }
 }
 
+fn memoryDeletePrefix(prefix: []const u8) void {
+    memory_fs_mutex.lock();
+    defer memory_fs_mutex.unlock();
+
+    var to_remove = std.ArrayList([]const u8).init(unsafe_init_cache_allocator);
+    defer to_remove.deinit();
+
+    var it = memory_fs_files.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+        to_remove.append(entry.key_ptr.*) catch return;
+    }
+
+    for (to_remove.items) |key| {
+        if (memory_fs_files.fetchRemove(key)) |entry| {
+            unsafe_init_cache_allocator.free(entry.key);
+            unsafe_init_cache_allocator.free(entry.value);
+        }
+    }
+}
+
 fn memoryRename(old_path: []const u8, new_path: []const u8) TableError!void {
     memory_fs_mutex.lock();
     defer memory_fs_mutex.unlock();
@@ -1286,6 +1307,8 @@ fn fileExists(path: []const u8) bool {
 }
 
 fn loadRecoveredActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    if (isMemoryRoot(root_dir)) return TableError.NotFound;
+
     var best: ?TableMeta = null;
     defer if (best) |*meta| meta.deinit(allocator);
 
@@ -4148,6 +4171,15 @@ fn cleanupPendingTxMarkers(allocator: std.mem.Allocator, root_dir: []const u8, t
 }
 
 fn deleteRootTableArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    if (isMemoryRoot(root_dir)) {
+        const prefix = try allocPrintPath(allocator, "{s}.", .{table_name});
+        defer allocator.free(prefix);
+        const memory_prefix = try activePath(allocator, root_dir, prefix);
+        defer allocator.free(memory_prefix);
+        memoryDeletePrefix(memory_prefix);
+        return;
+    }
+
     const dir_path = rootPrefix(root_dir);
     var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
     defer dir.close();
@@ -20531,6 +20563,24 @@ test "table memory snapshot cleanup keeps prefix-neighbor tables isolated" {
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(snapshot, 0, 0));
+}
+
+test "table memory remove missing table does not touch filesystem" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ":memory:test_missing_remove";
+    const info = try removeTable(std.testing.allocator, root, "missing_table");
+    try std.testing.expectEqual(@as(u64, 0), info.row_count);
+    try std.testing.expectEqual(@as(usize, 0), info.segment_count);
+    try std.testing.expectEqual(@as(u64, 0), info.epoch);
+    try std.testing.expect(!info.locked);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_remove", .{}));
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {

@@ -1062,7 +1062,9 @@ over memory roots keep their own artifact bytes, so removing or reusing a table
 in the same memory namespace does not mutate an already-open snapshot. Memory
 snapshot cleanup also treats table snapshot paths as path components, so removing
 one table does not delete snapshot artifacts for another table whose name shares
-the same prefix.
+the same prefix. Removing a missing table from a memory root is also handled
+entirely in the in-memory namespace and does not probe or create a real
+`:memory:*` filesystem directory.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
