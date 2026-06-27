@@ -451,6 +451,8 @@ sa build-exe benchmark_test/db_memory_exact_smoke.sa -o benchmark_test/db_memory
 
 该补充是接口覆盖和隔离语义证据，不改变上面的 indexed ERP memory 性能表。
 
+随后继续收窄 unsafe/no-sync indexed append 的固定成本：`tryAppendIndexesForAppendedRows()` 的 in-place merge 分支不再先额外 `activePath + mappedReadFile()` 一次旧 index。旧 index bytes 只有安全重写分支需要传给 allocator-owned merge；unsafe 分支本身会在 `unsafeMerge*IndexFileInPlace()` 内完成扩容和原地合并。这次改动去掉的是每个需要 merge 的 index append 分支里一次无效旧索引映射/读取，覆盖磁盘 unsafe 路径和 `mem://` memory index merge 路径。已通过 `zig test src/table.zig`、`zig test src/db_saasm_api.zig` 和 `zig build`；没有重新跑 5-run benchmark，因此不更新上面的 SQLite 对比表。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

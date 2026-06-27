@@ -9964,14 +9964,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, index.unique, false, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
@@ -9999,14 +9999,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeU64PairIndexFileInPlace(allocator, root_dir, index, appended, index.unique, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeU64PairIndexBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
@@ -10034,14 +10034,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeU64PairIndexFileInPlace(allocator, root_dir, index, appended, index.unique, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeU64PairIndexBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
@@ -10068,14 +10068,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, index.unique, false, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count, index.unique);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
@@ -10102,14 +10102,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
@@ -10136,14 +10136,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);
@@ -10170,14 +10170,14 @@ fn tryAppendIndexesForAppendedRows(
                     }
                 }
             }
-            const index_path = try activePath(allocator, root_dir, index.path);
-            defer allocator.free(index_path);
-            const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(allocator, mapped_existing);
-            const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
             } else {
+                const index_path = try activePath(allocator, root_dir, index.path);
+                defer allocator.free(index_path);
+                const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
+                defer releaseMappedRegion(allocator, mapped_existing);
+                const existing_bytes = mappedRegionBytes(mapped_existing);
                 const merged = try mergeVariableIndexEntryBytes(allocator, existing_bytes, appended, meta.row_count);
                 defer allocator.free(merged);
                 try rewriteIndexMetaBytes(allocator, root_dir, meta.table_name, meta.epoch, index, merged);

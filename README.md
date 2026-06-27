@@ -1379,8 +1379,11 @@ bootstrap, indexed blob-store bootstrap before the first row write, deferred
 bootstrap `schema_path`, the inline duplicate-def hash set inside
 `compileInitFast()`, the O(1) unsafe missing-root remove path, inline ABI buffers
 for small `sa_db_dict_intern_many` batches, and the exact schema-source
-unsafe-init template cache for repeated same-schema init/remove/reinit paths. The
-reinstall step is important: SA benchmark executables call the installed plugin
+unsafe-init template cache for repeated same-schema init/remove/reinit paths.
+After that sample, unsafe/no-sync index merge was tightened again so the
+in-place merge branch no longer maps the old index once before calling the merge
+helper; only the safe rewrite branch maps old bytes for an allocator-owned merge.
+The reinstall step is important: SA benchmark executables call the installed plugin
 `libdb.so`, so a fresh Zig build alone is not enough to benchmark the current
 source tree. The ERP benchmark initializes each table schema once per process, so
 the template cache is covered by targeted regression tests and repeated-init
