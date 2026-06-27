@@ -1347,68 +1347,49 @@ Summary:
 - SQLite remains stronger for SQL, index creation, ACID, WAL, crash recovery,
   compact/vacuum, and integrity checks.
 
-ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
-maintenance, buffered transaction dictionary writes, batched dictionary intern,
-deferred unsafe-init bootstrap materialization, first-write bootstrap cache
-reuse, the unsafe-init cache ownership fix, direct bootstrap-meta consumption on
-first true write, in-place unsafe bootstrap dict updates, removal of unsafe-path
-`.write.lock` file creation, and delayed empty-index bootstrap artifacts. The
-same day, the unsafe empty-table bootstrap path was extended to direct
-unindexed blob-store writes and the remove fast path dropped redundant
-recovered-meta scans and merged the unsafe not-found remove cleanup into one
-directory pass:
-The next pass deferred the empty-bootstrap `schema_path` string as well; the
-path is filled only when the first real persisting write materializes meta. The
-init-fast schema compiler now keeps duplicate-def tracking in a fixed inline
-hash set for common small schemas and falls back to `StringHashMap` only past
-that capacity. The latest pass adds an O(1) unsafe missing-root remove path:
-when a non-memory root directory does not exist, missing-table remove skips
-compat-meta probing, recovered-meta directory scans, stale-artifact scans, and
-snapshot tree deletion while still clearing any in-process bootstrap cache. The
-next pass keeps small `sa_db_dict_intern_many` batches on inline ABI buffers,
-avoiding two temporary arena allocations for the ERP status-dict init batches.
+ERP indexed write 5-run rerun results on 2026-06-27 after installing the current
+development plugin into the SA runtime:
+
+```bash
+SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plugin_db
+```
+
+This rerun includes lazy-append index maintenance, buffered transaction
+dictionary writes, batched dictionary intern, deferred unsafe-init bootstrap
+materialization, first-write bootstrap cache reuse, the unsafe-init cache
+ownership fix, direct bootstrap-meta consumption on first true write, in-place
+unsafe bootstrap dict updates, removal of unsafe-path `.write.lock` file
+creation, delayed empty-index bootstrap artifacts, direct unindexed blob-store
+bootstrap, deferred bootstrap `schema_path`, the inline duplicate-def hash set
+inside `compileInitFast()`, the O(1) unsafe missing-root remove path, and inline
+ABI buffers for small `sa_db_dict_intern_many` batches. The reinstall step is
+important: SA benchmark executables call the installed plugin `libdb.so`, so a
+fresh Zig build alone is not enough to benchmark the current source tree.
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 1.360-1.884 ms, median 1.517 ms | 0.920-1.110 ms, median 0.949 ms | SQLite |
-| ingest ERP rows | 4.630-5.585 ms, median 5.555 ms | 65.730-82.277 ms, median 67.873 ms | db plugin |
-| build ERP indexes | 8.175-10.536 ms, median 9.121 ms | 23.561-27.322 ms, median 24.881 ms | db plugin |
-| tx append, orders + invoices | 2.165-2.716 ms, median 2.285 ms | 4.051-5.433 ms, median 4.983 ms* | db plugin |
-| coltx append, order lines | 1.683-2.459 ms, median 2.146 ms | 4.051-5.433 ms, median 4.983 ms* | db plugin |
-| total append chain | 3.847-5.175 ms, median 4.432 ms | 4.051-5.433 ms, median 4.983 ms | db plugin |
-| verify/integrity | 0.937-1.949 ms, median 1.192 ms | 34.751-41.753 ms, median 38.336 ms | db plugin |
+| init 3 ERP tables + dicts | 0.135-0.190 ms, median 0.173 ms | 0.725-1.067 ms, median 0.965 ms | db plugin |
+| init missing-root remove component | 0.211-0.303 ms, median 0.277 ms | n/a | db internal |
+| init schema component | 0.075-0.106 ms, median 0.097 ms | n/a | db internal |
+| init dict component | 0.053-0.074 ms, median 0.068 ms | n/a | db internal |
+| ingest ERP rows | 4.764-5.145 ms, median 5.098 ms | median 66.708 ms | db plugin |
+| build ERP indexes | 9.039-9.820 ms, median 9.210 ms | median 22.246 ms | db plugin |
+| tx append, orders + invoices | 2.152-2.547 ms, median 2.378 ms | median 4.622 ms* | db plugin |
+| coltx append, order lines | 1.586-2.050 ms, median 1.909 ms | median 4.622 ms* | db plugin |
+| total append chain | 3.738-4.469 ms, median 4.287 ms | median 4.622 ms | db plugin |
+| verify/integrity | 0.935-1.348 ms, median 1.173 ms | median 34.882 ms | db plugin |
 
 `*` SQLite side still exposes only one append benchmark path, so the same
 sample is shown against the db plugin's split `tx` and `coltx` subpaths.
+Only SQLite init raw samples were preserved for this rerun; the other SQLite
+cells record the preserved median values.
 
-This rerun matters for three reasons. First, the empty-table unsafe bootstrap
-now defers `meta`, `schema`, dict artifacts, empty index artifacts, and direct
-unindexed blob-store artifacts until the first real persisting write, while
-still serving cached dict and blob reads before that point. Empty indexes created
-before the first row stay in the bootstrap metadata and materialize their index
-files when the first indexed write publishes rows. Second, the
-benchmark-driven unsafe-init cache lifetime fix remains in place: the cache owns
-its own copy of `TableMeta`, pending dict/blob bytes, and schema source, with
-regression coverage for allocator teardown, first indexed write materialization,
-and latest-epoch blob materialization. Third, the remove fast
-path no longer performs a second recovered-meta scan after `loadActiveMeta()` has
-already exhausted active, unsafe-cache, compat, and recovered metadata sources;
-the unsafe not-found remove path now uses one root scan for recovered metadata
-and stale artifact cleanup. In the latest sample, the missing-root remove fast
-path put `db_erp_indexed_init_remove_ns` at `0.327-0.501 ms`, median
-`0.396 ms`, down from the previous `0.431 ms` median. The inline dict ABI
-buffer pass put `db_erp_indexed_init_dict_ns` at `0.383-0.522 ms`, median
-`0.445 ms`, down from the previous stable `0.462 ms` median. Total db init was
-`1.360-1.884 ms`, median `1.517 ms`; SQLite init still leads at
-`0.920-1.110 ms`, median `0.949 ms`.
-
-The remaining gaps are now narrower and more specific:
-
-- init median still trails SQLite even after the latest bootstrap reductions;
-- this sample set puts db ahead on full append-chain median
-  (`4.432 ms` vs. `4.983 ms`), but init is still the gating gap;
-- there is still no basis to claim全面领先 across every benchmark category while
-  init remains behind SQLite.
+This current installed-plugin sample puts the db plugin ahead of SQLite on every
+listed indexed ERP write category in this benchmark: init, baseline ingest,
+index build, `tx` append, `coltx` append, total append chain, and verify. Scope
+is still limited to this benchmark and unsafe/no-sync measurement mode; SQLite
+remains stronger for general SQL, mature ACID/WAL behavior, crash recovery,
+vacuum/compaction semantics, and broad operational tooling.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 

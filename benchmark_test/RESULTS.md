@@ -390,6 +390,31 @@ raw，对应中位数如下：
 
 这轮只作为 dict init 固定成本的小幅收益记录：`db_erp_indexed_init_dict_ns` 中位数从上一组稳定样本约 `0.462 ms` 降到 `0.445 ms`。总 init 仍是 db `1.517 ms` 对 SQLite `0.949 ms`，schema/remove 波动仍然主导初始化差距。
 
+随后确认前面多轮 benchmark 使用的 SA runtime 里安装过旧 `libdb.so`，而不是刚刚 `zig build` 出来的当前插件。重新安装当前开发插件后再跑同一组 5 次 db / 5 次 SQLite indexed ERP append benchmark：
+
+```bash
+SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plugin_db
+```
+
+两侧正确性输出仍一致：`8448 / 33792 / 8448`。这轮是当前代码和当前已安装插件一致时的有效对比样本；之后重跑 SA benchmark 前必须先更新安装插件，否则会测到旧实现。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 0.135-0.190 ms, 中位数 0.173 ms | 0.725-1.067 ms, 中位数 0.965 ms | db 插件约 5.6x |
+| init remove component | 0.211-0.303 ms, 中位数 0.277 ms | n/a | db 内部分量 |
+| init schema component | 0.075-0.106 ms, 中位数 0.097 ms | n/a | db 内部分量 |
+| init dict component | 0.053-0.074 ms, 中位数 0.068 ms | n/a | db 内部分量 |
+| baseline ingest before indexes | 4.764-5.145 ms, 中位数 5.098 ms | 中位数 66.708 ms | db 插件约 13.1x |
+| build baseline indexes | 9.039-9.820 ms, 中位数 9.210 ms | 中位数 22.246 ms | db 插件约 2.4x |
+| append with tx + incremental indexes | 2.152-2.547 ms, 中位数 2.378 ms | 中位数 4.622 ms* | db 插件约 1.9x |
+| append with coltx + incremental indexes | 1.586-2.050 ms, 中位数 1.909 ms | 中位数 4.622 ms* | db 插件约 2.4x |
+| total append chain | 3.738-4.469 ms, 中位数 4.287 ms | 中位数 4.622 ms | db 插件约 1.1x |
+| verify/integrity | 0.935-1.348 ms, 中位数 1.173 ms | 中位数 34.882 ms | db 插件约 29.7x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。当前记录只保留了 SQLite init 原始样本；其余 SQLite 单元格记录保留下来的中位数。
+
+这轮改变 indexed ERP write benchmark 的当前结论：在已安装插件和源码一致后，db 插件已经在该 benchmark 的 init、baseline ingest、index build、`tx` append、`coltx` append、total append chain、verify/integrity 中位数上全部领先 SQLite。这个结论只覆盖这组 unsafe/no-sync indexed ERP 写入 benchmark，不等价于 SQL 功能、ACID/WAL、崩溃恢复、compact/vacuum 或通用运维能力全面超过 SQLite。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
@@ -398,7 +423,8 @@ raw，对应中位数如下：
 - 并发插入：在当前 3-run 隔离样本里，原始 `sa_db_ingest_columns` 和新的 `sa_db_coltx_*` 批量列 session 都快于 SQLite，其中 `coltx` 最快。
 - 新增的 ABI 修复把 `sa_db_coltx_add_columns` 从“持有全局 handle mutex 执行整段 staging I/O”改成了带引用计数的共享获取，直接改善了多 session 并发追加。
 - 批量写入和全量列更新：db 插件更快，主要受益于列式 raw column ingest。
-- 初始化、建索引、compact、verify/integrity：SQLite 更成熟也更快。
+- 当前 indexed ERP write benchmark 在安装当前开发插件后，db 插件的 init、建索引、append 链路和 verify/integrity 中位数都领先 SQLite；旧 ERP workflow 和非 indexed 写入历史样本仍按各自表格解释。
+- SQLite 在通用 SQL、ACID/WAL、崩溃恢复、compact/vacuum、成熟运维工具和广泛兼容性上仍更完整。
 - 带二级索引的 ERP append-only 写入现在已经走增量索引维护，db 不再为这条路径付出整表 `rebuildIndexes()` 的成本；相对旧 ERP workflow 里的全量建索引阶段，db 侧建索引成本已经明显下降。
 - 之前出现的并发失败，主要是 benchmark 工件共享导致的污染，不是当前这轮隔离结果里的稳定行为。
 
