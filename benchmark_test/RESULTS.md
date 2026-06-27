@@ -272,6 +272,25 @@ raw，对应中位数如下：
 
 这轮不能作为“全部领先”的依据：db 在 baseline、build、单段 append、verify 继续领先，total append chain 中位数也略快，但区间和 SQLite 重叠；init 中位数仍明显慢于 SQLite。blob 首写 bootstrap 是功能覆盖和空表首写路径一致性收益，不是当前 indexed ERP init benchmark 的直接收益，因为这组 init 只包含 remove、schema init 和 dict init。
 
+同日继续压 `removeTable()` 在 unsafe / 空 root 下的固定成本：not-found 路径不再先让 `loadActiveMeta()` 做 recovered-meta 目录扫描、再由 `deleteRootTableArtifacts()` 为 stale artifact cleanup 再扫一次目录；现在合并成一次 root 遍历，同时保留 stale artifact 删除和 `.write.lock` 保留语义。新增回归测试覆盖 unsafe not-found remove 清理 stale 文件且保留 lock 文件。
+
+重新 `zig build` 后顺序跑 5 次 db 和 5 次 SQLite indexed ERP append benchmark。两侧正确性输出仍一致：`8448 / 33792 / 8448`。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 1.407-1.569 ms, 中位数 1.507 ms | 0.840-1.348 ms, 中位数 0.966 ms | SQLite |
+| init remove component | 0.342-0.547 ms, 中位数 0.366 ms | n/a | db 内部改善 |
+| baseline ingest before indexes | 4.911-5.519 ms, 中位数 5.212 ms | 59.753-75.525 ms, 中位数 70.698 ms | db 插件约 13.6x |
+| build baseline indexes | 8.573-10.291 ms, 中位数 9.611 ms | 19.998-24.267 ms, 中位数 21.246 ms | db 插件约 2.2x |
+| append with tx + incremental indexes | 2.573-3.115 ms, 中位数 2.577 ms | 4.474-9.344 ms, 中位数 5.059 ms* | db 插件约 2.0x |
+| append with coltx + incremental indexes | 1.675-1.892 ms, 中位数 1.742 ms | 4.474-9.344 ms, 中位数 5.059 ms* | db 插件约 2.9x |
+| total append chain | 4.309-4.790 ms, 中位数 4.469 ms | 4.474-9.344 ms, 中位数 5.059 ms | db 插件约 1.1x |
+| verify/integrity | 1.001-1.328 ms, 中位数 1.113 ms | 33.446-39.843 ms, 中位数 36.915 ms | db 插件约 33.2x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这轮证明 remove 固定成本继续下降，尤其 `db_erp_indexed_init_remove_ns` 中位数压到 `0.366 ms`；但总 init 仍是 `1.507 ms` 对 SQLite `0.966 ms`，所以目标“init 稳定领先”仍未达成。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

@@ -4056,6 +4056,62 @@ fn scanVersionedRecoveryMetas(
     }
 }
 
+fn scanUnsafeRemoveArtifactsAndRecovery(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    best: *?TableMeta,
+) TableError!void {
+    const dir_path = rootPrefix(root_dir);
+    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| switch (mapFileError(err)) {
+        TableError.NotFound => return,
+        else => |mapped| return mapped,
+    };
+    defer dir.close();
+
+    const artifact_prefix = try allocPrintPath(allocator, "{s}.", .{table_name});
+    defer allocator.free(artifact_prefix);
+    const meta_prefix = try allocPrintPath(allocator, "{s}.meta.", .{table_name});
+    defer allocator.free(meta_prefix);
+    const lock_name = try tableWriteLockName(allocator, table_name);
+    defer allocator.free(lock_name);
+
+    var stale_files = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (stale_files.items) |name| allocator.free(name);
+        stale_files.deinit();
+    }
+
+    var it = dir.iterate();
+    while (it.next() catch |err| return mapFileError(err)) |entry| {
+        if (entry.kind != .file) continue;
+
+        if (std.mem.startsWith(u8, entry.name, meta_prefix)) {
+            const epoch_text = entry.name[meta_prefix.len..];
+            if (epoch_text.len != 0) {
+                if (std.fmt.parseInt(u64, epoch_text, 10)) |_| {
+                    const path = try activePath(allocator, root_dir, entry.name);
+                    defer allocator.free(path);
+                    try maybeSelectRecoveryMeta(allocator, root_dir, table_name, path, best);
+                } else |_| {}
+            }
+        }
+
+        if (!std.mem.startsWith(u8, entry.name, artifact_prefix)) continue;
+        if (std.mem.eql(u8, entry.name, lock_name)) continue;
+        try stale_files.append(try allocator.dupe(u8, entry.name));
+    }
+
+    if (best.* != null) return;
+
+    for (stale_files.items) |name| {
+        dir.deleteFile(name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return mapFileError(err),
+        };
+    }
+}
+
 fn cleanupPendingTxMarkers(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
     const dir_path = rootPrefix(root_dir);
     var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
@@ -4221,7 +4277,20 @@ fn deleteActiveMetaArtifacts(allocator: std.mem.Allocator, root_dir: []const u8,
 
 fn deleteTableArtifactsFast(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
     var removed_targeted = false;
-    if (loadActiveMeta(allocator, root_dir, table_name)) |meta| {
+    const meta_result = if (skipDurabilitySync()) blk: {
+        break :blk loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
+            TableError.NotFound => {
+                if (try unsafeInitCachePeek(allocator, root_dir, table_name)) |meta| break :blk meta;
+                var best: ?TableMeta = null;
+                errdefer if (best) |*meta| meta.deinit(allocator);
+                try scanUnsafeRemoveArtifactsAndRecovery(allocator, root_dir, table_name, &best);
+                break :blk best orelse return;
+            },
+            else => return err,
+        };
+    } else loadActiveMeta(allocator, root_dir, table_name);
+
+    if (meta_result) |meta| {
         var owned = meta;
         defer owned.deinit(allocator);
         try deleteActiveMetaArtifacts(allocator, root_dir, owned);
@@ -22316,6 +22385,33 @@ test "table remove preserves write lock file" {
 
     var next_lock = try acquireTableWriteLock(std.testing.allocator, ".", table_name);
     next_lock.release();
+}
+
+test "table unsafe remove not found clears stale artifacts and preserves lock" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_stale_remove";
+    const stale_data = "unsafe_stale_remove.col0.0.dat";
+    const stale_meta = "unsafe_stale_remove.meta.7";
+    const lock_name = "unsafe_stale_remove.write.lock";
+    try writeFile(std.testing.allocator, stale_data, "stale column");
+    try writeFile(std.testing.allocator, stale_meta, "not json");
+    try writeFile(std.testing.allocator, lock_name, "held");
+
+    _ = try removeTable(std.testing.allocator, ".", table_name);
+    try std.testing.expect(!fileExists(stale_data));
+    try std.testing.expect(!fileExists(stale_meta));
+    try std.testing.expect(fileExists(lock_name));
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {
