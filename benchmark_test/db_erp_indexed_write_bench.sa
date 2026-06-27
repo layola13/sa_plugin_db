@@ -24,8 +24,14 @@
 @const NL = utf8:"\n"
 
 @const ERP_INIT = utf8:"db_erp_indexed_init_ns="
+@const ERP_INIT_REMOVE = utf8:"db_erp_indexed_init_remove_ns="
+@const ERP_INIT_SCHEMA = utf8:"db_erp_indexed_init_schema_ns="
+@const ERP_INIT_DICT = utf8:"db_erp_indexed_init_dict_ns="
 @const ERP_BASELINE = utf8:"db_erp_indexed_baseline_ns="
 @const ERP_INDEX = utf8:"db_erp_indexed_build_ns="
+@const ERP_INDEX_ORDERS = utf8:"db_erp_indexed_build_orders_ns="
+@const ERP_INDEX_LINES = utf8:"db_erp_indexed_build_lines_ns="
+@const ERP_INDEX_INVOICES = utf8:"db_erp_indexed_build_invoices_ns="
 @const ERP_TX_APPEND = utf8:"db_erp_indexed_tx_append_ns="
 @const ERP_COLTX_APPEND = utf8:"db_erp_indexed_coltx_append_ns="
 @const ERP_VERIFY = utf8:"db_erp_indexed_verify_ns="
@@ -69,8 +75,14 @@
 #def FMT_BUF_BYTES = 32
 
 #def ERP_INIT_LEN = 23
+#def ERP_INIT_REMOVE_LEN = 30
+#def ERP_INIT_SCHEMA_LEN = 30
+#def ERP_INIT_DICT_LEN = 28
 #def ERP_BASELINE_LEN = 27
 #def ERP_INDEX_LEN = 24
+#def ERP_INDEX_ORDERS_LEN = 31
+#def ERP_INDEX_LINES_LEN = 30
+#def ERP_INDEX_INVOICES_LEN = 33
 #def ERP_TX_APPEND_LEN = 28
 #def ERP_COLTX_APPEND_LEN = 31
 #def ERP_VERIFY_LEN = 25
@@ -291,6 +303,12 @@ L_DONE:
 @main() -> i32:
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
+    order_dict_inputs = stack_alloc 32
+    order_dict_ids = stack_alloc 16
+    order_dict_inserted = stack_alloc 16
+    invoice_dict_inputs = stack_alloc 32
+    invoice_dict_ids = stack_alloc 16
+    invoice_dict_inserted = stack_alloc 16
     order_columns = stack_alloc MAX_COLUMNS_BYTES
     line_columns = stack_alloc MAX_COLUMNS_BYTES
     invoice_columns = stack_alloc MAX_COLUMNS_BYTES
@@ -333,17 +351,34 @@ L_ENTRY:
     append_invoice_due_col = alloc APPEND_INVOICE_COL_BYTES
     append_invoice_amount_col = alloc APPEND_INVOICE_COL_BYTES
 
-    t_init0 = call @sa_time_instant_ns()
+    t_remove0 = call @sa_time_instant_ns()
     EXPAND DB_REMOVE_TABLE remove_orders_status, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, info
     EXPAND DB_REMOVE_TABLE remove_lines_status, ROOT, ROOT_LEN, TABLE_LINES, TABLE_LINES_LEN, info
     EXPAND DB_REMOVE_TABLE remove_invoices_status, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, info
+    t_remove1 = call @sa_time_instant_ns()
+    db_erp_indexed_init_remove_ns = sub t_remove1, t_remove0
+
+    t_init0 = call @sa_time_instant_ns()
+    t_schema0 = call @sa_time_instant_ns()
     EXPAND DB_INIT_SCHEMA init_orders_status, ROOT, ROOT_LEN, ORDERS_SCHEMA_PATH, ORDERS_SCHEMA_PATH_LEN, ORDERS_SCHEMA, ORDERS_SCHEMA_LEN, info
     EXPAND DB_INIT_SCHEMA init_lines_status, ROOT, ROOT_LEN, LINES_SCHEMA_PATH, LINES_SCHEMA_PATH_LEN, LINES_SCHEMA, LINES_SCHEMA_LEN, info
     EXPAND DB_INIT_SCHEMA init_invoices_status, ROOT, ROOT_LEN, INVOICES_SCHEMA_PATH, INVOICES_SCHEMA_PATH_LEN, INVOICES_SCHEMA, INVOICES_SCHEMA_LEN, info
-    EXPAND DB_DICT_INTERN order_open_status, order_open_id, order_open_inserted, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, ORDER_STATUS_DICT, ORDER_STATUS_DICT_LEN, STATUS_OPEN, STATUS_OPEN_LEN, info
-    EXPAND DB_DICT_INTERN order_posted_status, order_posted_id, order_posted_inserted, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, ORDER_STATUS_DICT, ORDER_STATUS_DICT_LEN, STATUS_POSTED, STATUS_POSTED_LEN, info
-    EXPAND DB_DICT_INTERN invoice_paid_status, invoice_paid_id, invoice_paid_inserted, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, INVOICE_STATUS_DICT, INVOICE_STATUS_DICT_LEN, STATUS_PAID, STATUS_PAID_LEN, info
-    EXPAND DB_DICT_INTERN invoice_unpaid_status, invoice_unpaid_id, invoice_unpaid_inserted, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, INVOICE_STATUS_DICT, INVOICE_STATUS_DICT_LEN, STATUS_UNPAID, STATUS_UNPAID_LEN, info
+    t_schema1 = call @sa_time_instant_ns()
+    db_erp_indexed_init_schema_ns = sub t_schema1, t_schema0
+
+    t_dict0 = call @sa_time_instant_ns()
+    EXPAND DB_BYTES_INPUT_SET order_dict_inputs, 0, STATUS_OPEN, STATUS_OPEN_LEN
+    EXPAND DB_BYTES_INPUT_SET order_dict_inputs, 1, STATUS_POSTED, STATUS_POSTED_LEN
+    EXPAND DB_DICT_INTERN_MANY order_dict_status, ROOT, ROOT_LEN, TABLE_ORDERS, TABLE_ORDERS_LEN, ORDER_STATUS_DICT, ORDER_STATUS_DICT_LEN, order_dict_inputs, 2, order_dict_ids, 2, order_dict_inserted, 2, info
+    order_open_id = load order_dict_ids+0 as u64
+    order_posted_id = load order_dict_ids+8 as u64
+    EXPAND DB_BYTES_INPUT_SET invoice_dict_inputs, 0, STATUS_PAID, STATUS_PAID_LEN
+    EXPAND DB_BYTES_INPUT_SET invoice_dict_inputs, 1, STATUS_UNPAID, STATUS_UNPAID_LEN
+    EXPAND DB_DICT_INTERN_MANY invoice_dict_status, ROOT, ROOT_LEN, TABLE_INVOICES, TABLE_INVOICES_LEN, INVOICE_STATUS_DICT, INVOICE_STATUS_DICT_LEN, invoice_dict_inputs, 2, invoice_dict_ids, 2, invoice_dict_inserted, 2, info
+    invoice_paid_id = load invoice_dict_ids+0 as u64
+    invoice_unpaid_id = load invoice_dict_ids+8 as u64
+    t_dict1 = call @sa_time_instant_ns()
+    db_erp_indexed_init_dict_ns = sub t_dict1, t_dict0
     EXPAND DB_DATE_FROM_YMD base_day_status, base_day, 2026, 1, 1
     t_init1 = call @sa_time_instant_ns()
     db_erp_indexed_init_ns = sub t_init1, t_init0
@@ -412,11 +447,20 @@ L_ENTRY:
     db_erp_indexed_baseline_ns = sub t_base1, t_base0
 
     t_index0 = call @sa_time_instant_ns()
+    t_order_index0 = call @sa_time_instant_ns()
     order_index_status = call @sa_db_create_indexes(&ROOT, ROOT_LEN, &TABLE_ORDERS, TABLE_ORDERS_LEN, order_index_requests, 1, &info)
+    t_order_index1 = call @sa_time_instant_ns()
+    t_line_index0 = call @sa_time_instant_ns()
     line_index_status = call @sa_db_create_indexes(&ROOT, ROOT_LEN, &TABLE_LINES, TABLE_LINES_LEN, line_index_requests, 2, &info)
+    t_line_index1 = call @sa_time_instant_ns()
+    t_invoice_index0 = call @sa_time_instant_ns()
     invoice_index_status = call @sa_db_create_indexes(&ROOT, ROOT_LEN, &TABLE_INVOICES, TABLE_INVOICES_LEN, invoice_index_requests, 2, &info)
+    t_invoice_index1 = call @sa_time_instant_ns()
     t_index1 = call @sa_time_instant_ns()
     db_erp_indexed_build_ns = sub t_index1, t_index0
+    db_erp_indexed_build_orders_ns = sub t_order_index1, t_order_index0
+    db_erp_indexed_build_lines_ns = sub t_line_index1, t_line_index0
+    db_erp_indexed_build_invoices_ns = sub t_invoice_index1, t_invoice_index0
 
     fill_append_orders_status = call @fill_order_columns(&append_order_id_col, &append_order_customer_col, &append_order_status_col, &append_order_day_col, BASE_ORDER_ROWS, APPEND_ORDER_ROWS, order_open_id, order_posted_id, base_day)
     fill_append_lines_status = call @fill_line_columns(&append_line_order_col, &append_line_no_col, &append_line_product_col, &append_line_qty_col, &append_line_net_col, BASE_LINE_ROWS, APPEND_LINE_ROWS)
@@ -466,8 +510,14 @@ L_ENTRY:
     db_erp_indexed_verify_ns = sub t_verify1, t_verify0
 
     EXPAND PRINT_U64_LINE ERP_INIT, ERP_INIT_LEN, db_erp_indexed_init_ns
+    EXPAND PRINT_U64_LINE ERP_INIT_REMOVE, ERP_INIT_REMOVE_LEN, db_erp_indexed_init_remove_ns
+    EXPAND PRINT_U64_LINE ERP_INIT_SCHEMA, ERP_INIT_SCHEMA_LEN, db_erp_indexed_init_schema_ns
+    EXPAND PRINT_U64_LINE ERP_INIT_DICT, ERP_INIT_DICT_LEN, db_erp_indexed_init_dict_ns
     EXPAND PRINT_U64_LINE ERP_BASELINE, ERP_BASELINE_LEN, db_erp_indexed_baseline_ns
     EXPAND PRINT_U64_LINE ERP_INDEX, ERP_INDEX_LEN, db_erp_indexed_build_ns
+    EXPAND PRINT_U64_LINE ERP_INDEX_ORDERS, ERP_INDEX_ORDERS_LEN, db_erp_indexed_build_orders_ns
+    EXPAND PRINT_U64_LINE ERP_INDEX_LINES, ERP_INDEX_LINES_LEN, db_erp_indexed_build_lines_ns
+    EXPAND PRINT_U64_LINE ERP_INDEX_INVOICES, ERP_INDEX_INVOICES_LEN, db_erp_indexed_build_invoices_ns
     EXPAND PRINT_U64_LINE ERP_TX_APPEND, ERP_TX_APPEND_LEN, db_erp_indexed_tx_append_ns
     EXPAND PRINT_U64_LINE ERP_COLTX_APPEND, ERP_COLTX_APPEND_LEN, db_erp_indexed_coltx_append_ns
     EXPAND PRINT_U64_LINE ERP_VERIFY, ERP_VERIFY_LEN, db_erp_indexed_verify_ns
@@ -481,10 +531,8 @@ L_ENTRY:
     ok_init_orders = eq init_orders_status, SA_DB_OK
     ok_init_lines = eq init_lines_status, SA_DB_OK
     ok_init_invoices = eq init_invoices_status, SA_DB_OK
-    ok_order_open = eq order_open_status, SA_DB_OK
-    ok_order_posted = eq order_posted_status, SA_DB_OK
-    ok_invoice_paid = eq invoice_paid_status, SA_DB_OK
-    ok_invoice_unpaid = eq invoice_unpaid_status, SA_DB_OK
+    ok_order_dict = eq order_dict_status, SA_DB_OK
+    ok_invoice_dict = eq invoice_dict_status, SA_DB_OK
     ok_base_day = eq base_day_status, SA_DB_OK
     ok_fill_orders = eq fill_orders_status, 0
     ok_fill_lines = eq fill_lines_status, 0
@@ -517,36 +565,34 @@ L_ENTRY:
     ok03 = and ok02, ok_init_orders
     ok04 = and ok03, ok_init_lines
     ok05 = and ok04, ok_init_invoices
-    ok06 = and ok05, ok_order_open
-    ok07 = and ok06, ok_order_posted
-    ok08 = and ok07, ok_invoice_paid
-    ok09 = and ok08, ok_invoice_unpaid
-    ok10 = and ok09, ok_base_day
-    ok11 = and ok10, ok_fill_orders
-    ok12 = and ok11, ok_fill_lines
-    ok13 = and ok12, ok_fill_invoices
-    ok14 = and ok13, ok_ingest_orders
-    ok15 = and ok14, ok_ingest_lines
-    ok16 = and ok15, ok_ingest_invoices
-    ok17 = and ok16, ok_index_orders
-    ok18 = and ok17, ok_index_lines
-    ok19 = and ok18, ok_index_invoices
-    ok20 = and ok19, ok_fill_append_orders
-    ok21 = and ok20, ok_fill_append_lines
-    ok22 = and ok21, ok_fill_append_invoices
-    ok23 = and ok22, ok_tx_begin_orders
-    ok24 = and ok23, ok_tx_commit_orders
-    ok25 = and ok24, ok_tx_begin_invoices
-    ok26 = and ok25, ok_tx_commit_invoices
-    ok27 = and ok26, ok_coltx_begin
-    ok28 = and ok27, ok_coltx_add
-    ok29 = and ok28, ok_coltx_commit
-    ok30 = and ok29, ok_verify_orders
-    ok31 = and ok30, ok_verify_lines
-    ok32 = and ok31, ok_verify_invoices
-    ok33 = and ok32, ok_order_rows
-    ok34 = and ok33, ok_line_rows
-    ok = and ok34, ok_invoice_rows
+    ok06 = and ok05, ok_order_dict
+    ok07 = and ok06, ok_invoice_dict
+    ok08 = and ok07, ok_base_day
+    ok09 = and ok08, ok_fill_orders
+    ok10 = and ok09, ok_fill_lines
+    ok11 = and ok10, ok_fill_invoices
+    ok12 = and ok11, ok_ingest_orders
+    ok13 = and ok12, ok_ingest_lines
+    ok14 = and ok13, ok_ingest_invoices
+    ok15 = and ok14, ok_index_orders
+    ok16 = and ok15, ok_index_lines
+    ok17 = and ok16, ok_index_invoices
+    ok18 = and ok17, ok_fill_append_orders
+    ok19 = and ok18, ok_fill_append_lines
+    ok20 = and ok19, ok_fill_append_invoices
+    ok21 = and ok20, ok_tx_begin_orders
+    ok22 = and ok21, ok_tx_commit_orders
+    ok23 = and ok22, ok_tx_begin_invoices
+    ok24 = and ok23, ok_tx_commit_invoices
+    ok25 = and ok24, ok_coltx_begin
+    ok26 = and ok25, ok_coltx_add
+    ok27 = and ok26, ok_coltx_commit
+    ok28 = and ok27, ok_verify_orders
+    ok29 = and ok28, ok_verify_lines
+    ok30 = and ok29, ok_verify_invoices
+    ok31 = and ok30, ok_order_rows
+    ok32 = and ok31, ok_line_rows
+    ok = and ok32, ok_invoice_rows
 
     br ok -> L_OK, L_FAIL
 
@@ -588,18 +634,12 @@ L_OK:
     !init_orders_status
     !init_lines_status
     !init_invoices_status
-    !order_open_status
+    !order_dict_status
     !order_open_id
-    !order_open_inserted
-    !order_posted_status
     !order_posted_id
-    !order_posted_inserted
-    !invoice_paid_status
+    !invoice_dict_status
     !invoice_paid_id
-    !invoice_paid_inserted
-    !invoice_unpaid_status
     !invoice_unpaid_id
-    !invoice_unpaid_inserted
     !base_day_status
     !base_day
     !t_init1

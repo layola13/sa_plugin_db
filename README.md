@@ -120,6 +120,7 @@ Core native calls:
 - `sa_db_create_blob_prefix_index`
 - `sa_db_create_blob_contains_index`
 - `sa_db_dict_intern`
+- `sa_db_dict_intern_many`
 - `sa_db_dict_lookup`
 - `sa_db_dict_value_len`
 - `sa_db_dict_value_copy`
@@ -1007,7 +1008,10 @@ absent. `sa_db_tx_delete_blob_eq_key` / `DB_TX_DELETE_BLOB_EQ_KEY` provides the
 same behavior inside a write transaction.
 
 `sa_db_dict_intern` / `DB_DICT_INTERN` provides the first string data-model layer
-for ERP fields with small repeated value sets. `sa_db_tx_dict_intern` /
+for ERP fields with small repeated value sets. `sa_db_dict_intern_many` /
+`DB_DICT_INTERN_MANY` batches one dictionary lookup/insert pass for multiple
+values, returning one ID and inserted flag per input without re-reading or
+re-writing the dictionary for each label. `sa_db_tx_dict_intern` /
 `DB_TX_DICT_INTERN` provides the same dictionary ID allocation inside a
 single-table transaction, so a new status/category label and the rows that refer
 to it commit or roll back together. The dictionary itself is a versioned table
@@ -1316,6 +1320,28 @@ Summary:
   each benchmark to a dedicated root and cleaning SQLite WAL/SHM side files.
 - SQLite remains stronger for SQL, index creation, ACID, WAL, crash recovery,
   compact/vacuum, and integrity checks.
+
+ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
+maintenance, buffered transaction dictionary writes, batched dictionary intern,
+and unsafe init-path reductions:
+
+| Operation | db plugin | SQLite | Fastest |
+| --- | ---: | ---: | --- |
+| init 3 ERP tables + dicts | 0.616-1.014 ms | 0.711-1.092 ms | mixed |
+| ingest ERP rows | 4.884-6.341 ms | 60.795-68.881 ms | db plugin |
+| build ERP indexes | 9.425-10.557 ms | 19.328-24.279 ms | db plugin |
+| append ERP rows | 3.582-5.868 ms* | 3.862-4.950 ms | db plugin overall |
+| verify/integrity | 0.996-1.458 ms | 35.250-43.172 ms | db plugin |
+
+`*` db append is split into indexed row-transaction append (`2.036-3.514 ms`)
+for orders/invoices and indexed column-transaction append (`1.545-2.355 ms`)
+for order lines. Summed wall time remains below the SQLite append path across
+the sampled runs.
+
+This rerun matters because the write path no longer falls back to O(N) index
+rebuilds for dictionary-only transactions, append-only indexed commits update
+existing index files incrementally in unsafe mode, and dictionary bootstrap now
+has a real batched API surfaced through both `.sai` and `.sal`.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 

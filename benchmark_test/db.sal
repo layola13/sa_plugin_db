@@ -87,6 +87,10 @@
 #def SaDbColumnInput_data = +0
 #def SaDbColumnInput_len = +8
 
+#def SaDbBytesInput_SIZE = 16
+#def SaDbBytesInput_data = +0
+#def SaDbBytesInput_len = +8
+
 #def SaDbCreateIndexRequest_SIZE = 48
 #def SaDbCreateIndexRequest_kind = +0
 #def SaDbCreateIndexRequest_unique = +4
@@ -216,6 +220,15 @@
     store __db_col_ptr_%columns_%index+SaDbColumnInput_len, %len as u64
     !__db_col_ptr_%columns_%index
     !__db_col_off_%columns_%index
+[END_MACRO]
+
+[MACRO] DB_BYTES_INPUT_SET %inputs, %index, %data, %len
+    __db_bytes_off_%inputs_%index = mul %index, SaDbBytesInput_SIZE
+    __db_bytes_ptr_%inputs_%index = ptr_add %inputs, __db_bytes_off_%inputs_%index
+    store __db_bytes_ptr_%inputs_%index+SaDbBytesInput_data, %data as ptr
+    store __db_bytes_ptr_%inputs_%index+SaDbBytesInput_len, %len as u64
+    !__db_bytes_ptr_%inputs_%index
+    !__db_bytes_off_%inputs_%index
 [END_MACRO]
 
 [MACRO] DB_CREATE_INDEX_REQUEST_SET %requests, %index, %kind, %column_index, %column_index2, %unique, %store_name, %store_name_len
@@ -382,6 +395,10 @@
 
 [MACRO] DB_TX_INSERT_ROW %out_status, %handle, %row, %row_len, %out_info
     %out_status = call @sa_db_tx_insert_row(%handle, &%row, %row_len, &%out_info)
+[END_MACRO]
+
+[MACRO] DB_TX_ADD_COLUMNS %out_status, %handle, %row_count, %columns, %columns_len, %out_info
+    %out_status = call @sa_db_tx_add_columns(%handle, %row_count, %columns, %columns_len, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_TX_DICT_INTERN %out_status, %out_id, %out_inserted, %handle, %dict_name, %dict_name_len, %value, %value_len, %out_info
@@ -652,6 +669,10 @@
     %out_status = call @sa_db_dict_intern(&%root, %root_len, &%table_name, %table_name_len, &%dict_name, %dict_name_len, &%value, %value_len, &__db_dict_id_slot_%out_id, &__db_dict_inserted_slot_%out_inserted, &%out_info)
     %out_id = load __db_dict_id_slot_%out_id+0 as u64
     %out_inserted = load __db_dict_inserted_slot_%out_inserted+0 as u64
+[END_MACRO]
+
+[MACRO] DB_DICT_INTERN_MANY %out_status, %root, %root_len, %table_name, %table_name_len, %dict_name, %dict_name_len, %values, %values_len, %out_ids, %out_ids_len, %out_inserted, %out_inserted_len, %out_info
+    %out_status = call @sa_db_dict_intern_many(&%root, %root_len, &%table_name, %table_name_len, &%dict_name, %dict_name_len, %values, %values_len, %out_ids, %out_ids_len, %out_inserted, %out_inserted_len, &%out_info)
 [END_MACRO]
 
 [MACRO] DB_DICT_LOOKUP %out_status, %out_found, %out_id, %root, %root_len, %table_name, %table_name_len, %dict_name, %dict_name_len, %value, %value_len

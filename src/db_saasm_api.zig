@@ -88,6 +88,11 @@ pub const SaDbColumnInput = extern struct {
     len: u64,
 };
 
+pub const SaDbBytesInput = extern struct {
+    data: ?[*]const u8,
+    len: u64,
+};
+
 pub const SaDbCreateIndexRequest = extern struct {
     kind: u32,
     unique: u32,
@@ -123,6 +128,14 @@ fn inputU64sAllowEmpty(ptr: ?[*]const u64, len: u64) ?[]const u64 {
 }
 
 fn inputCreateIndexRequests(ptr: ?[*]const SaDbCreateIndexRequest, len: u64) ?[]const SaDbCreateIndexRequest {
+    if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
+    const n: usize = @intCast(len);
+    if (n == 0) return &.{};
+    const p = ptr orelse return null;
+    return p[0..n];
+}
+
+fn inputBytesInputs(ptr: ?[*]const SaDbBytesInput, len: u64) ?[]const SaDbBytesInput {
     if (len > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
     const n: usize = @intCast(len);
     if (n == 0) return &.{};
@@ -261,6 +274,10 @@ fn fillColumnLogicalInfo(out_info: ?*SaDbColumnLogicalInfo, info: table.ColumnLo
         .nullable = info.nullable,
     };
     return SA_DB_OK;
+}
+
+fn tempArenaAllocator() std.heap.ArenaAllocator {
+    return std.heap.ArenaAllocator.init(std.heap.page_allocator);
 }
 
 fn fillPlanInfo(out_info: ?*SaDbPlanInfo, result: table.PlanRowsResult) u32 {
@@ -704,11 +721,11 @@ pub export fn sa_db_init_schema(
     const schema_path = requiredBytes(schema_path_ptr, schema_path_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const schema_source = requiredBytes(schema_ptr, schema_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var arena = tempArenaAllocator();
+    defer arena.deinit();
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
-    const info = table.initTableFromSchemaBytes(gpa.allocator(), root, schema_path, schema_source) catch |err| return tableStatus(err);
+    const info = table.initTableFromSchemaBytes(arena.allocator(), root, schema_path, schema_source) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -722,11 +739,11 @@ pub export fn sa_db_remove_table(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var arena = tempArenaAllocator();
+    defer arena.deinit();
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
-    const info = table.removeTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    const info = table.removeTable(arena.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -2581,13 +2598,55 @@ pub export fn sa_db_dict_intern(
     id_slot.* = 0;
     inserted_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var arena = tempArenaAllocator();
+    defer arena.deinit();
     mutation_mutex.lock();
     defer mutation_mutex.unlock();
-    const result = table.internStringDict(gpa.allocator(), root, table_name, dict_name, value) catch |err| return tableStatus(err);
+    const result = table.internStringDict(arena.allocator(), root, table_name, dict_name, value) catch |err| return tableStatus(err);
     id_slot.* = result.id;
     inserted_slot.* = if (result.inserted) 1 else 0;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_dict_intern_many(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    dict_ptr: ?[*]const u8,
+    dict_len: u64,
+    values_ptr: ?[*]const SaDbBytesInput,
+    values_len: u64,
+    out_ids_ptr: ?[*]u64,
+    out_ids_len: u64,
+    out_inserted_ptr: ?[*]u64,
+    out_inserted_len: u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const dict_name = requiredBytes(dict_ptr, dict_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const values_in = inputBytesInputs(values_ptr, values_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_ids = outputU64sAllowEmpty(out_ids_ptr, out_ids_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const out_inserted = outputU64sAllowEmpty(out_inserted_ptr, out_inserted_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (values_in.len != out_ids.len or values_in.len != out_inserted.len) return SA_DB_ERR_INVALID_ARGUMENT;
+
+    var arena = tempArenaAllocator();
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const values = allocator.alloc([]const u8, values_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    const inserted = allocator.alloc(bool, values_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    for (values_in, 0..) |input, idx| {
+        values[idx] = requiredBytes(input.data, input.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    }
+    @memset(out_ids, 0);
+    @memset(out_inserted, 0);
+
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.internStringDictMany(allocator, root, table_name, dict_name, values, out_ids, inserted) catch |err| return tableStatus(err);
+    for (inserted, 0..) |flag, idx| out_inserted[idx] = if (flag) 1 else 0;
     return fillInfo(info_slot, result.info);
 }
 
@@ -3015,9 +3074,9 @@ pub export fn sa_db_verify(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const info = table.verifyTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
+    var arena = tempArenaAllocator();
+    defer arena.deinit();
+    const info = table.verifyTable(arena.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
 
@@ -7210,6 +7269,59 @@ test "db SA ABI interns and reads string dictionaries" {
     try std.testing.expectEqual(SA_DB_OK, sa_db_close_read_table(read_handle));
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "members".ptr, "members".len, &info));
+}
+
+test "db SA ABI interns many dictionary values in one call" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const root = ".";
+    const schema_source =
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    ;
+    var info: SaDbTableInfo = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_init_schema(root.ptr, root.len, "members_many.sadb-schema".ptr, "members_many.sadb-schema".len, schema_source.ptr, schema_source.len, &info));
+
+    const first_values = [_]SaDbBytesInput{
+        .{ .data = "active".ptr, .len = "active".len },
+        .{ .data = "paused".ptr, .len = "paused".len },
+        .{ .data = "active".ptr, .len = "active".len },
+        .{ .data = "closed".ptr, .len = "closed".len },
+    };
+    var first_ids: [first_values.len]u64 = undefined;
+    var first_inserted: [first_values.len]u64 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern_many(root.ptr, root.len, "members_many".ptr, "members_many".len, "member_status".ptr, "member_status".len, &first_values, first_values.len, &first_ids, first_ids.len, &first_inserted, first_inserted.len, &info));
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 1, 3 }, &first_ids);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 1, 0, 1 }, &first_inserted);
+    try std.testing.expectEqual(@as(u64, 1), info.epoch);
+
+    const second_values = [_]SaDbBytesInput{
+        .{ .data = "paused".ptr, .len = "paused".len },
+        .{ .data = "open".ptr, .len = "open".len },
+        .{ .data = "closed".ptr, .len = "closed".len },
+        .{ .data = "open".ptr, .len = "open".len },
+    };
+    var second_ids: [second_values.len]u64 = undefined;
+    var second_inserted: [second_values.len]u64 = undefined;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_intern_many(root.ptr, root.len, "members_many".ptr, "members_many".len, "member_status".ptr, "member_status".len, &second_values, second_values.len, &second_ids, second_ids.len, &second_inserted, second_inserted.len, &info));
+    try std.testing.expectEqualSlices(u64, &.{ 2, 4, 3, 4 }, &second_ids);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1, 0, 0 }, &second_inserted);
+    try std.testing.expectEqual(@as(u64, 2), info.epoch);
+
+    var found: u64 = 0;
+    var lookup_id: u64 = 0;
+    try std.testing.expectEqual(SA_DB_OK, sa_db_dict_lookup(root.ptr, root.len, "members_many".ptr, "members_many".len, "member_status".ptr, "member_status".len, "open".ptr, "open".len, &found, &lookup_id));
+    try std.testing.expectEqual(@as(u64, 1), found);
+    try std.testing.expectEqual(@as(u64, 4), lookup_id);
+
+    try std.testing.expectEqual(SA_DB_ERR_INVALID_ARGUMENT, sa_db_dict_intern_many(root.ptr, root.len, "members_many".ptr, "members_many".len, "member_status".ptr, "member_status".len, &first_values, first_values.len, &first_ids, first_ids.len - 1, &first_inserted, first_inserted.len, &info));
+    try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "members_many".ptr, "members_many".len, &info));
 }
 
 test "db SA ABI queries logical bool columns" {
