@@ -10371,6 +10371,13 @@ test "db SA ABI creates ingests updates and scans raw columns" {
 }
 
 test "db SA ABI memory root supports index write tx and coltx flows" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
     const root = ":memory:abi_tx_coltx";
     const schema_source =
         \\#def MAX_ROWS = 8
@@ -10437,6 +10444,7 @@ test "db SA ABI memory root supports index write tx and coltx flows" {
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &info));
     try std.testing.expectEqual(@as(u64, 4), info.row_count);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(root, .{}));
 }
 
 test "db SA ABI exports packed null bitmap from logical null_bitmap column" {

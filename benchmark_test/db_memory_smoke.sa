@@ -1,0 +1,193 @@
+@import "db.sal"
+
+@const ROOT = utf8:":memory:sa_smoke"
+@const TABLE = utf8:"mem_sa_members"
+@const SCHEMA_PATH = utf8:"mem_sa_members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+
+#def ROOT_LEN = 16
+#def TABLE_LEN = 14
+#def SCHEMA_PATH_LEN = 26
+#def SCHEMA_LEN = 82
+#def ROW_BYTES = 16
+#def COL_BYTES = 8
+#def COLUMN_COUNT = 2
+#def COLUMNS_BYTES = 32
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    snapshot_info = stack_alloc SaDbSnapshotInfo_SIZE
+    columns = stack_alloc COLUMNS_BYTES
+    ids_col = alloc COL_BYTES
+    points_col = alloc COL_BYTES
+    row = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_CREATE_U64_INDEX create_index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+
+    EXPAND DB_TX_BEGIN tx_begin_status, tx, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store row+0, 1 as u64
+    store row+8, 10 as u64
+    EXPAND DB_TX_INSERT_ROW tx_insert1_status, tx, row, ROW_BYTES, info
+    store row+0, 2 as u64
+    store row+8, 20 as u64
+    EXPAND DB_TX_INSERT_ROW tx_insert2_status, tx, row, ROW_BYTES, info
+    EXPAND DB_TX_COMMIT tx_commit_status, tx, info
+    EXPAND DB_INFO_ROW_COUNT tx_rows, info
+
+    EXPAND DB_COLTX_BEGIN coltx_begin_status, coltx, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store ids_col+0, 3 as u64
+    store points_col+0, 30 as u64
+    EXPAND DB_COLUMN_INPUT_SET columns, 0, ids_col, COL_BYTES
+    EXPAND DB_COLUMN_INPUT_SET columns, 1, points_col, COL_BYTES
+    EXPAND DB_COLTX_ADD_COLUMNS coltx_add_status, coltx, 1, columns, COLUMN_COUNT
+    EXPAND DB_COLTX_COMMIT coltx_commit_status, coltx, info
+    EXPAND DB_INFO_ROW_COUNT coltx_rows, info
+
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SNAPSHOT_INFO_HANDLE shape_status, read_handle, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_COUNT shape_rows, snapshot_info
+    EXPAND DB_SUM_U64_HANDLE sum_status, sum_points, read_handle, 1
+    EXPAND DB_FIND_U64_HANDLE find_status, found_id3, row_id3, read_handle, 0, 3
+    EXPAND DB_GET_U64_HANDLE get_status, points_id3, read_handle, 1, row_id3
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_ROW_COUNT verify_rows, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_create_index = eq create_index_status, SA_DB_OK
+    ok_tx_begin = eq tx_begin_status, SA_DB_OK
+    ok_tx_insert1 = eq tx_insert1_status, SA_DB_OK
+    ok_tx_insert2 = eq tx_insert2_status, SA_DB_OK
+    ok_tx_commit = eq tx_commit_status, SA_DB_OK
+    ok_tx_rows = eq tx_rows, 2
+    ok_coltx_begin = eq coltx_begin_status, SA_DB_OK
+    ok_coltx_add = eq coltx_add_status, SA_DB_OK
+    ok_coltx_commit = eq coltx_commit_status, SA_DB_OK
+    ok_coltx_rows = eq coltx_rows, 3
+    ok_open = eq open_status, SA_DB_OK
+    ok_shape = eq shape_status, SA_DB_OK
+    ok_shape_rows = eq shape_rows, 3
+    ok_sum_status = eq sum_status, SA_DB_OK
+    ok_sum = eq sum_points, 60
+    ok_find_status = eq find_status, SA_DB_OK
+    ok_found_id3 = eq found_id3, 1
+    ok_get_status = eq get_status, SA_DB_OK
+    ok_points_id3 = eq points_id3, 30
+    ok_close = eq close_status, SA_DB_OK
+    ok_verify = eq verify_status, SA_DB_OK
+    ok_verify_rows = eq verify_rows, 3
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_create_index
+    ok03 = and ok02, ok_tx_begin
+    ok04 = and ok03, ok_tx_insert1
+    ok05 = and ok04, ok_tx_insert2
+    ok06 = and ok05, ok_tx_commit
+    ok07 = and ok06, ok_tx_rows
+    ok08 = and ok07, ok_coltx_begin
+    ok09 = and ok08, ok_coltx_add
+    ok10 = and ok09, ok_coltx_commit
+    ok11 = and ok10, ok_coltx_rows
+    ok12 = and ok11, ok_open
+    ok13 = and ok12, ok_shape
+    ok14 = and ok13, ok_shape_rows
+    ok15 = and ok14, ok_sum_status
+    ok16 = and ok15, ok_sum
+    ok17 = and ok16, ok_find_status
+    ok18 = and ok17, ok_found_id3
+    ok19 = and ok18, ok_get_status
+    ok20 = and ok19, ok_points_id3
+    ok21 = and ok20, ok_close
+    ok22 = and ok21, ok_verify
+    ok = and ok22, ok_verify_rows
+
+    !remove_status
+    !init_status
+    !create_index_status
+    !tx_begin_status
+    !tx
+    !tx_insert1_status
+    !tx_insert2_status
+    !tx_commit_status
+    !tx_rows
+    !coltx_begin_status
+    !coltx
+    !coltx_add_status
+    !coltx_commit_status
+    !coltx_rows
+    !open_status
+    !read_handle
+    !shape_status
+    !shape_rows
+    !sum_status
+    !sum_points
+    !find_status
+    !found_id3
+    !row_id3
+    !get_status
+    !points_id3
+    !close_status
+    !verify_status
+    !verify_rows
+    !ok_remove
+    !ok_init
+    !ok_create_index
+    !ok_tx_begin
+    !ok_tx_insert1
+    !ok_tx_insert2
+    !ok_tx_commit
+    !ok_tx_rows
+    !ok_coltx_begin
+    !ok_coltx_add
+    !ok_coltx_commit
+    !ok_coltx_rows
+    !ok_open
+    !ok_shape
+    !ok_shape_rows
+    !ok_sum_status
+    !ok_sum
+    !ok_find_status
+    !ok_found_id3
+    !ok_get_status
+    !ok_points_id3
+    !ok_close
+    !ok_verify
+    !ok_verify_rows
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !row
+    !ids_col
+    !points_col
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9003)
