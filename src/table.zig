@@ -438,12 +438,14 @@ pub const ReadColumnSnapshot = struct {
 };
 
 const MappedReadRegion = struct {
-    memory: []align(std.heap.page_size_min) const u8,
+    memory: []const u8,
     owned_by_mmap: bool = true,
+    owned_by_allocator: bool = false,
 };
 
-fn releaseMappedRegion(region: MappedReadRegion) void {
-    if (region.owned_by_mmap and region.memory.len != 0) std.posix.munmap(region.memory);
+fn releaseMappedRegion(allocator: std.mem.Allocator, region: MappedReadRegion) void {
+    if (region.owned_by_mmap and region.memory.len != 0) std.posix.munmap(@alignCast(region.memory));
+    if (region.owned_by_allocator and region.memory.len != 0) allocator.free(region.memory);
 }
 
 pub const ReadSegmentSnapshot = struct {
@@ -598,7 +600,7 @@ pub const ReadSnapshot = struct {
     pub fn destroy(self: *ReadSnapshot) void {
         const backing_allocator = self.backing_allocator;
         for (self.mapped_regions) |region| {
-            if (region.owned_by_mmap and region.memory.len != 0) std.posix.munmap(region.memory);
+            releaseMappedRegion(backing_allocator, region);
         }
         backing_allocator.free(self.mapped_regions);
         self.arena.deinit();
@@ -1047,7 +1049,7 @@ fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRe
     if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
         const bytes = try memoryFileSlice(path);
         if (bytes.len != expected_len) return TableError.VerifyFailed;
-        return .{ .memory = @alignCast(bytes), .owned_by_mmap = false };
+        return .{ .memory = bytes, .owned_by_mmap = false };
     }
     var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
     defer file.close();
@@ -1059,6 +1061,15 @@ fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRe
         else => return TableError.InvalidFormat,
     };
     return .{ .memory = mapped, .owned_by_mmap = true };
+}
+
+fn mappedReadFileOwned(allocator: std.mem.Allocator, path: []const u8, expected_len: usize) TableError!MappedReadRegion {
+    if (!std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return mappedReadFile(path, expected_len);
+    if (expected_len == 0) return .{ .memory = &[_]u8{} };
+    const bytes = try memoryReadFileAlloc(allocator, path, expected_len);
+    errdefer allocator.free(bytes);
+    if (bytes.len != expected_len) return TableError.VerifyFailed;
+    return .{ .memory = bytes, .owned_by_mmap = false, .owned_by_allocator = true };
 }
 
 fn readFileTail(path: []const u8, expected_len: usize, tail: []u8) TableError!void {
@@ -2434,7 +2445,7 @@ fn validateFileMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, file
     const path = try activePath(allocator, root_dir, file.path);
     defer allocator.free(path);
     const mapped = try mappedReadFile(path, @intCast(file.bytes));
-    defer releaseMappedRegion(mapped);
+    defer releaseMappedRegion(allocator, mapped);
     try validateFileMetaBytes(file, mappedRegionBytes(mapped));
 }
 
@@ -2451,7 +2462,7 @@ fn validateDictMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, dict
     const path = try activePath(allocator, root_dir, dict.path);
     defer allocator.free(path);
     const mapped = try mappedReadFile(path, @intCast(dict.bytes));
-    defer releaseMappedRegion(mapped);
+    defer releaseMappedRegion(allocator, mapped);
     const bytes = mappedRegionBytes(mapped);
     const count = try dictEntryCount(bytes);
     if (count != dict.entries) return TableError.VerifyFailed;
@@ -2462,7 +2473,7 @@ fn validateBlobStoreMetaPath(allocator: std.mem.Allocator, root_dir: []const u8,
     const path = try activePath(allocator, root_dir, blob.path);
     defer allocator.free(path);
     const mapped = try mappedReadFile(path, @intCast(blob.bytes));
-    defer releaseMappedRegion(mapped);
+    defer releaseMappedRegion(allocator, mapped);
     const bytes = mappedRegionBytes(mapped);
     const count = try blobEntryCount(bytes);
     if (count != blob.entries) return TableError.VerifyFailed;
@@ -3641,7 +3652,7 @@ fn validateIndexFiles(allocator: std.mem.Allocator, root_dir: []const u8, meta: 
         }
         if (index.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
         const mapped = try validateIndexMetaPath(allocator, root_dir, index);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         if (std.mem.eql(u8, index.kind, "u64_pair") or std.mem.eql(u8, index.kind, "u64_i64_pair")) {
             try validateU64PairIndexBytesShape(bytes, meta.row_count, index.unique);
@@ -8071,7 +8082,7 @@ fn buildU64IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -8118,7 +8129,7 @@ fn buildI64IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -8165,7 +8176,7 @@ fn buildU32IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 4);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -8212,7 +8223,7 @@ fn buildI32IndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 4);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -8284,7 +8295,7 @@ fn buildSmallIntegerIndexBytes(
     var previous_entry: IndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, stride);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -8356,9 +8367,9 @@ fn buildU64PairIndexBytes(
     var previous_entry: U64PairIndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped1 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer releaseMappedRegion(mapped1);
+        defer releaseMappedRegion(allocator, mapped1);
         const mapped2 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8);
-        defer releaseMappedRegion(mapped2);
+        defer releaseMappedRegion(allocator, mapped2);
         const bytes1 = mappedRegionBytes(mapped1);
         const bytes2 = mappedRegionBytes(mapped2);
         var i: u64 = 0;
@@ -8412,9 +8423,9 @@ fn buildU64I64PairIndexBytes(
     var previous_entry: U64PairIndexEntry = undefined;
     for (meta.segments) |segment| {
         const mapped1 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer releaseMappedRegion(mapped1);
+        defer releaseMappedRegion(allocator, mapped1);
         const mapped2 = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index2, 8);
-        defer releaseMappedRegion(mapped2);
+        defer releaseMappedRegion(allocator, mapped2);
         const bytes1 = mappedRegionBytes(mapped1);
         const bytes2 = mappedRegionBytes(mapped2);
         var i: u64 = 0;
@@ -8481,7 +8492,7 @@ fn buildBlobEqIndexBytes(
     var entry_idx: usize = 0;
     for (meta.segments) |segment| {
         const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
-        defer releaseMappedRegion(mapped);
+        defer releaseMappedRegion(allocator, mapped);
         const bytes = mappedRegionBytes(mapped);
         var i: u64 = 0;
         while (i < segment.rows) : (i += 1) {
@@ -9507,7 +9518,7 @@ fn unsafeMergeSingleIndexFileInPlace(
 
     var mapped_file = try mapExpandedFileReadWrite(path, existing_len, total_len);
     defer mapped_file.file.close();
-    defer if (mapped_file.mapped.memory.len != 0) std.posix.munmap(mapped_file.mapped.memory);
+    defer releaseMappedRegion(allocator, mapped_file.mapped);
 
     const bytes = mappedRegionBytes(mapped_file.mapped);
     var writable = @as([]u8, @constCast(bytes));
@@ -9591,7 +9602,7 @@ fn unsafeMergeU64PairIndexFileInPlace(
 
     var mapped_file = try mapExpandedFileReadWrite(path, existing_len, total_len);
     defer mapped_file.file.close();
-    defer if (mapped_file.mapped.memory.len != 0) std.posix.munmap(mapped_file.mapped.memory);
+    defer releaseMappedRegion(allocator, mapped_file.mapped);
 
     const bytes = mappedRegionBytes(mapped_file.mapped);
     var writable = @as([]u8, @constCast(bytes));
@@ -9729,7 +9740,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, index.unique, false, meta.row_count);
@@ -9760,7 +9771,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeU64PairIndexFileInPlace(allocator, root_dir, index, appended, index.unique, meta.row_count);
@@ -9791,7 +9802,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeU64PairIndexFileInPlace(allocator, root_dir, index, appended, index.unique, meta.row_count);
@@ -9821,7 +9832,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, index.unique, false, meta.row_count);
@@ -9851,7 +9862,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
@@ -9881,7 +9892,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
@@ -9911,7 +9922,7 @@ fn tryAppendIndexesForAppendedRows(
             const index_path = try activePath(allocator, root_dir, index.path);
             defer allocator.free(index_path);
             const mapped_existing = try mappedReadFile(index_path, @intCast(index.bytes));
-            defer releaseMappedRegion(mapped_existing);
+            defer releaseMappedRegion(allocator, mapped_existing);
             const existing_bytes = mappedRegionBytes(mapped_existing);
             if (allow_unsafe_index_io) {
                 try unsafeMergeSingleIndexFileInPlace(allocator, root_dir, index, appended, false, true, meta.row_count);
@@ -10084,7 +10095,7 @@ pub fn openReadSnapshot(
             if (file_meta.bytes != @as(u64, @intCast(expected_len))) return TableError.VerifyFailed;
             const path = try activePath(backing_allocator, root_dir, file_meta.path);
             defer backing_allocator.free(path);
-            const mapped = try mappedReadFile(path, expected_len);
+            const mapped = try mappedReadFileOwned(backing_allocator, path, expected_len);
             snapshot.mapped_regions[mapped_region_idx] = mapped;
             mapped_region_idx += 1;
             const bytes = mappedRegionBytes(mapped);
@@ -10188,7 +10199,7 @@ pub fn openReadSnapshot(
         if (index.bytes != @as(u64, @intCast(expected_bytes))) return TableError.VerifyFailed;
         const path = try activePath(backing_allocator, root_dir, index.path);
         defer backing_allocator.free(path);
-        const mapped = try mappedReadFile(path, @intCast(index.bytes));
+        const mapped = try mappedReadFileOwned(backing_allocator, path, @intCast(index.bytes));
         snapshot.mapped_regions[mapped_region_idx] = mapped;
         mapped_region_idx += 1;
         const bytes = mappedRegionBytes(mapped);
@@ -10221,7 +10232,7 @@ pub fn openReadSnapshot(
         }
         const path = try activePath(backing_allocator, root_dir, dict.path);
         defer backing_allocator.free(path);
-        const mapped = try mappedReadFile(path, @intCast(dict.bytes));
+        const mapped = try mappedReadFileOwned(backing_allocator, path, @intCast(dict.bytes));
         snapshot.mapped_regions[mapped_region_idx] = mapped;
         mapped_region_idx += 1;
         const bytes = mappedRegionBytes(mapped);
@@ -10244,7 +10255,7 @@ pub fn openReadSnapshot(
         }
         const path = try activePath(backing_allocator, root_dir, blob.path);
         defer backing_allocator.free(path);
-        const mapped = try mappedReadFile(path, @intCast(blob.bytes));
+        const mapped = try mappedReadFileOwned(backing_allocator, path, @intCast(blob.bytes));
         snapshot.mapped_regions[mapped_region_idx] = mapped;
         mapped_region_idx += 1;
         const bytes = mappedRegionBytes(mapped);
@@ -20403,6 +20414,44 @@ test "table memory root supports init ingest and snapshot reads" {
 
     const verified = try verifyTable(std.testing.allocator, root, table_name);
     try std.testing.expectEqual(@as(u64, 2), verified.row_count);
+}
+
+test "table memory read snapshot survives table remove and reuse" {
+    const root = ":memory:test_snapshot_isolation";
+    const table_name = "mem_isolated_members";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_isolated_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    var first = [_]u64{ 1, 10 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(first[0..]));
+
+    const old_snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer old_snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), old_snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(old_snapshot, 1, 0));
+
+    _ = try removeTable(std.testing.allocator, root, table_name);
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_isolated_members.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+    var second = [_]u64{ 2, 20 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(second[0..]));
+
+    try std.testing.expectEqual(@as(u64, 1), old_snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 1), try snapshotGetU64(old_snapshot, 0, 0));
+    try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(old_snapshot, 1, 0));
+
+    const new_snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer new_snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 1), new_snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 2), try snapshotGetU64(new_snapshot, 0, 0));
+    try std.testing.expectEqual(@as(u64, 20), try snapshotGetU64(new_snapshot, 1, 0));
 }
 
 test "table memory root snapshots and restores without filesystem directories" {

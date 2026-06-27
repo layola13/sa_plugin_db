@@ -331,6 +331,8 @@ raw，对应中位数如下：
 
 这轮 schema component 中位数继续降到 `0.968 ms`，但 db 总 init 中位数仍是 `1.379 ms`，SQLite init 中位数是 `0.968 ms`。init 目标还没完成。
 
+同日转入下一项 memory mode 稳定性：memory root 的 read snapshot 不再直接引用全局 `mem://` map 中的 artifact bytes，而是在打开 snapshot 时复制一份由 snapshot 自己释放的 bytes。这样 `:memory:name` 或精确 `:memory:` 里删除、重建、复用同名表时，旧 read handle 仍保持打开时的行数据。新增回归测试覆盖 memory read snapshot 在 remove + reuse 后仍读到旧行，新 snapshot 读到新行。这是内存模式隔离语义修正，不更新 indexed ERP vs SQLite 性能表。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。

@@ -1057,7 +1057,9 @@ the packed bitmap for `*_NULL_BITMAP_HANDLE` range/filter calls.
 Memory roots are also available now: `:memory:name` is a shared named in-process
 root, while exact `:memory:` resolves to the current thread-local unnamed root.
 Snapshot and restore artifacts for memory roots stay inside that same in-memory
-namespace instead of creating `:memory:*` directories on disk.
+namespace instead of creating `:memory:*` directories on disk. Open read handles
+over memory roots keep their own artifact bytes, so removing or reusing a table
+in the same memory namespace does not mutate an already-open snapshot.
 
 This is still not a replacement for SQLite-style ACID, WAL, general
 primary/secondary index planning, or multi-table transaction isolation. The v0.2
