@@ -43,6 +43,8 @@
 @extern sa_db_update_row_blob_eq_key(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, column_index: u64, &store_name: ptr, store_name_len: u64, &value: ptr, value_len: u64, &row: ptr, row_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_begin(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_handle: ptr) -> u32
 @extern sa_db_tx_insert_row(handle: ptr, &row: ptr, row_len: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_insert_rows(handle: ptr, &rows: ptr, rows_len: u64, row_count: u64, &out_info: ptr) -> u32
+@extern sa_db_tx_add_columns(handle: ptr, row_count: u64, columns: ptr, columns_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_dict_intern(handle: ptr, &dict_name: ptr, dict_name_len: u64, &value: ptr, value_len: u64, &out_id: ptr, &out_inserted: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_blob_put(handle: ptr, &store_name: ptr, store_name_len: u64, &value: ptr, value_len: u64, &out_id: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_upsert_row_u64_key(handle: ptr, column_index: u64, expected: u64, &row: ptr, row_len: u64, &out_inserted: ptr, &out_info: ptr) -> u32
@@ -78,7 +80,6 @@
 @extern sa_db_tx_delete_u64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_u64_i64_pair_key(handle: ptr, column_index: u64, column_index2: u64, key1: u64, key2: i64, &out_info: ptr) -> u32
 @extern sa_db_tx_delete_blob_eq_key(handle: ptr, column_index: u64, &store_name: ptr, store_name_len: u64, &value: ptr, value_len: u64, &out_info: ptr) -> u32
-@extern sa_db_tx_add_columns(handle: ptr, row_count: u64, columns: ptr, columns_len: u64, &out_info: ptr) -> u32
 @extern sa_db_tx_commit(handle: ptr, &out_info: ptr) -> u32
 @extern sa_db_tx_rollback(handle: ptr) -> u32
 @extern sa_db_coltx_begin(&root: ptr, root_len: u64, &table_name: ptr, table_name_len: u64, &out_handle: ptr) -> u32

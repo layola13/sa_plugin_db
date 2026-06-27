@@ -842,7 +842,8 @@ column ingest path, so the write advances the table epoch and rebuilds any
 persisted indexes.
 
 `sa_db_tx_begin` / `DB_TX_BEGIN` starts a single-table write transaction and
-returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
+returns an opaque handle. `DB_TX_INSERT_ROW`, `DB_TX_INSERT_ROWS`,
+`DB_TX_DICT_INTERN`, `DB_TX_BLOB_PUT`,
 `DB_TX_UPSERT_ROW_U64_KEY`, `DB_TX_UPDATE_ROW_U64_KEY`, and
 `DB_TX_DELETE_U64_KEY`, compact-key forms `DB_TX_UPSERT_ROW_U32_KEY`,
 `DB_TX_UPDATE_ROW_U32_KEY`, `DB_TX_DELETE_U32_KEY`, `DB_TX_UPSERT_ROW_I32_KEY`,
@@ -1148,7 +1149,10 @@ Dataset:
   smoke test covers typed timestamp-pair range wrappers over the same composite
   index shape.
 
-Run db benchmarks:
+Run db benchmarks. `db_tx_smoke.sa` covers the public transaction macros,
+including `DB_TX_INSERT_ROWS`; the checked-in `benchmark_test/db.sai` and
+`benchmark_test/db.sal` copies are kept byte-for-byte synchronized with the
+published root `db.sai` and `db.sal` interface files.
 
 ```bash
 cd /home/vscode/projects/sa_plugins/sa_plugin_db/benchmark_test

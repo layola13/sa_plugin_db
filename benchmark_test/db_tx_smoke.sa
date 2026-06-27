@@ -10,12 +10,14 @@
 #def SCHEMA_PATH_LEN = 22
 #def SCHEMA_LEN = 82
 #def ROW_BYTES = 16
+#def BATCH_ROWS_BYTES = 32
 
 @main() -> i32:
 L_ENTRY:
     info = stack_alloc SaDbTableInfo_SIZE
     snapshot_info = stack_alloc SaDbSnapshotInfo_SIZE
     row = alloc ROW_BYTES
+    batch_rows = alloc BATCH_ROWS_BYTES
 
     EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
     EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
@@ -71,6 +73,22 @@ L_ENTRY:
     EXPAND DB_SNAPSHOT_INFO_ROW_COUNT shape4_rows, snapshot_info
     EXPAND DB_SUM_U64_HANDLE sum4_status, sum4, read4, 1
     EXPAND DB_CLOSE_READ_TABLE close4_status, read4
+
+    EXPAND DB_TX_BEGIN tx5_begin_status, tx5, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    store batch_rows+0, 4 as u64
+    store batch_rows+8, 40 as u64
+    store batch_rows+16, 5 as u64
+    store batch_rows+24, 50 as u64
+    EXPAND DB_TX_INSERT_ROWS tx5_insert_rows_status, tx5, batch_rows, BATCH_ROWS_BYTES, 2, info
+    EXPAND DB_TX_COMMIT tx5_commit_status, tx5, info
+    EXPAND DB_INFO_ROW_COUNT tx5_rows, info
+    EXPAND DB_INFO_EPOCH tx5_epoch, info
+
+    EXPAND DB_OPEN_READ_TABLE open5_status, read5, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SNAPSHOT_INFO_HANDLE shape5_status, read5, snapshot_info
+    EXPAND DB_SNAPSHOT_INFO_ROW_COUNT shape5_rows, snapshot_info
+    EXPAND DB_SUM_U64_HANDLE sum5_status, sum5, read5, 1
+    EXPAND DB_CLOSE_READ_TABLE close5_status, read5
     EXPAND DB_VERIFY verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
 
     ok_remove = eq remove_status, SA_DB_OK
@@ -113,6 +131,17 @@ L_ENTRY:
     ok_sum4_status = eq sum4_status, SA_DB_OK
     ok_sum4 = eq sum4, 55
     ok_close4 = eq close4_status, SA_DB_OK
+    ok_tx5_begin = eq tx5_begin_status, SA_DB_OK
+    ok_tx5_insert_rows = eq tx5_insert_rows_status, SA_DB_OK
+    ok_tx5_commit = eq tx5_commit_status, SA_DB_OK
+    ok_tx5_rows = eq tx5_rows, 4
+    ok_tx5_epoch = eq tx5_epoch, 4
+    ok_open5 = eq open5_status, SA_DB_OK
+    ok_shape5 = eq shape5_status, SA_DB_OK
+    ok_shape5_rows = eq shape5_rows, 4
+    ok_sum5_status = eq sum5_status, SA_DB_OK
+    ok_sum5 = eq sum5, 145
+    ok_close5 = eq close5_status, SA_DB_OK
     ok_verify = eq verify_status, SA_DB_OK
 
     ok01 = and ok_remove, ok_init
@@ -154,7 +183,18 @@ L_ENTRY:
     ok37 = and ok36, ok_sum4_status
     ok38 = and ok37, ok_sum4
     ok39 = and ok38, ok_close4
-    ok = and ok39, ok_verify
+    ok40 = and ok39, ok_tx5_begin
+    ok41 = and ok40, ok_tx5_insert_rows
+    ok42 = and ok41, ok_tx5_commit
+    ok43 = and ok42, ok_tx5_rows
+    ok44 = and ok43, ok_tx5_epoch
+    ok45 = and ok44, ok_open5
+    ok46 = and ok45, ok_shape5
+    ok47 = and ok46, ok_shape5_rows
+    ok48 = and ok47, ok_sum5_status
+    ok49 = and ok48, ok_sum5
+    ok50 = and ok49, ok_close5
+    ok = and ok50, ok_verify
 
     !remove_status
     !init_status
@@ -203,6 +243,19 @@ L_ENTRY:
     !sum4_status
     !sum4
     !close4_status
+    !tx5_begin_status
+    !tx5
+    !tx5_insert_rows_status
+    !tx5_commit_status
+    !tx5_rows
+    !tx5_epoch
+    !open5_status
+    !read5
+    !shape5_status
+    !shape5_rows
+    !sum5_status
+    !sum5
+    !close5_status
     !verify_status
     !ok_remove
     !ok_init
@@ -244,6 +297,17 @@ L_ENTRY:
     !ok_sum4_status
     !ok_sum4
     !ok_close4
+    !ok_tx5_begin
+    !ok_tx5_insert_rows
+    !ok_tx5_commit
+    !ok_tx5_rows
+    !ok_tx5_epoch
+    !ok_open5
+    !ok_shape5
+    !ok_shape5_rows
+    !ok_sum5_status
+    !ok_sum5
+    !ok_close5
     !ok_verify
     !ok01
     !ok02
@@ -284,7 +348,19 @@ L_ENTRY:
     !ok37
     !ok38
     !ok39
+    !ok40
+    !ok41
+    !ok42
+    !ok43
+    !ok44
+    !ok45
+    !ok46
+    !ok47
+    !ok48
+    !ok49
+    !ok50
     !row
+    !batch_rows
     br ok -> L_OK, L_FAIL
 
 L_OK:
