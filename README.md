@@ -1323,25 +1323,27 @@ Summary:
 
 ERP indexed write 5-run rerun results on 2026-06-27 after lazy-append index
 maintenance, buffered transaction dictionary writes, batched dictionary intern,
-and unsafe init-path reductions:
+deferred unsafe-init meta persistence, and first-write bootstrap cache reuse:
 
 | Operation | db plugin | SQLite | Fastest |
 | --- | ---: | ---: | --- |
-| init 3 ERP tables + dicts | 0.616-1.014 ms | 0.711-1.092 ms | mixed |
-| ingest ERP rows | 4.884-6.341 ms | 60.795-68.881 ms | db plugin |
-| build ERP indexes | 9.425-10.557 ms | 19.328-24.279 ms | db plugin |
-| append ERP rows | 3.582-5.868 ms* | 3.862-4.950 ms | db plugin overall |
-| verify/integrity | 0.996-1.458 ms | 35.250-43.172 ms | db plugin |
+| init 3 ERP tables + dicts | 0.790-1.224 ms | 0.995-1.502 ms | db plugin median / mixed range |
+| ingest ERP rows | 5.582-6.564 ms | 72.138-87.125 ms | db plugin |
+| build ERP indexes | 9.708-12.164 ms | 23.139-33.717 ms | db plugin |
+| append ERP rows | 4.419-5.902 ms* | 4.614-5.880 ms | db plugin median / mixed range |
+| verify/integrity | 1.061-1.338 ms | 34.285-48.280 ms | db plugin |
 
-`*` db append is split into indexed row-transaction append (`2.036-3.514 ms`)
-for orders/invoices and indexed column-transaction append (`1.545-2.355 ms`)
-for order lines. Summed wall time remains below the SQLite append path across
-the sampled runs.
+`*` db append is split into indexed row-transaction append (`2.576-3.753 ms`)
+for orders/invoices and indexed column-transaction append (`1.842-2.360 ms`)
+for order lines. The summed append path stays ahead on median, while the sample
+range still overlaps SQLite.
 
 This rerun matters because the write path no longer falls back to O(N) index
 rebuilds for dictionary-only transactions, append-only indexed commits update
 existing index files incrementally in unsafe mode, and dictionary bootstrap now
-has a real batched API surfaced through both `.sai` and `.sal`.
+has a real batched API surfaced through both `.sai` and `.sal`. The remaining
+fixed-cost gap is concentrated in init variance rather than steady-state index
+build, append maintenance, or verify.
 
 Detailed results: `benchmark_test/RESULTS.md`.
 

@@ -4,6 +4,9 @@ const schema = @import("schema.zig");
 
 var temp_write_counter = std.atomic.Value(u64).init(0);
 var unsafe_no_sync_state = std.atomic.Value(u8).init(0);
+var unsafe_init_meta_cache_mutex: std.Thread.Mutex = .{};
+var unsafe_init_meta_cache_next_slot: usize = 0;
+var unsafe_init_meta_cache = [_]?UnsafeInitMetaCacheEntry{null} ** 4;
 const UNSAFE_NO_SYNC_ENV = "SA_DB_UNSAFE_NO_SYNC";
 const FILE_BLOCK_BYTES: usize = 64 * 1024;
 const COLTX_INLINE_BYTES_LIMIT: usize = 128 * 1024;
@@ -166,6 +169,12 @@ pub const BlobStoreMeta = struct {
     entries: u64,
     block_size: u64 = 0,
     block_sha256: [][]const u8 = &.{},
+};
+
+const UnsafeInitMetaCacheEntry = struct {
+    root_dir: []u8,
+    table_name: []u8,
+    meta: TableMeta,
 };
 
 pub const TableMeta = struct {
@@ -1092,6 +1101,7 @@ pub fn loadActiveMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     if (skipDurabilitySync()) {
         return loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
             TableError.NotFound => {
+                if (unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
                 const source = loadRecoveredActiveMetaSource(allocator, root_dir, table_name) catch |recover_err| switch (recover_err) {
                     TableError.NotFound => return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name),
                     else => return recover_err,
@@ -1225,6 +1235,83 @@ fn duplicateTableMeta(allocator: std.mem.Allocator, meta: TableMeta) TableError!
         .dicts = dicts,
         .blobs = blobs,
     };
+}
+
+fn freeUnsafeInitCacheEntry(allocator: std.mem.Allocator, entry: *UnsafeInitMetaCacheEntry) void {
+    allocator.free(entry.root_dir);
+    allocator.free(entry.table_name);
+    entry.meta.deinit(allocator);
+}
+
+fn unsafeInitCachePut(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
+    if (!skipDurabilitySync()) return;
+
+    const owned_root = try allocator.dupe(u8, root_dir);
+    errdefer allocator.free(owned_root);
+    const owned_table = try allocator.dupe(u8, table_name);
+    errdefer allocator.free(owned_table);
+    const owned_meta = try duplicateTableMeta(allocator, meta);
+    errdefer {
+        var cleanup_meta = owned_meta;
+        cleanup_meta.deinit(allocator);
+    }
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            freeUnsafeInitCacheEntry(allocator, entry);
+            slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
+            return;
+        }
+    }
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
+            return;
+        }
+    }
+
+    const slot = &unsafe_init_meta_cache[unsafe_init_meta_cache_next_slot];
+    freeUnsafeInitCacheEntry(allocator, &(slot.*.?));
+    slot.* = .{ .root_dir = owned_root, .table_name = owned_table, .meta = owned_meta };
+    unsafe_init_meta_cache_next_slot = (unsafe_init_meta_cache_next_slot + 1) % unsafe_init_meta_cache.len;
+}
+
+fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) ?TableMeta {
+    if (!skipDurabilitySync()) return null;
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+
+            const meta = entry.meta;
+            allocator.free(entry.root_dir);
+            allocator.free(entry.table_name);
+            slot.* = null;
+            return meta;
+        }
+    }
+    return null;
+}
+
+fn unsafeInitCacheDelete(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, root_dir) or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            freeUnsafeInitCacheEntry(allocator, entry);
+            slot.* = null;
+        }
+    }
 }
 
 fn buildInitialMeta(
@@ -2424,7 +2511,10 @@ fn loadWritableMeta(
     table_name: []const u8,
 ) TableError!TableMeta {
     return loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
-        TableError.NotFound => return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name),
+        TableError.NotFound => {
+            if (unsafeInitCacheTake(allocator, root_dir, table_name)) |meta| return meta;
+            return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name);
+        },
         else => return err,
     };
 }
@@ -3522,11 +3612,16 @@ fn publishWrittenMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
 }
 
 fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
-    if (skipDurabilitySync()) return writeCompatMeta(allocator, root_dir, table_name, meta);
+    if (skipDurabilitySync()) {
+        try writeCompatMeta(allocator, root_dir, table_name, meta);
+        unsafeInitCacheDelete(allocator, root_dir, table_name);
+        return;
+    }
 
     var written = try writeVersionedMeta(allocator, root_dir, table_name, meta);
     defer written.deinit(allocator);
     try publishWrittenMeta(allocator, root_dir, table_name, meta, written);
+    unsafeInitCacheDelete(allocator, root_dir, table_name);
 }
 
 fn writeTxPendingMarker(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, previous_epoch: u64, target_epoch: u64) TableError!void {
@@ -3660,7 +3755,10 @@ pub fn initTableFromSchemaBytes(
 
     var meta = try buildInitialMeta(allocator, schema_obj.table_name, schema_path, schema_hash, schema_obj);
     defer meta.deinit(allocator);
-    if (skipDurabilitySync()) return tableInfo(meta);
+    if (skipDurabilitySync()) {
+        try unsafeInitCachePut(allocator, root_dir, schema_obj.table_name, meta);
+        return tableInfo(meta);
+    }
     try writeMeta(allocator, root_dir, schema_obj.table_name, meta);
     return tableInfo(meta);
 }
@@ -3678,6 +3776,7 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
         try joinPath(allocator, &.{ prefix, ".sa", "db", "snapshots", table_name });
     defer allocator.free(snapshot_path);
     try deleteTreeIfExists(snapshot_path);
+    unsafeInitCacheDelete(allocator, root_dir, table_name);
 
     return .{ .row_count = 0, .segment_count = 0, .epoch = 0, .locked = false };
 }
@@ -18604,6 +18703,44 @@ test "table unsafe init defers empty meta until first write" {
     try std.testing.expect(visible.found);
     try std.testing.expectEqual(@as(u64, 2), visible.id);
     _ = try verifyTable(std.testing.allocator, ".", table_name);
+}
+
+test "table unsafe init cache serves first write transaction bootstrap" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const table_name = "unsafe_tx_bootstrap";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "unsafe_tx_bootstrap.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_STATUS_STRIDE = 8 // u64
+    );
+
+    const meta_path = try tableMetaPath(std.testing.allocator, ".", table_name);
+    defer std.testing.allocator.free(meta_path);
+    try std.testing.expect(!fileExists(meta_path));
+
+    const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    defer destroyWriteTransaction(std.testing.allocator, tx);
+    const interned = try writeTransactionInternStringDict(std.testing.allocator, tx, "status", "active");
+    try std.testing.expectEqual(@as(u64, 1), interned.id);
+    try std.testing.expect(interned.inserted);
+    const committed = try commitWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 1), committed.epoch);
+    try std.testing.expect(fileExists(meta_path));
+
+    const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
+    try std.testing.expect(visible.found);
+    try std.testing.expectEqual(@as(u64, 1), visible.id);
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {

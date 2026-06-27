@@ -208,6 +208,27 @@ raw，对应中位数如下：
 
 这一步的收益比前两轮更直接：相对前一组 db 单轮数据（`build ~= 133.5 ms`、`tx ~= 49.7 ms`、`coltx ~= 55.3 ms`、`verify ~= 137.6 ms`），批量建索引把 `build` 再压低约 `30.5%`，`tx` append 压低约 `25.4%`，`coltx` append 压低约 `23.3%`，`verify` 压低约 `48.1%`。原因也和 benchmark 结构一致：`orders`、`lines`、`invoices` 三张表现在只需要 3 次建索引事务，而不是为 `lines` 和 `invoices` 各自重复 load meta、写 manifest、刷新 epoch 两次。即便如此，SQLite 在 indexed ERP 写入链路上仍然全面领先，说明后续还要继续压缩 init/verify 常数开销，以及 append merge 内部 pair-index 维护的成本。
 
+2026-06-27 在 lazy append index maintenance、事务字典缓冲、批量 `dict intern many` 之后，继续加入 unsafe init 延迟空 meta 持久化，以及“同进程 init 后首次写入”直接复用内存里的初始 `TableMeta`，重新顺序跑了 5 次 db 和 5 次 SQLite 对照。两侧正确性输出仍一致：`8448 / 33792 / 8448`。本轮 SQLite 直接复用现有 `sqlite_erp_indexed_write_bench.out`，因为当前环境缺少 `libsqlite3.so` 开发链接名，但运行结果与此前同一二进制的行为一致。
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 0.790-1.224 ms | 0.995-1.502 ms | db 中位数领先，范围混合 |
+| baseline ingest before indexes | 5.582-6.564 ms | 72.138-87.125 ms | db 插件约 12.9x-13.3x |
+| build baseline indexes | 9.708-12.164 ms | 23.139-33.717 ms | db 插件约 2.4x-2.8x |
+| append with tx + incremental indexes | 2.576-3.753 ms | 4.614-5.880 ms | db 插件 |
+| append with coltx + incremental indexes | 1.842-2.360 ms | 4.614-5.880 ms* | db 插件 |
+| verify/integrity | 1.061-1.338 ms | 34.285-48.280 ms | db 插件约 32.3x-36.1x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态；如果把 db 的 `tx + coltx` 两段相加，总 append 墙钟为 `4.419-5.902 ms`，中位数仍领先，但样本范围与 SQLite 已有重叠。
+
+这一轮的意义比绝对数字更重要：
+- unsafe init 已经不再同步写空 `.meta`，首次真实写入才落盘；
+- 紧接着 init 的首个事务/coltx/bootstrap 不再回退到“重新读 schema + 重新编译 schema + 重建初始 meta”；
+- 这条路径通过进程内小型缓存直接把 init 阶段的 `TableMeta` 交给首写路径消费；
+- 缓存实现现在是固定槽位，不引入测试分配器泄漏，也不把生命周期问题留给调用方清理。
+
+因此当前 indexed ERP 写入链路已经从“SQLite 全面领先”转成了更细的状态：db 在 baseline ingest、index build、单段 tx append、单段 coltx append、verify 上都稳定领先；init 已经压缩到同一数量级，并且中位数领先，但 5 轮样本里还不是 100% 全赢。下一步仍应继续盯住 init 方差和首写固定成本，而不是回退到任何 O(N) rebuild 路径。
+
 ## 结论
 
 - 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
