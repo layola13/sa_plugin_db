@@ -14,6 +14,12 @@ var process_write_locks_mutex: std.Thread.Mutex = .{};
 var process_write_locks: std.StringHashMapUnmanaged(void) = .{};
 var memory_fs_mutex: std.Thread.Mutex = .{};
 var memory_fs_files: std.StringHashMapUnmanaged([]u8) = .{};
+var deferred_init_mutex: std.Thread.Mutex = .{};
+var deferred_init_entries = std.StringHashMapUnmanaged(struct {
+    schema_path_hint: []const u8,
+    schema_source: []const u8,
+    table_name: []const u8,
+}){};
 var exact_memory_namespace_counter = std.atomic.Value(u64).init(0);
 threadlocal var exact_memory_namespace: ?[]u8 = null;
 const unsafe_init_cache_allocator = std.heap.page_allocator;
@@ -1439,6 +1445,13 @@ pub fn loadActiveMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
         return loadCompatMeta(allocator, root_dir, table_name) catch |err| switch (err) {
             TableError.NotFound => {
                 if (try unsafeInitCachePeek(allocator, root_dir, table_name)) |meta| return meta;
+                if (isMemoryRoot(root_dir)) {
+                    if (try deferredInitGetSource(allocator, root_dir, table_name)) |src| {
+                        defer allocator.free(src);
+                        _ = try unsafeInitCacheBuildInitialMetaOwned(allocator, root_dir, table_name, src);
+                        return (try unsafeInitCachePeek(allocator, root_dir, table_name)) orelse return TableError.NotFound;
+                    }
+                }
                 const source = loadRecoveredActiveMetaSource(allocator, root_dir, table_name) catch |recover_err| switch (recover_err) {
                     TableError.NotFound => return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name),
                     else => return recover_err,
@@ -2316,11 +2329,131 @@ fn buildInitialMeta(
     };
 }
 
+
+fn deferredInitPut(root_dir: []const u8, table_name: []const u8, schema_path_hint: []const u8, schema_source: []const u8) void {
+    deferred_init_mutex.lock();
+    defer deferred_init_mutex.unlock();
+
+    var buf: [4096]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root_dir, table_name }) catch return;
+    const owned_key = unsafe_init_cache_allocator.dupe(u8, key) catch return;
+    const owned_path = unsafe_init_cache_allocator.dupe(u8, schema_path_hint) catch {
+        unsafe_init_cache_allocator.free(owned_key);
+        return;
+    };
+    const owned_source = unsafe_init_cache_allocator.dupe(u8, schema_source) catch {
+        unsafe_init_cache_allocator.free(owned_path);
+        unsafe_init_cache_allocator.free(owned_key);
+        return;
+    };
+    const owned_table = unsafe_init_cache_allocator.dupe(u8, table_name) catch {
+        unsafe_init_cache_allocator.free(owned_source);
+        unsafe_init_cache_allocator.free(owned_path);
+        unsafe_init_cache_allocator.free(owned_key);
+        return;
+    };
+
+    const entry = deferred_init_entries.getOrPut(unsafe_init_cache_allocator, owned_key) catch {
+        unsafe_init_cache_allocator.free(owned_table);
+        unsafe_init_cache_allocator.free(owned_source);
+        unsafe_init_cache_allocator.free(owned_path);
+        unsafe_init_cache_allocator.free(owned_key);
+        return;
+    };
+    if (entry.found_existing) {
+        unsafe_init_cache_allocator.free(entry.value_ptr.schema_path_hint);
+        unsafe_init_cache_allocator.free(entry.value_ptr.schema_source);
+        unsafe_init_cache_allocator.free(entry.value_ptr.table_name);
+        unsafe_init_cache_allocator.free(@constCast(entry.key_ptr.*));
+        entry.key_ptr.* = owned_key;
+    }
+    entry.value_ptr.* = .{
+        .schema_path_hint = owned_path,
+        .schema_source = owned_source,
+        .table_name = owned_table,
+    };
+}
+
+fn deferredInitGetSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?[]const u8 {
+    deferred_init_mutex.lock();
+    defer deferred_init_mutex.unlock();
+
+    var buf: [4096]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root_dir, table_name }) catch return TableError.OutOfMemory;
+    const entry = deferred_init_entries.get(key) orelse return null;
+    return allocator.dupe(u8, entry.schema_source) catch TableError.OutOfMemory;
+}
+
+fn deferredInitDelete(root_dir: []const u8, table_name: []const u8) void {
+    deferred_init_mutex.lock();
+    defer deferred_init_mutex.unlock();
+
+    var buf: [4096]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root_dir, table_name }) catch return;
+    if (deferred_init_entries.fetchRemove(key)) |entry| {
+        unsafe_init_cache_allocator.free(entry.value.schema_path_hint);
+        unsafe_init_cache_allocator.free(entry.value.schema_source);
+        unsafe_init_cache_allocator.free(entry.value.table_name);
+        unsafe_init_cache_allocator.free(@constCast(entry.key));
+    }
+}
+
+pub fn memoryGC(allocator: std.mem.Allocator, root_dir: []const u8) TableError!void {
+    if (!isMemoryRoot(root_dir)) return TableError.InvalidFormat;
+    const namespace = try resolveMemoryNamespace(root_dir);
+    var buf: [4096]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&buf, "{s}{s}/", .{ MEMORY_PATH_PREFIX, namespace }) catch return TableError.OutOfMemory;
+    memoryDeletePrefix(prefix);
+
+    unsafe_init_meta_cache_mutex.lock();
+    defer unsafe_init_meta_cache_mutex.unlock();
+    for (&unsafe_init_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.startsWith(u8, entry.root_dir, MEMORY_ROOT_PREFIX)) continue;
+            if (namespace.len > 0 and !std.mem.eql(u8, entry.root_dir, root_dir) and !std.mem.endsWith(u8, entry.root_dir, namespace)) continue;
+            freeUnsafeInitCacheEntry(entry);
+            slot.* = null;
+        }
+    }
+
+    deferred_init_mutex.lock();
+    defer deferred_init_mutex.unlock();
+    var it = deferred_init_entries.iterator();
+    var keys_to_delete = std.ArrayList([]const u8).init(allocator);
+    defer keys_to_delete.deinit();
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.key_ptr.*, root_dir)) {
+            keys_to_delete.append(entry.key_ptr.*) catch return;
+        }
+    }
+    for (keys_to_delete.items) |key| {
+        if (deferred_init_entries.fetchRemove(key)) |entry| {
+            unsafe_init_cache_allocator.free(entry.value.schema_path_hint);
+            unsafe_init_cache_allocator.free(entry.value.schema_source);
+            unsafe_init_cache_allocator.free(entry.value.table_name);
+            unsafe_init_cache_allocator.free(@constCast(entry.key));
+        }
+    }
+}
+
 fn buildInitialMetaFromSchemaFile(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableMeta {
+    if (isMemoryRoot(root_dir)) {
+        if (try deferredInitGetSource(allocator, root_dir, table_name)) |schema_source| {
+            defer allocator.free(schema_source);
+            const sp = try schemaMetaPath(allocator, root_dir, table_name);
+            defer allocator.free(sp);
+            var schema_obj = schema.compile(allocator, schema_source, sp) catch |err| return mapSchemaError(err);
+            defer schema_obj.deinit();
+            const sh = try hashHexAlloc(allocator, schema_source);
+            defer allocator.free(sh);
+            return buildInitialMeta(allocator, table_name, sp, sh, schema_obj);
+        }
+    }
+
     const schema_path = try schemaMetaPath(allocator, root_dir, table_name);
     defer allocator.free(schema_path);
     const schema_source = try readFileAlloc(allocator, schema_path, 16 * 1024 * 1024);
@@ -3536,6 +3669,13 @@ fn loadWritableMeta(
     return loadActiveMeta(allocator, root_dir, table_name) catch |err| switch (err) {
         TableError.NotFound => {
             if (try unsafeInitCachePeek(allocator, root_dir, table_name)) |meta| return meta;
+            if (isMemoryRoot(root_dir)) {
+                if (try deferredInitGetSource(allocator, root_dir, table_name)) |src| {
+                    defer allocator.free(src);
+                    _ = try unsafeInitCacheBuildInitialMetaOwned(allocator, root_dir, table_name, src);
+                    return (try unsafeInitCachePeek(allocator, root_dir, table_name)) orelse return TableError.NotFound;
+                }
+            }
             return buildInitialMetaFromSchemaFile(allocator, root_dir, table_name);
         },
         else => return err,
@@ -5084,6 +5224,30 @@ fn ensureUnsafeSchemaMaterialized(allocator: std.mem.Allocator, root_dir: []cons
     try writeFile(allocator, schema_path, schema_source);
 }
 
+fn initMemorySchemaDeferred(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    schema_path_hint: []const u8,
+    schema_source: []const u8,
+) TableError!TableInfo {
+    var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
+    errdefer arena.deinit();
+    var schema_obj = schema.compileInitFast(arena.allocator(), schema_source, schema_path_hint) catch |err| return mapSchemaError(err);
+
+    deferredInitPut(root_dir, schema_obj.table_name, schema_path_hint, schema_source);
+
+    const schema_hash_buf = try arena.allocator().alloc(u8, 0);
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, schema_obj.table_name);
+    defer write_lock.release();
+
+    const schema_path = try arena.allocator().alloc(u8, 0);
+    const owned_meta = try buildInitialMetaOwnedFromSchema(arena.allocator(), schema_path, schema_hash_buf, &schema_obj);
+
+    try unsafeInitCachePutOwnedWithPending(root_dir, schema_obj.table_name, schema_source, owned_meta, &.{}, &.{});
+
+    return tableInfo(owned_meta);
+}
+
 pub fn initTableFromSchemaBytes(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -5091,6 +5255,10 @@ pub fn initTableFromSchemaBytes(
     schema_source: []const u8,
 ) TableError!TableInfo {
     if (schema_path_hint.len == 0 or schema_source.len == 0) return TableError.InvalidFormat;
+
+    if (isMemoryRoot(root_dir)) {
+        return initMemorySchemaDeferred(allocator, root_dir, schema_path_hint, schema_source);
+    }
 
     if (skipDurabilitySync()) {
         return try unsafeInitCacheBuildInitialMetaOwned(allocator, root_dir, schema_path_hint, schema_source);
@@ -5329,6 +5497,18 @@ pub fn insertRawRow(
     defer allocator.free(columns);
 
     return try appendRawColumnsWithLoadedMeta(allocator, root_dir, table_name, &meta, 1, columns);
+}
+
+fn appendRawRowWithLoadedMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    row_bytes: []const u8,
+) TableError!TableInfo {
+    const columns = try splitRawRowColumns(allocator, meta.*, row_bytes);
+    defer allocator.free(columns);
+    return try appendRawColumnsWithLoadedMeta(allocator, root_dir, table_name, meta, 1, columns);
 }
 
 fn fixedRowBytes(meta: TableMeta) TableError!usize {
@@ -12578,6 +12758,7 @@ fn findUniqueU64KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12612,6 +12793,7 @@ fn findUniqueI64KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12646,6 +12828,7 @@ fn findUniqueU32KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12680,6 +12863,7 @@ fn findUniqueI32KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12714,6 +12898,7 @@ fn findUniqueU8KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12748,6 +12933,7 @@ fn findUniqueI8KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12782,6 +12968,7 @@ fn findUniqueU16KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12816,6 +13003,7 @@ fn findUniqueI16KeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12857,6 +13045,7 @@ fn findUniqueU64PairKeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedU64PairIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -12899,6 +13088,7 @@ fn findUniqueU64I64PairKeyRow(
     }
     const index = selected orelse return TableError.InvalidFormat;
     if (index.bytes != @as(u64, @intCast(try expectedU64PairIndexBytes(meta.row_count)))) return TableError.VerifyFailed;
+    if (meta.row_count == 0) return .{ .found = false, .row_index = 0 };
 
     const path = try activePath(allocator, root_dir, index.path);
     defer allocator.free(path);
@@ -13636,6 +13826,17 @@ pub fn updateRawRowBlobEqKey(
     return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
 }
 
+fn upsertInsertRawRowWithLoadedMeta(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    meta: *TableMeta,
+    row_bytes: []const u8,
+) TableError!UpsertResult {
+    const info = try appendRawRowWithLoadedMeta(allocator, root_dir, table_name, meta, row_bytes);
+    return .{ .info = info, .inserted = true };
+}
+
 pub fn upsertRawRowU64Key(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -13659,18 +13860,7 @@ pub fn upsertRawRowU64Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowI64Key(
@@ -13696,18 +13886,7 @@ pub fn upsertRawRowI64Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowU32Key(
@@ -13733,18 +13912,7 @@ pub fn upsertRawRowU32Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowI32Key(
@@ -13770,18 +13938,7 @@ pub fn upsertRawRowI32Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowU8Key(
@@ -13807,18 +13964,7 @@ pub fn upsertRawRowU8Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowI8Key(
@@ -13844,18 +13990,7 @@ pub fn upsertRawRowI8Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowU16Key(
@@ -13881,18 +14016,7 @@ pub fn upsertRawRowU16Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowI16Key(
@@ -13918,18 +14042,7 @@ pub fn upsertRawRowI16Key(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowU64PairKey(
@@ -13957,18 +14070,7 @@ pub fn upsertRawRowU64PairKey(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowU64I64PairKey(
@@ -13996,18 +14098,7 @@ pub fn upsertRawRowU64I64PairKey(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn upsertRawRowBlobEqKey(
@@ -14033,18 +14124,7 @@ pub fn upsertRawRowBlobEqKey(
         return .{ .info = info, .inserted = false };
     }
 
-    const total_rows = std.math.add(u64, owned.row_count, 1) catch return TableError.CursorOverflow;
-    if (total_rows > owned.max_rows) return TableError.CursorOverflow;
-    const buffers = try buildSingleRowColumnBuffers(allocator, owned, row_bytes);
-    defer {
-        for (buffers) |*buf| buf.deinit();
-        allocator.free(buffers);
-    }
-
-    try appendSegmentToMeta(allocator, root_dir, table_name, &owned, buffers, 1);
-    try rebuildIndexes(allocator, root_dir, &owned);
-    try writeMeta(allocator, root_dir, table_name, owned);
-    return .{ .info = tableInfo(owned), .inserted = true };
+    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
 pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
