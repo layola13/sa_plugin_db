@@ -45,6 +45,11 @@ require_count_at_least 'raise SystemExit(f"benchmark output negative metric: {ke
 require_count_at_least 'if runs <= 0 or runs % 2 == 0:' 2
 require_count_at_least 'raise SystemExit("benchmark compare run count must be positive odd")' 2
 require_count_at_least 'Positive odd number of runs' 2
+require_text 'fn requirePositiveOddRunCount(name: []const u8, value: u32) void'
+require_text 'std.log.err("{s} must be a positive odd run count, got {d}"'
+require_text 'std.process.exit(1)'
+require_text 'requirePositiveOddRunCount("bench-compare-runs", bench_compare_runs)'
+require_text 'requirePositiveOddRunCount("bench-compare-proof-runs", bench_compare_proof_runs)'
 require_count_at_least 'def observed_median(values):' 2
 require_count_at_least 'return sorted(values)[len(values) // 2]' 2
 forbid_text 'statistics.median'

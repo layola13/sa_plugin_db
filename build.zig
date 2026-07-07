@@ -9,6 +9,8 @@ pub fn build(b: *std.Build) void {
     const sa_std_lib = b.option([]const u8, "sa-std-lib", "Path to libsa_std.a; SQLite control benchmarks rebuild it with sqlite stubs renamed.") orelse "/home/vscode/.sa/std/libsa_std.a";
     const bench_compare_runs = b.option(u32, "bench-compare-runs", "Positive odd number of runs for the opt-in bench-compare median gate.") orelse 3;
     const bench_compare_proof_runs = b.option(u32, "bench-compare-proof-runs", "Positive odd number of runs for the bench-compare-proof report gate.") orelse 7;
+    requirePositiveOddRunCount("bench-compare-runs", bench_compare_runs);
+    requirePositiveOddRunCount("bench-compare-proof-runs", bench_compare_proof_runs);
     const bench_compare_strict_chain = b.option(bool, "bench-compare-strict-chain", "Require the combined db tx+coltx append chain to beat SQLite append in bench-compare.") orelse false;
     const bench_compare_strict_concurrent_insert = b.option(bool, "bench-compare-strict-concurrent-insert", "Require db raw/coltx concurrent insert correctness and performance to beat SQLite in bench-compare-concurrent.") orelse false;
     const lock_wait_seconds = b.option(u32, "lock-wait-seconds", "Seconds to wait for shared build locks before failing instead of hanging.") orelse 900;
@@ -464,6 +466,13 @@ pub fn build(b: *std.Build) void {
     sqlite_proof_strict_chain_summary.step.dependOn(&sqlite_audit_summary.step);
     sqlite_proof_strict_chain_summary.step.dependOn(&bench_compare_proof_strict_summary.step);
     sqlite_proof_strict_chain_step.dependOn(&sqlite_proof_strict_chain_summary.step);
+}
+
+fn requirePositiveOddRunCount(name: []const u8, value: u32) void {
+    if (value == 0 or value % 2 == 0) {
+        std.log.err("{s} must be a positive odd run count, got {d}", .{ name, value });
+        std.process.exit(1);
+    }
 }
 
 fn addBenchmarkArtifactGuardStep(b: *std.Build, benchmark_run_lock: []const u8, lock_wait_seconds_arg: []const u8) *std.Build.Step.Run {
