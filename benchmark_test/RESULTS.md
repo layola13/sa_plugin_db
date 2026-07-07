@@ -13,7 +13,30 @@
 
 ## 命令
 
-db 插件：
+推荐入口：
+
+```bash
+zig build bench
+zig build bench-compare
+zig build bench-compare-proof
+zig build sqlite-proof
+zig build bench-compare-memory
+zig build bench-compare-concurrent
+zig build bench-compare-disk-strict-chain
+zig build bench-compare-memory-strict-chain
+zig build bench-compare -Dbench-compare-strict-chain=true
+zig build bench-compare-concurrent -Dbench-compare-strict-concurrent-insert=true
+```
+
+`zig build bench` 会同时构建 db benchmark 和 SQLite control benchmark。SQLite control 的链接准备已经由 `build.zig` 自动完成：先用 `sa build-obj` 编译 SQLite 对照 `.sa`，再重建一份已重命名 std SQLite stub 的 `libsa_std_no_sqlite_stub.a`，最后链接系统 SQLite。默认使用 `/usr/lib/x86_64-linux-gnu/libsqlite3.so.0` 和 `/home/vscode/.sa/std/libsa_std.a`；需要时可用 `-Dsqlite-lib=...` 和 `-Dsa-std-lib=...` 覆盖。
+
+`zig build bench-compare` 是当前默认 SQLite-control gate：它会在隔离的 `SA_PLUGINS_HOME` 安装当前开发插件，连续运行 disk indexed ERP、memory indexed ERP 和 concurrent 三组对照。Indexed ERP gate 校验 db/SQLite 两侧 row count，并比较 init、baseline ingest、index build、`tx` append、`coltx` append、verify 的中位数。SQLite indexed write 对照样本运行在临时 cwd 中，不会触碰仓库根目录 tracked 的 `sqlite_erp_indexed_write.db`。输出格式为 `median [min,max]` 加 median margin，便于判断方差。默认模式会报告 total append chain，但不把它作为硬失败条件；`-Dbench-compare-strict-chain=true` 才会要求 `tx + coltx` 的 combined append chain 也严格快于 SQLite append。当前 strict chain 已有一组 7-run 通过样本，但默认 gate 仍保持保守 report-only，直到更多重复样本证明 margin 足够稳定。`zig build bench-compare-memory` 是只跑 memory indexed ERP 对照的窄入口。
+
+`zig build bench-compare-proof` 是当前推荐的宽证明入口：它按 configured-run 样本数运行 disk indexed ERP、memory indexed ERP 和 concurrent 对照，default 7，可用 `-Dbench-compare-proof-runs=N` 调整；最终 pass line 会显示实际 `runs=N`。disk/memory indexed ERP 的 total append chain 仍是 report-only 项，不作为硬失败条件；concurrent insert 则使用 strict gate，要求 raw 和 coltx 两条路径都正确且快于 SQLite。`zig build sqlite-proof` 会先运行 `sqlite-audit`，再运行这组 configured-run performance proof，并同样在最终摘要里显示 `runs=N`。这个入口适合 build/benchmark wiring 或并发写路径修改后的证明运行，但不能替代 SQL/ACID/WAL/crash recovery 等更广义 SQLite parity 验证。
+
+`zig build bench-compare-concurrent` 会备份并恢复 tracked 的 `.bench_raw`、`.bench_coltx`、`.bench_sqlite` benchmark roots，默认把 raw serial query、coltx serial query、raw concurrent query、coltx concurrent query 四条 SUM 查询路径分别作为硬门禁直接对比 SQLite，而不是选择更快的 best-path 汇总。它还会报告 raw/coltx 并发插入正确性与性能。`-Dbench-compare-strict-concurrent-insert=true` 现在是 opt-in strict gate：要求 raw 与 coltx 并发插入都达到 `db_ok=3/3` 且中位数快于 SQLite。默认门禁暂时仍保留 report 模式，等更多重复 strict 样本稳定后再升级为默认硬门禁。
+
+手工单独运行 db 插件 benchmark：
 
 ```bash
 sa build-exe db_member_bench.sa -o db_member_bench.out --no-incremental
@@ -26,7 +49,7 @@ sa build-exe db_erp_workflow_bench.sa -o db_erp_workflow_bench.out --no-incremen
 ./db_erp_workflow_bench.out
 ```
 
-SQLite 对照：
+SQLite 对照的手工等价流程如下；日常不应再手动维护这段，优先使用 `zig build bench`：
 
 ```bash
 rm -rf sqlite_link_std
@@ -142,6 +165,16 @@ raw，对应中位数如下：
 - `sa_db_coltx_add_columns` 改成共享句柄锁加 refcount 后，多 session 并发追加的中位数已经压到 raw ingest 之下。
 
 本轮并发测试都成功，没有出现 `VerifyFailed`、`CursorOverflow` 或 `NotFound`。
+
+2026-07-06 修复 unsafe/no-sync 并发写锁等待和 `coltx` 提交期重新加载最新 meta 后，`zig build bench-compare-concurrent -Dbench-compare-strict-concurrent-insert=true` 已经通过 3-run strict gate：
+
+| 操作 | db raw 中位数 | db coltx 中位数 | SQLite 中位数 | 结果 |
+| --- | ---: | ---: | ---: | --- |
+| serial 100x SUM | 4.089 ms | 3.901 ms | 302.068 ms | PASS，db coltx 最快 |
+| concurrent 4x25 SUM | 4.359 ms | 5.034 ms | 97.166 ms | PASS，db raw 最快 |
+| concurrent insert, 4x12,500 rows | 6.615 ms | 7.445 ms | 102.345 ms | PASS，raw/coltx 均 `db_ok=3/3` |
+
+同日默认 `zig build bench-compare` 里的 concurrent gate 也通过：raw concurrent insert `6.330 ms [5.415, 6.421]`、coltx concurrent insert `8.679 ms [8.238, 9.627]`、SQLite `101.937 ms [100.578, 103.244]`，两条 db 写入路径均为 `db_ok=3/3`。这说明当前并发写已经从“快但丢 worker/返回 Locked”推进到“正确且快于 SQLite”；下一步应通过更多 7-run 或 CI 样本确认方差，再决定是否把 strict insert 升级为默认硬门禁。
 
 ## ERP workflow 结果
 
@@ -442,6 +475,42 @@ SA_PLUGIN_DEV=1 sa plugin install --dev /home/vscode/projects/sa_plugins/sa_plug
 
 这轮 memory benchmark 的当前结论：对于这组 unsafe/no-sync indexed ERP 写入工作负载，db 的 named `:memory:` 模式已经在 init、baseline ingest、index build、`tx` append、`coltx` append、total append chain、verify/integrity 中位数上全部领先 SQLite `:memory:`。这不是 SQL 功能或持久化 ACID/WAL 能力的等价声明，但说明内存模式已经不只是 smoke 覆盖，而是可承载完整 ERP 类型、索引和事务路径。
 
+## 2026-07-06 rerun
+
+在 clean roots 和当前已安装的开发插件上，重新顺序跑了 5 次 db / 5 次 SQLite indexed ERP write benchmark，以及 5 次 db / 5 次 SQLite indexed ERP memory benchmark。原始样本见 `db_erp_indexed_write_bench_runs.txt`、`sqlite_erp_indexed_write_bench_runs.txt`、`db_erp_indexed_memory_bench_runs.txt` 和 `sqlite_erp_indexed_memory_bench_runs.txt`。
+
+### ERP indexed write results
+
+| 操作 | db 插件 | SQLite | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 0.171-0.176 ms, 中位数 0.174 ms | 0.764-0.928 ms, 中位数 0.798 ms | db 插件约 4.6x |
+| baseline ingest before indexes | 4.282-5.048 ms, 中位数 4.490 ms | 62.006-87.310 ms, 中位数 77.058 ms | db 插件约 17.2x |
+| build baseline indexes | 8.121-8.801 ms, 中位数 8.305 ms | 18.322-27.294 ms, 中位数 21.115 ms | db 插件约 2.5x |
+| append with tx + incremental indexes | 2.158-2.569 ms, 中位数 2.242 ms | 3.665-4.808 ms, 中位数 4.086 ms* | db 插件约 1.8x |
+| append with coltx + incremental indexes | 1.442-2.095 ms, 中位数 1.564 ms | 3.665-4.808 ms, 中位数 4.086 ms* | db 插件约 2.6x |
+| total append chain | 3.603-4.366 ms, 中位数 3.806 ms | 3.665-4.808 ms, 中位数 4.086 ms | db 插件约 1.1x |
+| verify/integrity | 0.796-1.179 ms, 中位数 0.988 ms | 33.303-39.072 ms, 中位数 35.944 ms | db 插件约 36.4x |
+
+`*` SQLite 对照这里只有一条追加路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这组 write 样本表明：在 unsafe/no-sync 模式下，db 已经在 init、baseline ingest、build、`tx` append、`coltx` append、combined append chain 和 verify 上全部领先。此次关键变化是 hot `loadActiveMeta` / `loadWritableMeta` 在 unsafe/no-sync 下先使用进程内 meta cache，事务提交后也刷新而不是删除 cache，因此连续的 transaction、coltx、verify 阶段不再反复读取和解析 compat meta。当前 combined append chain 中位数只领先约 `0.280 ms`，后续仍要继续压 durable write 链路的常数成本和波动。
+
+### ERP indexed memory results
+
+| 操作 | db `:memory:` 插件 | SQLite `:memory:` | 最快 |
+| --- | ---: | ---: | --- |
+| init indexed ERP tables | 0.275-0.449 ms, 中位数 0.352 ms | 0.404-0.787 ms, 中位数 0.578 ms | db 插件约 1.6x |
+| baseline ingest before indexes | 2.478-3.396 ms, 中位数 3.223 ms | 57.113-67.178 ms, 中位数 62.296 ms | db 插件约 19.3x |
+| build baseline indexes | 6.346-8.524 ms, 中位数 6.826 ms | 17.405-21.600 ms, 中位数 18.644 ms | db 插件约 2.7x |
+| append with tx + incremental indexes | 1.353-1.857 ms, 中位数 1.442 ms | 3.100-4.426 ms, 中位数 3.389 ms* | db 插件约 2.4x |
+| append with coltx + incremental indexes | 0.859-2.159 ms, 中位数 0.981 ms | 3.100-4.426 ms, 中位数 3.389 ms* | db 插件约 3.5x |
+| total append chain | 2.224-3.512 ms, 中位数 2.538 ms | 3.100-4.426 ms, 中位数 3.389 ms | db 插件约 1.3x |
+| verify/integrity | 0.219-0.425 ms, 中位数 0.273 ms | 32.563-36.181 ms, 中位数 33.654 ms | db 插件约 123.4x |
+
+`*` SQLite `:memory:` 对照这里只有一条追加事务路径，没有再单拆出 `coltx` 形态，所以同一组 SQLite append 样本同时对照 db 的 `tx` 与 `coltx` 子路径。
+
+这组 memory 样本说明 named `:memory:` 仍然全面领先 SQLite `:memory:`，而且 total append chain 也保持领先。
+
 随后补充公开接口层 exact memory smoke：新增 `db_memory_exact_smoke.sa`，使用精确 root `:memory:` 通过 `db.sal` 宏完成 remove/init、唯一 `u64` index、事务插入、read-handle find/get、verify；再用同名表验证 named root `:memory:sa_exact_peer` 初始打开返回 `SA_DB_ERR_NOT_FOUND`，写入不同值后不会污染 exact `:memory:` 的重新打开结果。这条 smoke 证明 SQLite 常见的精确 `:memory:` 入口已经从公开 `.sal` 层可用，并和 named memory root 隔离。实际验证命令：
 
 ```bash
@@ -453,15 +522,99 @@ sa build-exe benchmark_test/db_memory_exact_smoke.sa -o benchmark_test/db_memory
 
 随后继续收窄 unsafe/no-sync indexed append 的固定成本：`tryAppendIndexesForAppendedRows()` 的 in-place merge 分支不再先额外 `activePath + mappedReadFile()` 一次旧 index。旧 index bytes 只有安全重写分支需要传给 allocator-owned merge；unsafe 分支本身会在 `unsafeMerge*IndexFileInPlace()` 内完成扩容和原地合并。这次改动去掉的是每个需要 merge 的 index append 分支里一次无效旧索引映射/读取，覆盖磁盘 unsafe 路径和 `mem://` memory index merge 路径。已通过 `zig test src/table.zig`、`zig test src/db_saasm_api.zig` 和 `zig build`；没有重新跑 5-run benchmark，因此不更新上面的 SQLite 对比表。
 
+同日补充默认自动比较 gate：`zig build bench-compare` 会先把当前开发插件安装到隔离的 `.zig-cache/db-bench-compare-home`，再运行 3 轮 disk indexed ERP write db/SQLite 对照。db 样本在仓库 root 下运行，SQLite 样本在临时 cwd 下运行，避免生成或删除 tracked 的 `sqlite_erp_indexed_write.db`。这次早期 disk-only 默认 gate 通过，输出中位数如下：
+
+| gate 项 | db 插件 | SQLite | 状态 |
+| --- | ---: | ---: | --- |
+| init | 0.237 ms | 0.718 ms | PASS |
+| baseline ingest | 5.284 ms | 67.957 ms | PASS |
+| build baseline indexes | 9.730 ms | 22.112 ms | PASS |
+| tx append | 2.459 ms | 4.793 ms | PASS |
+| coltx append | 1.631 ms | 4.793 ms | PASS |
+| verify/integrity | 0.981 ms | 39.080 ms | PASS |
+| total append chain | 4.091 ms | 4.793 ms | PASS, 默认仅报告 |
+
+默认 gate 对 init、baseline、build、`tx` append、`coltx` append 和 verify 是硬门禁；total append chain 只在 `-Dbench-compare-strict-chain=true` 下变成硬门禁。这个差异是刻意保留的，因为 combined append chain 的领先幅度仍小，之前 strict chain 单次运行暴露过 `db=4.507 ms` 对 SQLite `3.798 ms` 的波动失败。
+
+随后把 `bench-compare` 扩展成 disk + memory 两组连续 gate，并新增 `bench-compare-memory` 作为 memory-only 窄入口。比较脚本改成 prefix-driven，同一套 row-count、median、strict-chain 逻辑同时覆盖 `db_erp_indexed_*` / `sqlite_erp_indexed_*` 和 `db_erp_indexed_memory_*` / `sqlite_erp_indexed_memory_*`。扩展后的默认 `zig build bench-compare` 已通过所有硬门禁，本次输出中位数如下：
+
+| gate 项 | disk db | disk SQLite | disk 状态 | memory db | memory SQLite | memory 状态 |
+| --- | ---: | ---: | --- | ---: | ---: | --- |
+| init | 0.226 ms | 0.917 ms | PASS | 0.471 ms | 0.563 ms | PASS |
+| baseline ingest | 5.160 ms | 71.985 ms | PASS | 3.606 ms | 68.236 ms | PASS |
+| build baseline indexes | 10.061 ms | 24.657 ms | PASS | 7.912 ms | 22.331 ms | PASS |
+| tx append | 2.850 ms | 4.627 ms | PASS | 1.369 ms | 3.933 ms | PASS |
+| coltx append | 2.060 ms | 4.627 ms | PASS | 1.001 ms | 3.933 ms | PASS |
+| verify/integrity | 1.277 ms | 40.305 ms | PASS | 0.283 ms | 38.762 ms | PASS |
+| total append chain | 4.910 ms | 4.627 ms | WARN, 默认仅报告 | 2.455 ms | 3.933 ms | PASS, 默认仅报告 |
+
+这次扩展后的结果强化了当前判断：稳定阶段在 disk 和 memory 两组 indexed ERP 对照里都能被自动门禁证明领先 SQLite；disk combined append chain 仍然会波动到 SQLite 之后，因此继续保持 report-only，不能把 strict chain 当作默认完成标准。
+
+随后增强 `bench-compare` 诊断输出为 `median [min,max]` 和 median margin，并用 7-run 样本确认方差。`zig build bench-compare -Dbench-compare-runs=7` 已通过所有硬门禁，关键结果如下：
+
+| gate 项 | disk db | disk SQLite | disk margin | memory db | memory SQLite | memory margin |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| init | 0.247 ms [0.181, 0.444] | 0.836 ms [0.724, 1.126] | 0.589 ms | 0.339 ms [0.261, 0.420] | 0.462 ms [0.405, 5.938] | 0.123 ms |
+| baseline ingest | 4.687 ms [4.267, 6.031] | 61.442 ms [60.006, 80.417] | 56.754 ms | 2.802 ms [2.448, 3.600] | 59.587 ms [54.905, 90.905] | 56.786 ms |
+| build baseline indexes | 8.815 ms [8.273, 11.206] | 20.216 ms [18.884, 22.377] | 11.400 ms | 7.129 ms [6.568, 8.376] | 18.574 ms [16.735, 23.328] | 11.445 ms |
+| tx append | 2.214 ms [2.132, 2.771] | 4.220 ms [3.540, 4.600] | 2.007 ms | 1.694 ms [1.280, 1.758] | 3.415 ms [3.264, 3.817] | 1.720 ms |
+| coltx append | 1.604 ms [1.509, 2.124] | 4.220 ms [3.540, 4.600] | 2.616 ms | 0.968 ms [0.794, 1.258] | 3.415 ms [3.264, 3.817] | 2.447 ms |
+| verify/integrity | 0.917 ms [0.866, 1.201] | 35.596 ms [33.054, 49.717] | 34.679 ms | 0.268 ms [0.181, 0.319] | 33.894 ms [30.606, 36.690] | 33.626 ms |
+| total append chain | 3.814 ms [3.641, 4.895] | 4.220 ms [3.540, 4.600] | 0.406 ms | 2.662 ms [2.074, 2.976] | 3.415 ms [3.264, 3.817] | 0.753 ms |
+
+这个 7-run 样本里 disk combined append chain 的中位数重新领先，但两边 min/max 区间仍然重叠，所以它继续保持默认 report-only。要把 strict chain 升级为默认硬门禁，需要看到多轮 7-run 样本都保留更宽的正 margin，且区间重叠明显收敛。
+
+后续为 `coltx` commit 增加 unsafe meta cache generation 快路径后，无竞争 session 可以复用 begin 时的 meta snapshot；如果同表 generation 已变化，commit 仍会重新加载最新 meta，以保留并发正确性。`zig build bench-compare -Dbench-compare-runs=7 -Dbench-compare-strict-chain=true` 已通过，关键结果如下：
+
+| gate 项 | disk db | disk SQLite | disk margin | memory db | memory SQLite | memory margin |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| init | 0.204 ms [0.182, 0.254] | 0.990 ms [0.735, 1.190] | 0.786 ms | 0.314 ms [0.249, 0.417] | 0.580 ms [0.504, 0.887] | 0.266 ms |
+| baseline ingest | 5.052 ms [4.679, 5.209] | 76.172 ms [67.119, 96.887] | 71.120 ms | 2.816 ms [2.541, 3.066] | 67.942 ms [65.875, 148.456] | 65.126 ms |
+| build baseline indexes | 9.885 ms [8.695, 10.075] | 26.210 ms [21.082, 32.033] | 16.325 ms | 7.231 ms [6.939, 7.762] | 22.973 ms [20.483, 31.471] | 15.742 ms |
+| tx append | 2.468 ms [2.168, 2.741] | 5.094 ms [4.182, 6.790] | 2.626 ms | 1.445 ms [1.343, 1.687] | 4.230 ms [3.896, 5.854] | 2.785 ms |
+| coltx append | 1.802 ms [1.717, 1.839] | 5.094 ms [4.182, 6.790] | 3.292 ms | 0.966 ms [0.886, 1.061] | 4.230 ms [3.896, 5.854] | 3.264 ms |
+| verify/integrity | 1.010 ms [0.916, 1.236] | 43.100 ms [35.644, 46.177] | 42.089 ms | 0.250 ms [0.215, 0.279] | 43.021 ms [35.284, 52.622] | 42.771 ms |
+| total append chain | 4.241 ms [3.921, 4.543] | 5.094 ms [4.182, 6.790] | 0.853 ms | 2.430 ms [2.242, 2.653] | 4.230 ms [3.896, 5.854] | 1.800 ms |
+
+这组 7-run strict-chain 样本已经比上一组更强：disk total append chain 的 median margin 从 `0.406 ms` 扩大到 `0.853 ms`，且 strict gate 实际通过。不过单组样本仍不足以把默认 gate 改成 hard-fail；当前策略是继续把 strict chain 作为 opt-in gate，并继续收集重复样本。
+
+随后新增 `bench-compare-proof` 作为更稳妥的 configured-run 证明入口（default 7）：disk/memory indexed ERP 不强制 total append chain，但 strict concurrent insert 必须通过。2026-07-07 新增 `zig build sqlite-proof` 后，它会串联 `sqlite-audit` 与这组 configured-run proof，并在最终摘要里打印实际 `runs=N`；本次关键结果如下：
+
+| gate 项 | db 插件 | SQLite | margin | 状态 |
+| --- | ---: | ---: | ---: | --- |
+| disk total append chain | 4.038 ms [3.546, 4.487] | 3.989 ms [3.519, 5.131] | -0.049 ms | WARN, report-only |
+| memory total append chain | 2.204 ms [2.138, 3.252] | 3.507 ms [3.225, 4.643] | 1.302 ms | PASS, report-only |
+| raw serial query | per-path gate passed | 311.656 ms [287.780, 320.286] | db < SQLite | PASS |
+| coltx serial query | per-path gate passed | 311.656 ms [287.780, 320.286] | db < SQLite | PASS |
+| raw concurrent query | per-path gate passed | 126.613 ms [115.972, 162.804] | db < SQLite | PASS |
+| coltx concurrent query | per-path gate passed | 126.613 ms [115.972, 162.804] | db < SQLite | PASS |
+| raw concurrent insert | 5.912 ms [5.502, 8.980] | 99.104 ms [77.259, 106.191] | 93.192 ms | PASS, `db_ok=7/7` |
+| coltx concurrent insert | 8.757 ms [7.452, 11.543] | 99.104 ms [77.259, 106.191] | 90.348 ms | PASS, `db_ok=7/7` |
+
+这次 proof run 说明当前自动化证据已经覆盖 disk、memory、concurrent 三条主要 benchmark 线，并且并发插入严格正确。Concurrent 查询证据按 raw/coltx 两条路径分别 gate，不能由单条更快路径掩盖另一条路径的回退。本轮 disk total append chain 中位数落后 SQLite `0.049 ms`，与同日 opt-in strict-chain 1-run 失败一起再次证明它必须继续作为 evidence/report，不升级为默认 hard gate。
+
+随后新增并发自动 gate：`bench-compare-concurrent` 运行 raw db、coltx db 和 SQLite 三组并发 benchmark。默认 `zig build bench-compare` 现在也串联该 gate。当前 3-run 默认输出中，并发查询硬门禁通过：
+
+| gate 项 | db 插件 | SQLite | margin | 状态 |
+| --- | ---: | ---: | ---: | --- |
+| raw serial query | per-path gate passed | 329.901 ms [314.287, 348.408] | db < SQLite | PASS |
+| coltx serial query | per-path gate passed | 329.901 ms [314.287, 348.408] | db < SQLite | PASS |
+| raw concurrent query | per-path gate passed | 88.207 ms [86.392, 111.835] | db < SQLite | PASS |
+| coltx concurrent query | per-path gate passed | 88.207 ms [86.392, 111.835] | db < SQLite | PASS |
+| raw concurrent insert | 3.316 ms [3.164, 6.222] | 101.249 ms [75.421, 101.560] | 97.933 ms | WARN, `db_ok=0/3` |
+| coltx concurrent insert | 3.804 ms [3.326, 5.025] | 101.249 ms [75.421, 101.560] | 97.445 ms | WARN, `db_ok=0/3` |
+
+这组 `db_ok=0/3` 是修复前的历史结果，已被后续并发写锁等待和 `coltx` commit reload/generation 修复覆盖。当前 7-run `bench-compare` 并发样本中，raw concurrent insert `6.648 ms [5.022, 7.394]`、coltx concurrent insert `8.090 ms [6.748, 10.086]`，SQLite 为 `97.265 ms [73.542, 109.421]`，两条 db 写入路径均达到 `db_ok=7/7`。下一步如果要把 strict concurrent insert 升级为默认硬门禁，需要继续收集重复 7-run/CI-like 样本，而不是再修 `db_ok=0/3` 问题。
+
 ## 结论
 
-- 查询速度：复用 read-handle 的 100 次全表 SUM，db 插件在串行和并发查询下都快于 SQLite。
+- 查询速度：复用 read-handle 的 100 次全表 SUM，raw 和 coltx 两条 db 查询路径在串行和并发查询下都分别快于 SQLite。
 - 并发 benchmark 现在各自跑在独立 root 下，历史工件和 SQLite WAL/SHM 侧文件不再污染结果。
 - 读句柄打开不再被全局 mutation 锁阻塞；活跃写事务期间也能打开已提交快照读取。
 - 并发插入：在当前 3-run 隔离样本里，原始 `sa_db_ingest_columns` 和新的 `sa_db_coltx_*` 批量列 session 都快于 SQLite，其中 `coltx` 最快。
 - 新增的 ABI 修复把 `sa_db_coltx_add_columns` 从“持有全局 handle mutex 执行整段 staging I/O”改成了带引用计数的共享获取，直接改善了多 session 并发追加。
 - 批量写入和全量列更新：db 插件更快，主要受益于列式 raw column ingest。
-- 当前 indexed ERP write benchmark 在安装当前开发插件后，db 插件的 init、建索引、append 链路和 verify/integrity 中位数都领先 SQLite；旧 ERP workflow 和非 indexed 写入历史样本仍按各自表格解释。
+- 当前 indexed ERP write benchmark 在安装当前开发插件后，db 插件的 init、baseline ingest、build、`tx` append、`coltx` append 和 verify/integrity 中位数都领先 SQLite；disk combined append chain 仍会在小 margin 内反复波动，当前继续按 report-only 处理，旧 ERP workflow 和非 indexed 写入历史样本仍按各自表格解释。
 - 当前 indexed ERP memory benchmark 中，named `:memory:` db root 对 SQLite `:memory:` 也在 init、建索引、append 链路和 verify/integrity 中位数上全部领先。
 - SQLite 在通用 SQL、ACID/WAL、崩溃恢复、compact/vacuum、成熟运维工具和广泛兼容性上仍更完整。
 - 带二级索引的 ERP append-only 写入现在已经走增量索引维护，db 不再为这条路径付出整表 `rebuildIndexes()` 的成本；相对旧 ERP workflow 里的全量建索引阶段，db 侧建索引成本已经明显下降。

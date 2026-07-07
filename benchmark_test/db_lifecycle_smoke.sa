@@ -1,0 +1,233 @@
+@import "db.sal"
+
+@const ROOT = utf8:"."
+@const TABLE = utf8:"lifecycle_members"
+@const SCHEMA_PATH = utf8:"lifecycle_members.sadb-schema"
+@const SCHEMA = utf8:"#def MAX_ROWS = 8\n#def COL_ID_STRIDE = 8 // u64\n#def COL_POINTS_STRIDE = 8 // u64\n"
+
+#def ROOT_LEN = 1
+#def TABLE_LEN = 17
+#def SCHEMA_PATH_LEN = 29
+#def SCHEMA_LEN = 82
+#def ROW_BYTES = 16
+
+@main() -> i32:
+L_ENTRY:
+    info = stack_alloc SaDbTableInfo_SIZE
+    row = alloc ROW_BYTES
+
+    EXPAND DB_REMOVE_TABLE remove_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INIT_SCHEMA init_status, ROOT, ROOT_LEN, SCHEMA_PATH, SCHEMA_PATH_LEN, SCHEMA, SCHEMA_LEN, info
+    EXPAND DB_CREATE_U64_INDEX index_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, 0, 1, info
+
+    store row+0, 1 as u64
+    store row+8, 10 as u64
+    EXPAND DB_INSERT_ROW insert1_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 2 as u64
+    store row+8, 20 as u64
+    EXPAND DB_INSERT_ROW insert2_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+
+    EXPAND DB_SNAPSHOT snapshot_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_EPOCH snapshot_epoch, info
+    EXPAND DB_INFO_ROW_COUNT snapshot_rows, info
+
+    store row+0, 3 as u64
+    store row+8, 30 as u64
+    EXPAND DB_INSERT_ROW insert3_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    EXPAND DB_COMPACT compact_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_SEGMENT_COUNT compact_segments, info
+    EXPAND DB_LOCK lock_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_LOCKED locked_value, info
+
+    store row+0, 4 as u64
+    store row+8, 40 as u64
+    EXPAND DB_INSERT_ROW locked_insert_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+
+    EXPAND DB_UNLOCK unlock_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_LOCKED unlocked_value, info
+
+    EXPAND DB_INSERT_ROW insert4_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    store row+0, 5 as u64
+    store row+8, 50 as u64
+    EXPAND DB_INSERT_ROW insert5_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, row, ROW_BYTES, info
+    EXPAND DB_VERIFY verify5_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_ROW_COUNT verify5_rows, info
+    EXPAND DB_INFO_EPOCH verify5_epoch, info
+
+    EXPAND DB_RESTORE restore_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, snapshot_epoch, info
+    EXPAND DB_INFO_ROW_COUNT restore_rows, info
+    EXPAND DB_INFO_EPOCH restore_epoch, info
+    restore_is_newer = ugt restore_epoch, verify5_epoch
+
+    EXPAND DB_RECOVER recover_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+    EXPAND DB_INFO_ROW_COUNT recover_rows, info
+    EXPAND DB_INFO_EPOCH recover_epoch, info
+
+    EXPAND DB_OPEN_READ_TABLE open_status, read_handle, ROOT, ROOT_LEN, TABLE, TABLE_LEN
+    EXPAND DB_SUM_U64_HANDLE sum_status, points_sum, read_handle, 1
+    EXPAND DB_CLOSE_READ_TABLE close_status, read_handle
+    EXPAND DB_VERIFY final_verify_status, ROOT, ROOT_LEN, TABLE, TABLE_LEN, info
+
+    ok_remove = eq remove_status, SA_DB_OK
+    ok_init = eq init_status, SA_DB_OK
+    ok_index = eq index_status, SA_DB_OK
+    ok_insert1 = eq insert1_status, SA_DB_OK
+    ok_insert2 = eq insert2_status, SA_DB_OK
+    ok_snapshot = eq snapshot_status, SA_DB_OK
+    ok_snapshot_rows = eq snapshot_rows, 2
+    ok_insert3 = eq insert3_status, SA_DB_OK
+    ok_compact = eq compact_status, SA_DB_OK
+    ok_compact_segments = eq compact_segments, 1
+    ok_lock = eq lock_status, SA_DB_OK
+    ok_locked_value = eq locked_value, 1
+    ok_locked_insert = eq locked_insert_status, SA_DB_ERR_LOCKED
+    ok_unlock = eq unlock_status, SA_DB_OK
+    ok_unlocked_value = eq unlocked_value, 0
+    ok_insert4 = eq insert4_status, SA_DB_OK
+    ok_insert5 = eq insert5_status, SA_DB_OK
+    ok_verify5 = eq verify5_status, SA_DB_OK
+    ok_verify5_rows = eq verify5_rows, 5
+    ok_restore = eq restore_status, SA_DB_OK
+    ok_restore_rows = eq restore_rows, 2
+    ok_restore_newer = eq restore_is_newer, 1
+    ok_recover = eq recover_status, SA_DB_OK
+    ok_recover_rows = eq recover_rows, 2
+    ok_recover_epoch = eq recover_epoch, restore_epoch
+    ok_open = eq open_status, SA_DB_OK
+    ok_sum_status = eq sum_status, SA_DB_OK
+    ok_sum = eq points_sum, 30
+    ok_close = eq close_status, SA_DB_OK
+    ok_final_verify = eq final_verify_status, SA_DB_OK
+
+    ok01 = and ok_remove, ok_init
+    ok02 = and ok01, ok_index
+    ok03 = and ok02, ok_insert1
+    ok04 = and ok03, ok_insert2
+    ok05 = and ok04, ok_snapshot
+    ok06 = and ok05, ok_snapshot_rows
+    ok07 = and ok06, ok_insert3
+    ok08 = and ok07, ok_compact
+    ok09 = and ok08, ok_compact_segments
+    ok10 = and ok09, ok_lock
+    ok11 = and ok10, ok_locked_value
+    ok12 = and ok11, ok_locked_insert
+    ok13 = and ok12, ok_unlock
+    ok14 = and ok13, ok_unlocked_value
+    ok15 = and ok14, ok_insert4
+    ok16 = and ok15, ok_insert5
+    ok17 = and ok16, ok_verify5
+    ok18 = and ok17, ok_verify5_rows
+    ok19 = and ok18, ok_restore
+    ok20 = and ok19, ok_restore_rows
+    ok21 = and ok20, ok_restore_newer
+    ok22 = and ok21, ok_recover
+    ok23 = and ok22, ok_recover_rows
+    ok24 = and ok23, ok_recover_epoch
+    ok25 = and ok24, ok_open
+    ok26 = and ok25, ok_sum_status
+    ok27 = and ok26, ok_sum
+    ok28 = and ok27, ok_close
+    ok = and ok28, ok_final_verify
+
+    !remove_status
+    !init_status
+    !index_status
+    !insert1_status
+    !insert2_status
+    !snapshot_status
+    !snapshot_epoch
+    !snapshot_rows
+    !insert3_status
+    !compact_status
+    !compact_segments
+    !lock_status
+    !locked_value
+    !locked_insert_status
+    !unlock_status
+    !unlocked_value
+    !insert4_status
+    !insert5_status
+    !verify5_status
+    !verify5_rows
+    !verify5_epoch
+    !restore_status
+    !restore_rows
+    !restore_epoch
+    !restore_is_newer
+    !recover_status
+    !recover_rows
+    !recover_epoch
+    !open_status
+    !read_handle
+    !sum_status
+    !points_sum
+    !close_status
+    !final_verify_status
+    !ok_remove
+    !ok_init
+    !ok_index
+    !ok_insert1
+    !ok_insert2
+    !ok_snapshot
+    !ok_snapshot_rows
+    !ok_insert3
+    !ok_compact
+    !ok_compact_segments
+    !ok_lock
+    !ok_locked_value
+    !ok_locked_insert
+    !ok_unlock
+    !ok_unlocked_value
+    !ok_insert4
+    !ok_insert5
+    !ok_verify5
+    !ok_verify5_rows
+    !ok_restore
+    !ok_restore_rows
+    !ok_restore_newer
+    !ok_recover
+    !ok_recover_rows
+    !ok_recover_epoch
+    !ok_open
+    !ok_sum_status
+    !ok_sum
+    !ok_close
+    !ok_final_verify
+    !ok01
+    !ok02
+    !ok03
+    !ok04
+    !ok05
+    !ok06
+    !ok07
+    !ok08
+    !ok09
+    !ok10
+    !ok11
+    !ok12
+    !ok13
+    !ok14
+    !ok15
+    !ok16
+    !ok17
+    !ok18
+    !ok19
+    !ok20
+    !ok21
+    !ok22
+    !ok23
+    !ok24
+    !ok25
+    !ok26
+    !ok27
+    !ok28
+    !row
+    br ok -> L_OK, L_FAIL
+
+L_OK:
+    !ok
+    return 0
+
+L_FAIL:
+    !ok
+    panic(9011)
