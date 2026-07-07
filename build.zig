@@ -174,6 +174,12 @@ pub fn build(b: *std.Build) void {
     proof_wiring.addFileInput(b.path("build.zig"));
     proof_wiring_step.dependOn(&proof_wiring.step);
 
+    const sqlite_archive_rewrite_step = b.step("check-sqlite-archive-rewrite", "Verify SQLite control std archive rewrite behavior.");
+    const sqlite_archive_rewrite = b.addSystemCommand(&.{ "bash", "tests/check_sqlite_archive_rewrite.sh" });
+    sqlite_archive_rewrite.addFileInput(b.path("tests/check_sqlite_archive_rewrite.sh"));
+    sqlite_archive_rewrite.addFileInput(b.path("build.zig"));
+    sqlite_archive_rewrite_step.dependOn(&sqlite_archive_rewrite.step);
+
     const bounded_locks_step = b.step("check-bounded-locks", "Verify every shared build lock uses a bounded wait.");
     const bounded_locks = b.addSystemCommand(&.{ "bash", "tests/check_bounded_locks.sh" });
     bounded_locks.addFileInput(b.path("tests/check_bounded_locks.sh"));
@@ -259,6 +265,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(abi_smoke_step);
     test_step.dependOn(check_docs_step);
     test_step.dependOn(proof_wiring_step);
+    test_step.dependOn(sqlite_archive_rewrite_step);
     test_step.dependOn(bounded_locks_step);
     test_step.dependOn(benchmark_parser_guards_step);
     test_step.dependOn(hot_io_guards_step);
@@ -301,7 +308,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_audit_summary = b.addSystemCommand(&.{
         "bash",
         "-c",
-        "printf '%s\n' 'sqlite-audit passed: zig tests, docs guard, ABI/facade/layout, install+CLI/recovery smokes, ABI smoke coverage, public ABI smokes, benchmark executable builds, benchmark parser guards, proof wiring, bounded lock guard, and protected benchmark artifacts are clean'",
+        "printf '%s\n' 'sqlite-audit passed: zig tests, docs guard, ABI/facade/layout, install+CLI/recovery smokes, ABI smoke coverage, public ABI smokes, benchmark executable builds, benchmark parser guards, proof wiring, SQLite archive rewrite guard, bounded lock guard, and protected benchmark artifacts are clean'",
     });
     sqlite_audit_summary.step.dependOn(test_step);
     sqlite_audit_summary.step.dependOn(bench_step);
