@@ -54,6 +54,11 @@ require(
     re.S,
 )
 require(
+    r"fn\s+buildCountedArtifactBytesAndHashes\s*\([^)]*old_bytes:\s*\[\]const u8[^)]*new_count:\s*u64[^)]*values:\s*\[\]const \[\]const u8[^)]*\)\s*TableError!CountedArtifactBuildResult\s*\{(?:(?!\nfn\s).)*appendCountedArtifactBuildChunkAndHash",
+    "staged dictionary/blob artifact builds must combine replacement-buffer construction and hash metadata",
+    re.S,
+)
+require(
     r"fn\s+writeCountedArtifactFile\s*\([^)]*old_bytes:\s*\[\]const u8[^)]*new_count:\s*u64[^)]*values:\s*\[\]const \[\]const u8[^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeCountedArtifactToFile",
     "counted dictionary/blob artifact append must stream file writes without a replacement artifact buffer",
     re.S,
@@ -99,6 +104,11 @@ require(
     re.S,
 )
 require(
+    r"fn\s+unsafeInitCacheInternStringDictMany\s*\([^)]*\)\s*TableError!\?DictInternManyResult\s*\{(?:(?!\nfn\s).)*buildCountedArtifactBytesAndHashes\(owned_allocator,\s*old_bytes,\s*new_count,\s*pending_values\[0\.\.pending_count\]\)(?:(?!\nfn\s).)*makeDictMetaFromCountedArtifactBuild\(owned_allocator,\s*dict_name,\s*basename,\s*new_count,\s*built\)",
+    "unsafe batched dictionary intern must build staged bytes and hashes in one pass",
+    re.S,
+)
+require(
     r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*dictScanCountAndFindValueIds\(old_bytes,\s*values,\s*out_ids\)(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(out_ids\[idx\]\s*!=\s*0\)",
     "batched dictionary intern must use the single-pass old-dictionary scan",
     re.S,
@@ -118,6 +128,31 @@ require(
     "direct blob append must combine counted-artifact write/hash streaming before meta publish",
     re.S,
 )
+require(
+    r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*canDeferUnsafeBootstrapMeta\(meta\)(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMetaFromCountedArtifactBuild\(allocator,\s*dict_name,\s*basename,\s*new_count,\s*built\)",
+    "direct unsafe dictionary bootstrap must build staged bytes and hashes in one pass",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*canDeferUnsafeBootstrapMeta\(meta\)(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*pending_values\[0\.\.pending_count\]\)(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMetaFromCountedArtifactBuild\(allocator,\s*dict_name,\s*basename,\s*new_count,\s*built\)",
+    "direct unsafe batched dictionary bootstrap must build staged bytes and hashes in one pass",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*canDeferUnsafeBootstrapMeta\(meta\)(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaFromCountedArtifactBuild\(allocator,\s*store_name,\s*basename,\s*new_count,\s*built\)",
+    "direct unsafe blob bootstrap must build staged bytes and hashes in one pass",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+writeTransactionInternStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMetaFromCountedArtifactBuild\(allocator,\s*dict_name,\s*basename,\s*new_count,\s*built\)(?:(?!\n(?:pub\s+)?fn\s).)*putPendingDictWrite\(allocator,\s*tx,\s*dict_name,\s*basename,\s*built\.bytes\)",
+    "transaction dictionary append must build pending bytes and hash metadata in one pass",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+writeTransactionPutBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaFromCountedArtifactBuild\(allocator,\s*store_name,\s*basename,\s*new_count,\s*built\)(?:(?!\n(?:pub\s+)?fn\s).)*putPendingBlobWrite\(allocator,\s*tx,\s*store_name,\s*basename,\s*built\.bytes\)",
+    "transaction blob append must build pending bytes and hash metadata in one pass",
+    re.S,
+)
 forbid(
     r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMetaForCountedArtifactAppend\(",
     "direct dictionary append reintroduced separate counted-artifact hash pass",
@@ -131,6 +166,31 @@ forbid(
 forbid(
     r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaForCountedArtifactAppend\(",
     "direct blob append reintroduced separate counted-artifact hash pass",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+writeTransactionInternStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMeta\(allocator,\s*dict_name,\s*basename,\s*new_bytes,\s*new_count\)",
+    "transaction dictionary append reintroduced separate pending-buffer hash pass",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+writeTransactionPutBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMeta\(allocator,\s*store_name,\s*basename,\s*new_bytes,\s*new_count\)",
+    "transaction blob append reintroduced separate pending-buffer hash pass",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMeta\(allocator,\s*dict_name,\s*basename,\s*new_bytes,\s*new_count\)",
+    "direct unsafe dictionary bootstrap reintroduced separate pending-buffer hash pass",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMeta\(allocator,\s*dict_name,\s*basename,\s*new_bytes,\s*new_count\)",
+    "direct unsafe batched dictionary bootstrap reintroduced separate pending-buffer hash pass",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMeta\(allocator,\s*store_name,\s*basename,\s*new_bytes,\s*new_count\)",
+    "direct unsafe blob bootstrap reintroduced separate pending-buffer hash pass",
     re.S,
 )
 forbid(
@@ -501,7 +561,7 @@ require(
     re.S,
 )
 require(
-    r"pub\s+fn\s+writeTransactionPutBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*findPendingBlobWriteIndex\(tx,\s*store_name\)(?:(?!\n(?:pub\s+)?fn\s).)*putPendingBlobWrite\(allocator,\s*tx,\s*store_name,\s*basename,\s*new_bytes\)",
+    r"pub\s+fn\s+writeTransactionPutBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*findPendingBlobWriteIndex\(tx,\s*store_name\)(?:(?!\n(?:pub\s+)?fn\s).)*putPendingBlobWrite\(allocator,\s*tx,\s*store_name,\s*basename,\s*built\.bytes\)",
     "transaction blob put must stage blob bytes in pending writes instead of publishing immediately",
     re.S,
 )

@@ -738,6 +738,11 @@ const CountedArtifactWriteResult = struct {
     hashes: FileHashes,
 };
 
+const CountedArtifactBuildResult = struct {
+    bytes: []u8,
+    hashes: FileHashes,
+};
+
 fn freeFileHashes(allocator: std.mem.Allocator, hashes: FileHashes) void {
     freeMaybeBytes(allocator, hashes.sha256);
     freeBlockSha256List(allocator, hashes.block_sha256);
@@ -2217,11 +2222,12 @@ fn unsafeInitCacheInternStringDictMany(
                 return .{ .info = tableInfo(entry.meta), .inserted_count = 0 };
             }
 
-            const new_bytes = try buildDictBytesWithValues(owned_allocator, old_bytes, old_count, pending_values[0..pending_count]);
             const new_count = std.math.add(u64, old_count, pending_count) catch return TableError.CursorOverflow;
+            const built = try buildCountedArtifactBytesAndHashes(owned_allocator, old_bytes, new_count, pending_values[0..pending_count]);
+            const new_bytes = built.bytes;
             const next_epoch = std.math.add(u64, entry.meta.epoch, 1) catch return TableError.CursorOverflow;
             const basename = try dictFileName(owned_allocator, table_name, dict_name, next_epoch);
-            const new_meta = try makeDictMeta(owned_allocator, dict_name, basename, new_bytes, new_count);
+            const new_meta = try makeDictMetaFromCountedArtifactBuild(owned_allocator, dict_name, basename, new_count, built);
             try putDictMeta(owned_allocator, &entry.meta, new_meta);
             entry.generation = nextUnsafeMetaCacheGeneration();
 
@@ -2848,11 +2854,6 @@ fn duplicateBlockSha256List(allocator: std.mem.Allocator, hashes: []const []cons
     errdefer freeBlockSha256List(allocator, out);
     for (hashes, 0..) |hash, idx| out[idx] = try allocator.dupe(u8, hash);
     return out;
-}
-
-fn artifactBlockSize(bytes: []const u8) u64 {
-    if (skipDurabilitySync()) return 0;
-    return if (bytes.len == 0) 0 else FILE_BLOCK_BYTES;
 }
 
 fn validateBlockSha256List(block_size_value: u64, block_sha256: []const []const u8, bytes: []const u8) TableError!void {
@@ -7565,22 +7566,29 @@ pub fn writeTransactionInternStringDict(
     }
 
     const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
-    const new_bytes = try buildDictBytesWithValue(allocator, old_bytes, old_count, value);
+    const values = [_][]const u8{value};
+    const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, &values);
+    var build_consumed = false;
+    errdefer if (!build_consumed) {
+        allocator.free(built.bytes);
+        freeFileHashes(allocator, built.hashes);
+    };
 
     const target_epoch = std.math.add(u64, tx.meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try dictFileName(allocator, tx.table_name, dict_name, target_epoch);
     defer allocator.free(basename);
 
-    const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
+    const new_meta = try makeDictMetaFromCountedArtifactBuild(allocator, dict_name, basename, new_count, built);
+    build_consumed = true;
     var consumed = false;
     errdefer {
         if (!consumed) {
             freeDictMeta(allocator, new_meta);
-            allocator.free(new_bytes);
+            allocator.free(built.bytes);
         }
     }
     try putDictMeta(allocator, &tx.meta, new_meta);
-    try putPendingDictWrite(allocator, tx, dict_name, basename, new_bytes);
+    try putPendingDictWrite(allocator, tx, dict_name, basename, built.bytes);
     consumed = true;
     tx.dirty = true;
     tx.metadata_dirty = true;
@@ -7611,22 +7619,29 @@ pub fn writeTransactionPutBlobValue(
     defer if (mapped_old) |mapped| releaseMappedRegion(allocator, mapped);
 
     const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
-    const new_bytes = try buildBlobBytesWithValue(allocator, old_bytes, old_count, value);
+    const values = [_][]const u8{value};
+    const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, &values);
+    var build_consumed = false;
+    errdefer if (!build_consumed) {
+        allocator.free(built.bytes);
+        freeFileHashes(allocator, built.hashes);
+    };
 
     const target_epoch = std.math.add(u64, tx.meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try blobStoreFileName(allocator, tx.table_name, store_name, target_epoch);
     defer allocator.free(basename);
 
-    const new_meta = try makeBlobStoreMeta(allocator, store_name, basename, new_bytes, new_count);
+    const new_meta = try makeBlobStoreMetaFromCountedArtifactBuild(allocator, store_name, basename, new_count, built);
+    build_consumed = true;
     var consumed = false;
     errdefer {
         if (!consumed) {
             freeBlobStoreMeta(allocator, new_meta);
-            allocator.free(new_bytes);
+            allocator.free(built.bytes);
         }
     }
     try putBlobStoreMeta(allocator, &tx.meta, new_meta);
-    try putPendingBlobWrite(allocator, tx, store_name, basename, new_bytes);
+    try putPendingBlobWrite(allocator, tx, store_name, basename, built.bytes);
     consumed = true;
     tx.dirty = true;
     tx.metadata_dirty = true;
@@ -7748,6 +7763,89 @@ fn buildCountedArtifactBytesWithValues(
         }
     }
     return out;
+}
+
+fn appendCountedArtifactBuildChunkAndHash(
+    allocator: std.mem.Allocator,
+    out: []u8,
+    offset: *usize,
+    file_hasher: ?*std.crypto.hash.sha2.Sha256,
+    block_hasher: ?*std.crypto.hash.sha2.Sha256,
+    block_sha256: [][]const u8,
+    block_size: usize,
+    block_index: *usize,
+    block_used: *usize,
+    chunk: []const u8,
+) TableError!void {
+    if (offset.* > out.len or chunk.len > out.len - offset.*) return TableError.VerifyFailed;
+    if (chunk.len != 0) @memcpy(out[offset.*..][0..chunk.len], chunk);
+    offset.* += chunk.len;
+    if (file_hasher) |hasher| {
+        const block = block_hasher orelse return TableError.VerifyFailed;
+        try updateStreamingFileHashes(allocator, hasher, block, block_sha256, block_size, block_index, block_used, chunk);
+    }
+}
+
+fn buildCountedArtifactBytesAndHashes(
+    allocator: std.mem.Allocator,
+    old_bytes: []const u8,
+    new_count: u64,
+    values: []const []const u8,
+) TableError!CountedArtifactBuildResult {
+    const total = try countedArtifactBytesLen(old_bytes, values);
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+
+    const hash_enabled = !skipDurabilitySync();
+    const block_size = if (hash_enabled) FILE_BLOCK_BYTES else 0;
+    const block_sha256 = try allocator.alloc([]const u8, if (hash_enabled) blockHashCount(total, FILE_BLOCK_BYTES) else 0);
+    for (block_sha256) |*hash| hash.* = &.{};
+    errdefer freeBlockSha256List(allocator, block_sha256);
+
+    var file_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var block_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var block_index: usize = 0;
+    var block_used: usize = 0;
+    const file_hasher_ptr: ?*std.crypto.hash.sha2.Sha256 = if (hash_enabled) &file_hasher else null;
+    const block_hasher_ptr: ?*std.crypto.hash.sha2.Sha256 = if (hash_enabled) &block_hasher else null;
+
+    var offset: usize = 0;
+    var word: [8]u8 = undefined;
+    writeU64LE(word[0..], 0, new_count);
+    try appendCountedArtifactBuildChunkAndHash(allocator, out, &offset, file_hasher_ptr, block_hasher_ptr, block_sha256, block_size, &block_index, &block_used, word[0..]);
+    if (old_bytes.len != 0) {
+        try appendCountedArtifactBuildChunkAndHash(allocator, out, &offset, file_hasher_ptr, block_hasher_ptr, block_sha256, block_size, &block_index, &block_used, old_bytes[8..]);
+    }
+    for (values) |value| {
+        writeU64LE(word[0..], 0, @intCast(value.len));
+        try appendCountedArtifactBuildChunkAndHash(allocator, out, &offset, file_hasher_ptr, block_hasher_ptr, block_sha256, block_size, &block_index, &block_used, word[0..]);
+        if (value.len != 0) {
+            try appendCountedArtifactBuildChunkAndHash(allocator, out, &offset, file_hasher_ptr, block_hasher_ptr, block_sha256, block_size, &block_index, &block_used, value);
+        }
+    }
+    if (offset != total) return TableError.VerifyFailed;
+
+    if (!hash_enabled) {
+        const sha256 = try optionalHashHexAlloc(allocator, out);
+        errdefer allocator.free(sha256);
+        return .{ .bytes = out, .hashes = .{ .sha256 = sha256, .block_size = 0, .block_sha256 = block_sha256 } };
+    }
+
+    if (block_used != 0) {
+        if (block_index >= block_sha256.len) return TableError.VerifyFailed;
+        var block_digest: [32]u8 = undefined;
+        block_hasher.final(&block_digest);
+        block_sha256[block_index] = try hashHexFromDigestAlloc(allocator, block_digest);
+        block_index += 1;
+    }
+    if (block_index != block_sha256.len) return TableError.VerifyFailed;
+
+    var file_digest: [32]u8 = undefined;
+    file_hasher.final(&file_digest);
+    const sha256 = try hashHexFromDigestAlloc(allocator, file_digest);
+    errdefer allocator.free(sha256);
+
+    return .{ .bytes = out, .hashes = .{ .sha256 = sha256, .block_size = FILE_BLOCK_BYTES, .block_sha256 = block_sha256 } };
 }
 
 fn updateCountedArtifactHashesWithValues(
@@ -8009,62 +8107,6 @@ fn writeCountedArtifactFileAndHashes(
     return .{ .bytes = bytes_len, .hashes = hashes };
 }
 
-fn buildDictBytesWithValue(allocator: std.mem.Allocator, old_bytes: []const u8, old_count: u64, value: []const u8) TableError![]u8 {
-    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
-    const values = [_][]const u8{value};
-    return buildCountedArtifactBytesWithValues(allocator, old_bytes, new_count, &values);
-}
-
-fn buildDictBytesWithValues(allocator: std.mem.Allocator, old_bytes: []const u8, old_count: u64, values: []const []const u8) TableError![]u8 {
-    const new_count = std.math.add(u64, old_count, values.len) catch return TableError.CursorOverflow;
-    return buildCountedArtifactBytesWithValues(allocator, old_bytes, new_count, values);
-}
-
-fn makeDictMeta(allocator: std.mem.Allocator, dict_name: []const u8, path: []const u8, bytes: []const u8, entries: u64) TableError!DictMeta {
-    const name = try allocator.dupe(u8, dict_name);
-    errdefer allocator.free(name);
-    const owned_path = try allocator.dupe(u8, path);
-    errdefer allocator.free(owned_path);
-    const sha256 = try optionalHashHexAlloc(allocator, bytes);
-    errdefer allocator.free(sha256);
-    const block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
-    errdefer freeBlockSha256List(allocator, block_sha256);
-    return .{
-        .name = name,
-        .path = owned_path,
-        .sha256 = sha256,
-        .bytes = bytes.len,
-        .entries = entries,
-        .block_size = artifactBlockSize(bytes),
-        .block_sha256 = block_sha256,
-    };
-}
-
-fn makeDictMetaForCountedArtifactAppend(
-    allocator: std.mem.Allocator,
-    dict_name: []const u8,
-    path: []const u8,
-    old_bytes: []const u8,
-    entries: u64,
-    values: []const []const u8,
-) TableError!DictMeta {
-    const name = try allocator.dupe(u8, dict_name);
-    errdefer allocator.free(name);
-    const owned_path = try allocator.dupe(u8, path);
-    errdefer allocator.free(owned_path);
-    const hashes = try makeCountedArtifactHashes(allocator, old_bytes, entries, values);
-    errdefer freeFileHashes(allocator, hashes);
-    return .{
-        .name = name,
-        .path = owned_path,
-        .sha256 = hashes.sha256,
-        .bytes = try countedArtifactBytesLen(old_bytes, values),
-        .entries = entries,
-        .block_size = hashes.block_size,
-        .block_sha256 = hashes.block_sha256,
-    };
-}
-
 fn makeDictMetaFromCountedArtifactWrite(
     allocator: std.mem.Allocator,
     dict_name: []const u8,
@@ -8087,54 +8129,25 @@ fn makeDictMetaFromCountedArtifactWrite(
     };
 }
 
-fn buildBlobBytesWithValue(allocator: std.mem.Allocator, old_bytes: []const u8, old_count: u64, value: []const u8) TableError![]u8 {
-    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
-    const values = [_][]const u8{value};
-    return buildCountedArtifactBytesWithValues(allocator, old_bytes, new_count, &values);
-}
-
-fn makeBlobStoreMeta(allocator: std.mem.Allocator, store_name: []const u8, path: []const u8, bytes: []const u8, entries: u64) TableError!BlobStoreMeta {
-    const name = try allocator.dupe(u8, store_name);
-    errdefer allocator.free(name);
-    const owned_path = try allocator.dupe(u8, path);
-    errdefer allocator.free(owned_path);
-    const sha256 = try optionalHashHexAlloc(allocator, bytes);
-    errdefer allocator.free(sha256);
-    const block_sha256 = try makeBlockSha256List(allocator, bytes, FILE_BLOCK_BYTES);
-    errdefer freeBlockSha256List(allocator, block_sha256);
-    return .{
-        .name = name,
-        .path = owned_path,
-        .sha256 = sha256,
-        .bytes = bytes.len,
-        .entries = entries,
-        .block_size = artifactBlockSize(bytes),
-        .block_sha256 = block_sha256,
-    };
-}
-
-fn makeBlobStoreMetaForCountedArtifactAppend(
+fn makeDictMetaFromCountedArtifactBuild(
     allocator: std.mem.Allocator,
-    store_name: []const u8,
+    dict_name: []const u8,
     path: []const u8,
-    old_bytes: []const u8,
     entries: u64,
-    values: []const []const u8,
-) TableError!BlobStoreMeta {
-    const name = try allocator.dupe(u8, store_name);
+    built: CountedArtifactBuildResult,
+) TableError!DictMeta {
+    const name = try allocator.dupe(u8, dict_name);
     errdefer allocator.free(name);
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
-    const hashes = try makeCountedArtifactHashes(allocator, old_bytes, entries, values);
-    errdefer freeFileHashes(allocator, hashes);
     return .{
         .name = name,
         .path = owned_path,
-        .sha256 = hashes.sha256,
-        .bytes = try countedArtifactBytesLen(old_bytes, values),
+        .sha256 = built.hashes.sha256,
+        .bytes = @intCast(built.bytes.len),
         .entries = entries,
-        .block_size = hashes.block_size,
-        .block_sha256 = hashes.block_sha256,
+        .block_size = built.hashes.block_size,
+        .block_sha256 = built.hashes.block_sha256,
     };
 }
 
@@ -8157,6 +8170,28 @@ fn makeBlobStoreMetaFromCountedArtifactWrite(
         .entries = entries,
         .block_size = written.hashes.block_size,
         .block_sha256 = written.hashes.block_sha256,
+    };
+}
+
+fn makeBlobStoreMetaFromCountedArtifactBuild(
+    allocator: std.mem.Allocator,
+    store_name: []const u8,
+    path: []const u8,
+    entries: u64,
+    built: CountedArtifactBuildResult,
+) TableError!BlobStoreMeta {
+    const name = try allocator.dupe(u8, store_name);
+    errdefer allocator.free(name);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    return .{
+        .name = name,
+        .path = owned_path,
+        .sha256 = built.hashes.sha256,
+        .bytes = @intCast(built.bytes.len),
+        .entries = entries,
+        .block_size = built.hashes.block_size,
+        .block_sha256 = built.hashes.block_sha256,
     };
 }
 
@@ -8237,20 +8272,23 @@ pub fn internStringDict(
     const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try dictFileName(allocator, table_name, dict_name, next_epoch);
     defer allocator.free(basename);
+    const values = [_][]const u8{value};
     if (canDeferUnsafeBootstrapMeta(meta)) {
-        const new_bytes = try buildDictBytesWithValue(allocator, old_bytes, old_count, value);
-        defer allocator.free(new_bytes);
-        const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
+        const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, &values);
+        defer allocator.free(built.bytes);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, built.hashes);
+        const new_meta = try makeDictMetaFromCountedArtifactBuild(allocator, dict_name, basename, new_count, built);
+        hashes_consumed = true;
         var consumed = false;
         errdefer if (!consumed) freeDictMeta(allocator, new_meta);
         try putDictMeta(allocator, &meta, new_meta);
         consumed = true;
         meta.epoch = next_epoch;
-        const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = @constCast(new_bytes) }};
+        const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = built.bytes }};
         try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending, &.{});
         return .{ .info = tableInfo(meta), .id = new_count, .inserted = true };
     }
-    const values = [_][]const u8{value};
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
     const written = try writeCountedArtifactFileAndHashes(allocator, path, old_bytes, new_count, &values);
@@ -8346,15 +8384,18 @@ pub fn internStringDictMany(
     const basename = try dictFileName(allocator, table_name, dict_name, next_epoch);
     defer allocator.free(basename);
     if (canDeferUnsafeBootstrapMeta(meta)) {
-        const new_bytes = try buildDictBytesWithValues(allocator, old_bytes, old_count, pending_values[0..pending_count]);
-        defer allocator.free(new_bytes);
-        const new_meta = try makeDictMeta(allocator, dict_name, basename, new_bytes, new_count);
+        const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, pending_values[0..pending_count]);
+        defer allocator.free(built.bytes);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, built.hashes);
+        const new_meta = try makeDictMetaFromCountedArtifactBuild(allocator, dict_name, basename, new_count, built);
+        hashes_consumed = true;
         var consumed = false;
         errdefer if (!consumed) freeDictMeta(allocator, new_meta);
         try putDictMeta(allocator, &meta, new_meta);
         consumed = true;
         meta.epoch = next_epoch;
-        const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = @constCast(new_bytes) }};
+        const pending = [_]PendingDictWrite{.{ .name = dict_name, .path = basename, .bytes = built.bytes }};
         try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &pending, &.{});
         return .{ .info = tableInfo(meta), .inserted_count = inserted_count };
     }
@@ -8465,22 +8506,25 @@ pub fn putBlobValue(
     const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try blobStoreFileName(allocator, table_name, store_name, next_epoch);
     defer allocator.free(basename);
+    const values = [_][]const u8{value};
 
     if (canDeferUnsafeBootstrapMeta(meta)) {
-        const new_bytes = try buildBlobBytesWithValue(allocator, old_bytes, old_count, value);
-        defer allocator.free(new_bytes);
-        const new_meta = try makeBlobStoreMeta(allocator, store_name, basename, new_bytes, new_count);
+        const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, &values);
+        defer allocator.free(built.bytes);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, built.hashes);
+        const new_meta = try makeBlobStoreMetaFromCountedArtifactBuild(allocator, store_name, basename, new_count, built);
+        hashes_consumed = true;
         var consumed = false;
         errdefer if (!consumed) freeBlobStoreMeta(allocator, new_meta);
         try putBlobStoreMeta(allocator, &meta, new_meta);
         consumed = true;
         meta.epoch = next_epoch;
-        const pending = [_]PendingBlobWrite{.{ .name = store_name, .path = basename, .bytes = @constCast(new_bytes) }};
+        const pending = [_]PendingBlobWrite{.{ .name = store_name, .path = basename, .bytes = built.bytes }};
         try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &.{}, &pending);
         return .{ .info = tableInfo(meta), .id = new_count };
     }
 
-    const values = [_][]const u8{value};
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
     const written = try writeCountedArtifactFileAndHashes(allocator, path, old_bytes, new_count, &values);
