@@ -2159,8 +2159,10 @@ fn unsafeInitCacheInternStringDictMany(
                 const dict = entry.meta.dicts[idx];
                 old_bytes = unsafeInitCachePendingDictBytesForEntry(entry, dict.path) orelse return TableError.NotFound;
                 if (old_bytes.len != dict.bytes) return TableError.VerifyFailed;
-                old_count = try dictEntryCount(old_bytes);
+                old_count = try dictScanCountAndFindValueIds(old_bytes, values, out_ids);
                 if (old_count != dict.entries) return TableError.VerifyFailed;
+            } else {
+                @memset(out_ids, 0);
             }
 
             const pending_values = try owned_allocator.alloc([]const u8, values.len);
@@ -2169,12 +2171,9 @@ fn unsafeInitCacheInternStringDictMany(
             var next_id = old_count;
 
             for (values, 0..) |value, idx| {
-                if (old_bytes.len != 0) {
-                    if (try dictFindValueId(old_bytes, value)) |id| {
-                        out_ids[idx] = id;
-                        out_inserted[idx] = false;
-                        continue;
-                    }
+                if (out_ids[idx] != 0) {
+                    out_inserted[idx] = false;
+                    continue;
                 }
 
                 var existing_pending: ?u64 = null;
@@ -4362,6 +4361,32 @@ fn dictScanCountAndFindValueId(bytes: []const u8, value: []const u8) TableError!
     }
     if (offset != bytes.len) return TableError.VerifyFailed;
     return .{ .count = count, .found_id = found_id };
+}
+
+fn dictScanCountAndFindValueIds(bytes: []const u8, values: []const []const u8, out_ids: []u64) TableError!u64 {
+    if (values.len != out_ids.len) return TableError.InvalidFormat;
+    @memset(out_ids, 0);
+    if (bytes.len < 8) return TableError.VerifyFailed;
+
+    const count = readU64LE(bytes, 0);
+    var offset: usize = 8;
+    var current_id: u64 = 1;
+    while (current_id <= count) : (current_id += 1) {
+        if (offset > bytes.len or bytes.len - offset < 8) return TableError.VerifyFailed;
+        const len_u64 = readU64LE(bytes, offset);
+        if (len_u64 == 0 or len_u64 > DICT_MAX_VALUE_BYTES) return TableError.VerifyFailed;
+        if (len_u64 > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.VerifyFailed;
+        const len: usize = @intCast(len_u64);
+        offset += 8;
+        if (offset > bytes.len or bytes.len - offset < len) return TableError.VerifyFailed;
+        const candidate = bytes[offset .. offset + len];
+        for (values, 0..) |value, idx| {
+            if (out_ids[idx] == 0 and std.mem.eql(u8, candidate, value)) out_ids[idx] = current_id;
+        }
+        offset += len;
+    }
+    if (offset != bytes.len) return TableError.VerifyFailed;
+    return count;
 }
 
 fn findDictMetaIndex(meta: TableMeta, dict_name: []const u8) ?usize {
@@ -7880,7 +7905,9 @@ pub fn internStringDictMany(
         const mapped = try mappedDictBytesForRead(allocator, root_dir, meta.dicts[idx]);
         mapped_old = mapped;
         old_bytes = mappedRegionBytes(mapped);
-        old_count = try dictEntryCount(old_bytes);
+        old_count = try dictScanCountAndFindValueIds(old_bytes, values, out_ids);
+    } else {
+        @memset(out_ids, 0);
     }
 
     const pending_values = try allocator.alloc([]const u8, values.len);
@@ -7890,12 +7917,9 @@ pub fn internStringDictMany(
     var next_id = old_count;
 
     for (values, 0..) |value, idx| {
-        if (mapped_old != null) {
-            if (try dictFindValueId(old_bytes, value)) |id| {
-                out_ids[idx] = id;
-                out_inserted[idx] = false;
-                continue;
-            }
+        if (out_ids[idx] != 0) {
+            out_inserted[idx] = false;
+            continue;
         }
 
         var existing_pending: ?u64 = null;

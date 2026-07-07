@@ -74,6 +74,31 @@ require(
     re.S,
 )
 require(
+    r"fn\s+dictScanCountAndFindValueIds\s*\([^)]*values:\s*\[\]const \[\]const u8[^)]*out_ids:\s*\[\]u64[^)]*\)\s*TableError!u64\s*\{(?:(?!\nfn\s).)*@memset\(out_ids,\s*0\)(?:(?!\nfn\s).)*for\s*\(values,\s*0\.\.\)\s*\|value,\s*idx\|(?:(?!\nfn\s).)*out_ids\[idx\]\s*=\s*current_id",
+    "batched dictionary intern must scan existing dictionary bytes once for all requested values",
+    re.S,
+)
+require(
+    r"fn\s+unsafeInitCacheInternStringDictMany\s*\([^)]*\)\s*TableError!\?DictInternManyResult\s*\{(?:(?!\nfn\s).)*dictScanCountAndFindValueIds\(old_bytes,\s*values,\s*out_ids\)(?:(?!\nfn\s).)*if\s*\(out_ids\[idx\]\s*!=\s*0\)",
+    "unsafe batched dictionary intern must use the single-pass old-dictionary scan",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*dictScanCountAndFindValueIds\(old_bytes,\s*values,\s*out_ids\)(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(out_ids\[idx\]\s*!=\s*0\)",
+    "batched dictionary intern must use the single-pass old-dictionary scan",
+    re.S,
+)
+forbid(
+    r"fn\s+unsafeInitCacheInternStringDictMany\s*\([^)]*\)\s*TableError!\?DictInternManyResult\s*\{(?:(?!\nfn\s).)*dictFindValueId\(",
+    "unsafe batched dictionary intern reintroduced repeated old-dictionary scans",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*dictFindValueId\(",
+    "batched dictionary intern reintroduced repeated old-dictionary scans",
+    re.S,
+)
+require(
     r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
     "direct blob append must use artifact write before meta publish",
     re.S,
