@@ -42,8 +42,9 @@ require_text "test_step.dependOn(benchmark_parser_guards_step)"
 require_count_at_least 'raise SystemExit(f"benchmark output duplicate metric: {key}")' 2
 require_count_at_least 'raise SystemExit(f"benchmark output invalid integer metric: {key}={raw}")' 2
 require_count_at_least 'raise SystemExit(f"benchmark output negative metric: {key}={values[key]}")' 2
-require_count_at_least 'if runs <= 0:' 2
-require_count_at_least 'raise SystemExit("benchmark compare run count must be positive")' 2
+require_count_at_least 'if runs <= 0 or runs % 2 == 0:' 2
+require_count_at_least 'raise SystemExit("benchmark compare run count must be positive odd")' 2
+require_count_at_least 'Positive odd number of runs' 2
 require_text 'if strict_chain_s not in ("0", "1"):'
 require_text 'raise SystemExit("benchmark compare strict-chain flag must be 0 or 1")'
 require_text 'if strict_insert_s not in ("0", "1"):'
@@ -78,4 +79,4 @@ require_text 'require_insert_consistency(raw_samples, "db_concurrent_insert_ok",
 require_text 'require_insert_consistency(coltx_samples, "db_concurrent_insert_ok", "db_concurrent_insert_rows", 50000, "coltx db")'
 require_text 'require_insert_consistency(sqlite_samples, "sqlite_concurrent_insert_ok", "sqlite_concurrent_insert_rows", 50000, "sqlite")'
 
-echo "benchmark parser guard passed: positive-run-count, strict-flag, missing, invalid-integer, negative, duplicate, non-positive timing, boolean status, per-path query gates, and insert row consistency checks are wired"
+echo "benchmark parser guard passed: positive-odd-run-count, strict-flag, missing, invalid-integer, negative, duplicate, non-positive timing, boolean status, per-path query gates, and insert row consistency checks are wired"

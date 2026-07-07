@@ -7,8 +7,8 @@ pub fn build(b: *std.Build) void {
     const sa_bin = b.option([]const u8, "sa-bin", "Path to the SA host binary used for db integration tests.") orelse b.pathJoin(&.{ sa_repo_root, "zig-out/bin/sa" });
     const sqlite_lib = b.option([]const u8, "sqlite-lib", "Path to the SQLite shared library used by SQLite control benchmarks.") orelse "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0";
     const sa_std_lib = b.option([]const u8, "sa-std-lib", "Path to libsa_std.a; SQLite control benchmarks rebuild it with sqlite stubs renamed.") orelse "/home/vscode/.sa/std/libsa_std.a";
-    const bench_compare_runs = b.option(u32, "bench-compare-runs", "Number of runs for the opt-in bench-compare median gate.") orelse 3;
-    const bench_compare_proof_runs = b.option(u32, "bench-compare-proof-runs", "Number of runs for the bench-compare-proof report gate.") orelse 7;
+    const bench_compare_runs = b.option(u32, "bench-compare-runs", "Positive odd number of runs for the opt-in bench-compare median gate.") orelse 3;
+    const bench_compare_proof_runs = b.option(u32, "bench-compare-proof-runs", "Positive odd number of runs for the bench-compare-proof report gate.") orelse 7;
     const bench_compare_strict_chain = b.option(bool, "bench-compare-strict-chain", "Require the combined db tx+coltx append chain to beat SQLite append in bench-compare.") orelse false;
     const bench_compare_strict_concurrent_insert = b.option(bool, "bench-compare-strict-concurrent-insert", "Require db raw/coltx concurrent insert correctness and performance to beat SQLite in bench-compare-concurrent.") orelse false;
     const lock_wait_seconds = b.option(u32, "lock-wait-seconds", "Seconds to wait for shared build locks before failing instead of hanging.") orelse 900;
@@ -285,10 +285,10 @@ pub fn build(b: *std.Build) void {
     const bench_compare_concurrent_strict_insert_step = b.step("bench-compare-concurrent-strict-insert", "Run the concurrent db-vs-SQLite gate with strict concurrent insert correctness and performance.");
     const bench_compare_disk_strict_chain_step = b.step("bench-compare-disk-strict-chain", "Run the disk indexed ERP strict combined append-chain gate.");
     const bench_compare_memory_strict_chain_step = b.step("bench-compare-memory-strict-chain", "Run the memory indexed ERP strict combined append-chain gate.");
-    const bench_compare_proof_step = b.step("bench-compare-proof", "Run the configured-run SQLite proof report (default 7): disk+memory compare plus strict concurrent insert.");
-    const bench_compare_proof_strict_chain_step = b.step("bench-compare-proof-strict-chain", "Run the configured-run SQLite proof (default 7) with disk/memory combined append chain as hard gates.");
-    const sqlite_proof_step = b.step("sqlite-proof", "Run SQLite readiness audit plus the configured-run performance proof report (default 7).");
-    const sqlite_proof_strict_chain_step = b.step("sqlite-proof-strict-chain", "Run SQLite readiness audit plus the strict-chain configured-run performance proof (default 7).");
+    const bench_compare_proof_step = b.step("bench-compare-proof", "Run the configured-run SQLite proof report (positive odd, default 7): disk+memory compare plus strict concurrent insert.");
+    const bench_compare_proof_strict_chain_step = b.step("bench-compare-proof-strict-chain", "Run the configured-run SQLite proof (positive odd, default 7) with disk/memory combined append chain as hard gates.");
+    const sqlite_proof_step = b.step("sqlite-proof", "Run SQLite readiness audit plus the configured-run performance proof report (positive odd, default 7).");
+    const sqlite_proof_strict_chain_step = b.step("sqlite-proof-strict-chain", "Run SQLite readiness audit plus the strict-chain configured-run performance proof (positive odd, default 7).");
     const benchmark_artifacts_step = b.step("check-benchmark-artifacts", "Verify protected tracked benchmark artifacts are clean.");
     const benchmark_run_lock = b.pathFromRoot(".zig-cache/db-benchmark-run.lock");
     const benchmark_artifacts = addBenchmarkArtifactGuardStep(b, benchmark_run_lock, lock_wait_seconds_arg);
@@ -642,8 +642,8 @@ fn addBenchCompareStep(
         \\
         \\db_bench, sqlite_bench, runs_s, strict_chain_s, suite_label, db_prefix, sqlite_prefix = sys.argv[1:8]
         \\runs = int(runs_s)
-        \\if runs <= 0:
-        \\    raise SystemExit("benchmark compare run count must be positive")
+        \\if runs <= 0 or runs % 2 == 0:
+        \\    raise SystemExit("benchmark compare run count must be positive odd")
         \\if strict_chain_s not in ("0", "1"):
         \\    raise SystemExit("benchmark compare strict-chain flag must be 0 or 1")
         \\strict_chain = strict_chain_s == "1"
@@ -813,8 +813,8 @@ fn addBenchCompareConcurrentStep(
         \\
         \\db_raw_bench, db_coltx_bench, sqlite_bench, runs_s, strict_insert_s = sys.argv[1:6]
         \\runs = int(runs_s)
-        \\if runs <= 0:
-        \\    raise SystemExit("benchmark compare run count must be positive")
+        \\if runs <= 0 or runs % 2 == 0:
+        \\    raise SystemExit("benchmark compare run count must be positive odd")
         \\if strict_insert_s not in ("0", "1"):
         \\    raise SystemExit("benchmark compare strict-insert flag must be 0 or 1")
         \\strict_insert = strict_insert_s == "1"
