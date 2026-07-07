@@ -570,10 +570,10 @@ fn addSqliteStdArchiveStep(b: *std.Build, sa_std_lib: []const u8) std.Build.Lazy
         \\set -euo pipefail
         \\src="$1"
         \\out="$2"
-        \\work="$(dirname "$out")/sqlite_link_std_work"
+        \\out_dir="$(dirname "$out")"
+        \\mkdir -p "$out_dir"
+        \\work="$(mktemp -d "$out_dir/sqlite_link_std_work.XXXXXX")"
         \\trap 'rm -rf "$work"' EXIT
-        \\rm -rf "$work"
-        \\mkdir -p "$work"
         \\if ! (cd "$work" && ar x "$src" 2> ar.stderr); then
         \\  cat "$work/ar.stderr" >&2
         \\  exit 1

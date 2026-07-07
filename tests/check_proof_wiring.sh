@@ -47,6 +47,7 @@ require_text "benchmark executable builds"
 require_text "bounded lock guard"
 require_text "benchmark executable builds, benchmark parser guards, proof wiring, bounded lock guard, and protected benchmark artifacts are clean"
 require_text "sqlite_link_std_work"
+require_text 'work="$(mktemp -d "$out_dir/sqlite_link_std_work.XXXXXX")"'
 require_text "trap 'rm -rf \"\$work\"' EXIT"
 require_text "--redefine-sym sqlite3_prepare=sa_std_stub_sqlite3_prepare"
 require_text "--redefine-sym sqlite3_step=sa_std_stub_sqlite3_step"
