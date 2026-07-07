@@ -49,6 +49,16 @@ require(
     re.S,
 )
 require(
+    r"fn\s+makeCountedArtifactHashes\s*\([^)]*old_bytes:\s*\[\]const u8[^)]*new_count:\s*u64[^)]*values:\s*\[\]const \[\]const u8[^)]*\)\s*TableError!FileHashes\s*\{(?:(?!\nfn\s).)*updateCountedArtifactHashesWithValues",
+    "counted dictionary/blob artifact append must stream hash metadata without a replacement artifact buffer",
+    re.S,
+)
+require(
+    r"fn\s+writeCountedArtifactFile\s*\([^)]*old_bytes:\s*\[\]const u8[^)]*new_count:\s*u64[^)]*values:\s*\[\]const \[\]const u8[^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeCountedArtifactToFile",
+    "counted dictionary/blob artifact append must stream file writes without a replacement artifact buffer",
+    re.S,
+)
+require(
     r"fn\s+flushPendingDictWrites\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)",
     "transaction dictionary artifact flush must use artifact writes",
     re.S,
@@ -64,13 +74,13 @@ require(
     re.S,
 )
 require(
-    r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
-    "direct dictionary append must use artifact write before meta publish",
+    r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMetaForCountedArtifactAppend\(allocator,\s*dict_name,\s*basename,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*writeCountedArtifactFile\(allocator,\s*path,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    "direct dictionary append must use counted-artifact streaming before meta publish",
     re.S,
 )
 require(
-    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
-    "batched dictionary append must use artifact write before meta publish",
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeDictMetaForCountedArtifactAppend\(allocator,\s*dict_name,\s*basename,\s*old_bytes,\s*new_count,\s*pending_values\[0\.\.pending_count\]\)(?:(?!\n(?:pub\s+)?fn\s).)*writeCountedArtifactFile\(allocator,\s*path,\s*old_bytes,\s*new_count,\s*pending_values\[0\.\.pending_count\]\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    "batched dictionary append must use counted-artifact streaming before meta publish",
     re.S,
 )
 require(
@@ -99,8 +109,23 @@ forbid(
     re.S,
 )
 require(
-    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
-    "direct blob append must use artifact write before meta publish",
+    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaForCountedArtifactAppend\(allocator,\s*store_name,\s*basename,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*writeCountedArtifactFile\(allocator,\s*path,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    "direct blob append must use counted-artifact streaming before meta publish",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)",
+    "direct dictionary append reintroduced replacement-buffer artifact writes",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)",
+    "batched dictionary append reintroduced replacement-buffer artifact writes",
+    re.S,
+)
+forbid(
+    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)",
+    "direct blob append reintroduced replacement-buffer artifact writes",
     re.S,
 )
 require(
