@@ -69,6 +69,16 @@ require(
     re.S,
 )
 require(
+    r"fn\s+writeCountedArtifactFileAndHashes\s*\([^)]*old_bytes:\s*\[\]const u8[^)]*new_count:\s*u64[^)]*values:\s*\[\]const \[\]const u8[^)]*\)\s*TableError!CountedArtifactWriteResult\s*\{(?:(?!\nfn\s).)*MEMORY_PATH_PREFIX(?:(?!\nfn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*values\)(?:(?!\nfn\s).)*memoryWriteFile\(allocator,\s*path,\s*built\.bytes\)",
+    "memory counted dictionary/blob artifact append must build bytes and hash metadata in one pass",
+    re.S,
+)
+forbid(
+    r"fn\s+writeCountedArtifactFileAndHashes\s*\([^)]*\)\s*TableError!CountedArtifactWriteResult\s*\{(?:(?!\nfn\s).)*makeFileHashesSinglePass\(",
+    "memory counted dictionary/blob artifact append reintroduced a second hash scan",
+    re.S,
+)
+require(
     r"fn\s+flushPendingDictWrites\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)",
     "transaction dictionary artifact flush must use artifact writes",
     re.S,

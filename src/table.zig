@@ -8064,16 +8064,18 @@ fn writeCountedArtifactFileAndHashes(
     values: []const []const u8,
 ) TableError!CountedArtifactWriteResult {
     if (old_bytes.len != 0 and old_bytes.len < 8) return TableError.VerifyFailed;
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, values);
+        defer allocator.free(built.bytes);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, built.hashes);
+        try memoryWriteFile(allocator, path, built.bytes);
+        hashes_consumed = true;
+        return .{ .bytes = @intCast(built.bytes.len), .hashes = built.hashes };
+    }
+
     const total = try countedArtifactBytesLen(old_bytes, values);
     const bytes_len: u64 = @intCast(total);
-    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
-        const bytes = try buildCountedArtifactBytesWithValues(allocator, old_bytes, new_count, values);
-        defer allocator.free(bytes);
-        const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
-        errdefer freeFileHashes(allocator, hashes);
-        try memoryWriteFile(allocator, path, bytes);
-        return .{ .bytes = bytes_len, .hashes = hashes };
-    }
     if (skipDurabilitySync()) {
         const hashes = try makeCountedArtifactHashes(allocator, old_bytes, new_count, values);
         errdefer freeFileHashes(allocator, hashes);
