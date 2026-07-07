@@ -49,6 +49,20 @@ require(
     re.S,
 )
 require(
+    r"fn\s+writeFileWithParentSyncAndHashes\s*\([^)]*path:\s*\[\]const u8[^)]*bytes:\s*\[\]const u8[^)]*sync_parent:\s*bool[^)]*\)\s*TableError!FileWriteResult\s*\{(?:(?!\nfn\s).)*writeBytesToFileAndHashes(?:(?!\nfn\s).)*renamePath\(temp_path,\s*path\)(?:(?!\nfn\s).)*if\s*\(sync_parent\)\s*syncParentDirBestEffort\(path\)",
+    "full-buffer artifact writes must combine file writes and hash metadata while preserving rename and optional parent sync",
+    re.S,
+)
+require(
+    r"fn\s+makeFileMetaFromWrite\s*\([^)]*written:\s*FileWriteResult[^)]*\)\s*TableError!FileMeta\s*\{(?:(?!\nfn\s).)*written\.hashes\.sha256(?:(?!\nfn\s).)*written\.bytes(?:(?!\nfn\s).)*written\.hashes\.block_sha256",
+    "full-buffer artifact metadata must be built from write-time hashes",
+    re.S,
+)
+forbid(
+    r"\bmakeFileMeta\s*\(",
+    "old full-buffer write-then-hash metadata helper reintroduced",
+)
+require(
     r"fn\s+makeCountedArtifactHashes\s*\([^)]*old_bytes:\s*\[\]const u8[^)]*new_count:\s*u64[^)]*values:\s*\[\]const \[\]const u8[^)]*\)\s*TableError!FileHashes\s*\{(?:(?!\nfn\s).)*updateCountedArtifactHashesWithValues",
     "counted dictionary/blob artifact append must stream hash metadata without a replacement artifact buffer",
     re.S,
@@ -91,6 +105,41 @@ require(
 require(
     r"fn\s+writeCompatMeta\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*pending_dict_writes(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)(?:(?!\nfn\s).)*pending_blob_writes(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)",
     "unsafe cached dictionary/blob materialization must use artifact writes before compat meta publish",
+    re.S,
+)
+require(
+    r"fn\s+writeSegmentFiles\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*path,\s*buffer\.items,\s*false\)(?:(?!\nfn\s).)*makeFileMetaFromWrite\(allocator,\s*basename,\s*written\)",
+    "segment file writes must build file metadata from write-time hashes",
+    re.S,
+)
+require(
+    r"fn\s+writeSegmentRawFiles\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*path,\s*column\.bytes,\s*false\)(?:(?!\nfn\s).)*makeFileMetaFromWrite\(allocator,\s*basename,\s*written\)",
+    "raw segment file writes must build file metadata from write-time hashes",
+    re.S,
+)
+require(
+    r"fn\s+stageRawColumnFiles\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*staged_path,\s*column\.bytes,\s*false\)(?:(?!\nfn\s).)*written\.hashes\.sha256(?:(?!\nfn\s).)*written\.hashes\.block_sha256",
+    "staged raw column writes must keep write-time hashes",
+    re.S,
+)
+require(
+    r"fn\s+mergeSegmentFiles\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*dst_path,\s*merged\.items,\s*true\)(?:(?!\nfn\s).)*makeFileMetaFromWrite\(allocator,\s*basename,\s*written\)",
+    "compact merge output writes must build file metadata from write-time hashes",
+    re.S,
+)
+require(
+    r"fn\s+rewriteColumnFileForEpoch\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*active_next_path,\s*bytes,\s*true\)(?:(?!\nfn\s).)*makeFileMetaFromWrite\(allocator,\s*next_path,\s*written\)",
+    "epoch column rewrite must build file metadata from write-time hashes",
+    re.S,
+)
+require(
+    r"fn\s+rewriteIndexMetaBytes\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*path,\s*bytes,\s*false\)(?:(?!\nfn\s).)*index\.sha256\s*=\s*written\.hashes\.sha256",
+    "index rewrite must keep write-time hashes",
+    re.S,
+)
+require(
+    r"fn\s+rebuildIndexAt\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*path,\s*bytes,\s*false\)(?:(?!\nfn\s).)*index\.sha256\s*=\s*written\.hashes\.sha256",
+    "index rebuild must keep write-time hashes",
     re.S,
 )
 require(

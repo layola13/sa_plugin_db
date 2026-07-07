@@ -743,6 +743,11 @@ const CountedArtifactBuildResult = struct {
     hashes: FileHashes,
 };
 
+const FileWriteResult = struct {
+    bytes: u64,
+    hashes: FileHashes,
+};
+
 fn freeFileHashes(allocator: std.mem.Allocator, hashes: FileHashes) void {
     freeMaybeBytes(allocator, hashes.sha256);
     freeBlockSha256List(allocator, hashes.block_sha256);
@@ -1376,6 +1381,109 @@ fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes
 
     try renamePath(temp_path, path);
     if (sync_parent) syncParentDirBestEffort(path);
+}
+
+fn writeFileChunkAndHash(
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    file_hasher: *std.crypto.hash.sha2.Sha256,
+    block_hasher: *std.crypto.hash.sha2.Sha256,
+    block_sha256: [][]const u8,
+    block_size: usize,
+    block_index: *usize,
+    block_used: *usize,
+    chunk: []const u8,
+) TableError!void {
+    file.writeAll(chunk) catch |err| return mapFileError(err);
+    try updateStreamingFileHashes(allocator, file_hasher, block_hasher, block_sha256, block_size, block_index, block_used, chunk);
+}
+
+fn writeBytesToFileAndHashes(
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    bytes: []const u8,
+    block_size: usize,
+) TableError!FileHashes {
+    if (skipDurabilitySync()) {
+        file.writeAll(bytes) catch |err| return mapFileError(err);
+        const sha256 = try optionalHashHexAlloc(allocator, bytes);
+        errdefer allocator.free(sha256);
+        const block_sha256 = try allocator.alloc([]const u8, 0);
+        return .{ .sha256 = sha256, .block_size = 0, .block_sha256 = block_sha256 };
+    }
+    if (block_size == 0) return TableError.InvalidFormat;
+
+    const block_sha256 = try allocator.alloc([]const u8, blockHashCount(bytes.len, block_size));
+    for (block_sha256) |*hash| hash.* = &.{};
+    errdefer freeBlockSha256List(allocator, block_sha256);
+
+    var file_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var block_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var block_index: usize = 0;
+    var block_used: usize = 0;
+    if (bytes.len != 0) {
+        try writeFileChunkAndHash(allocator, file, &file_hasher, &block_hasher, block_sha256, block_size, &block_index, &block_used, bytes);
+    }
+    if (block_used != 0) {
+        if (block_index >= block_sha256.len) return TableError.VerifyFailed;
+        var block_digest: [32]u8 = undefined;
+        block_hasher.final(&block_digest);
+        block_sha256[block_index] = try hashHexFromDigestAlloc(allocator, block_digest);
+        block_index += 1;
+    }
+    if (block_index != block_sha256.len) return TableError.VerifyFailed;
+
+    var file_digest: [32]u8 = undefined;
+    file_hasher.final(&file_digest);
+    const sha256 = try hashHexFromDigestAlloc(allocator, file_digest);
+    errdefer allocator.free(sha256);
+
+    return .{ .sha256 = sha256, .block_size = if (bytes.len == 0) 0 else block_size, .block_sha256 = block_sha256 };
+}
+
+fn writeFileWithParentSyncAndHashes(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: []const u8,
+    sync_parent: bool,
+) TableError!FileWriteResult {
+    if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) {
+        const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
+        errdefer freeFileHashes(allocator, hashes);
+        try memoryWriteFile(allocator, path, bytes);
+        return .{ .bytes = @intCast(bytes.len), .hashes = hashes };
+    }
+    if (skipDurabilitySync()) {
+        var file = try createFileEnsuringParent(path, .{ .truncate = true });
+        defer file.close();
+        const hashes = try writeBytesToFileAndHashes(allocator, file, bytes, FILE_BLOCK_BYTES);
+        errdefer freeFileHashes(allocator, hashes);
+        return .{ .bytes = @intCast(bytes.len), .hashes = hashes };
+    }
+
+    const temp_path = try tempWritePath(allocator, path);
+    defer allocator.free(temp_path);
+    errdefer deleteIfExists(temp_path) catch {};
+
+    var hashes: FileHashes = undefined;
+    var hashes_ready = false;
+    errdefer if (hashes_ready) freeFileHashes(allocator, hashes);
+    {
+        var file = try createFileEnsuringParent(temp_path, .{ .truncate = true, .exclusive = true });
+        defer file.close();
+        hashes = try writeBytesToFileAndHashes(allocator, file, bytes, FILE_BLOCK_BYTES);
+        hashes_ready = true;
+        if (builtin.os.tag == .linux) {
+            std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+        } else {
+            file.sync() catch |err| return mapFileError(err);
+        }
+    }
+
+    try renamePath(temp_path, path);
+    if (sync_parent) syncParentDirBestEffort(path);
+    hashes_ready = false;
+    return .{ .bytes = @intCast(bytes.len), .hashes = hashes };
 }
 
 fn writeFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
@@ -2924,18 +3032,15 @@ fn validateHashesSinglePass(
     if (!std.mem.eql(u8, file_hex[0..], expected_sha256)) return TableError.VerifyFailed;
 }
 
-fn makeFileMeta(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!FileMeta {
+fn makeFileMetaFromWrite(allocator: std.mem.Allocator, path: []const u8, written: FileWriteResult) TableError!FileMeta {
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
-    const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
-    errdefer allocator.free(hashes.sha256);
-    errdefer freeBlockSha256List(allocator, hashes.block_sha256);
     return .{
         .path = owned_path,
-        .sha256 = hashes.sha256,
-        .bytes = bytes.len,
-        .block_size = hashes.block_size,
-        .block_sha256 = hashes.block_sha256,
+        .sha256 = written.hashes.sha256,
+        .bytes = written.bytes,
+        .block_size = written.hashes.block_size,
+        .block_sha256 = written.hashes.block_sha256,
     };
 }
 
@@ -3072,8 +3177,11 @@ fn writeSegmentFiles(
         defer allocator.free(basename);
         const path = try activePath(allocator, root_dir, basename);
         defer allocator.free(path);
-        try writeFileWithParentSync(allocator, path, buffer.items, false);
-        files[idx] = try makeFileMeta(allocator, basename, buffer.items);
+        const written = try writeFileWithParentSyncAndHashes(allocator, path, buffer.items, false);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
+        files[idx] = try makeFileMetaFromWrite(allocator, basename, written);
+        hashes_consumed = true;
     }
     const dir_sync_path = try activePath(allocator, root_dir, table_name);
     defer allocator.free(dir_sync_path);
@@ -3101,8 +3209,11 @@ fn writeSegmentRawFiles(
         defer allocator.free(basename);
         const path = try activePath(allocator, root_dir, basename);
         defer allocator.free(path);
-        try writeFileWithParentSync(allocator, path, column.bytes, false);
-        files[idx] = try makeFileMeta(allocator, basename, column.bytes);
+        const written = try writeFileWithParentSyncAndHashes(allocator, path, column.bytes, false);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
+        files[idx] = try makeFileMetaFromWrite(allocator, basename, written);
+        hashes_consumed = true;
     }
     const dir_sync_path = try activePath(allocator, root_dir, table_name);
     defer allocator.free(dir_sync_path);
@@ -3127,19 +3238,18 @@ fn stageRawColumnFiles(
         defer allocator.free(staged_name);
         const staged_path = try activePath(allocator, root_dir, staged_name);
         errdefer allocator.free(staged_path);
-        try writeFileWithParentSync(allocator, staged_path, column.bytes, false);
-
-        const hashes = try makeFileHashesSinglePass(allocator, column.bytes, FILE_BLOCK_BYTES);
-        errdefer allocator.free(hashes.sha256);
-        errdefer freeBlockSha256List(allocator, hashes.block_sha256);
+        const written = try writeFileWithParentSyncAndHashes(allocator, staged_path, column.bytes, false);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
 
         files[idx] = .{
             .staged_path = staged_path,
-            .sha256 = @constCast(hashes.sha256),
-            .bytes = column.bytes.len,
-            .block_size = hashes.block_size,
-            .block_sha256 = hashes.block_sha256,
+            .sha256 = @constCast(written.hashes.sha256),
+            .bytes = written.bytes,
+            .block_size = written.hashes.block_size,
+            .block_sha256 = written.hashes.block_sha256,
         };
+        hashes_consumed = true;
     }
 
     return files;
@@ -3925,8 +4035,11 @@ fn mergeSegmentFiles(
         defer allocator.free(basename);
         const dst_path = try activePath(allocator, root_dir, basename);
         defer allocator.free(dst_path);
-        try writeFile(allocator, dst_path, merged.items);
-        files[col_idx] = try makeFileMeta(allocator, basename, merged.items);
+        const written = try writeFileWithParentSyncAndHashes(allocator, dst_path, merged.items, true);
+        var hashes_consumed = false;
+        errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
+        files[col_idx] = try makeFileMetaFromWrite(allocator, basename, written);
+        hashes_consumed = true;
         merged.deinit();
     }
 
@@ -5528,8 +5641,12 @@ pub fn rewriteColumnFileForEpoch(
     defer allocator.free(next_path);
     const active_next_path = try activePath(allocator, root_dir, next_path);
     defer allocator.free(active_next_path);
-    try writeFile(allocator, active_next_path, bytes);
-    return try makeFileMeta(allocator, next_path, bytes);
+    const written = try writeFileWithParentSyncAndHashes(allocator, active_next_path, bytes, true);
+    var hashes_consumed = false;
+    errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
+    const meta = try makeFileMetaFromWrite(allocator, next_path, written);
+    hashes_consumed = true;
+    return meta;
 }
 
 fn writeGeneratedIface(allocator: std.mem.Allocator, root_dir: []const u8, schema_obj: schema.Schema) TableError!void {
@@ -10998,22 +11115,22 @@ fn rewriteIndexMetaBytes(allocator: std.mem.Allocator, root_dir: []const u8, tab
 
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeArtifactFile(allocator, path, bytes);
+    const written = try writeFileWithParentSyncAndHashes(allocator, path, bytes, false);
+    var hashes_consumed = false;
+    errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
 
     const next_path = try allocator.dupe(u8, basename);
     errdefer allocator.free(next_path);
-    const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
-    errdefer allocator.free(hashes.sha256);
-    errdefer freeBlockSha256List(allocator, hashes.block_sha256);
 
     allocator.free(index.path);
     allocator.free(index.sha256);
     freeBlockSha256List(allocator, index.block_sha256);
     index.path = next_path;
-    index.sha256 = hashes.sha256;
-    index.bytes = bytes.len;
-    index.block_size = hashes.block_size;
-    index.block_sha256 = hashes.block_sha256;
+    index.sha256 = written.hashes.sha256;
+    index.bytes = written.bytes;
+    index.block_size = written.hashes.block_size;
+    index.block_sha256 = written.hashes.block_sha256;
+    hashes_consumed = true;
 }
 
 fn appendIndexMetaBytesUnsafe(
@@ -11794,20 +11911,20 @@ fn rebuildIndexAt(allocator: std.mem.Allocator, root_dir: []const u8, meta: *Tab
     defer allocator.free(basename);
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeArtifactFile(allocator, path, bytes);
+    const written = try writeFileWithParentSyncAndHashes(allocator, path, bytes, false);
+    var hashes_consumed = false;
+    errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
     const next_path = try allocator.dupe(u8, basename);
     errdefer allocator.free(next_path);
-    const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
-    errdefer allocator.free(hashes.sha256);
-    errdefer freeBlockSha256List(allocator, hashes.block_sha256);
     allocator.free(index.path);
     allocator.free(index.sha256);
     freeBlockSha256List(allocator, index.block_sha256);
     index.path = next_path;
-    index.sha256 = hashes.sha256;
-    index.bytes = bytes.len;
-    index.block_size = hashes.block_size;
-    index.block_sha256 = hashes.block_sha256;
+    index.sha256 = written.hashes.sha256;
+    index.bytes = written.bytes;
+    index.block_size = written.hashes.block_size;
+    index.block_sha256 = written.hashes.block_sha256;
+    hashes_consumed = true;
 }
 
 pub fn rebuildIndexes(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta) TableError!void {
