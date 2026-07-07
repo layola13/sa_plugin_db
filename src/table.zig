@@ -10636,6 +10636,7 @@ fn mergeSingleIndexBytesInPlace(
     const appended_count = appended_len / INDEX_RECORD_BYTES;
     const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
     const total_len = std.math.mul(usize, total_count, INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    if (!validate_variable_shape and total_len != try expectedIndexBytes(total_row_count)) return TableError.VerifyFailed;
     if (writable.len != total_len) return TableError.VerifyFailed;
 
     if (unique) try detectUniqueSingleMergeConflict(writable[0..existing_len], appended_bytes);
@@ -10647,6 +10648,9 @@ fn mergeSingleIndexBytesInPlace(
     appended_idx -= 1;
     var out_idx: isize = @intCast(total_count);
     out_idx -= 1;
+    var have_next = false;
+    var next_key: u64 = 0;
+    var next_row: u64 = 0;
 
     while (existing_idx >= 0 or appended_idx >= 0) : (out_idx -= 1) {
         const use_existing = if (appended_idx < 0)
@@ -10681,14 +10685,24 @@ fn mergeSingleIndexBytesInPlace(
             break :blk entry;
         };
 
+        if (chosen.row >= total_row_count) return TableError.VerifyFailed;
+        if (have_next) {
+            if (chosen.key > next_key) return TableError.VerifyFailed;
+            if (chosen.key == next_key) {
+                if (unique) return TableError.VerifyFailed;
+                if (validate_variable_shape) {
+                    if (chosen.row >= next_row) return TableError.VerifyFailed;
+                } else if (chosen.row > next_row) return TableError.VerifyFailed;
+            }
+        }
+
         writeIndexEntry(writable, @intCast(out_idx), chosen);
+        next_key = chosen.key;
+        next_row = chosen.row;
+        have_next = true;
     }
 
-    if (validate_variable_shape) {
-        try validateVariableIndexBytesShape(writable, total_row_count);
-    } else {
-        try validateIndexBytesShape(writable, total_row_count, unique);
-    }
+    if (out_idx != -1) return TableError.VerifyFailed;
 }
 
 fn mergeU64PairIndexBytesInPlace(
@@ -10707,6 +10721,7 @@ fn mergeU64PairIndexBytesInPlace(
     const appended_count = appended_len / U64_PAIR_INDEX_RECORD_BYTES;
     const total_count = std.math.add(usize, existing_count, appended_count) catch return TableError.CursorOverflow;
     const total_len = std.math.mul(usize, total_count, U64_PAIR_INDEX_RECORD_BYTES) catch return TableError.CursorOverflow;
+    if (total_len != try expectedU64PairIndexBytes(total_row_count)) return TableError.VerifyFailed;
     if (writable.len != total_len) return TableError.VerifyFailed;
 
     if (unique) try detectUniquePairMergeConflict(writable[0..existing_len], appended_bytes);
@@ -10718,6 +10733,10 @@ fn mergeU64PairIndexBytesInPlace(
     appended_idx -= 1;
     var out_idx: isize = @intCast(total_count);
     out_idx -= 1;
+    var have_next = false;
+    var next_key1: u64 = 0;
+    var next_key2: u64 = 0;
+    var next_row: u64 = 0;
 
     while (existing_idx >= 0 or appended_idx >= 0) : (out_idx -= 1) {
         const use_existing = if (appended_idx < 0)
@@ -10756,10 +10775,85 @@ fn mergeU64PairIndexBytesInPlace(
             break :blk entry;
         };
 
+        if (chosen.row >= total_row_count) return TableError.VerifyFailed;
+        if (have_next) {
+            if (chosen.key1 > next_key1) return TableError.VerifyFailed;
+            if (chosen.key1 == next_key1) {
+                if (chosen.key2 > next_key2) return TableError.VerifyFailed;
+                if (chosen.key2 == next_key2) {
+                    if (unique) return TableError.VerifyFailed;
+                    if (chosen.row > next_row) return TableError.VerifyFailed;
+                }
+            }
+        }
+
         writeU64PairIndexEntry(writable, @intCast(out_idx), chosen);
+        next_key1 = chosen.key1;
+        next_key2 = chosen.key2;
+        next_row = chosen.row;
+        have_next = true;
     }
 
-    try validateU64PairIndexBytesShape(writable, total_row_count, unique);
+    if (out_idx != -1) return TableError.VerifyFailed;
+}
+
+test "table unsafe in-place index merge validates while merging" {
+    const allocator = std.testing.allocator;
+
+    const single_len = 3 * INDEX_RECORD_BYTES;
+    const single = try allocator.alloc(u8, single_len);
+    defer allocator.free(single);
+    const single_appended = try allocator.alloc(u8, INDEX_RECORD_BYTES);
+    defer allocator.free(single_appended);
+
+    writeIndexEntry(single, 0, .{ .key = 1, .row = 0 });
+    writeIndexEntry(single, 1, .{ .key = 3, .row = 1 });
+    writeIndexEntry(single_appended, 0, .{ .key = 2, .row = 2 });
+    try mergeSingleIndexBytesInPlace(single, 2 * INDEX_RECORD_BYTES, single_appended, false, false, 3);
+    try std.testing.expectEqual(@as(u64, 1), readIndexKey(single, 0));
+    try std.testing.expectEqual(@as(u64, 2), readIndexKey(single, 1));
+    try std.testing.expectEqual(@as(u64, 3), readIndexKey(single, 2));
+
+    writeIndexEntry(single, 0, .{ .key = 3, .row = 0 });
+    writeIndexEntry(single, 1, .{ .key = 1, .row = 1 });
+    writeIndexEntry(single_appended, 0, .{ .key = 2, .row = 2 });
+    try std.testing.expectError(TableError.VerifyFailed, mergeSingleIndexBytesInPlace(single, 2 * INDEX_RECORD_BYTES, single_appended, false, false, 3));
+
+    writeIndexEntry(single, 0, .{ .key = 1, .row = 0 });
+    writeIndexEntry(single, 1, .{ .key = 2, .row = 1 });
+    writeIndexEntry(single_appended, 0, .{ .key = 1, .row = 0 });
+    try std.testing.expectError(TableError.VerifyFailed, mergeSingleIndexBytesInPlace(single, 2 * INDEX_RECORD_BYTES, single_appended, false, true, 3));
+
+    const short_single = try allocator.alloc(u8, 2 * INDEX_RECORD_BYTES);
+    defer allocator.free(short_single);
+    writeIndexEntry(short_single, 0, .{ .key = 1, .row = 0 });
+    writeIndexEntry(single_appended, 0, .{ .key = 2, .row = 1 });
+    try std.testing.expectError(TableError.VerifyFailed, mergeSingleIndexBytesInPlace(short_single, INDEX_RECORD_BYTES, single_appended, false, false, 3));
+
+    const pair_len = 3 * U64_PAIR_INDEX_RECORD_BYTES;
+    const pair = try allocator.alloc(u8, pair_len);
+    defer allocator.free(pair);
+    const pair_appended = try allocator.alloc(u8, U64_PAIR_INDEX_RECORD_BYTES);
+    defer allocator.free(pair_appended);
+
+    writeU64PairIndexEntry(pair, 0, .{ .key1 = 1, .key2 = 1, .row = 0 });
+    writeU64PairIndexEntry(pair, 1, .{ .key1 = 3, .key2 = 1, .row = 1 });
+    writeU64PairIndexEntry(pair_appended, 0, .{ .key1 = 2, .key2 = 1, .row = 2 });
+    try mergeU64PairIndexBytesInPlace(pair, 2 * U64_PAIR_INDEX_RECORD_BYTES, pair_appended, false, 3);
+    try std.testing.expectEqual(@as(u64, 1), readU64PairIndexKey1(pair, 0));
+    try std.testing.expectEqual(@as(u64, 2), readU64PairIndexKey1(pair, 1));
+    try std.testing.expectEqual(@as(u64, 3), readU64PairIndexKey1(pair, 2));
+
+    writeU64PairIndexEntry(pair, 0, .{ .key1 = 3, .key2 = 1, .row = 0 });
+    writeU64PairIndexEntry(pair, 1, .{ .key1 = 1, .key2 = 1, .row = 1 });
+    writeU64PairIndexEntry(pair_appended, 0, .{ .key1 = 2, .key2 = 1, .row = 2 });
+    try std.testing.expectError(TableError.VerifyFailed, mergeU64PairIndexBytesInPlace(pair, 2 * U64_PAIR_INDEX_RECORD_BYTES, pair_appended, false, 3));
+
+    const short_pair = try allocator.alloc(u8, 2 * U64_PAIR_INDEX_RECORD_BYTES);
+    defer allocator.free(short_pair);
+    writeU64PairIndexEntry(short_pair, 0, .{ .key1 = 1, .key2 = 1, .row = 0 });
+    writeU64PairIndexEntry(pair_appended, 0, .{ .key1 = 2, .key2 = 1, .row = 1 });
+    try std.testing.expectError(TableError.VerifyFailed, mergeU64PairIndexBytesInPlace(short_pair, U64_PAIR_INDEX_RECORD_BYTES, pair_appended, false, 3));
 }
 
 fn unsafeMergeSingleIndexFileInPlace(
