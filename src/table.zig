@@ -5306,7 +5306,7 @@ fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
 
 fn writeCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {
     if (skipDurabilitySync()) {
-        try ensureDeferredSchemaMaterialized(allocator, root_dir, table_name);
+        if (!isMemoryRoot(root_dir)) try ensureDeferredSchemaMaterialized(allocator, root_dir, table_name);
         const pending_dict_writes = try unsafeInitCachePendingDictWritesForTable(allocator, root_dir, table_name);
         defer freePendingDictWrites(allocator, pending_dict_writes);
         for (pending_dict_writes) |write| {
@@ -22342,6 +22342,54 @@ test "table memory root defers schema file materialization until verification" {
 
     const verified = try verifyTable(std.testing.allocator, root, table_name);
     try std.testing.expectEqual(@as(u64, 1), verified.row_count);
+    try std.testing.expect(fileExists(schema_path));
+}
+
+test "table unsafe memory root write paths defer schema file materialization until verification" {
+    const previous_unsafe = unsafe_no_sync_state.load(.acquire);
+    unsafe_no_sync_state.store(2, .release);
+    defer unsafe_no_sync_state.store(previous_unsafe, .release);
+
+    const root = ":memory:test_unsafe_deferred_schema";
+    const table_name = "mem_unsafe_deferred_schema";
+
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "mem_unsafe_deferred_schema.sadb-schema",
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_POINTS_STRIDE = 8 // u64
+    );
+
+    const schema_path = try schemaMetaPath(std.testing.allocator, root, table_name);
+    defer std.testing.allocator.free(schema_path);
+    try std.testing.expect(!fileExists(schema_path));
+
+    var direct_row = [_]u64{ 1, 10 };
+    _ = try insertRawRow(std.testing.allocator, root, table_name, std.mem.sliceAsBytes(direct_row[0..]));
+    try std.testing.expect(!fileExists(schema_path));
+
+    var tx_row: [16]u8 = undefined;
+    writeU64LE(&tx_row, 0, 2);
+    writeU64LE(&tx_row, 8, 20);
+    const tx = try beginWriteTransaction(std.testing.allocator, root, table_name);
+    _ = try writeTransactionInsertRawRow(tx, &tx_row);
+    _ = try commitWriteTransaction(std.testing.allocator, tx);
+    destroyWriteTransaction(std.testing.allocator, tx);
+    try std.testing.expect(!fileExists(schema_path));
+
+    var coltx_ids = [_]u64{3};
+    var coltx_points = [_]u64{30};
+    const coltx_columns = [_]RawColumnBytes{
+        .{ .bytes = std.mem.sliceAsBytes(coltx_ids[0..]) },
+        .{ .bytes = std.mem.sliceAsBytes(coltx_points[0..]) },
+    };
+    const session = try beginColumnIngestSession(std.testing.allocator, root, table_name);
+    defer destroyColumnIngestSession(std.testing.allocator, session);
+    try columnIngestSessionAddRawColumns(std.testing.allocator, session, coltx_ids.len, &coltx_columns);
+    _ = try commitColumnIngestSession(std.testing.allocator, session);
+    try std.testing.expect(!fileExists(schema_path));
+
+    const verified = try verifyTable(std.testing.allocator, root, table_name);
+    try std.testing.expectEqual(@as(u64, 3), verified.row_count);
     try std.testing.expect(fileExists(schema_path));
 }
 

@@ -36,6 +36,11 @@ def forbid(pattern: str, message: str, flags: int = 0) -> None:
 forbid(r"readFileAlloc\([^\n;]*1\s*<<\s*30", "1GiB readFileAlloc hot-path read reintroduced")
 forbid(r"\breadDictBytes\s*\(", "owned dictionary read helper reintroduced")
 forbid(r"\breadBlobStoreBytes\s*\(", "owned blob-store read helper reintroduced")
+require(
+    r"fn\s+writeCompatMeta\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*if\s*\(!isMemoryRoot\(root_dir\)\)\s*try\s+ensureDeferredSchemaMaterialized\(allocator,\s*root_dir,\s*table_name\)",
+    "no-sync compat meta writes must materialize disk schemas while preserving memory-root deferred schema",
+    re.S,
+)
 
 require(r"fn\s+mappedReadFileMaxOwned\s*\(", "bounded mapped input helper is missing")
 require(
@@ -62,6 +67,11 @@ require(
 require(
     r"fn\s+getCachedSegmentColumnBytes\s*\([^)]*\)\s*TableError!\[\]const u8\s*\{(?:(?!\nfn\s).)*mappedSegmentColumnBytes\(",
     "append-index segment-column cache must read through mappedSegmentColumnBytes",
+    re.S,
+)
+require(
+    r"test\s+\"table unsafe memory root write paths defer schema file materialization until verification\"(?:(?!\ntest\s+\").)*unsafe_no_sync_state\.store\(2(?:(?!\ntest\s+\").)*insertRawRow(?:(?!\ntest\s+\").)*commitWriteTransaction(?:(?!\ntest\s+\").)*commitColumnIngestSession(?:(?!\ntest\s+\").)*!fileExists\(schema_path\)(?:(?!\ntest\s+\").)*verifyTable(?:(?!\ntest\s+\").)*fileExists\(schema_path\)",
+    "unsafe memory-root direct/tx/coltx writes must keep deferred schema unmaterialized until verification",
     re.S,
 )
 require(
