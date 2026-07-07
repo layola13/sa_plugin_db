@@ -8059,7 +8059,9 @@ pub fn putBlobValue(
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
     try writeFile(allocator, path, new_bytes);
-    try rebuildBlobIndexesForStore(allocator, root_dir, &meta, store_name);
+    if (try blobStoreAppendRequiresIndexRebuild(allocator, root_dir, meta, store_name, new_count)) {
+        try rebuildBlobIndexesForStore(allocator, root_dir, &meta, store_name);
+    }
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .id = new_count };
 }
@@ -11677,13 +11679,51 @@ fn rebuildIndexesForColumn(allocator: std.mem.Allocator, root_dir: []const u8, m
 fn rebuildBlobIndexesForStore(allocator: std.mem.Allocator, root_dir: []const u8, meta: *TableMeta, store_name: []const u8) TableError!void {
     for (0..meta.indexes.len) |idx| {
         const index = meta.indexes[idx];
-        if ((std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) or std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND) or std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND) or std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND)) and
-            index.store_name != null and
-            std.mem.eql(u8, index.store_name.?, store_name))
-        {
+        if (indexReferencesBlobStore(index, store_name)) {
             try rebuildIndexAt(allocator, root_dir, meta, idx);
         }
     }
+}
+
+fn indexReferencesBlobStore(index: IndexMeta, store_name: []const u8) bool {
+    return (std.mem.eql(u8, index.kind, BLOB_EQ_INDEX_KIND) or
+        std.mem.eql(u8, index.kind, BLOB_TOKEN_INDEX_KIND) or
+        std.mem.eql(u8, index.kind, BLOB_PREFIX_INDEX_KIND) or
+        std.mem.eql(u8, index.kind, BLOB_CONTAINS_INDEX_KIND)) and
+        index.store_name != null and
+        std.mem.eql(u8, index.store_name.?, store_name);
+}
+
+fn blobStoreAppendRequiresIndexRebuild(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    meta: TableMeta,
+    store_name: []const u8,
+    appended_blob_id: u64,
+) TableError!bool {
+    for (meta.indexes) |index| {
+        if (!indexReferencesBlobStore(index, store_name)) continue;
+        if (index.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.InvalidFormat;
+        const column_index: usize = @intCast(index.column_index);
+        try ensureBlobHandleColumn(meta, column_index);
+
+        for (meta.segments) |segment| {
+            const found = blk: {
+                const mapped = try mappedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8);
+                defer releaseMappedRegion(allocator, mapped);
+                const bytes = mappedRegionBytes(mapped);
+
+                var row: u64 = 0;
+                while (row < segment.rows) : (row += 1) {
+                    const offset: usize = @intCast(row * 8);
+                    if (readU64LE(bytes, offset) == appended_blob_id) break :blk true;
+                }
+                break :blk false;
+            };
+            if (found) return true;
+        }
+    }
+    return false;
 }
 
 pub fn openReadSnapshot(
@@ -19560,6 +19600,79 @@ test "table blob exact index is rebuilt when blob values are appended" {
     try std.testing.expectEqual(@as(u64, 1), exact.total);
     try std.testing.expectEqual(@as(u64, 1), exact.written);
     try std.testing.expectEqual(@as(u64, 0), rows[0]);
+}
+
+test "table blob append skips index rebuild until appended blob is referenced" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "blob_index_unreferenced_append";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_index_unreferenced_append.sadb-schema",
+        \\#def MAX_ROWS = 4
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const first = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "first note");
+    var row_bytes: [16]u8 = undefined;
+    writeU64LE(&row_bytes, 0, 200);
+    writeU64LE(&row_bytes, 8, first.id);
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+    _ = try createBlobEqIndex(std.testing.allocator, ".", table_name, 1, "notes", false);
+
+    var before_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer before_meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), before_meta.indexes.len);
+    const before_index_path = try std.testing.allocator.dupe(u8, before_meta.indexes[0].path);
+    defer std.testing.allocator.free(before_index_path);
+    const before_index_sha = try std.testing.allocator.dupe(u8, before_meta.indexes[0].sha256);
+    defer std.testing.allocator.free(before_index_sha);
+    const before_index_bytes_len = before_meta.indexes[0].bytes;
+    const before_active_path = try activePath(std.testing.allocator, ".", before_index_path);
+    defer std.testing.allocator.free(before_active_path);
+    const before_index_bytes = try readFileAlloc(std.testing.allocator, before_active_path, 1024 * 1024);
+    defer std.testing.allocator.free(before_index_bytes);
+
+    const late = try putBlobValue(std.testing.allocator, ".", table_name, "notes", "late note");
+    try std.testing.expectEqual(@as(u64, 2), late.id);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+
+    var after_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer after_meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), after_meta.indexes.len);
+    try std.testing.expectEqualStrings(before_index_path, after_meta.indexes[0].path);
+    try std.testing.expectEqualStrings(before_index_sha, after_meta.indexes[0].sha256);
+    try std.testing.expectEqual(before_index_bytes_len, after_meta.indexes[0].bytes);
+    const after_index_bytes = try readFileAlloc(std.testing.allocator, before_active_path, 1024 * 1024);
+    defer std.testing.allocator.free(after_index_bytes);
+    try std.testing.expectEqualSlices(u8, before_index_bytes, after_index_bytes);
+
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        var rows: [2]u64 = undefined;
+        const exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "late note", 0, 2, &rows);
+        try std.testing.expectEqual(@as(u64, 0), exact.total);
+        try std.testing.expectEqual(@as(u64, 0), exact.written);
+    }
+
+    writeU64LE(&row_bytes, 0, 201);
+    writeU64LE(&row_bytes, 8, late.id);
+    _ = try insertRawRow(std.testing.allocator, ".", table_name, &row_bytes);
+    _ = try verifyTable(std.testing.allocator, ".", table_name);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    var rows: [2]u64 = undefined;
+    const exact = try snapshotFilterBlobEqRows(std.testing.allocator, snapshot, 1, "notes", "late note", 0, 2, &rows);
+    try std.testing.expectEqual(@as(u64, 1), exact.total);
+    try std.testing.expectEqual(@as(u64, 1), exact.written);
+    try std.testing.expectEqual(@as(u64, 1), rows[0]);
 }
 
 test "table unique blob eq key copies full rows" {

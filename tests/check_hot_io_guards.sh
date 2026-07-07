@@ -75,6 +75,26 @@ require(
     re.S,
 )
 require(
+    r"fn\s+indexReferencesBlobStore\s*\([^)]*\)\s*bool\s*\{(?:(?!\nfn\s).)*BLOB_EQ_INDEX_KIND(?:(?!\nfn\s).)*BLOB_TOKEN_INDEX_KIND(?:(?!\nfn\s).)*BLOB_PREFIX_INDEX_KIND(?:(?!\nfn\s).)*BLOB_CONTAINS_INDEX_KIND(?:(?!\nfn\s).)*index\.store_name",
+    "blob append rebuild decisions must identify blob indexes by store",
+    re.S,
+)
+require(
+    r"fn\s+blobStoreAppendRequiresIndexRebuild\s*\([^)]*\)\s*TableError!bool\s*\{(?:(?!\nfn\s).)*indexReferencesBlobStore\(index,\s*store_name\)(?:(?!\nfn\s).)*mappedSegmentColumnBytes\(allocator,\s*root_dir,\s*segment,\s*column_index,\s*8\)(?:(?!\nfn\s).)*readU64LE\(bytes,\s*offset\)\s*==\s*appended_blob_id",
+    "direct blob append must scan mapped blob-handle columns before deciding to rebuild blob indexes",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(try\s+blobStoreAppendRequiresIndexRebuild\(allocator,\s*root_dir,\s*meta,\s*store_name,\s*new_count\)\)\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*try\s+rebuildBlobIndexesForStore\(allocator,\s*root_dir,\s*&meta,\s*store_name\)",
+    "direct blob append must rebuild blob indexes only when existing rows reference the appended blob id",
+    re.S,
+)
+require(
+    r"test\s+\"table blob append skips index rebuild until appended blob is referenced\"(?:(?!\ntest\s+\").)*before_index_path(?:(?!\ntest\s+\").)*putBlobValue(?:(?!\ntest\s+\").)*expectEqualStrings\(before_index_path,\s*after_meta\.indexes\[0\]\.path\)(?:(?!\ntest\s+\").)*snapshotFilterBlobEqRows(?:(?!\ntest\s+\").)*insertRawRow(?:(?!\ntest\s+\").)*snapshotFilterBlobEqRows",
+    "unreferenced direct blob append must keep index artifacts unchanged until a row references the appended blob",
+    re.S,
+)
+require(
     r"fn\s+mergeSegmentFiles\s*\([^)]*\)\s*TableError!\[\]FileMeta\s*\{(?:(?!\nfn\s).)*mappedSegmentColumnBytes\(",
     "compact merge inputs must read through mappedSegmentColumnBytes",
     re.S,
