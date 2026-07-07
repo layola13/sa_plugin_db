@@ -635,7 +635,6 @@ fn addBenchCompareStep(
         \\
         \\import os
         \\import shutil
-        \\import statistics
         \\import subprocess
         \\import sys
         \\import tempfile
@@ -729,13 +728,16 @@ fn addBenchCompareStep(
         \\            if sample.get(key) != expected:
         \\                raise SystemExit(f"{key} expected {expected}, got {sample.get(key)}")
         \\
+        \\    def observed_median(values):
+        \\        return sorted(values)[len(values) // 2]
+        \\
         \\    def stat(samples, key):
         \\        values = [sample[key] for sample in samples]
-        \\        return (min(values), int(statistics.median(values)), max(values))
+        \\        return (min(values), observed_median(values), max(values))
         \\
         \\    def stat_sum(samples, left_key, right_key):
         \\        values = [sample[left_key] + sample[right_key] for sample in samples]
-        \\        return (min(values), int(statistics.median(values)), max(values))
+        \\        return (min(values), observed_median(values), max(values))
         \\
         \\    def fmt_stat(ns):
         \\        return f"{ns[1] / 1_000_000:.3f} ms [{ns[0] / 1_000_000:.3f}, {ns[2] / 1_000_000:.3f}]"
@@ -806,7 +808,6 @@ fn addBenchCompareConcurrentStep(
         \\
         \\import os
         \\import shutil
-        \\import statistics
         \\import subprocess
         \\import sys
         \\import tempfile
@@ -841,9 +842,12 @@ fn addBenchCompareConcurrentStep(
         \\            raise SystemExit(f"benchmark output negative metric: {key}={values[key]}")
         \\    return values
         \\
+        \\def observed_median(values):
+        \\    return sorted(values)[len(values) // 2]
+        \\
         \\def stat(samples, key):
         \\    values = [sample[key] for sample in samples]
-        \\    return (min(values), int(statistics.median(values)), max(values))
+        \\    return (min(values), observed_median(values), max(values))
         \\
         \\def fmt_stat(ns):
         \\    return f"{ns[1] / 1_000_000:.3f} ms [{ns[0] / 1_000_000:.3f}, {ns[2] / 1_000_000:.3f}]"
