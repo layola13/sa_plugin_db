@@ -33,6 +33,9 @@ require_text "test_step.dependOn(proof_wiring_step)"
 require_text 'b.step("check-benchmark-parser-guards"'
 require_text "tests/check_benchmark_parser_guards.sh"
 require_text "test_step.dependOn(benchmark_parser_guards_step)"
+require_text 'b.step("check-bounded-locks"'
+require_text "tests/check_bounded_locks.sh"
+require_text "test_step.dependOn(bounded_locks_step)"
 require_text 'b.option(u32, "lock-wait-seconds"'
 require_text "lock_wait_seconds_arg"
 require_count_at_least '"flock", "-w", lock_wait_seconds_arg' 12
@@ -41,7 +44,8 @@ require_text "sqlite_audit_summary.step.dependOn(test_step)"
 require_text "sqlite_audit_summary.step.dependOn(bench_step)"
 require_text "sqlite_audit_summary.step.dependOn(benchmark_artifacts_step)"
 require_text "benchmark executable builds"
-require_text "benchmark executable builds, benchmark parser guards, proof wiring, and protected benchmark artifacts are clean"
+require_text "bounded lock guard"
+require_text "benchmark executable builds, benchmark parser guards, proof wiring, bounded lock guard, and protected benchmark artifacts are clean"
 
 require_text "bench-compare passed: runs={d} disk indexed ERP, memory indexed ERP, concurrent compare, and protected artifact guard completed"
 require_text "bench_compare_summary.step.dependOn(&bench_compare_artifacts.step)"

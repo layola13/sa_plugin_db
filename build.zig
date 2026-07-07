@@ -172,6 +172,12 @@ pub fn build(b: *std.Build) void {
     proof_wiring.addFileInput(b.path("build.zig"));
     proof_wiring_step.dependOn(&proof_wiring.step);
 
+    const bounded_locks_step = b.step("check-bounded-locks", "Verify every shared build lock uses a bounded wait.");
+    const bounded_locks = b.addSystemCommand(&.{ "bash", "tests/check_bounded_locks.sh" });
+    bounded_locks.addFileInput(b.path("tests/check_bounded_locks.sh"));
+    bounded_locks.addFileInput(b.path("build.zig"));
+    bounded_locks_step.dependOn(&bounded_locks.step);
+
     const benchmark_parser_guards_step = b.step("check-benchmark-parser-guards", "Verify benchmark compare parser guards stay intact.");
     const benchmark_parser_guards = b.addSystemCommand(&.{ "bash", "tests/check_benchmark_parser_guards.sh" });
     benchmark_parser_guards.addFileInput(b.path("tests/check_benchmark_parser_guards.sh"));
@@ -251,6 +257,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(abi_smoke_step);
     test_step.dependOn(check_docs_step);
     test_step.dependOn(proof_wiring_step);
+    test_step.dependOn(bounded_locks_step);
     test_step.dependOn(benchmark_parser_guards_step);
     test_step.dependOn(hot_io_guards_step);
 
@@ -292,7 +299,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_audit_summary = b.addSystemCommand(&.{
         "bash",
         "-c",
-        "printf '%s\n' 'sqlite-audit passed: zig tests, docs guard, ABI/facade/layout, install+CLI/recovery smokes, ABI smoke coverage, public ABI smokes, benchmark executable builds, benchmark parser guards, proof wiring, and protected benchmark artifacts are clean'",
+        "printf '%s\n' 'sqlite-audit passed: zig tests, docs guard, ABI/facade/layout, install+CLI/recovery smokes, ABI smoke coverage, public ABI smokes, benchmark executable builds, benchmark parser guards, proof wiring, bounded lock guard, and protected benchmark artifacts are clean'",
     });
     sqlite_audit_summary.step.dependOn(test_step);
     sqlite_audit_summary.step.dependOn(bench_step);

@@ -34,7 +34,7 @@ fi
 
 mapfile -t required_targets < <(
     sed -nE 's/.*b\.step\("([^"]+)".*/\1/p' "$build_path" |
-        awk '/^sqlite-/ || /^bench-compare/ || /^check-benchmark/ || $0 == "check-docs" || $0 == "check-proof-wiring" { print }' |
+        awk '/^sqlite-/ || /^bench-compare/ || /^check-benchmark/ || $0 == "check-docs" || $0 == "check-proof-wiring" || $0 == "check-bounded-locks" { print }' |
         sort -u
 )
 
@@ -87,11 +87,17 @@ require_text "$tasks_path" "benchmark parser guards"
 require_text "$progress_path" "benchmark parser guards"
 require_text "$tasks_path" "proof wiring"
 require_text "$progress_path" "proof wiring"
+require_text "$tasks_path" "bounded lock guard"
+require_text "$progress_path" "bounded lock guard"
 
 require_text "$build_path" 'b.step("check-docs"'
 require_text "$build_path" "tests/check_docs.sh"
 require_text "$build_path" "test_step.dependOn(check_docs_step)"
 require_text "$build_path" "docs guard"
+require_text "$build_path" 'b.step("check-bounded-locks"'
+require_text "$build_path" "tests/check_bounded_locks.sh"
+require_text "$build_path" "test_step.dependOn(bounded_locks_step)"
+require_text "$build_path" "bounded lock guard"
 require_text "$build_path" 'b.step("check-benchmark-parser-guards"'
 require_text "$build_path" "tests/check_benchmark_parser_guards.sh"
 require_text "$build_path" "test_step.dependOn(benchmark_parser_guards_step)"
