@@ -3592,7 +3592,7 @@ fn flushPendingDictWrites(allocator: std.mem.Allocator, tx: *WriteTransaction) T
     for (tx.pending_dict_writes) |write| {
         const path = try activePath(allocator, tx.root_dir, write.path);
         defer allocator.free(path);
-        try writeFile(allocator, path, write.bytes);
+        try writeArtifactFile(allocator, path, write.bytes);
     }
 }
 
@@ -3630,7 +3630,7 @@ fn flushPendingBlobWrites(allocator: std.mem.Allocator, tx: *WriteTransaction) T
     for (tx.pending_blob_writes) |write| {
         const path = try activePath(allocator, tx.root_dir, write.path);
         defer allocator.free(path);
-        try writeFile(allocator, path, write.bytes);
+        try writeArtifactFile(allocator, path, write.bytes);
     }
 }
 
@@ -5312,14 +5312,14 @@ fn writeCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
         for (pending_dict_writes) |write| {
             const path = try activePath(allocator, root_dir, write.path);
             defer allocator.free(path);
-            try writeFile(allocator, path, write.bytes);
+            try writeArtifactFile(allocator, path, write.bytes);
         }
         const pending_blob_writes = try unsafeInitCachePendingBlobWritesForTable(allocator, root_dir, table_name);
         defer freePendingBlobWrites(allocator, pending_blob_writes);
         for (pending_blob_writes) |write| {
             const path = try activePath(allocator, root_dir, write.path);
             defer allocator.free(path);
-            try writeFile(allocator, path, write.bytes);
+            try writeArtifactFile(allocator, path, write.bytes);
         }
     }
 
@@ -7843,7 +7843,7 @@ pub fn internStringDict(
     }
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeFile(allocator, path, new_bytes);
+    try writeArtifactFile(allocator, path, new_bytes);
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .id = new_count, .inserted = true };
 }
@@ -7943,7 +7943,7 @@ pub fn internStringDictMany(
     }
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeFile(allocator, path, new_bytes);
+    try writeArtifactFile(allocator, path, new_bytes);
     try writeMeta(allocator, root_dir, table_name, meta);
     return .{ .info = tableInfo(meta), .inserted_count = inserted_count };
 }
@@ -8058,7 +8058,7 @@ pub fn putBlobValue(
 
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    try writeFile(allocator, path, new_bytes);
+    try writeArtifactFile(allocator, path, new_bytes);
     if (try blobStoreAppendRequiresIndexRebuild(allocator, root_dir, meta, store_name, new_count)) {
         try rebuildBlobIndexesForStore(allocator, root_dir, &meta, store_name);
     }

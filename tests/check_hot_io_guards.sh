@@ -44,6 +44,41 @@ require(
 
 require(r"fn\s+mappedReadFileMaxOwned\s*\(", "bounded mapped input helper is missing")
 require(
+    r"fn\s+writeArtifactFile\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeFileWithParentSync\(allocator,\s*path,\s*bytes,\s*false\)",
+    "artifact writes must avoid per-artifact parent-directory fsync",
+    re.S,
+)
+require(
+    r"fn\s+flushPendingDictWrites\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)",
+    "transaction dictionary artifact flush must use artifact writes",
+    re.S,
+)
+require(
+    r"fn\s+flushPendingBlobWrites\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)",
+    "transaction blob artifact flush must use artifact writes",
+    re.S,
+)
+require(
+    r"fn\s+writeCompatMeta\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*pending_dict_writes(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)(?:(?!\nfn\s).)*pending_blob_writes(?:(?!\nfn\s).)*writeArtifactFile\(allocator,\s*path,\s*write\.bytes\)",
+    "unsafe cached dictionary/blob materialization must use artifact writes before compat meta publish",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+internStringDict\s*\([^)]*\)\s*TableError!DictInternResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    "direct dictionary append must use artifact write before meta publish",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+internStringDictMany\s*\([^)]*\)\s*TableError!DictInternManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    "batched dictionary append must use artifact write before meta publish",
+    re.S,
+)
+require(
+    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeArtifactFile\(allocator,\s*path,\s*new_bytes\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    "direct blob append must use artifact write before meta publish",
+    re.S,
+)
+require(
     r"fn\s+copyFile\s*\([^)]*\)\s*TableError!void\s*\{(?:(?!\nfn\s).)*mappedReadFileMaxOwned\(allocator,\s*src_path,\s*1\s*<<\s*30\)",
     "copyFile memory-root fallback must use bounded mapped input helper",
     re.S,
