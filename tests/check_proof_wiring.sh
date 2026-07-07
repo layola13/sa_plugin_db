@@ -49,6 +49,10 @@ require_text "benchmark executable builds, benchmark parser guards, proof wiring
 require_text "sqlite_link_std_work"
 require_text 'work="$(mktemp -d "$out_dir/sqlite_link_std_work.XXXXXX")"'
 require_text "trap 'rm -rf \"\$work\"' EXIT"
+require_text "shopt -s nullglob"
+require_text 'objs=("$work"/*.o)'
+require_text "sqlite std archive rewrite found no object files"
+require_text 'for obj in "${objs[@]}"; do'
 require_text "--redefine-sym sqlite3_prepare=sa_std_stub_sqlite3_prepare"
 require_text "--redefine-sym sqlite3_step=sa_std_stub_sqlite3_step"
 require_text "--redefine-sym sqlite3_finalize=sa_std_stub_sqlite3_finalize"

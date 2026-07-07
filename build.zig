@@ -579,7 +579,13 @@ fn addSqliteStdArchiveStep(b: *std.Build, sa_std_lib: []const u8) std.Build.Lazy
         \\  exit 1
         \\fi
         \\grep -v 'illegal output pathname for archive member' "$work/ar.stderr" >&2 || true
-        \\for obj in "$work"/*.o; do
+        \\shopt -s nullglob
+        \\objs=("$work"/*.o)
+        \\if [ "${#objs[@]}" -eq 0 ]; then
+        \\  echo "sqlite std archive rewrite found no object files in $src" >&2
+        \\  exit 1
+        \\fi
+        \\for obj in "${objs[@]}"; do
         \\  objcopy \
         \\    --redefine-sym sqlite3_prepare=sa_std_stub_sqlite3_prepare \
         \\    --redefine-sym sqlite3_step=sa_std_stub_sqlite3_step \
