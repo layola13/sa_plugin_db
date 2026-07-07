@@ -571,6 +571,7 @@ fn addSqliteStdArchiveStep(b: *std.Build, sa_std_lib: []const u8) std.Build.Lazy
         \\src="$1"
         \\out="$2"
         \\work="$(dirname "$out")/sqlite_link_std_work"
+        \\trap 'rm -rf "$work"' EXIT
         \\rm -rf "$work"
         \\mkdir -p "$work"
         \\if ! (cd "$work" && ar x "$src" 2> ar.stderr); then
@@ -586,7 +587,6 @@ fn addSqliteStdArchiveStep(b: *std.Build, sa_std_lib: []const u8) std.Build.Lazy
         \\    "$obj"
         \\done
         \\(cd "$work" && ar rcs "$out" *.o)
-        \\rm -rf "$work"
         ,
         "sqlite-std-archive",
     });
