@@ -180,6 +180,23 @@ pub fn build(b: *std.Build) void {
     sqlite_archive_rewrite.addFileInput(b.path("build.zig"));
     sqlite_archive_rewrite_step.dependOn(&sqlite_archive_rewrite.step);
 
+    const sqlite_lib_symbols_step = b.step("check-sqlite-lib-symbols", "Verify configured SQLite shared library exports benchmark symbols.");
+    const sqlite_lib_symbols = b.addSystemCommand(&.{ "bash", "tests/check_sqlite_lib_symbols.sh", sqlite_lib });
+    sqlite_lib_symbols.addFileInput(b.path("tests/check_sqlite_lib_symbols.sh"));
+    sqlite_lib_symbols.addFileInput(.{ .cwd_relative = sqlite_lib });
+    const sqlite_symbol_sources = [_][]const u8{
+        "benchmark_test/sqlite_member_bench.sa",
+        "benchmark_test/sqlite_concurrent_bench.sa",
+        "benchmark_test/sqlite_erp_workflow_bench.sa",
+        "benchmark_test/sqlite_erp_indexed_write_bench.sa",
+        "benchmark_test/sqlite_erp_indexed_memory_bench.sa",
+        "benchmark_test/sqlite_link_probe.sa",
+    };
+    for (sqlite_symbol_sources) |source_rel| {
+        sqlite_lib_symbols.addFileArg(b.path(source_rel));
+    }
+    sqlite_lib_symbols_step.dependOn(&sqlite_lib_symbols.step);
+
     const bounded_locks_step = b.step("check-bounded-locks", "Verify every shared build lock uses a bounded wait.");
     const bounded_locks = b.addSystemCommand(&.{ "bash", "tests/check_bounded_locks.sh" });
     bounded_locks.addFileInput(b.path("tests/check_bounded_locks.sh"));
@@ -266,6 +283,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(check_docs_step);
     test_step.dependOn(proof_wiring_step);
     test_step.dependOn(sqlite_archive_rewrite_step);
+    test_step.dependOn(sqlite_lib_symbols_step);
     test_step.dependOn(bounded_locks_step);
     test_step.dependOn(benchmark_parser_guards_step);
     test_step.dependOn(hot_io_guards_step);
@@ -308,7 +326,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_audit_summary = b.addSystemCommand(&.{
         "bash",
         "-c",
-        "printf '%s\n' 'sqlite-audit passed: zig tests, docs guard, ABI/facade/layout, install+CLI/recovery smokes, ABI smoke coverage, public ABI smokes, benchmark executable builds, benchmark parser guards, proof wiring, SQLite archive rewrite guard, bounded lock guard, and protected benchmark artifacts are clean'",
+        "printf '%s\n' 'sqlite-audit passed: zig tests, docs guard, ABI/facade/layout, install+CLI/recovery smokes, ABI smoke coverage, public ABI smokes, benchmark executable builds, benchmark parser guards, proof wiring, SQLite archive rewrite guard, SQLite lib symbol guard, bounded lock guard, and protected benchmark artifacts are clean'",
     });
     sqlite_audit_summary.step.dependOn(test_step);
     sqlite_audit_summary.step.dependOn(bench_step);

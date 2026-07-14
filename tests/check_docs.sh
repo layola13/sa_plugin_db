@@ -92,6 +92,8 @@ require_text "$tasks_path" "proof wiring"
 require_text "$progress_path" "proof wiring"
 require_text "$tasks_path" "SQLite archive rewrite guard"
 require_text "$progress_path" "SQLite archive rewrite guard"
+require_text "$tasks_path" "SQLite lib symbol guard"
+require_text "$progress_path" "SQLite lib symbol guard"
 require_text "$tasks_path" "bounded lock guard"
 require_text "$progress_path" "bounded lock guard"
 
@@ -107,6 +109,10 @@ require_text "$build_path" 'b.step("check-sqlite-archive-rewrite"'
 require_text "$build_path" "tests/check_sqlite_archive_rewrite.sh"
 require_text "$build_path" "test_step.dependOn(sqlite_archive_rewrite_step)"
 require_text "$build_path" "SQLite archive rewrite guard"
+require_text "$build_path" 'b.step("check-sqlite-lib-symbols"'
+require_text "$build_path" "tests/check_sqlite_lib_symbols.sh"
+require_text "$build_path" "test_step.dependOn(sqlite_lib_symbols_step)"
+require_text "$build_path" "SQLite lib symbol guard"
 require_text "$build_path" 'b.step("check-benchmark-parser-guards"'
 require_text "$build_path" "tests/check_benchmark_parser_guards.sh"
 require_text "$build_path" "test_step.dependOn(benchmark_parser_guards_step)"
