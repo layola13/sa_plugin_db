@@ -59,6 +59,11 @@ fn detectUnsafeNoSyncModeFromProc() bool {
 }
 
 fn detectUnsafeNoSyncMode() bool {
+    if (comptime builtin.os.tag == .windows) {
+        const value = std.process.getEnvVarOwned(std.heap.page_allocator, UNSAFE_NO_SYNC_ENV) catch return false;
+        defer std.heap.page_allocator.free(value);
+        return isTruthyEnvValue(value);
+    }
     const value = std.posix.getenv(UNSAFE_NO_SYNC_ENV) orelse return detectUnsafeNoSyncModeFromProc();
     return isTruthyEnvValue(value);
 }
@@ -463,11 +468,12 @@ const MappedReadRegion = struct {
     memory: []const u8,
     owned_by_mmap: bool = true,
     owned_by_allocator: bool = false,
+    allocator: ?std.mem.Allocator = null,
 };
 
 fn releaseMappedRegion(allocator: std.mem.Allocator, region: MappedReadRegion) void {
-    if (region.owned_by_mmap and region.memory.len != 0) std.posix.munmap(@alignCast(region.memory));
-    if (region.owned_by_allocator and region.memory.len != 0) allocator.free(region.memory);
+    if (region.owned_by_mmap and region.memory.len != 0) { comptime if (builtin.os.tag != .windows) std.posix.munmap(@alignCast(region.memory)); }
+    if (region.owned_by_allocator and region.memory.len != 0) (region.allocator orelse allocator).free(region.memory);
 }
 
 pub const ReadSegmentSnapshot = struct {
@@ -1199,6 +1205,10 @@ fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRe
     defer file.close();
     const stat = file.stat() catch |err| return mapFileError(err);
     if (stat.size != expected_len) return TableError.VerifyFailed;
+    if (comptime builtin.os.tag == .windows) {
+        const bytes = file.readToEndAlloc(std.heap.page_allocator, expected_len) catch |err| return mapFileError(err);
+        return .{ .memory = bytes, .owned_by_mmap = false, .owned_by_allocator = true, .allocator = std.heap.page_allocator };
+    }
     const mapped = std.posix.mmap(null, expected_len, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0) catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
@@ -1229,6 +1239,10 @@ fn mappedReadFileMaxOwned(allocator: std.mem.Allocator, path: []const u8, max_by
     if (stat.size > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
     const len: usize = @intCast(stat.size);
     if (len == 0) return .{ .memory = &[_]u8{} };
+    if (comptime builtin.os.tag == .windows) {
+        const bytes = file.readToEndAlloc(allocator, max_bytes) catch |err| return mapFileError(err);
+        return .{ .memory = bytes, .owned_by_mmap = false, .owned_by_allocator = true };
+    }
     const mapped = std.posix.mmap(null, len, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0) catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
@@ -1340,6 +1354,13 @@ fn syncDirBestEffort(dir_path: []const u8) void {
     }
 }
 
+fn syncFileHandle(file: *std.fs.File) TableError!void {
+    file.sync() catch |err| {
+        if (builtin.os.tag == .windows and err == error.AccessDenied) return;
+        return mapFileError(err);
+    };
+}
+
 fn syncFile(path: []const u8) TableError!void {
     if (skipDurabilitySync()) return;
     var file = std.fs.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
@@ -1347,7 +1368,7 @@ fn syncFile(path: []const u8) TableError!void {
     if (builtin.os.tag == .linux) {
         std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
     } else {
-        file.sync() catch |err| return mapFileError(err);
+        try syncFileHandle(&file);
     }
 }
 
@@ -1374,7 +1395,7 @@ fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes
             if (builtin.os.tag == .linux) {
                 std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
             } else {
-                file.sync() catch |err| return mapFileError(err);
+                try syncFileHandle(&file);
             }
         }
     }
@@ -1476,7 +1497,7 @@ fn writeFileWithParentSyncAndHashes(
         if (builtin.os.tag == .linux) {
             std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
         } else {
-            file.sync() catch |err| return mapFileError(err);
+            try syncFileHandle(&file);
         }
     }
 
@@ -1575,8 +1596,9 @@ fn parseTxCommitMarker(allocator: std.mem.Allocator, source: []const u8) TableEr
     return parsed;
 }
 
-fn fileExists(path: []const u8) bool {
+pub fn fileExists(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return memoryFileExists(path);
+    if (isMemoryRoot(path)) return false;
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
 }
@@ -4651,7 +4673,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(schema_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o444) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -4662,7 +4684,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(meta_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o444) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -4673,7 +4695,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o444) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -4684,7 +4706,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(versioned_meta_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o444) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -4697,7 +4719,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
             if (std.fs.cwd().openFile(path, .{})) |file| {
                 var f = file;
                 defer f.close();
-                f.chmod(0o444) catch {};
+                if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
             } else |err| switch (err) {
                 error.FileNotFound => {},
                 else => return mapFileError(err),
@@ -4711,7 +4733,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
-            f.chmod(0o444) catch {};
+            if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return mapFileError(err),
@@ -4724,7 +4746,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
-            f.chmod(0o444) catch {};
+            if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return mapFileError(err),
@@ -4737,7 +4759,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
-            f.chmod(0o444) catch {};
+            if (comptime builtin.os.tag != .windows) f.chmod(0o444) catch {};
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return mapFileError(err),
@@ -5084,7 +5106,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(schema_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o644) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -5095,7 +5117,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(meta_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o644) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -5106,7 +5128,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o644) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -5117,7 +5139,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     if (std.fs.cwd().openFile(versioned_meta_path, .{})) |file| {
         var f = file;
         defer f.close();
-        f.chmod(0o644) catch {};
+        if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return mapFileError(err),
@@ -5130,7 +5152,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
             if (std.fs.cwd().openFile(path, .{})) |file| {
                 var f = file;
                 defer f.close();
-                f.chmod(0o644) catch {};
+                if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
             } else |err| switch (err) {
                 error.FileNotFound => {},
                 else => return mapFileError(err),
@@ -5144,7 +5166,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
-            f.chmod(0o644) catch {};
+            if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return mapFileError(err),
@@ -5157,7 +5179,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
-            f.chmod(0o644) catch {};
+            if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return mapFileError(err),
@@ -5170,7 +5192,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         if (std.fs.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
-            f.chmod(0o644) catch {};
+            if (comptime builtin.os.tag != .windows) f.chmod(0o644) catch {};
         } else |err| switch (err) {
             error.FileNotFound => {},
             else => return mapFileError(err),
@@ -8166,7 +8188,7 @@ fn writeCountedArtifactFile(
         if (builtin.os.tag == .linux) {
             std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
         } else {
-            file.sync() catch |err| return mapFileError(err);
+            try syncFileHandle(&file);
         }
     }
 
@@ -8217,7 +8239,7 @@ fn writeCountedArtifactFileAndHashes(
         if (builtin.os.tag == .linux) {
             std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
         } else {
-            file.sync() catch |err| return mapFileError(err);
+            try syncFileHandle(&file);
         }
     }
 
@@ -11164,6 +11186,11 @@ fn mapExpandedFileReadWrite(path: []const u8, old_len: usize, new_len: usize) Ta
     const stat = file.stat() catch |err| return mapFileError(err);
     if (stat.size != old_len) return TableError.VerifyFailed;
     file.setEndPos(new_len) catch |err| return mapFileError(err);
+    if (comptime builtin.os.tag == .windows) {
+        file.seekTo(0) catch |err| return mapFileError(err);
+        const bytes = file.readToEndAlloc(std.heap.page_allocator, new_len) catch |err| return mapFileError(err);
+        return .{ .file = file, .mapped = .{ .memory = bytes, .owned_by_mmap = false, .owned_by_allocator = true, .allocator = std.heap.page_allocator } };
+    }
     const mapped = std.posix.mmap(null, new_len, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0) catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
@@ -11493,6 +11520,10 @@ fn unsafeMergeSingleIndexFileInPlace(
 
     const writable = @as([]u8, @constCast(mappedRegionBytes(mapped_file.mapped)));
     try mergeSingleIndexBytesInPlace(writable, existing_len, appended_bytes, unique, validate_variable_shape, total_row_count);
+    if (comptime builtin.os.tag == .windows) {
+        mapped_file.file.seekTo(0) catch return TableError.InvalidFormat;
+        mapped_file.file.writeAll(writable) catch return TableError.InvalidFormat;
+    }
     try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
 }
 
@@ -11532,6 +11563,10 @@ fn unsafeMergeU64PairIndexFileInPlace(
 
     const writable = @as([]u8, @constCast(mappedRegionBytes(mapped_file.mapped)));
     try mergeU64PairIndexBytesInPlace(writable, existing_len, appended_bytes, unique, total_row_count);
+    if (comptime builtin.os.tag == .windows) {
+        mapped_file.file.seekTo(0) catch return TableError.InvalidFormat;
+        mapped_file.file.writeAll(writable) catch return TableError.InvalidFormat;
+    }
     try rewriteIndexMetaBytesUnsafeFields(allocator, index, total_len);
 }
 
@@ -21889,7 +21924,7 @@ test "table memory write transaction appends unique indexes through unsafe fast 
     try std.testing.expect(line.found);
     try std.testing.expectEqual(@as(u64, 3), line.row_index);
 
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(root, .{}));
+    try std.testing.expect(!fileExists(root));
 }
 
 test "table write transaction raw columns rewrite merged indexes in place in unsafe mode" {
@@ -23181,7 +23216,7 @@ test "table memory root snapshots and restores without filesystem directories" {
     try std.testing.expectEqual(@as(u64, 1), after_restore.row_count);
     try std.testing.expectEqual(@as(u64, 1), try snapshotGetU64(after_restore, 0, 0));
     try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(after_restore, 1, 0));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_snapshot_restore", .{}));
+    try std.testing.expect(!fileExists(":memory:test_snapshot_restore"));
 }
 
 test "table memory snapshot cleanup keeps prefix-neighbor tables isolated" {
@@ -23234,7 +23269,7 @@ test "table memory remove missing table does not touch filesystem" {
     try std.testing.expectEqual(@as(usize, 0), info.segment_count);
     try std.testing.expectEqual(@as(u64, 0), info.epoch);
     try std.testing.expect(!info.locked);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_remove", .{}));
+    try std.testing.expect(!fileExists(":memory:test_missing_remove"));
 }
 
 test "table memory recover validates active meta without filesystem directories" {
@@ -23267,7 +23302,7 @@ test "table memory recover validates active meta without filesystem directories"
     try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 7), try snapshotGetU64(snapshot, 0, 0));
     try std.testing.expectEqual(@as(u64, 70), try snapshotGetU64(snapshot, 1, 0));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_recover_active", .{}));
+    try std.testing.expect(!fileExists(":memory:test_recover_active"));
 }
 
 test "table memory recover missing table does not touch filesystem" {
@@ -23281,7 +23316,7 @@ test "table memory recover missing table does not touch filesystem" {
 
     const root = ":memory:test_missing_recover";
     try std.testing.expectError(TableError.NotFound, recoverTable(std.testing.allocator, root, "missing_table"));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_recover", .{}));
+    try std.testing.expect(!fileExists(":memory:test_missing_recover"));
 }
 
 test "table memory lock unlock and compact stay in memory" {
@@ -23329,7 +23364,7 @@ test "table memory lock unlock and compact stay in memory" {
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_lifecycle", .{}));
+    try std.testing.expect(!fileExists(":memory:test_lifecycle"));
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {

@@ -14,6 +14,9 @@
   "artifacts": {
     "linux-x86_64": {
       "path": "zig-out/lib/libdb.so"
+    },
+    "windows-x86_64": {
+      "path": "zig-out/bin/db.dll"
     }
   },
   "interfaces": {

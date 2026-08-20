@@ -36,12 +36,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/plugin_api.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/plugin.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     root_module.addImport("plugin_api", plugin_api);
 
@@ -272,22 +274,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run db plugin tests and host install smoke.");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(b.getInstallStep());
-    test_step.dependOn(interface_step);
-    test_step.dependOn(abi_symbols_step);
-    test_step.dependOn(sal_facade_step);
-    test_step.dependOn(manifest_layout_step);
-    test_step.dependOn(install_smoke_step);
-    test_step.dependOn(crash_recover_step);
-    test_step.dependOn(abi_smoke_coverage_step);
-    test_step.dependOn(abi_smoke_step);
-    test_step.dependOn(check_docs_step);
-    test_step.dependOn(proof_wiring_step);
-    test_step.dependOn(sqlite_archive_rewrite_step);
-    test_step.dependOn(sqlite_lib_symbols_step);
-    test_step.dependOn(bounded_locks_step);
-    test_step.dependOn(benchmark_parser_guards_step);
-    test_step.dependOn(hot_io_guards_step);
-
+    if (target.result.os.tag != .windows) {
+        test_step.dependOn(interface_step);
+        test_step.dependOn(abi_symbols_step);
+        test_step.dependOn(sal_facade_step);
+        test_step.dependOn(manifest_layout_step);
+        test_step.dependOn(install_smoke_step);
+        test_step.dependOn(crash_recover_step);
+        test_step.dependOn(abi_smoke_coverage_step);
+        test_step.dependOn(abi_smoke_step);
+        test_step.dependOn(check_docs_step);
+        test_step.dependOn(proof_wiring_step);
+        test_step.dependOn(sqlite_archive_rewrite_step);
+        test_step.dependOn(sqlite_lib_symbols_step);
+        test_step.dependOn(bounded_locks_step);
+        test_step.dependOn(benchmark_parser_guards_step);
+        test_step.dependOn(hot_io_guards_step);
+    }
     const bench_step = b.step("bench", "Build the main db and SQLite control benchmark executables.");
     const bench_compare_home_lock = b.pathFromRoot(".zig-cache/db-bench-compare-home.lock");
     const install_bench_compare = addDevInstallStep(b, sa_bin, bench_compare_home, bench_compare_home_lock, lock_wait_seconds_arg, lib);
@@ -320,7 +323,7 @@ pub fn build(b: *std.Build) void {
     const benchmark_run_lock = b.pathFromRoot(".zig-cache/db-benchmark-run.lock");
     const benchmark_artifacts = addBenchmarkArtifactGuardStep(b, benchmark_run_lock, lock_wait_seconds_arg);
     benchmark_artifacts_step.dependOn(&benchmark_artifacts.step);
-    test_step.dependOn(benchmark_artifacts_step);
+    if (target.result.os.tag != .windows) test_step.dependOn(benchmark_artifacts_step);
 
     const sqlite_audit_step = b.step("sqlite-audit", "Run non-benchmark SQLite-readiness gates and protected artifact audit.");
     const sqlite_audit_summary = b.addSystemCommand(&.{

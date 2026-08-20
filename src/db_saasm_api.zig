@@ -10444,7 +10444,7 @@ test "db SA ABI memory root supports index write tx and coltx flows" {
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &info));
     try std.testing.expectEqual(@as(u64, 4), info.row_count);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(root, .{}));
+    try std.testing.expect(!table.fileExists(root));
 }
 
 test "db SA ABI exports packed null bitmap from logical null_bitmap column" {
