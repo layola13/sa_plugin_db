@@ -11,6 +11,9 @@ var unsafe_init_meta_cache_generation = std.atomic.Value(u64).init(1);
 var unsafe_init_template_cache_mutex: std.Thread.Mutex = .{};
 var unsafe_init_template_cache_next_slot: usize = 0;
 var unsafe_init_template_cache = [_]?UnsafeInitTemplateCacheEntry{null} ** 4;
+var active_meta_cache_mutex: std.Thread.Mutex = .{};
+var active_meta_cache_next_slot: usize = 0;
+var active_meta_cache = [_]?ActiveMetaCacheEntry{null} ** 8;
 var process_write_locks_mutex: std.Thread.Mutex = .{};
 var process_write_locks: std.StringHashMapUnmanaged(void) = .{};
 var memory_fs_mutex: std.Thread.Mutex = .{};
@@ -446,6 +449,16 @@ const TxCommitMarker = struct {
     meta_bytes: u64,
 };
 
+const ActiveMetaCacheEntry = struct {
+    arena: std.heap.ArenaAllocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    epoch: u64,
+    meta_path: []const u8,
+    meta_sha256: []const u8,
+    meta_bytes: u64,
+};
+
 const WrittenMeta = struct {
     json: []u8,
     versioned_name: []u8,
@@ -472,7 +485,9 @@ const MappedReadRegion = struct {
 };
 
 fn releaseMappedRegion(allocator: std.mem.Allocator, region: MappedReadRegion) void {
-    if (region.owned_by_mmap and region.memory.len != 0) { comptime if (builtin.os.tag != .windows) std.posix.munmap(@alignCast(region.memory)); }
+    if (region.owned_by_mmap and region.memory.len != 0) {
+        comptime if (builtin.os.tag != .windows) std.posix.munmap(@alignCast(region.memory));
+    }
     if (region.owned_by_allocator and region.memory.len != 0) (region.allocator orelse allocator).free(region.memory);
 }
 
@@ -1643,6 +1658,120 @@ fn readCompatMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, tabl
     return source;
 }
 
+fn findActiveMetaCacheEntry(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+) ?ActiveMetaCacheSummary {
+    const cache_root = cacheRootKey(allocator, root_dir) catch return null;
+    defer allocator.free(cache_root);
+
+    active_meta_cache_mutex.lock();
+    defer active_meta_cache_mutex.unlock();
+
+    for (&active_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, cache_root) or
+                !std.mem.eql(u8, entry.table_name, table_name)) continue;
+
+            const owned_path = allocator.dupe(u8, entry.meta_path) catch return null;
+            errdefer allocator.free(owned_path);
+            const owned_hash = allocator.dupe(u8, entry.meta_sha256) catch {
+                allocator.free(owned_path);
+                return null;
+            };
+            errdefer allocator.free(owned_hash);
+            return .{
+                .epoch = entry.epoch,
+                .meta_path = owned_path,
+                .meta_sha256 = owned_hash,
+                .meta_bytes = entry.meta_bytes,
+            };
+        }
+    }
+    return null;
+}
+
+const ActiveMetaCacheSummary = struct {
+    epoch: u64 = 0,
+    meta_path: []u8,
+    meta_sha256: []u8,
+    meta_bytes: u64 = 0,
+};
+
+fn putActiveMetaCacheEntry(
+    root_dir: []const u8,
+    manifest: TableManifest,
+) TableError!void {
+    if (!std.mem.eql(u8, manifest.magic, "sa-db-table-manifest")) return TableError.InvalidFormat;
+    if (manifest.version != 1) return TableError.InvalidFormat;
+
+    var arena = std.heap.ArenaAllocator.init(unsafe_init_cache_allocator);
+    errdefer arena.deinit();
+    const owned_root = try cacheRootKey(arena.allocator(), root_dir);
+    const owned_table = try arena.allocator().dupe(u8, manifest.table_name);
+    const owned_path = try arena.allocator().dupe(u8, manifest.meta_path);
+    const owned_hash = try arena.allocator().dupe(u8, manifest.meta_sha256);
+
+    active_meta_cache_mutex.lock();
+    defer active_meta_cache_mutex.unlock();
+
+    for (&active_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, owned_root) or
+                !std.mem.eql(u8, entry.table_name, owned_table)) continue;
+            slot.* = null;
+        }
+    }
+
+    for (&active_meta_cache) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{
+                .arena = arena,
+                .root_dir = owned_root,
+                .table_name = owned_table,
+                .epoch = manifest.epoch,
+                .meta_path = owned_path,
+                .meta_sha256 = owned_hash,
+                .meta_bytes = manifest.meta_bytes,
+            };
+            return;
+        }
+    }
+
+    const slot = &active_meta_cache[active_meta_cache_next_slot];
+    if (slot.*) |*stale_entry| {
+        stale_entry.* = undefined;
+    }
+    slot.* = .{
+        .arena = arena,
+        .root_dir = owned_root,
+        .table_name = owned_table,
+        .epoch = manifest.epoch,
+        .meta_path = owned_path,
+        .meta_sha256 = owned_hash,
+        .meta_bytes = manifest.meta_bytes,
+    };
+    active_meta_cache_next_slot = (active_meta_cache_next_slot + 1) % active_meta_cache.len;
+}
+
+fn deleteActiveMetaCacheEntry(root_dir: []const u8, table_name: []const u8) void {
+    const cache_root = cacheRootKey(unsafe_init_cache_allocator, root_dir) catch return;
+    defer unsafe_init_cache_allocator.free(cache_root);
+
+    active_meta_cache_mutex.lock();
+    defer active_meta_cache_mutex.unlock();
+
+    for (&active_meta_cache) |*slot| {
+        if (slot.*) |*entry| {
+            if (!std.mem.eql(u8, entry.root_dir, cache_root) or
+                !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            entry.* = undefined;
+            slot.* = null;
+        }
+    }
+}
+
 fn parseOwnedTableMeta(allocator: std.mem.Allocator, source: []const u8, table_name: []const u8) TableError!TableMeta {
     const value = std.json.parseFromSliceLeaky(TableMeta, allocator, source, .{ .allocate = .alloc_always }) catch |err| return mapJsonError(err);
     if (!std.mem.eql(u8, value.table_name, table_name)) return TableError.InvalidFormat;
@@ -1677,9 +1806,32 @@ pub fn readActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, 
     };
     defer allocator.free(manifest_source);
 
+    if (findActiveMetaCacheEntry(allocator, root_dir, table_name)) |entry| {
+        defer {
+            allocator.free(entry.meta_path);
+            allocator.free(entry.meta_sha256);
+        }
+        var cached_manifest = try parseTableManifest(allocator, manifest_source);
+        defer cached_manifest.deinit();
+        if (!std.mem.eql(u8, cached_manifest.value.table_name, table_name)) return TableError.InvalidFormat;
+        if (cached_manifest.value.epoch == entry.epoch and
+            cached_manifest.value.meta_bytes == entry.meta_bytes and
+            std.mem.eql(u8, cached_manifest.value.meta_path, entry.meta_path) and
+            std.mem.eql(u8, cached_manifest.value.meta_sha256, entry.meta_sha256))
+        {
+            const meta_path = try activePath(allocator, root_dir, cached_manifest.value.meta_path);
+            defer allocator.free(meta_path);
+            const meta_source = try readFileAlloc(allocator, meta_path, 16 * 1024 * 1024);
+            errdefer allocator.free(meta_source);
+            if (meta_source.len != cached_manifest.value.meta_bytes) return TableError.VerifyFailed;
+            return meta_source;
+        }
+    }
+
     var manifest = try parseTableManifest(allocator, manifest_source);
     defer manifest.deinit();
     if (!std.mem.eql(u8, manifest.value.table_name, table_name)) return TableError.InvalidFormat;
+    putActiveMetaCacheEntry(root_dir, manifest.value) catch {};
 
     const meta_path = try activePath(allocator, root_dir, manifest.value.meta_path);
     defer allocator.free(meta_path);
@@ -1722,6 +1874,52 @@ pub fn loadActiveMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     const source = try readActiveMetaSource(allocator, root_dir, table_name);
     defer allocator.free(source);
     return parseOwnedTableMeta(allocator, source, table_name);
+}
+
+test "active meta cache invalidates after external manifest replace" {
+    const allocator = std.testing.allocator;
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "meta_cache_external_replace";
+    try writeFileToTemp(tmp_dir.dir, table_name ++ ".sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+    var one = [_]u64{1};
+    _ = try initTableFromSchemaBytes(allocator, ".", table_name ++ ".sadb-schema",
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+    );
+    _ = try ingestRawColumns(allocator, ".", table_name, 1, &.{.{ .bytes = std.mem.sliceAsBytes(one[0..]) }});
+
+    const first_source = try readActiveMetaSource(allocator, ".", table_name);
+    defer allocator.free(first_source);
+    var first_parsed = try parseTableMeta(allocator, first_source);
+    defer first_parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 1), first_parsed.value.epoch);
+
+    const manifest_path = try tableManifestPath(allocator, ".", table_name);
+    defer allocator.free(manifest_path);
+    const source = try readFileAlloc(allocator, manifest_path, 1024 * 1024);
+    defer allocator.free(source);
+    var parsed = try parseTableManifest(allocator, source);
+    defer parsed.deinit();
+    parsed.value.epoch += 1;
+    var replaced = std.ArrayList(u8).init(allocator);
+    defer replaced.deinit();
+    try std.json.stringify(parsed.value, .{}, replaced.writer());
+    {
+        const file = try createFileEnsuringParent(manifest_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(replaced.items);
+    }
+    deleteActiveMetaCacheEntry(".", table_name);
+    try std.testing.expectError(TableError.VerifyFailed, loadActiveMeta(allocator, ".", table_name));
 }
 
 fn parseJsonValue(allocator: std.mem.Allocator, source: []const u8) TableError!std.json.Parsed(std.json.Value) {
@@ -5082,6 +5280,7 @@ fn deleteTableArtifactsFast(allocator: std.mem.Allocator, root_dir: []const u8, 
             else => return err,
         };
     } else loadActiveMeta(allocator, root_dir, table_name);
+    deleteActiveMetaCacheEntry(root_dir, table_name);
 
     if (meta_result) |meta| {
         var owned = meta;
@@ -5559,6 +5758,7 @@ fn publishWrittenMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     defer allocator.free(manifest_path);
     try writeFileWithParentSync(allocator, manifest_path, manifest_json, false);
     syncParentDirBestEffort(manifest_path);
+    putActiveMetaCacheEntry(root_dir, manifest) catch {};
 }
 
 fn writeMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!void {

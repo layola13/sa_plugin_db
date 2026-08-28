@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sa_repo_root = b.option([]const u8, "sa-repo-root", "SA repository root used to resolve the host binary.") orelse "/home/vscode/projects/sci";
     const sa_bin = b.option([]const u8, "sa-bin", "Path to the SA host binary used for db integration tests.") orelse b.pathJoin(&.{ sa_repo_root, "zig-out/bin/sa" });
-    const sqlite_lib = b.option([]const u8, "sqlite-lib", "Path to the SQLite shared library used by SQLite control benchmarks.") orelse "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0";
+    const sqlite_lib = b.option([]const u8, "sqlite-lib", "Path to the SQLite shared library used by SQLite control benchmarks.") orelse b.pathJoin(&.{ b.pathFromRoot("benchmark_test"), "sqlite3_runtime", "sqlite3.dll" });
     const sa_std_lib = b.option([]const u8, "sa-std-lib", "Path to libsa_std.a; SQLite control benchmarks rebuild it with sqlite stubs renamed.") orelse "/home/vscode/.sa/std/libsa_std.a";
     const bench_compare_runs = b.option(u32, "bench-compare-runs", "Positive odd number of runs for the opt-in bench-compare median gate.") orelse 3;
     const bench_compare_proof_runs = b.option(u32, "bench-compare-proof-runs", "Positive odd number of runs for the bench-compare-proof report gate.") orelse 7;
@@ -550,7 +550,30 @@ fn addSaBenchStep(
     cmd.addArg("--no-incremental");
     cmd.step.dependOn(install_step);
     bench_step.dependOn(&cmd.step);
+    stageDbRuntimeNextToOut(b, bench_step, cmd, out, plugins_home);
+    if (b.graph.host.result.os.tag == .windows) {
+        const enlarge_stack = b.addSystemCommand(&.{ "bash", "-c", "set -euo pipefail; out='$1'; eb='${EDITBIN:-editbin}'; if command -v '$eb' >/dev/null 2>&1; then '$eb' /STACK:16777216 '$out'; fi" });
+        enlarge_stack.addFileArg(out);
+        enlarge_stack.step.dependOn(&cmd.step);
+        bench_step.dependOn(&enlarge_stack.step);
+    }
     return out;
+}
+
+fn stageDbRuntimeNextToOut(
+    b: *std.Build,
+    bench_step: *std.Build.Step,
+    build_cmd: *std.Build.Step.Run,
+    out: std.Build.LazyPath,
+    plugins_home: []const u8,
+) void {
+    const db_dll = b.pathJoin(&.{ plugins_home, "installed", "db", "current", "db.dll" });
+    const copy_db = b.addSystemCommand(&.{ "bash", "-c", "set -euo pipefail; cp -f '$1' '$2'" });
+    copy_db.addFileInput(.{ .cwd_relative = db_dll });
+    copy_db.addFileArg(.{ .cwd_relative = db_dll });
+    copy_db.addFileArg(out);
+    copy_db.step.dependOn(&build_cmd.step);
+    bench_step.dependOn(&copy_db.step);
 }
 
 fn addSaSmokeStep(
@@ -654,11 +677,37 @@ fn addSqliteBenchStep(
     if (std.fs.path.dirname(sqlite_lib)) |sqlite_dir| {
         link.addArg(b.fmt("-Wl,-rpath,{s}", .{sqlite_dir}));
     }
+    if (b.graph.host.result.os.tag == .windows) {
+        link.addArg("-lws2_32");
+        link.addArg("-liphlpapi");
+    }
     link.addArg("-o");
     const out = link.addOutputFileArg(out_name);
     link.step.dependOn(&build_obj.step);
     bench_step.dependOn(&link.step);
+    stageSqliteRuntimeNextToOut(b, bench_step, link, out, sqlite_lib);
     return out;
+}
+
+fn stageSqliteRuntimeNextToOut(
+    b: *std.Build,
+    bench_step: *std.Build.Step,
+    link: *std.Build.Step.Run,
+    out: std.Build.LazyPath,
+    sqlite_lib: []const u8,
+) void {
+    const copy_sqlite = b.addSystemCommand(&.{ "bash", "-c", "set -euo pipefail; cp -f '$1' '$2'" });
+    copy_sqlite.addFileInput(.{ .cwd_relative = sqlite_lib });
+    copy_sqlite.addFileArg(.{ .cwd_relative = sqlite_lib });
+    copy_sqlite.addFileArg(out);
+    copy_sqlite.step.dependOn(&link.step);
+    bench_step.dependOn(&copy_sqlite.step);
+    if (b.graph.host.result.os.tag == .windows) {
+        const enlarge_stack = b.addSystemCommand(&.{ "bash", "-c", "set -euo pipefail; out='$1'; eb='${EDITBIN:-editbin}'; if command -v '$eb' >/dev/null 2>&1; then '$eb' /STACK:16777216 '$out'; fi" });
+        enlarge_stack.addFileArg(out);
+        enlarge_stack.step.dependOn(&copy_sqlite.step);
+        bench_step.dependOn(&enlarge_stack.step);
+    }
 }
 
 fn addBenchCompareStep(
