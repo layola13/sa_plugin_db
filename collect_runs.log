@@ -1,0 +1,75 @@
+=== DB RUN 1 ===
+db_erp_indexed_init_ns=256500
+db_erp_indexed_init_remove_ns=16518200
+db_erp_indexed_init_schema_ns=158800
+db_erp_indexed_init_dict_ns=87000
+db_erp_indexed_baseline_ns=23012000
+db_erp_indexed_build_ns=29246700
+db_erp_indexed_build_orders_ns=6903100
+db_erp_indexed_build_lines_ns=15698100
+db_erp_indexed_build_invoices_ns=6641800
+db_erp_indexed_tx_append_ns=18892800
+db_erp_indexed_coltx_append_ns=8305200
+db_erp_indexed_verify_ns=22327500
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448
+=== SQLITE RUN 1 ===
+sqlite_erp_indexed_init_ns=3594500
+sqlite_erp_indexed_baseline_ns=128845100
+sqlite_erp_indexed_build_ns=78320600
+sqlite_erp_indexed_append_ns=17328700
+sqlite_erp_indexed_verify_ns=129217400
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448
+=== DB RUN 2 ===
+db_erp_indexed_init_ns=602500
+db_erp_indexed_init_remove_ns=25025400
+db_erp_indexed_init_schema_ns=448600
+db_erp_indexed_init_dict_ns=136800
+db_erp_indexed_baseline_ns=17426600
+db_erp_indexed_build_ns=36159200
+db_erp_indexed_build_orders_ns=11447500
+db_erp_indexed_build_lines_ns=15353400
+db_erp_indexed_build_invoices_ns=9353900
+db_erp_indexed_tx_append_ns=14619600
+db_erp_indexed_coltx_append_ns=7607100
+db_erp_indexed_verify_ns=29890100
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448
+=== SQLITE RUN 2 ===
+sqlite_erp_indexed_init_ns=3184900
+sqlite_erp_indexed_baseline_ns=124243100
+sqlite_erp_indexed_build_ns=81118200
+sqlite_erp_indexed_append_ns=11384300
+sqlite_erp_indexed_verify_ns=120747000
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448
+=== DB RUN 3 ===
+db_erp_indexed_init_ns=373500
+db_erp_indexed_init_remove_ns=20029200
+db_erp_indexed_init_schema_ns=268500
+db_erp_indexed_init_dict_ns=94900
+db_erp_indexed_baseline_ns=21220600
+db_erp_indexed_build_ns=31244700
+db_erp_indexed_build_orders_ns=5044000
+db_erp_indexed_build_lines_ns=19289100
+db_erp_indexed_build_invoices_ns=6907600
+db_erp_indexed_tx_append_ns=17734700
+db_erp_indexed_coltx_append_ns=8452100
+db_erp_indexed_verify_ns=27985600
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448
+=== SQLITE RUN 3 ===
+sqlite_erp_indexed_init_ns=3901500
+sqlite_erp_indexed_baseline_ns=168975100
+sqlite_erp_indexed_build_ns=73725000
+sqlite_erp_indexed_append_ns=10959700
+sqlite_erp_indexed_verify_ns=95684700
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448

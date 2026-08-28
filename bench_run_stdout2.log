@@ -1,0 +1,161 @@
+protected benchmark artifacts are clean
+D:\projects\sla\sa_plugin_db\.zig-cache\db-bench-compare-home\installed\db\current
+benchmark failed: D:\projects\sla\sa_plugin_db\.zig-cache\o\6daac3d495ae596f830f45054fc6a6e4\db_erp_indexed_write_bench.out exit=3221225781
+bench-compare-disk
++- run bash
+   +- run flock
+      +- run flock failure
+error: the following command exited with error code 1:
+flock -w 900 D:\projects\sla\sa_plugin_db\.zig-cache\db-benchmark-run.lock python3 -c 
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+db_bench, sqlite_bench, runs_s, strict_chain_s, suite_label, db_prefix, sqlite_prefix = sys.argv[1:8]
+runs = int(runs_s)
+if runs <= 0 or runs % 2 == 0:
+    raise SystemExit("benchmark compare run count must be positive odd")
+if strict_chain_s not in ("0", "1"):
+    raise SystemExit("benchmark compare strict-chain flag must be 0 or 1")
+strict_chain = strict_chain_s == "1"
+
+def parse(output):
+    values = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        if key in values:
+            raise SystemExit(f"benchmark output duplicate metric: {key}")
+        try:
+            values[key] = int(raw)
+        except ValueError:
+            raise SystemExit(f"benchmark output invalid integer metric: {key}={raw}")
+        if values[key] < 0:
+            raise SystemExit(f"benchmark output negative metric: {key}={values[key]}")
+    return values
+
+def clean_roots():
+    shutil.rmtree("benchmark_test/.bench_erp_indexed_db", ignore_errors=True)
+
+def run_bench(path, env, cwd):
+    clean_roots()
+    completed = subprocess.run([path], cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.stderr:
+        sys.stderr.write(completed.stderr)
+    if completed.returncode != 0:
+        if completed.stdout:
+            sys.stderr.write(completed.stdout)
+        raise SystemExit(f"benchmark failed: {path} exit={completed.returncode}")
+    return parse(completed.stdout)
+
+env = os.environ.copy()
+env["SA_PLUGIN_DEV"] = "1"
+env["SA_DB_UNSAFE_NO_SYNC"] = "1"
+try:
+    repo_cwd = os.getcwd()
+    db_samples = [run_bench(db_bench, env, repo_cwd) for _ in range(runs)]
+    with tempfile.TemporaryDirectory(prefix="sa-db-sqlite-control-") as sqlite_cwd:
+        sqlite_samples = [run_bench(sqlite_bench, env, sqlite_cwd) for _ in range(runs)]
+
+    expected_rows = {
+        "indexed_order_rows": 8448,
+        "indexed_line_rows": 33792,
+        "indexed_invoice_rows": 8448,
+    }
+    def require_keys(samples, keys, label):
+        for idx, sample in enumerate(samples):
+            missing = [key for key in keys if key not in sample]
+            if missing:
+                raise SystemExit(f"bench-compare failed: {suite_label} {label} sample {idx + 1} missing metrics: {', '.join(missing)}")
+
+    def require_positive_keys(samples, keys, label):
+        for idx, sample in enumerate(samples):
+            non_positive = [key for key in keys if sample[key] <= 0]
+            if non_positive:
+                raise SystemExit(f"bench-compare failed: {suite_label} {label} sample {idx + 1} non-positive timing metrics: {', '.join(non_positive)}")
+
+    row_keys = list(expected_rows.keys())
+    db_timing_keys = [
+        f"{db_prefix}_init_ns",
+        f"{db_prefix}_baseline_ns",
+        f"{db_prefix}_build_ns",
+        f"{db_prefix}_tx_append_ns",
+        f"{db_prefix}_coltx_append_ns",
+        f"{db_prefix}_verify_ns",
+    ]
+    sqlite_timing_keys = [
+        f"{sqlite_prefix}_init_ns",
+        f"{sqlite_prefix}_baseline_ns",
+        f"{sqlite_prefix}_build_ns",
+        f"{sqlite_prefix}_append_ns",
+        f"{sqlite_prefix}_verify_ns",
+    ]
+    require_keys(db_samples, db_timing_keys + row_keys, "db")
+    require_keys(sqlite_samples, sqlite_timing_keys + row_keys, "sqlite")
+    require_positive_keys(db_samples, db_timing_keys, "db")
+    require_positive_keys(sqlite_samples, sqlite_timing_keys, "sqlite")
+    for sample in db_samples + sqlite_samples:
+        for key, expected in expected_rows.items():
+            if sample.get(key) != expected:
+                raise SystemExit(f"{key} expected {expected}, got {sample.get(key)}")
+
+    def observed_median(values):
+        return sorted(values)[len(values) // 2]
+
+    def stat(samples, key):
+        values = [sample[key] for sample in samples]
+        return (min(values), observed_median(values), max(values))
+
+    def stat_sum(samples, left_key, right_key):
+        values = [sample[left_key] + sample[right_key] for sample in samples]
+        return (min(values), observed_median(values), max(values))
+
+    def fmt_stat(ns):
+        return f"{ns[1] / 1_000_000:.3f} ms [{ns[0] / 1_000_000:.3f}, {ns[2] / 1_000_000:.3f}]"
+
+    db_init_stat = stat(db_samples, f"{db_prefix}_init_ns")
+    db_baseline_stat = stat(db_samples, f"{db_prefix}_baseline_ns")
+    db_build_stat = stat(db_samples, f"{db_prefix}_build_ns")
+    db_tx_stat = stat(db_samples, f"{db_prefix}_tx_append_ns")
+    db_coltx_stat = stat(db_samples, f"{db_prefix}_coltx_append_ns")
+    db_verify_stat = stat(db_samples, f"{db_prefix}_verify_ns")
+    db_chain_stat = stat_sum(db_samples, f"{db_prefix}_tx_append_ns", f"{db_prefix}_coltx_append_ns")
+
+    sqlite_init_stat = stat(sqlite_samples, f"{sqlite_prefix}_init_ns")
+    sqlite_baseline_stat = stat(sqlite_samples, f"{sqlite_prefix}_baseline_ns")
+    sqlite_build_stat = stat(sqlite_samples, f"{sqlite_prefix}_build_ns")
+    sqlite_append_stat = stat(sqlite_samples, f"{sqlite_prefix}_append_ns")
+    sqlite_verify_stat = stat(sqlite_samples, f"{sqlite_prefix}_verify_ns")
+
+    hard_checks = [
+        ("init", db_init_stat, sqlite_init_stat),
+        ("baseline", db_baseline_stat, sqlite_baseline_stat),
+        ("build", db_build_stat, sqlite_build_stat),
+        ("tx append", db_tx_stat, sqlite_append_stat),
+        ("coltx append", db_coltx_stat, sqlite_append_stat),
+        ("verify", db_verify_stat, sqlite_verify_stat),
+    ]
+    report_checks = hard_checks + [("total append chain", db_chain_stat, sqlite_append_stat)]
+    for check_label, db_stat, sqlite_stat in hard_checks:
+        if db_stat[1] >= sqlite_stat[1]:
+            raise SystemExit(f"bench-compare failed: {suite_label} {check_label}: db={db_stat[1]} sqlite={sqlite_stat[1]}")
+    if strict_chain and db_chain_stat[1] >= sqlite_append_stat[1]:
+        raise SystemExit(f"bench-compare failed: {suite_label} total append chain: db={db_chain_stat[1]} sqlite={sqlite_append_stat[1]}")
+
+    print(f"bench-compare {suite_label} runs={runs} strict_chain={strict_chain}")
+    for check_label, db_stat, sqlite_stat in report_checks:
+        status = "PASS" if db_stat[1] < sqlite_stat[1] else "WARN"
+        margin = sqlite_stat[1] - db_stat[1]
+        print(f"{check_label}: {status} db={fmt_stat(db_stat)} sqlite={fmt_stat(sqlite_stat)} margin={margin / 1_000_000:.3f} ms")
+finally:
+    clean_roots() D:\projects\sla\sa_plugin_db\.zig-cache\o\6daac3d495ae596f830f45054fc6a6e4\db_erp_indexed_write_bench.out D:\projects\sla\sa_plugin_db\.zig-cache\o\912b547b454b370e1c9202b7f277981f\sqlite_erp_indexed_write_bench.out 3 0 disk indexed ERP db_erp_indexed sqlite_erp_indexed 
+Build Summary: 11/15 steps succeeded; 1 failed
+bench-compare-disk transitive failure
++- run bash transitive failure
+   +- run flock transitive failure
+      +- run flock failure
+error: the following build command failed with exit code 1:
+D:\projects\sla\sa_plugin_db\.zig-cache\o\96a40e00a1dc4b91c71b9dca501f6517\build.exe D:\tools\zig-x86_64-windows-0.14.1\zig.exe D:\tools\zig-x86_64-windows-0.14.1\lib D:\projects\sla\sa_plugin_db D:\projects\sla\sa_plugin_db\.zig-cache C:\Users\Administrator\AppData\Local\zig --seed 0xb706f08a -Z217ab9e17c224cd7 bench-compare-disk -Dsa-bin=D:\projects\sla\sci\zig-out\bin\sa.exe -Dsa-repo-root=D:\projects\sla\sci -Dsa-std-lib=D:\projects\sla\sci\artifacts\sa_std\libsa_std_windows.oa -Dbench-compare-runs=3 -Dlock-wait-seconds=900

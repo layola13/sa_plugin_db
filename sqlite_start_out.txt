@@ -1,0 +1,8 @@
+sqlite_erp_indexed_init_ns=15663400
+sqlite_erp_indexed_baseline_ns=170712200
+sqlite_erp_indexed_build_ns=68213300
+sqlite_erp_indexed_append_ns=11879300
+sqlite_erp_indexed_verify_ns=112114300
+indexed_order_rows=8448
+indexed_line_rows=33792
+indexed_invoice_rows=8448
