@@ -26632,3 +26632,148 @@ test "table upsertRawRowsU64Key batches inserts and updates atomically" {
     const not_there = try snapshotFindU64(after, 0, 42);
     try std.testing.expect(!not_there.found);
 }
+
+test "table concurrent same-table batch upserts lose no writes" {
+    const root = ":memory:test_conc_same";
+    const table_name = "conc_same";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, root, "conc_same.sadb-schema",
+        \\#def MAX_ROWS = 1024
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VAL_STRIDE = 8 // u64
+    );
+    _ = try createU64Index(std.testing.allocator, root, table_name, 0, true);
+
+    const THREADS = 4;
+    const ROWS_PER_THREAD = 25;
+    const WorkerCtx = struct {
+        tid: usize,
+        err: ?TableError = null,
+        inserted: u64 = 0,
+    };
+    var ctxs: [THREADS]WorkerCtx = undefined;
+    for (&ctxs, 0..) |*c, i| c.* = .{ .tid = i };
+
+    const worker = struct {
+        fn run(c: *WorkerCtx) void {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var rows: [ROWS_PER_THREAD][16]u8 = undefined;
+            var keys: [ROWS_PER_THREAD]u64 = undefined;
+            for (0..ROWS_PER_THREAD) |i| {
+                const key: u64 = @as(u64, @intCast(c.tid * ROWS_PER_THREAD + i)) + 1;
+                keys[i] = key;
+                writeU64LE(&rows[i], 0, key);
+                writeU64LE(&rows[i], 8, key * 1000 + @as(u64, @intCast(c.tid)));
+            }
+            var slices: [ROWS_PER_THREAD][]const u8 = undefined;
+            for (&slices, 0..) |*s, i| s.* = &rows[i];
+            const res = upsertRawRowsU64Key(alloc, root, table_name, 0, &keys, &slices) catch |err| {
+                c.err = err;
+                return;
+            };
+            c.inserted = res.inserted_count;
+        }
+    }.run;
+
+    var threads: [THREADS]std.Thread = undefined;
+    for (&threads, &ctxs) |*t, *c| {
+        t.* = std.Thread.spawn(.{}, worker, .{c}) catch |err| {
+            std.debug.panic("spawn failed: {s}", .{@errorName(err)});
+        };
+    }
+    for (&threads) |*t| t.join();
+    for (&ctxs) |*c| {
+        try std.testing.expect(c.err == null);
+        try std.testing.expectEqual(@as(u64, ROWS_PER_THREAD), c.inserted);
+    }
+
+    // every key present with exactly the value its thread wrote
+    const snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, THREADS * ROWS_PER_THREAD), snapshot.row_count);
+    for (0..THREADS) |tid| {
+        for (0..ROWS_PER_THREAD) |i| {
+            const key: u64 = @as(u64, @intCast(tid * ROWS_PER_THREAD + i)) + 1;
+            const found = try snapshotFindU64(snapshot, 0, key);
+            try std.testing.expect(found.found);
+            const val = try snapshotGetU64(snapshot, 1, found.row_index);
+            try std.testing.expectEqual(key * 1000 + @as(u64, @intCast(tid)), val);
+        }
+    }
+}
+
+test "table concurrent multi-table writes proceed independently" {
+    const root = ":memory:test_conc_multi";
+    const THREADS = 4;
+    const ROWS = 25;
+    const table_names = [_][]const u8{ "conc_multi_0", "conc_multi_1", "conc_multi_2", "conc_multi_3" };
+    const WorkerCtx = struct {
+        tid: usize,
+        err: ?TableError = null,
+    };
+    var ctxs: [THREADS]WorkerCtx = undefined;
+    for (&ctxs, 0..) |*c, i| c.* = .{ .tid = i };
+
+    const worker = struct {
+        fn run(c: *WorkerCtx) void {
+            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            const table_name = table_names[c.tid];
+            var hint_buf: [48]u8 = undefined;
+            const hint = std.fmt.bufPrint(&hint_buf, "{s}.sadb-schema", .{table_name}) catch {
+                c.err = TableError.OutOfMemory;
+                return;
+            };
+            _ = initTableFromSchemaBytes(alloc, root, hint,
+                \\#def MAX_ROWS = 256
+                \\#def COL_ID_STRIDE = 8 // u64
+                \\#def COL_VAL_STRIDE = 8 // u64
+            ) catch |err| {
+                c.err = err;
+                return;
+            };
+            _ = createU64Index(alloc, root, table_name, 0, true) catch |err| {
+                c.err = err;
+                return;
+            };
+            var rows: [ROWS][16]u8 = undefined;
+            var keys: [ROWS]u64 = undefined;
+            for (0..ROWS) |i| {
+                const key: u64 = @as(u64, @intCast(i)) + 1;
+                keys[i] = key;
+                writeU64LE(&rows[i], 0, key);
+                writeU64LE(&rows[i], 8, key * 10 + @as(u64, @intCast(c.tid)));
+            }
+            var slices: [ROWS][]const u8 = undefined;
+            for (&slices, 0..) |*s, i| s.* = &rows[i];
+            _ = upsertRawRowsU64Key(alloc, root, table_name, 0, &keys, &slices) catch |err| {
+                c.err = err;
+                return;
+            };
+        }
+    }.run;
+
+    var threads: [THREADS]std.Thread = undefined;
+    for (&threads, &ctxs) |*t, *c| {
+        t.* = std.Thread.spawn(.{}, worker, .{c}) catch |err| {
+            std.debug.panic("spawn failed: {s}", .{@errorName(err)});
+        };
+    }
+    for (&threads) |*t| t.join();
+    for (&ctxs) |*c| try std.testing.expect(c.err == null);
+
+    for (table_names, 0..) |table_name, tid| {
+        const snapshot = try openReadSnapshot(std.testing.allocator, root, table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, ROWS), snapshot.row_count);
+        // spot-check first and last key of this table
+        for ([_]u64{ 1, ROWS }) |key| {
+            const found = try snapshotFindU64(snapshot, 0, key);
+            try std.testing.expect(found.found);
+            const val = try snapshotGetU64(snapshot, 1, found.row_index);
+            try std.testing.expectEqual(key * 10 + @as(u64, @intCast(tid)), val);
+        }
+    }
+}
