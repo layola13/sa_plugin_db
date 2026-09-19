@@ -16,11 +16,48 @@ const DECIMAL_MAX_SCALE: u32 = 18;
 const MS_PER_DAY: u64 = 86_400_000;
 const US_PER_DAY: u64 = 86_400_000_000;
 
-var mutation_mutex = std.Thread.Mutex{};
+// Per-table mutual exclusion is provided by table-level file locks
+// (acquireTableWriteLock in table.zig); no global mutation mutex is needed.
+// Thread-local re-entrancy guard: prevents a thread from deadlocking itself
+// by beginning a second write tx on a table it already holds.
+threadlocal var active_tx_table_keys: [16]u64 = [_]u64{0} ** 16;
+threadlocal var active_tx_table_count: usize = 0;
+
+fn txTableKey(root: []const u8, table_name: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(root);
+    h.update(&[_]u8{0});
+    h.update(table_name);
+    return h.final();
+}
+
+fn txReentrancyCheck(key: u64) bool {
+    for (active_tx_table_keys[0..active_tx_table_count]) |k| {
+        if (k == key) return false;
+    }
+    return true;
+}
+
+fn txReentrancyPush(key: u64) bool {
+    if (active_tx_table_count >= active_tx_table_keys.len) return false;
+    active_tx_table_keys[active_tx_table_count] = key;
+    active_tx_table_count += 1;
+    return true;
+}
+
+fn txReentrancyPop(key: u64) void {
+    for (active_tx_table_keys[0..active_tx_table_count], 0..) |k, i| {
+        if (k == key) {
+            active_tx_table_keys[i] = active_tx_table_keys[active_tx_table_count - 1];
+            active_tx_table_count -= 1;
+            return;
+        }
+    }
+}
 var read_handle_lock = std.Thread.RwLock{};
 var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
 var tx_handle_mutex = std.Thread.Mutex{};
-var active_write_tx: ?*table.WriteTransaction = null;
+var write_tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
 var coltx_handle_lock = std.Thread.RwLock{};
 var coltx_handles = std.AutoHashMap(usize, ColtxHandleEntry).init(std.heap.page_allocator);
 var empty_output_bytes: [0]u8 = .{};
@@ -126,8 +163,6 @@ pub export fn sa_db_blob_put_many(
         values[i] = inputBytes(item.data, item.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     }
 
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.putBlobValues(gpa.allocator(), root, table_name, store_name, values) catch |err| return tableStatus(err);
     first_id_slot.* = result.first_id;
     return fillInfo(info_slot, result.info);
@@ -155,8 +190,6 @@ pub export fn sa_db_blob_put(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.putBlobValue(gpa.allocator(), root, table_name, store_name, value) catch |err| return tableStatus(err);
     id_slot.* = result.id;
     return fillInfo(info_slot, result.info);
@@ -423,22 +456,21 @@ fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapsh
 fn registerWriteTransaction(tx: *table.WriteTransaction) bool {
     tx_handle_mutex.lock();
     defer tx_handle_mutex.unlock();
-    if (active_write_tx != null) return false;
-    active_write_tx = tx;
+    const key = @intFromPtr(tx);
+    write_tx_handles.put(key, tx) catch return false;
     return true;
 }
 
 fn lockWriteTransaction(handle: ?*anyopaque) ?*table.WriteTransaction {
     tx_handle_mutex.lock();
-    const tx = active_write_tx orelse {
+    const key = readHandleKey(handle) orelse {
         tx_handle_mutex.unlock();
         return null;
     };
-    if (handle != @as(?*anyopaque, @ptrCast(tx))) {
+    return write_tx_handles.get(key) orelse {
         tx_handle_mutex.unlock();
         return null;
-    }
-    return tx;
+    };
 }
 
 fn registerColumnIngestSession(session: *table.ColumnIngestSession) bool {
@@ -472,10 +504,9 @@ fn unregisterWriteTransaction(handle: ?*anyopaque, out_tx: *?*table.WriteTransac
     out_tx.* = null;
     tx_handle_mutex.lock();
     defer tx_handle_mutex.unlock();
-    const tx = active_write_tx orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    if (handle != @as(?*anyopaque, @ptrCast(tx))) return SA_DB_ERR_INVALID_ARGUMENT;
-    out_tx.* = tx;
-    active_write_tx = null;
+    const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const entry = write_tx_handles.fetchRemove(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    out_tx.* = entry.value;
     return SA_DB_OK;
 }
 
@@ -792,8 +823,6 @@ pub export fn sa_db_init_schema(
 
     var arena = tempArenaAllocator();
     defer arena.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.initTableFromSchemaBytes(arena.allocator(), root, schema_path, schema_source) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -810,8 +839,6 @@ pub export fn sa_db_remove_table(
 
     var arena = tempArenaAllocator();
     defer arena.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.removeTable(arena.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -862,8 +889,6 @@ pub export fn sa_db_insert_row(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.insertRawRow(gpa.allocator(), root, table_name, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -889,8 +914,6 @@ pub export fn sa_db_upsert_row_u64_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -931,8 +954,6 @@ pub export fn sa_db_upsert_many_u64_key(
         rows[i] = inputBytes(item.data, item.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     }
 
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowsU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, rows) catch |err| return tableStatus(err);
     inserted_slot.* = result.inserted_count;
     return fillInfo(info_slot, result.info);
@@ -956,8 +977,6 @@ pub export fn sa_db_update_row_u64_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -983,8 +1002,6 @@ pub export fn sa_db_upsert_row_u32_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowU32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1008,8 +1025,6 @@ pub export fn sa_db_update_row_u32_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowU32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1035,8 +1050,6 @@ pub export fn sa_db_upsert_row_i32_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1060,8 +1073,6 @@ pub export fn sa_db_update_row_i32_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1087,8 +1098,6 @@ pub export fn sa_db_upsert_row_u8_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1112,8 +1121,6 @@ pub export fn sa_db_update_row_u8_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1139,8 +1146,6 @@ pub export fn sa_db_upsert_row_i8_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1164,8 +1169,6 @@ pub export fn sa_db_update_row_i8_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1191,8 +1194,6 @@ pub export fn sa_db_upsert_row_u16_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1216,8 +1217,6 @@ pub export fn sa_db_update_row_u16_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1243,8 +1242,6 @@ pub export fn sa_db_upsert_row_i16_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1268,8 +1265,6 @@ pub export fn sa_db_update_row_i16_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1295,8 +1290,6 @@ pub export fn sa_db_upsert_row_i64_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1320,8 +1313,6 @@ pub export fn sa_db_update_row_i64_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1351,8 +1342,6 @@ pub export fn sa_db_upsert_row_u64_pair_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowU64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1379,8 +1368,6 @@ pub export fn sa_db_update_row_u64_pair_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowU64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1410,8 +1397,6 @@ pub export fn sa_db_upsert_row_u64_i64_pair_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1438,8 +1423,6 @@ pub export fn sa_db_update_row_u64_i64_pair_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1471,8 +1454,6 @@ pub export fn sa_db_upsert_row_blob_eq_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.upsertRawRowBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -1501,8 +1482,6 @@ pub export fn sa_db_update_row_blob_eq_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.updateRawRowBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -1519,14 +1498,20 @@ pub export fn sa_db_tx_begin(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    if (!mutation_mutex.tryLock()) return SA_DB_ERR_LOCKED;
+    // Fail fast on same-thread re-entrant begin (would self-deadlock on the
+    // table file lock). Cross-thread contention blocks on the table lock.
+    const tkey = txTableKey(root, table_name);
+    if (!txReentrancyCheck(tkey)) return SA_DB_ERR_LOCKED;
     const tx = table.beginWriteTransaction(std.heap.page_allocator, root, table_name) catch |err| {
-        mutation_mutex.unlock();
         return tableStatus(err);
     };
+    if (!txReentrancyPush(tkey)) {
+        table.destroyWriteTransaction(std.heap.page_allocator, tx);
+        return SA_DB_ERR_LOCKED;
+    }
     if (!registerWriteTransaction(tx)) {
         table.destroyWriteTransaction(std.heap.page_allocator, tx);
-        mutation_mutex.unlock();
+        txReentrancyPop(tkey);
         return SA_DB_ERR_OUT_OF_MEMORY;
     }
     slot.* = @ptrCast(tx);
@@ -2224,13 +2209,14 @@ pub export fn sa_db_tx_commit(handle: ?*anyopaque, out_info: ?*SaDbTableInfo) u3
     const status = unregisterWriteTransaction(handle, &tx);
     if (status != SA_DB_OK) return status;
 
+    const tkey = txTableKey(tx.?.root_dir, tx.?.table_name);
     const info = table.commitWriteTransaction(std.heap.page_allocator, tx.?) catch |err| {
         table.destroyWriteTransaction(std.heap.page_allocator, tx.?);
-        mutation_mutex.unlock();
+        txReentrancyPop(tkey);
         return tableStatus(err);
     };
     table.destroyWriteTransaction(std.heap.page_allocator, tx.?);
-    mutation_mutex.unlock();
+    txReentrancyPop(tkey);
     return fillInfo(info_slot, info);
 }
 
@@ -2238,8 +2224,9 @@ pub export fn sa_db_tx_rollback(handle: ?*anyopaque) u32 {
     var tx: ?*table.WriteTransaction = null;
     const status = unregisterWriteTransaction(handle, &tx);
     if (status != SA_DB_OK) return status;
+    const tkey = txTableKey(tx.?.root_dir, tx.?.table_name);
     table.destroyWriteTransaction(std.heap.page_allocator, tx.?);
-    mutation_mutex.unlock();
+    txReentrancyPop(tkey);
     return SA_DB_OK;
 }
 
@@ -2324,8 +2311,6 @@ pub export fn sa_db_create_u64_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createU64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2345,8 +2330,6 @@ pub export fn sa_db_create_i64_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createI64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2366,8 +2349,6 @@ pub export fn sa_db_create_u32_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createU32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2387,8 +2368,6 @@ pub export fn sa_db_create_i32_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createI32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2408,8 +2387,6 @@ pub export fn sa_db_create_u8_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createU8Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2429,8 +2406,6 @@ pub export fn sa_db_create_i8_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createI8Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2450,8 +2425,6 @@ pub export fn sa_db_create_u16_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createU16Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2471,8 +2444,6 @@ pub export fn sa_db_create_i16_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createI16Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2492,8 +2463,6 @@ pub export fn sa_db_create_f32_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createF32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2513,8 +2482,6 @@ pub export fn sa_db_create_f64_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createF64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2536,8 +2503,6 @@ pub export fn sa_db_create_u64_pair_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createU64PairIndex(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2559,8 +2524,6 @@ pub export fn sa_db_create_u64_i64_pair_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createU64I64PairIndex(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2583,8 +2546,6 @@ pub export fn sa_db_create_blob_eq_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createBlobEqIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name, unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2606,8 +2567,6 @@ pub export fn sa_db_create_blob_token_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createBlobTokenIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2629,8 +2588,6 @@ pub export fn sa_db_create_blob_prefix_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createBlobPrefixIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2652,8 +2609,6 @@ pub export fn sa_db_create_blob_contains_index(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createBlobContainsIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2680,8 +2635,6 @@ pub export fn sa_db_create_indexes(
         requests[idx] = decodeCreateIndexRequest(request) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     }
 
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.createIndexes(allocator, root, table_name, requests) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2711,8 +2664,6 @@ pub export fn sa_db_dict_intern(
 
     var arena = tempArenaAllocator();
     defer arena.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.internStringDict(arena.allocator(), root, table_name, dict_name, value) catch |err| return tableStatus(err);
     id_slot.* = result.id;
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -2762,8 +2713,6 @@ pub export fn sa_db_dict_intern_many(
     @memset(out_ids, 0);
     @memset(out_inserted, 0);
 
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const result = table.internStringDictMany(allocator, root, table_name, dict_name, values, out_ids, inserted) catch |err| return tableStatus(err);
     for (inserted, 0..) |flag, idx| out_inserted[idx] = if (flag) 1 else 0;
     return fillInfo(info_slot, result.info);
@@ -2927,8 +2876,6 @@ pub export fn sa_db_delete_u64_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2948,8 +2895,6 @@ pub export fn sa_db_delete_u32_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteU32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2969,8 +2914,6 @@ pub export fn sa_db_delete_i32_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -2990,8 +2933,6 @@ pub export fn sa_db_delete_u8_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3011,8 +2952,6 @@ pub export fn sa_db_delete_i8_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3032,8 +2971,6 @@ pub export fn sa_db_delete_u16_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3053,8 +2990,6 @@ pub export fn sa_db_delete_i16_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3074,8 +3009,6 @@ pub export fn sa_db_delete_i64_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3098,8 +3031,6 @@ pub export fn sa_db_delete_u64_pair_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteU64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3122,8 +3053,6 @@ pub export fn sa_db_delete_u64_i64_pair_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3148,8 +3077,6 @@ pub export fn sa_db_delete_blob_eq_key(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.deleteBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3182,8 +3109,6 @@ pub export fn sa_db_snapshot(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.snapshotTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3201,8 +3126,6 @@ pub export fn sa_db_restore(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.restoreTable(gpa.allocator(), root, table_name, epoch) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3219,8 +3142,6 @@ pub export fn sa_db_recover(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.recoverTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3237,8 +3158,6 @@ pub export fn sa_db_compact(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.compactTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3255,8 +3174,6 @@ pub export fn sa_db_lock(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.lockTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3273,8 +3190,6 @@ pub export fn sa_db_unlock(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const info = table.unlockTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
 }
@@ -3297,8 +3212,6 @@ pub export fn sa_db_update_u64_add(
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
     const updated = table.updateU64ColumnAdd(gpa.allocator(), root, table_name, @intCast(column_index), start_row, update_count, delta) catch |err| return tableStatus(err);
     updated_slot.* = updated;
     return SA_DB_OK;
