@@ -8596,15 +8596,27 @@ pub fn copyStringDictValue(
     return .{ .found = true, .written = value.len };
 }
 
-pub fn putBlobValue(
+pub const BlobPutManyResult = struct {
+    info: TableInfo,
+    /// id of the first appended blob; ids are contiguous: first_id .. first_id + count - 1
+    first_id: u64,
+    count: u64,
+};
+
+/// Batch blob append: all `values` are appended to `store_name` in a single
+/// transaction (one artifact file, one meta publish). This is the fast path
+/// for bulk loads; the per-value `putBlobValue` does a full durable
+/// transaction per call. Returned ids are contiguous starting at `first_id`.
+pub fn putBlobValues(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
     table_name: []const u8,
     store_name: []const u8,
-    value: []const u8,
-) TableError!BlobPutResult {
+    values: []const []const u8,
+) TableError!BlobPutManyResult {
+    if (values.len == 0) return TableError.InvalidFormat;
     try validateBlobStoreName(store_name);
-    try validateBlobValue(value);
+    for (values) |value| try validateBlobValue(value);
 
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
@@ -8624,14 +8636,15 @@ pub fn putBlobValue(
     }
     defer if (mapped_old) |mapped| releaseMappedRegion(allocator, mapped);
 
-    const new_count = std.math.add(u64, old_count, 1) catch return TableError.CursorOverflow;
+    const add_count: u64 = @intCast(values.len);
+    const new_count = std.math.add(u64, old_count, add_count) catch return TableError.CursorOverflow;
     const next_epoch = std.math.add(u64, meta.epoch, 1) catch return TableError.CursorOverflow;
     const basename = try blobStoreFileName(allocator, table_name, store_name, next_epoch);
     defer allocator.free(basename);
-    const values = [_][]const u8{value};
+    const first_id = old_count + 1;
 
     if (canDeferUnsafeBootstrapMeta(meta)) {
-        const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, &values);
+        const built = try buildCountedArtifactBytesAndHashes(allocator, old_bytes, new_count, values);
         defer allocator.free(built.bytes);
         var hashes_consumed = false;
         errdefer if (!hashes_consumed) freeFileHashes(allocator, built.hashes);
@@ -8644,12 +8657,12 @@ pub fn putBlobValue(
         meta.epoch = next_epoch;
         const pending = [_]PendingBlobWrite{.{ .name = store_name, .path = basename, .bytes = built.bytes }};
         try cacheUnsafeBootstrapMeta(allocator, root_dir, table_name, meta, &.{}, &pending);
-        return .{ .info = tableInfo(meta), .id = new_count };
+        return .{ .info = tableInfo(meta), .first_id = first_id, .count = add_count };
     }
 
     const path = try activePath(allocator, root_dir, basename);
     defer allocator.free(path);
-    const written = try writeCountedArtifactFileAndHashes(allocator, path, old_bytes, new_count, &values);
+    const written = try writeCountedArtifactFileAndHashes(allocator, path, old_bytes, new_count, values);
     var hashes_consumed = false;
     errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
     const new_meta = try makeBlobStoreMetaFromCountedArtifactWrite(allocator, store_name, basename, new_count, written);
@@ -8660,11 +8673,27 @@ pub fn putBlobValue(
     consumed = true;
     meta.epoch = next_epoch;
 
-    if (try blobStoreAppendRequiresIndexRebuild(allocator, root_dir, meta, store_name, new_count)) {
-        try rebuildBlobIndexesForStore(allocator, root_dir, &meta, store_name);
+    var appended_id = first_id;
+    while (appended_id <= new_count) : (appended_id += 1) {
+        if (try blobStoreAppendRequiresIndexRebuild(allocator, root_dir, meta, store_name, appended_id)) {
+            try rebuildBlobIndexesForStore(allocator, root_dir, &meta, store_name);
+            break;
+        }
     }
     try writeMeta(allocator, root_dir, table_name, meta);
-    return .{ .info = tableInfo(meta), .id = new_count };
+    return .{ .info = tableInfo(meta), .first_id = first_id, .count = add_count };
+}
+
+pub fn putBlobValue(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    store_name: []const u8,
+    value: []const u8,
+) TableError!BlobPutResult {
+    const values = [_][]const u8{value};
+    const many = try putBlobValues(allocator, root_dir, table_name, store_name, &values);
+    return .{ .info = many.info, .id = many.first_id };
 }
 
 pub fn blobValueLen(

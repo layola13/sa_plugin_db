@@ -183,7 +183,7 @@ forbid(
     re.S,
 )
 require(
-    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeCountedArtifactFileAndHashes\(allocator,\s*path,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaFromCountedArtifactWrite\(allocator,\s*store_name,\s*basename,\s*new_count,\s*written\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
+    r"pub\s+fn\s+putBlobValues\s*\([^)]*\)\s*TableError!BlobPutManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*writeCountedArtifactFileAndHashes\(allocator,\s*path,\s*old_bytes,\s*new_count,\s*values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaFromCountedArtifactWrite\(allocator,\s*store_name,\s*basename,\s*new_count,\s*written\)(?:(?!\n(?:pub\s+)?fn\s).)*try\s+writeMeta\(allocator,\s*root_dir,\s*table_name,\s*meta\)",
     "direct blob append must combine counted-artifact write/hash streaming before meta publish",
     re.S,
 )
@@ -198,7 +198,7 @@ require(
     re.S,
 )
 require(
-    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*canDeferUnsafeBootstrapMeta\(meta\)(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*&values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaFromCountedArtifactBuild\(allocator,\s*store_name,\s*basename,\s*new_count,\s*built\)",
+    r"pub\s+fn\s+putBlobValues\s*\([^)]*\)\s*TableError!BlobPutManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*canDeferUnsafeBootstrapMeta\(meta\)(?:(?!\n(?:pub\s+)?fn\s).)*buildCountedArtifactBytesAndHashes\(allocator,\s*old_bytes,\s*new_count,\s*values\)(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaFromCountedArtifactBuild\(allocator,\s*store_name,\s*basename,\s*new_count,\s*built\)",
     "direct unsafe blob bootstrap must build staged bytes and hashes in one pass",
     re.S,
 )
@@ -223,7 +223,7 @@ forbid(
     re.S,
 )
 forbid(
-    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaForCountedArtifactAppend\(",
+    r"pub\s+fn\s+putBlobValues\s*\([^)]*\)\s*TableError!BlobPutManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*makeBlobStoreMetaForCountedArtifactAppend\(",
     "direct blob append reintroduced separate counted-artifact hash pass",
     re.S,
 )
@@ -309,7 +309,7 @@ require(
     re.S,
 )
 require(
-    r"pub\s+fn\s+putBlobValue\s*\([^)]*\)\s*TableError!BlobPutResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(try\s+blobStoreAppendRequiresIndexRebuild\(allocator,\s*root_dir,\s*meta,\s*store_name,\s*new_count\)\)\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*try\s+rebuildBlobIndexesForStore\(allocator,\s*root_dir,\s*&meta,\s*store_name\)",
+    r"pub\s+fn\s+putBlobValues\s*\([^)]*\)\s*TableError!BlobPutManyResult\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(try\s+blobStoreAppendRequiresIndexRebuild\(allocator,\s*root_dir,\s*meta,\s*store_name,\s*appended_id\)\)\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*try\s+rebuildBlobIndexesForStore\(allocator,\s*root_dir,\s*&meta,\s*store_name\)",
     "direct blob append must rebuild blob indexes only when existing rows reference the appended blob id",
     re.S,
 )

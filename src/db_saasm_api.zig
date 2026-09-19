@@ -93,6 +93,75 @@ pub const SaDbBytesInput = extern struct {
     len: u64,
 };
 
+/// Batch blob append: `values[0..values_len]` are appended to `store_name` in
+/// one transaction. `out_first_id` receives the id of values[0]; subsequent
+/// ids are contiguous. `out_ids` may be null when only the first id is needed.
+pub export fn sa_db_blob_put_many(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    values_ptr: ?[*]const SaDbBytesInput,
+    values_len: u64,
+    out_first_id: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const first_id_slot = out_first_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    first_id_slot.* = 0;
+    if (values_len == 0 or values_len > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const n: usize = @intCast(values_len);
+    const values_in = (values_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const values = gpa.allocator().alloc([]const u8, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    defer gpa.allocator().free(values);
+    for (values_in, 0..) |item, i| {
+        values[i] = inputBytes(item.data, item.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    }
+
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.putBlobValues(gpa.allocator(), root, table_name, store_name, values) catch |err| return tableStatus(err);
+    first_id_slot.* = result.first_id;
+    return fillInfo(info_slot, result.info);
+}
+
+pub export fn sa_db_blob_put(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    store_ptr: ?[*]const u8,
+    store_len: u64,
+    value_ptr: ?[*]const u8,
+    value_len: u64,
+    out_id: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    id_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.putBlobValue(gpa.allocator(), root, table_name, store_name, value) catch |err| return tableStatus(err);
+    id_slot.* = result.id;
+    return fillInfo(info_slot, result.info);
+}
+
 pub const SaDbCreateIndexRequest = extern struct {
     kind: u32,
     unique: u32,
@@ -2742,35 +2811,6 @@ pub export fn sa_db_dict_value_copy(
     found_slot.* = if (result.found) 1 else 0;
     written_slot.* = result.written;
     return SA_DB_OK;
-}
-
-pub export fn sa_db_blob_put(
-    root_ptr: ?[*]const u8,
-    root_len: u64,
-    table_ptr: ?[*]const u8,
-    table_len: u64,
-    store_ptr: ?[*]const u8,
-    store_len: u64,
-    value_ptr: ?[*]const u8,
-    value_len: u64,
-    out_id: ?*u64,
-    out_info: ?*SaDbTableInfo,
-) u32 {
-    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const id_slot = out_id orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    id_slot.* = 0;
-
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    mutation_mutex.lock();
-    defer mutation_mutex.unlock();
-    const result = table.putBlobValue(gpa.allocator(), root, table_name, store_name, value) catch |err| return tableStatus(err);
-    id_slot.* = result.id;
-    return fillInfo(info_slot, result.info);
 }
 
 pub export fn sa_db_blob_value_len(
