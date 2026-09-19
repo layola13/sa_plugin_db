@@ -26505,3 +26505,109 @@ test "table csv ingest appends existing indexes incrementally" {
     try std.testing.expectEqual(@as(u64, 2), found.row_index);
     try std.testing.expectEqual(@as(u64, 30), try snapshotGetU64(snapshot, 1, found.row_index));
 }
+
+test "table putBlobValues appends many blobs in one transaction" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "blob_many";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "blob_many.sadb-schema",
+        \\#def MAX_ROWS = 16
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_NOTE_STRIDE = 8 // blob_handle
+    );
+
+    const values = [_][]const u8{ "alpha", "beta", "gamma" };
+    const many = try putBlobValues(std.testing.allocator, ".", table_name, "notes", &values);
+    try std.testing.expectEqual(@as(u64, 1), many.first_id);
+    try std.testing.expectEqual(@as(u64, 3), many.count);
+
+    // ids are contiguous and each value reads back
+    for (values, 0..) |expected, i| {
+        const id = many.first_id + @as(u64, @intCast(i));
+        const len_result = try blobValueLen(std.testing.allocator, ".", table_name, "notes", id);
+        try std.testing.expect(len_result.found);
+        try std.testing.expectEqual(expected.len, @as(usize, @intCast(len_result.len)));
+        var buf: [16]u8 = undefined;
+        const got = try copyBlobValue(std.testing.allocator, ".", table_name, "notes", id, &buf);
+        try std.testing.expect(got.found);
+        try std.testing.expectEqualStrings(expected, buf[0..got.written]);
+    }
+
+    // empty batch is rejected
+    try std.testing.expectError(TableError.InvalidFormat, putBlobValues(std.testing.allocator, ".", table_name, "notes", &.{}));
+}
+
+test "table upsertRawRowsU64Key batches inserts and updates atomically" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "upsert_many";
+    _ = try initTableFromSchemaBytes(std.testing.allocator, ".", "upsert_many.sadb-schema",
+        \\#def MAX_ROWS = 16
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VAL_STRIDE = 8 // u64
+    );
+    _ = try createU64Index(std.testing.allocator, ".", table_name, 0, true);
+
+    var rows: [4][16]u8 = undefined;
+    const keys = [_]u64{ 1, 2, 3, 4 };
+    for (keys, 0..) |key, i| {
+        writeU64LE(&rows[i], 0, key);
+        writeU64LE(&rows[i], 8, key * 10);
+    }
+    const row_slices = [_][]const u8{ &rows[0], &rows[1], &rows[2], &rows[3] };
+    const inserted = try upsertRawRowsU64Key(std.testing.allocator, ".", table_name, 0, &keys, &row_slices);
+    try std.testing.expectEqual(@as(u64, 4), inserted.inserted_count);
+    try std.testing.expectEqual(@as(u64, 4), inserted.info.row_count);
+
+    // mixed: update keys 2,3 and insert key 5
+    var rows2: [3][16]u8 = undefined;
+    const keys2 = [_]u64{ 2, 3, 5 };
+    for (keys2, 0..) |key, i| {
+        writeU64LE(&rows2[i], 0, key);
+        writeU64LE(&rows2[i], 8, key * 99);
+    }
+    const row_slices2 = [_][]const u8{ &rows2[0], &rows2[1], &rows2[2] };
+    const mixed = try upsertRawRowsU64Key(std.testing.allocator, ".", table_name, 0, &keys2, &row_slices2);
+    try std.testing.expectEqual(@as(u64, 1), mixed.inserted_count);
+    try std.testing.expectEqual(@as(u64, 5), mixed.info.row_count);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    const check = [_]struct { key: u64, val: u64 }{
+        .{ .key = 1, .val = 10 },
+        .{ .key = 2, .val = 198 },
+        .{ .key = 3, .val = 297 },
+        .{ .key = 4, .val = 40 },
+        .{ .key = 5, .val = 495 },
+    };
+    for (check) |c| {
+        const found = try snapshotFindU64(snapshot, 0, c.key);
+        try std.testing.expect(found.found);
+        try std.testing.expectEqual(c.val, try snapshotGetU64(snapshot, 1, found.row_index));
+    }
+
+    // key mismatch fails and commits nothing
+    var bad: [16]u8 = undefined;
+    writeU64LE(&bad, 0, 42);
+    writeU64LE(&bad, 8, 1);
+    const bad_rows = [_][]const u8{&bad};
+    const bad_keys = [_]u64{43};
+    try std.testing.expectError(TableError.InvalidFormat, upsertRawRowsU64Key(std.testing.allocator, ".", table_name, 0, &bad_keys, &bad_rows));
+    const after = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer after.destroy();
+    try std.testing.expectEqual(@as(u64, 5), after.row_count);
+    const not_there = try snapshotFindU64(after, 0, 42);
+    try std.testing.expect(!not_there.found);
+}
