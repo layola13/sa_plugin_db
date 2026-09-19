@@ -1333,7 +1333,10 @@ fn syncParentDirBestEffort(path: []const u8) void {
 
 fn syncDirBestEffort(dir_path: []const u8) void {
     if (skipDurabilitySync()) return;
-    var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
+    // NOTE: openDir defaults to O_PATH on Linux, and fsync on an O_PATH fd
+    // always fails with EBADF. .iterate = true forces O_RDONLY so the fsync
+    // below is a real durability barrier for the rename that precedes it.
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     if (builtin.os.tag == .linux) {
         _ = std.os.linux.fsync(dir.fd);
