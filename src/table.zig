@@ -15725,6 +15725,47 @@ pub fn upsertRawRowU64Key(
     return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
 }
 
+pub const UpsertManyResult = struct {
+    info: TableInfo,
+    inserted_count: u64,
+};
+
+/// Batch upsert keyed by a u64 column: `expected_keys[i]` must equal the u64
+/// key stored inside `rows[i]` (same rule as the single-row upsert). All rows
+/// are applied in one transaction; on any validation failure nothing is
+/// committed. `inserted_count` reports how many rows were inserts (the rest
+/// were updates of existing keys).
+pub fn upsertRawRowsU64Key(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    column_index: usize,
+    expected_keys: []const u64,
+    rows: []const []const u8,
+) TableError!UpsertManyResult {
+    if (expected_keys.len != rows.len or rows.len == 0) return TableError.InvalidFormat;
+
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    var tx_live = true;
+    defer if (tx_live) destroyWriteTransaction(allocator, tx);
+
+    var inserted_count: u64 = 0;
+    for (rows, 0..) |row_bytes, i| {
+        const result = writeTransactionUpsertRawRowU64Key(tx, column_index, expected_keys[i], row_bytes) catch |err| {
+            // Rollback: the tx holds all changes in memory, so destroying it
+            // without committing discards everything.
+            destroyWriteTransaction(allocator, tx);
+            tx_live = false;
+            return err;
+        };
+        if (result.inserted) inserted_count += 1;
+    }
+
+    const info = try commitWriteTransaction(allocator, tx);
+    // tx is still owned here; the defer above destroys it.
+    return .{ .info = info, .inserted_count = inserted_count };
+}
+
 pub fn upsertRawRowI64Key(
     allocator: std.mem.Allocator,
     root_dir: []const u8,

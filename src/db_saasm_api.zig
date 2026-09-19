@@ -896,6 +896,48 @@ pub export fn sa_db_upsert_row_u64_key(
     return fillInfo(info_slot, result.info);
 }
 
+/// Batch upsert keyed by a u64 column. `expected[i]` must equal the u64 key
+/// stored inside `rows[i]` (each row is a `SaDbBytesInput`). All rows are
+/// applied in one transaction; `out_inserted_count` reports how many were
+/// inserts. On any validation failure nothing is committed.
+pub export fn sa_db_upsert_many_u64_key(
+    root_ptr: ?[*]const u8,
+    root_len: u64,
+    table_ptr: ?[*]const u8,
+    table_len: u64,
+    column_index: u64,
+    expected_ptr: ?[*]const u64,
+    rows_ptr: ?[*]const SaDbBytesInput,
+    rows_len: u64,
+    out_inserted_count: ?*u64,
+    out_info: ?*SaDbTableInfo,
+) u32 {
+    const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    if (rows_len == 0 or rows_len > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
+    const n: usize = @intCast(rows_len);
+    const inserted_slot = out_inserted_count orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    inserted_slot.* = 0;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const expected = (expected_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
+    const rows_in = (rows_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
+    const rows = gpa.allocator().alloc([]const u8, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
+    defer gpa.allocator().free(rows);
+    for (rows_in, 0..) |item, i| {
+        rows[i] = inputBytes(item.data, item.len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    }
+
+    mutation_mutex.lock();
+    defer mutation_mutex.unlock();
+    const result = table.upsertRawRowsU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, rows) catch |err| return tableStatus(err);
+    inserted_slot.* = result.inserted_count;
+    return fillInfo(info_slot, result.info);
+}
+
 pub export fn sa_db_update_row_u64_key(
     root_ptr: ?[*]const u8,
     root_len: u64,
