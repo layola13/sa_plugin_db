@@ -54,8 +54,36 @@ fn txReentrancyPop(key: u64) void {
         }
     }
 }
-var read_handle_lock = std.Thread.RwLock{};
-var read_handles = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
+// Sharded registry (32 shards) to reduce contention on concurrent reads.
+// Each shard has an independent lock; handles are assigned by hash.
+const READ_HANDLE_SHARDS: usize = 32;
+var read_shard_locks: [READ_HANDLE_SHARDS]std.Thread.Mutex = [_]std.Thread.Mutex{.{}} ** READ_HANDLE_SHARDS;
+var read_shard_maps: [READ_HANDLE_SHARDS]std.AutoHashMap(usize, ReadHandleEntry) = undefined;
+var read_shards_initialized: bool = false;
+var read_shards_init_lock: std.Thread.Mutex = .{};
+
+fn ensureReadShards() void {
+    if (read_shards_initialized) return;
+    read_shards_init_lock.lock();
+    defer read_shards_init_lock.unlock();
+    if (read_shards_initialized) return;
+    for (&read_shard_maps) |*m| {
+        m.* = std.AutoHashMap(usize, ReadHandleEntry).init(std.heap.page_allocator);
+    }
+    read_shards_initialized = true;
+}
+
+fn readShardIndex(key: usize) usize {
+    // MurmurHash3 finalizer: avalanches low-entropy pointer bits (page-aligned
+    // allocations have 12 zero low bits) for uniform shard distribution.
+    var h: u64 = @intCast(key);
+    h ^= h >> 33;
+    h *%= 0xff51afd7ed558ccd;
+    h ^= h >> 33;
+    h *%= 0xc4ceb9fe1a85ec53;
+    h ^= h >> 33;
+    return @as(usize, @intCast(h % READ_HANDLE_SHARDS));
+}
 var tx_handle_mutex = std.Thread.Mutex{};
 var write_tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
 var coltx_handle_lock = std.Thread.RwLock{};
@@ -415,41 +443,48 @@ fn readHandleKey(handle: ?*anyopaque) ?usize {
 }
 
 fn registerReadSnapshot(snapshot: *table.ReadSnapshot) bool {
+    ensureReadShards();
     const key = @intFromPtr(snapshot);
-    read_handle_lock.lock();
-    defer read_handle_lock.unlock();
-    read_handles.put(key, .{ .snapshot = snapshot, .refs = std.atomic.Value(usize).init(0) }) catch return false;
+    const idx = readShardIndex(key);
+    read_shard_locks[idx].lock();
+    defer read_shard_locks[idx].unlock();
+    read_shard_maps[idx].put(key, .{ .snapshot = snapshot, .refs = std.atomic.Value(usize).init(0) }) catch return false;
     return true;
 }
 
 fn acquireReadSnapshot(handle: ?*anyopaque) ?*table.ReadSnapshot {
+    ensureReadShards();
     const key = readHandleKey(handle) orelse return null;
-    read_handle_lock.lockShared();
-    defer read_handle_lock.unlockShared();
-    const entry = read_handles.getPtr(key) orelse return null;
+    const idx = readShardIndex(key);
+    read_shard_locks[idx].lock();
+    defer read_shard_locks[idx].unlock();
+    const entry = read_shard_maps[idx].getPtr(key) orelse return null;
     _ = entry.refs.fetchAdd(1, .acq_rel);
     return entry.snapshot;
 }
 
 fn releaseReadSnapshot(snapshot: *table.ReadSnapshot) void {
     const key = @intFromPtr(snapshot);
-    read_handle_lock.lockShared();
-    defer read_handle_lock.unlockShared();
-    if (read_handles.getPtr(key)) |entry| {
+    const idx = readShardIndex(key);
+    read_shard_locks[idx].lock();
+    defer read_shard_locks[idx].unlock();
+    if (read_shard_maps[idx].getPtr(key)) |entry| {
         const previous = entry.refs.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
     }
 }
 
 fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapshot) u32 {
+    ensureReadShards();
     out_snapshot.* = null;
     const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    read_handle_lock.lock();
-    defer read_handle_lock.unlock();
-    const entry = read_handles.getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
+    const idx = readShardIndex(key);
+    read_shard_locks[idx].lock();
+    defer read_shard_locks[idx].unlock();
+    const entry = read_shard_maps[idx].getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (entry.refs.load(.acquire) != 0) return SA_DB_ERR_LOCKED;
     out_snapshot.* = entry.snapshot;
-    _ = read_handles.remove(key);
+    _ = read_shard_maps[idx].remove(key);
     return SA_DB_OK;
 }
 
