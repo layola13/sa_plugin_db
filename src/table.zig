@@ -4187,7 +4187,19 @@ fn appendSnapshotArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, t
     defer allocator.free(snapshot_meta_name);
     const snapshot_meta_path = try joinPath(allocator, &.{ snapshot_dir_path, snapshot_meta_name });
     defer allocator.free(snapshot_meta_path);
-    const active_meta_source = try readActiveMetaSource(allocator, root_dir, table_name);
+    // In durable mode, read the versioned meta for the pinned epoch
+    // (immutable) instead of the live meta source, which may advance
+    // concurrently. In unsafe mode there is no versioned meta; the caller
+    // holds the write lock so the live source is stable.
+    const active_meta_source = if (skipDurabilitySync())
+        try readActiveMetaSource(allocator, root_dir, table_name)
+    else blk: {
+        const versioned_meta_name = try tableVersionedMetaName(allocator, table_name, meta.epoch);
+        defer allocator.free(versioned_meta_name);
+        const versioned_meta_path = try activePath(allocator, root_dir, versioned_meta_name);
+        defer allocator.free(versioned_meta_path);
+        break :blk try readFileAlloc(allocator, versioned_meta_path, 256 * 1024 * 1024);
+    };
     defer allocator.free(active_meta_source);
     try writeFile(allocator, snapshot_meta_path, active_meta_source);
 
@@ -19615,8 +19627,17 @@ pub fn snapshotTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
+    // Lock-free in durable mode: pins the active epoch, then copies immutable
+    // artifacts. Segment/index/blob files are never modified or deleted by
+    // concurrent writers (old epochs persist until explicit remove), so
+    // copying them without the table write lock yields a consistent snapshot.
+    // In unsafe mode meta.json is overwritten in place (non-atomic), so the
+    // write lock is still required there.
+    var write_lock: ?TableWriteLock = null;
+    if (skipDurabilitySync()) {
+        write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    }
+    defer if (write_lock) |*wl| wl.release();
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
