@@ -309,3 +309,4 @@
 @extern sa_db_max_f32_handle(handle: ptr, column_index: u64, &out_max: ptr) -> u32
 @extern sa_db_min_f64_handle(handle: ptr, column_index: u64, &out_min: ptr) -> u32
 @extern sa_db_max_f64_handle(handle: ptr, column_index: u64, &out_max: ptr) -> u32
+@extern sa_db_set_unsafe_no_sync(enabled: u32) -> u32

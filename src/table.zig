@@ -4,6 +4,13 @@ const schema = @import("schema.zig");
 
 var temp_write_counter = std.atomic.Value(u64).init(0);
 var unsafe_no_sync_state = std.atomic.Value(u8).init(0);
+// Explicit programmatic override for unsafe no-sync mode, set via
+// sa_db_set_unsafe_no_sync(). Tri-state: 0 = not set by API (fall back to
+// SA_DB_UNSAFE_NO_SYNC environment detection), 1 = API forced durable,
+// 2 = API forced no-sync. Once set, the API value permanently overrides the
+// environment variable for the process lifetime. Read on every durability
+// decision, so the API takes effect immediately.
+var api_no_sync_override = std.atomic.Value(u8).init(0);
 var unsafe_init_meta_cache_mutex: std.Thread.Mutex = .{};
 var unsafe_init_meta_cache_next_slot: usize = 0;
 var unsafe_init_meta_cache = [_]?UnsafeInitMetaCacheEntry{null} ** 4;
@@ -59,11 +66,30 @@ fn detectUnsafeNoSyncModeFromProc() bool {
 }
 
 fn detectUnsafeNoSyncMode() bool {
+    // NOTE: the environment variable is only honored when inherited from the
+    // parent process at exec time. libdb.so is statically linked without libc,
+    // so std.posix.getenv returns null here and we fall back to
+    // /proc/self/environ, which reflects the exec-time environment only.
+    // Programmatic setenv()/unsetenv() (e.g. Python os.environ) after process
+    // start is INVISIBLE to this detection. Hosts that need runtime control
+    // must use the sa_db_set_unsafe_no_sync() API instead.
     const value = std.posix.getenv(UNSAFE_NO_SYNC_ENV) orelse return detectUnsafeNoSyncModeFromProc();
     return isTruthyEnvValue(value);
 }
 
+/// Programmatic override for unsafe no-sync mode (backing for the
+/// sa_db_set_unsafe_no_sync C API). Takes effect immediately: the override
+/// is consulted on every durability decision. An explicit false restores
+/// full durability even when SA_DB_UNSAFE_NO_SYNC=1 was inherited.
+pub fn setUnsafeNoSyncOverride(enabled: bool) void {
+    api_no_sync_override.store(if (enabled) 2 else 1, .release);
+}
+
 fn skipDurabilitySync() bool {
+    // Explicit API override wins over the environment variable.
+    const api = api_no_sync_override.load(.acquire);
+    if (api != 0) return api == 2;
+
     const cached = unsafe_no_sync_state.load(.acquire);
     if (cached != 0) return cached == 2;
 
@@ -23200,6 +23226,31 @@ test "table unsafe init cache serves first write transaction bootstrap" {
     const visible = try lookupStringDict(std.testing.allocator, ".", table_name, "status", "active");
     try std.testing.expect(visible.found);
     try std.testing.expectEqual(@as(u64, 1), visible.id);
+}
+
+test "table api no-sync override beats env cache" {
+    const prev_api = api_no_sync_override.load(.acquire);
+    const prev_env = unsafe_no_sync_state.load(.acquire);
+    defer api_no_sync_override.store(prev_api, .release);
+    defer unsafe_no_sync_state.store(prev_env, .release);
+
+    // No API override: cached env detection decides.
+    api_no_sync_override.store(0, .release);
+    unsafe_no_sync_state.store(1, .release); // env said durable
+    try std.testing.expect(!skipDurabilitySync());
+    unsafe_no_sync_state.store(2, .release); // env said no-sync
+    try std.testing.expect(skipDurabilitySync());
+
+    // API true overrides cached durable.
+    unsafe_no_sync_state.store(1, .release);
+    setUnsafeNoSyncOverride(true);
+    try std.testing.expect(skipDurabilitySync());
+
+    // API false overrides cached no-sync: restores durability even when the
+    // env var was inherited as 1 (the dangerous direction).
+    unsafe_no_sync_state.store(2, .release);
+    setUnsafeNoSyncOverride(false);
+    try std.testing.expect(!skipDurabilitySync());
 }
 
 test "table durable init refreshes the meta cache" {

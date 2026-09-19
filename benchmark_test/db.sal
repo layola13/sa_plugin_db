@@ -2116,3 +2116,7 @@
     %out_status = call @sa_db_max_f64_handle(%handle, %column_index, &__db_handle_max_f64_slot_%out_max)
     %out_max = load __db_handle_max_f64_slot_%out_max+0 as f64
 [END_MACRO]
+
+[MACRO] DB_SET_UNSAFE_NO_SYNC %out_status, %enabled
+    %out_status = call @sa_db_set_unsafe_no_sync(%enabled)
+[END_MACRO]

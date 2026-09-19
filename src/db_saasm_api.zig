@@ -7156,6 +7156,18 @@ pub export fn sa_db_max_f64_handle(handle: ?*anyopaque, column_index: u64, out_m
     return SA_DB_OK;
 }
 
+/// Programmatically control unsafe no-sync mode (durability bypass).
+/// `enabled != 0` disables all fsync/fdatasync/rename durability work for
+/// subsequent commits; `enabled == 0` restores full durability. Takes effect
+/// immediately and permanently overrides the SA_DB_UNSAFE_NO_SYNC environment
+/// variable for the process lifetime (the env var is only honored when
+/// inherited from the parent process at exec time; programmatic setenv() is
+/// invisible to the library). Returns SA_DB_OK.
+pub export fn sa_db_set_unsafe_no_sync(enabled: u32) u32 {
+    table.setUnsafeNoSyncOverride(enabled != 0);
+    return SA_DB_OK;
+}
+
 test "db SA ABI logical type helpers" {
     var decimal: i64 = 0;
     try std.testing.expectEqual(SA_DB_OK, sa_db_decimal_from_parts(0, 123, 45, 2, &decimal));
