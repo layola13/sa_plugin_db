@@ -7986,7 +7986,11 @@ fn walShouldCheckpoint(allocator: std.mem.Allocator, root_dir: []const u8, table
     const committed = st.committed_txs;
     const last_ns = st.last_checkpoint_ns;
     wal_checkpoint_states_mutex.unlock();
-    if (committed >= 1000) return true;
+    // 100 txs (was 1000): single-row one-op commits would otherwise let the
+    // WAL grow unbounded between checkpoints, making the per-begin memtable
+    // overlay replay O(N^2). Batch paths (hundreds of rows per tx) are
+    // unaffected — they commit few txs per table.
+    if (committed >= 100) return true;
     const wal_size = walFileSize(allocator, root_dir, table_name);
     if (wal_size >= 4 * 1024 * 1024) return true;
     if (std.time.nanoTimestamp() - last_ns >= 30 * std.time.ns_per_s) return true;
