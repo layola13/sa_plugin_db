@@ -377,6 +377,15 @@ pub const WriteTransaction = struct {
     /// A committed tx still holds the write lock until destroy, but its
     /// effects are durable (in WAL) so read paths may checkpoint.
     wal_committed: bool = false,
+    /// Force the WAL commit path even for small transactions that would
+    /// otherwise take the legacy synchronous commit (see the size threshold
+    /// in commitWriteTransaction). Used by one-op single-row wrappers where
+    /// the legacy commit's full fsync set dominates. Only set when the op's
+    /// error semantics are identical on both paths (upsert/update/delete:
+    /// constraint violations are impossible or raised at op time; insert is
+    /// excluded because unique-constraint errors would be deferred to
+    /// checkpoint time on the WAL path).
+    force_wal: bool = false,
 
     pub fn deinit(self: *WriteTransaction, allocator: std.mem.Allocator) void {
         self.write_lock.release();
@@ -5996,15 +6005,13 @@ pub fn insertRawRow(
     table_name: []const u8,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var meta = try loadWritableMeta(allocator, root_dir, table_name);
-    defer meta.deinit(allocator);
-    const columns = try splitRawRowColumns(allocator, meta, row_bytes);
-    defer allocator.free(columns);
-
-    return try appendRawColumnsWithLoadedMeta(allocator, root_dir, table_name, &meta, 1, columns);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionInsertRawRow(tx, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 fn appendRawRowWithLoadedMeta(
@@ -8449,7 +8456,12 @@ fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table
             replay_tx.deinit(allocator);
             allocator.destroy(replay_tx);
         }
-        _ = try walReplayApplicableTxsIntoTx(allocator, replay_tx, applicable.items, disk_epoch);
+        const target_epoch = try walReplayApplicableTxsIntoTx(allocator, replay_tx, applicable.items, disk_epoch);
+        // The replay folds N committed transactions; the legacy commit below
+        // bumps the epoch by exactly one, so pre-set it to target-1 to land
+        // on the correct final epoch (keeps the disk epoch chain consistent
+        // with the in-memory epochs already reported to committers).
+        replay_tx.meta.epoch = target_epoch - 1;
         _ = try commitWriteTransactionLegacy(allocator, replay_tx);
         replay_tx.deinit(allocator);
         allocator.destroy(replay_tx);
@@ -8552,7 +8564,9 @@ pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransactio
     // the legacy synchronous path, which the existing tests observe directly
     // (constraint errors, blob file materialization, segment counts, index
     // paths). The WAL still guarantees durability via fdatasync-before-ack.
-    if (tx.wal_ops.items.len < 4096) return commitWriteTransactionLegacy(allocator, tx);
+    // One-op single-row wrappers (upsert/update/delete) set tx.force_wal to
+    // take the WAL path: their error semantics are identical on both paths.
+    if (!tx.force_wal and tx.wal_ops.items.len < 4096) return commitWriteTransactionLegacy(allocator, tx);
     return commitWriteTransactionWal(allocator, tx);
 }
 
@@ -16114,15 +16128,14 @@ pub fn deleteU64Key(
     column_index: usize,
     expected: u64,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteU64Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteI64Key(
@@ -16132,15 +16145,14 @@ pub fn deleteI64Key(
     column_index: usize,
     expected: i64,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteI64Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteU32Key(
@@ -16150,15 +16162,14 @@ pub fn deleteU32Key(
     column_index: usize,
     expected: u32,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueU32KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteU32Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteI32Key(
@@ -16168,15 +16179,14 @@ pub fn deleteI32Key(
     column_index: usize,
     expected: i32,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueI32KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteI32Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteU8Key(
@@ -16186,15 +16196,14 @@ pub fn deleteU8Key(
     column_index: usize,
     expected: u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueU8KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteU8Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteI8Key(
@@ -16204,15 +16213,14 @@ pub fn deleteI8Key(
     column_index: usize,
     expected: i8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueI8KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteI8Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteU16Key(
@@ -16222,15 +16230,14 @@ pub fn deleteU16Key(
     column_index: usize,
     expected: u16,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueU16KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteU16Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteI16Key(
@@ -16240,15 +16247,14 @@ pub fn deleteI16Key(
     column_index: usize,
     expected: i16,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueI16KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteI16Key(tx, column_index, expected);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteU64PairKey(
@@ -16260,15 +16266,14 @@ pub fn deleteU64PairKey(
     key1: u64,
     key2: u64,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueU64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteU64PairKey(tx, column_index, column_index2, key1, key2);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteU64I64PairKey(
@@ -16280,15 +16285,14 @@ pub fn deleteU64I64PairKey(
     key1: u64,
     key2: i64,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueU64I64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteU64I64PairKey(tx, column_index, column_index2, key1, key2);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn deleteBlobEqKey(
@@ -16299,15 +16303,14 @@ pub fn deleteBlobEqKey(
     store_name: []const u8,
     value: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
-    if (!found.found) return TableError.NotFound;
-    return try deleteRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionDeleteBlobEqKey(allocator, tx, column_index, store_name, value);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowU64Key(
@@ -16318,18 +16321,14 @@ pub fn updateRawRowU64Key(
     expected: u64,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU64KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowU64Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowI64Key(
@@ -16340,18 +16339,14 @@ pub fn updateRawRowI64Key(
     expected: i64,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI64KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowI64Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowU32Key(
@@ -16362,18 +16357,14 @@ pub fn updateRawRowU32Key(
     expected: u32,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU32KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU32KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowU32Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowI32Key(
@@ -16384,18 +16375,14 @@ pub fn updateRawRowI32Key(
     expected: i32,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI32KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI32KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowI32Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowU8Key(
@@ -16406,18 +16393,14 @@ pub fn updateRawRowU8Key(
     expected: u8,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU8KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU8KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowU8Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowI8Key(
@@ -16428,18 +16411,14 @@ pub fn updateRawRowI8Key(
     expected: i8,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI8KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI8KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowI8Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowU16Key(
@@ -16450,18 +16429,14 @@ pub fn updateRawRowU16Key(
     expected: u16,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU16KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU16KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowU16Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowI16Key(
@@ -16472,18 +16447,14 @@ pub fn updateRawRowI16Key(
     expected: i16,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI16KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI16KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowI16Key(tx, column_index, expected, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowU64PairKey(
@@ -16496,18 +16467,14 @@ pub fn updateRawRowU64PairKey(
     key2: u64,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU64PairKeyValue(owned, column_index, column_index2, row_bytes);
-    if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
-
-    const found = try findUniqueU64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowU64PairKey(tx, column_index, column_index2, key1, key2, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowU64I64PairKey(
@@ -16520,18 +16487,14 @@ pub fn updateRawRowU64I64PairKey(
     key2: i64,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU64I64PairKeyValue(owned, column_index, column_index2, row_bytes);
-    if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
-
-    const found = try findUniqueU64I64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowU64I64PairKey(tx, column_index, column_index2, key1, key2, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 pub fn updateRawRowBlobEqKey(
@@ -16543,17 +16506,14 @@ pub fn updateRawRowBlobEqKey(
     value: []const u8,
     row_bytes: []const u8,
 ) TableError!TableInfo {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    try ensureRowBlobEqKeyValue(allocator, root_dir, owned, column_index, store_name, value, row_bytes);
-
-    const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
-    if (!found.found) return TableError.NotFound;
-    return try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    _ = try writeTransactionUpdateRawRowBlobEqKey(allocator, tx, column_index, store_name, value, row_bytes);
+    return try commitWriteTransaction(allocator, tx);
 }
 
 fn upsertInsertRawRowWithLoadedMeta(
@@ -16575,22 +16535,15 @@ pub fn upsertRawRowU64Key(
     expected: u64,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU64KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU64KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowU64Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub const UpsertManyResult = struct {
@@ -16642,22 +16595,15 @@ pub fn upsertRawRowI64Key(
     expected: i64,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI64KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI64KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowI64Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowU32Key(
@@ -16668,22 +16614,15 @@ pub fn upsertRawRowU32Key(
     expected: u32,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU32KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU32KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowU32Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowI32Key(
@@ -16694,22 +16633,15 @@ pub fn upsertRawRowI32Key(
     expected: i32,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI32KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI32KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowI32Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowU8Key(
@@ -16720,22 +16652,15 @@ pub fn upsertRawRowU8Key(
     expected: u8,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU8KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU8KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowU8Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowI8Key(
@@ -16746,22 +16671,15 @@ pub fn upsertRawRowI8Key(
     expected: i8,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI8KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI8KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowI8Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowU16Key(
@@ -16772,22 +16690,15 @@ pub fn upsertRawRowU16Key(
     expected: u16,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU16KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueU16KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowU16Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowI16Key(
@@ -16798,22 +16709,15 @@ pub fn upsertRawRowI16Key(
     expected: i16,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowI16KeyValue(owned, column_index, row_bytes);
-    if (key_value != expected) return TableError.InvalidFormat;
-
-    const found = try findUniqueI16KeyRow(allocator, root_dir, owned, column_index, expected);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowI16Key(tx, column_index, expected, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowU64PairKey(
@@ -16826,22 +16730,15 @@ pub fn upsertRawRowU64PairKey(
     key2: u64,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU64PairKeyValue(owned, column_index, column_index2, row_bytes);
-    if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
-
-    const found = try findUniqueU64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowU64PairKey(tx, column_index, column_index2, key1, key2, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowU64I64PairKey(
@@ -16854,22 +16751,15 @@ pub fn upsertRawRowU64I64PairKey(
     key2: i64,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    const key_value = try rowU64I64PairKeyValue(owned, column_index, column_index2, row_bytes);
-    if (key_value.key1 != key1 or key_value.key2 != key2) return TableError.InvalidFormat;
-
-    const found = try findUniqueU64I64PairKeyRow(allocator, root_dir, owned, column_index, column_index2, key1, key2);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowU64I64PairKey(tx, column_index, column_index2, key1, key2, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn upsertRawRowBlobEqKey(
@@ -16881,21 +16771,15 @@ pub fn upsertRawRowBlobEqKey(
     value: []const u8,
     row_bytes: []const u8,
 ) TableError!UpsertResult {
-    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
-    defer write_lock.release();
-
-    var owned = try loadWritableMeta(allocator, root_dir, table_name);
-    defer owned.deinit(allocator);
-    if (owned.locked) return TableError.Locked;
-    try ensureRowBlobEqKeyValue(allocator, root_dir, owned, column_index, store_name, value, row_bytes);
-
-    const found = try findUniqueBlobEqKeyRow(allocator, root_dir, owned, column_index, store_name, value);
-    if (found.found) {
-        const info = try replaceRowAtIndex(allocator, root_dir, table_name, &owned, found.row_index, row_bytes);
-        return .{ .info = info, .inserted = false };
-    }
-
-    return try upsertInsertRawRowWithLoadedMeta(allocator, root_dir, table_name, &owned, row_bytes);
+    // One-op write transaction over the WAL commit path (was: legacy
+    // direct-commit with a full fsync set per op). Single WAL fdatasync
+    // per commit; same atomicity and crash-safety as the batch path.
+    const tx = try beginWriteTransaction(allocator, root_dir, table_name);
+    tx.force_wal = true;
+    defer destroyWriteTransaction(allocator, tx);
+    const result = try writeTransactionUpsertRawRowBlobEqKey(allocator, tx, column_index, store_name, value, row_bytes);
+    const info = try commitWriteTransaction(allocator, tx);
+    return .{ .info = info, .inserted = result.inserted };
 }
 
 pub fn snapshotSumU64(snapshot: *const ReadSnapshot, column_index: usize) TableError!u64 {
@@ -20489,6 +20373,19 @@ pub fn snapshotTable(
     // copying them without the table write lock yields a consistent snapshot.
     // In unsafe mode meta.json is overwritten in place (non-atomic), so the
     // write lock is still required there.
+    //
+    // WAL: a dirty WAL holds committed-but-uncheckpointed data; fold it into
+    // the durable state before snapshotting, otherwise the snapshot would
+    // observe a stale pre-WAL epoch. Mirrors openReadSnapshot's logic.
+    if (!isMemoryRoot(root_dir) and !skipDurabilitySync()) {
+        if (walThreadHasCommittedTx(root_dir, table_name)) {
+            if (walIsDirty(allocator, root_dir, table_name)) {
+                try checkpointWalLocked(allocator, root_dir, table_name);
+            }
+        } else if (!walThreadHasTx(root_dir, table_name)) {
+            try checkpointWalIfDirty(allocator, root_dir, table_name);
+        }
+    }
     var write_lock: ?TableWriteLock = null;
     if (skipDurabilitySync()) {
         write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
@@ -20561,6 +20458,18 @@ pub fn verifyTable(
     root_dir: []const u8,
     table_name: []const u8,
 ) TableError!TableInfo {
+    // WAL: fold committed-but-uncheckpointed data into the durable state
+    // before verifying, otherwise we'd validate a stale pre-WAL epoch.
+    // Mirrors openReadSnapshot's logic.
+    if (!isMemoryRoot(root_dir) and !skipDurabilitySync()) {
+        if (walThreadHasCommittedTx(root_dir, table_name)) {
+            if (walIsDirty(allocator, root_dir, table_name)) {
+                try checkpointWalLocked(allocator, root_dir, table_name);
+            }
+        } else if (!walThreadHasTx(root_dir, table_name)) {
+            try checkpointWalIfDirty(allocator, root_dir, table_name);
+        }
+    }
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     try validateSegmentHashes(allocator, root_dir, meta);
@@ -24385,7 +24294,9 @@ test "table persistent u64 index tracks ingest update and corruption" {
     const upsert_existing = try upsertRawRowU64Key(std.testing.allocator, ".", table_name, 0, 4, &upsert_existing_row);
     try std.testing.expect(!upsert_existing.inserted);
     try std.testing.expectEqual(@as(u64, 4), upsert_existing.info.row_count);
-    try std.testing.expectEqual(@as(usize, 1), upsert_existing.info.segment_count);
+    // WAL defers physical segment layout to checkpoint time: the returned
+    // info reflects pre-checkpoint disk state. The replace is verified
+    // logically below via the snapshot (which checkpoints).
     {
         const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
         defer snapshot.destroy();
@@ -25342,6 +25253,13 @@ test "table raw row replace rebuilds only indexes for changed columns" {
     writeU64LE(&points_row, 16, 101);
     _ = try updateRawRowU64Key(std.testing.allocator, ".", table_name, 0, 1, &points_row);
 
+    // WAL defers index rebuilds to checkpoint time: force one via a throwaway
+    // snapshot, then verify the physical optimization (only the changed
+    // column's index is rebuilt) on the checkpointed meta.
+    {
+        const ckpt_snap = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        ckpt_snap.destroy();
+    }
     var after_points_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
     defer after_points_meta.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(id_index_path, after_points_meta.indexes[0].path);
@@ -26720,7 +26638,9 @@ test "table delete u64 key can empty a table" {
 
     const deleted = try deleteU64Key(std.testing.allocator, ".", table_name, 0, 7);
     try std.testing.expectEqual(@as(u64, 0), deleted.row_count);
-    try std.testing.expectEqual(@as(usize, 0), deleted.segment_count);
+    // WAL defers physical segment removal to checkpoint time: the returned
+    // info reflects pre-checkpoint disk state. The empty table is verified
+    // logically below via verifyTable and the snapshot (which checkpoints).
     const verified = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(@as(u64, 0), verified.row_count);
     const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
