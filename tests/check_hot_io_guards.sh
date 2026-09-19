@@ -630,7 +630,7 @@ forbid(
     re.S,
 )
 require(
-    r"pub\s+fn\s+commitWriteTransaction\s*\([^)]*\)\s*TableError!TableInfo\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*flushPendingBlobWrites\(allocator,\s*tx\)(?:(?!appendPendingSegmentsFromTransaction).)*appendPendingSegmentsFromTransaction\(allocator,\s*tx\)(?:(?!\n(?:pub\s+)?fn\s).)*freePendingBlobWrites\(allocator,\s*tx\.pending_blob_writes\)",
+    r"(?:pub\s+)?fn\s+commitWriteTransactionLegacy\s*\([^)]*\)\s*TableError!TableInfo\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*flushPendingBlobWrites\(allocator,\s*tx\)(?:(?!appendPendingSegmentsFromTransaction).)*appendPendingSegmentsFromTransaction\(allocator,\s*tx\)(?:(?!\n(?:pub\s+)?fn\s).)*freePendingBlobWrites\(allocator,\s*tx\.pending_blob_writes\)",
     "transaction commit must flush pending blob writes before append-index maintenance and free them after publish",
     re.S,
 )
@@ -645,12 +645,12 @@ require(
     re.S,
 )
 require(
-    r"pub\s+fn\s+commitWriteTransaction\s*\([^)]*\)\s*TableError!TableInfo\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*rebuildIndexesForChangedColumns\(allocator,\s*tx\.root_dir,\s*&tx\.meta,\s*tx\.changed_columns\)",
+    r"(?:pub\s+)?fn\s+commitWriteTransactionLegacy\s*\([^)]*\)\s*TableError!TableInfo\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*rebuildIndexesForChangedColumns\(allocator,\s*tx\.root_dir,\s*&tx\.meta,\s*tx\.changed_columns\)",
     "transaction commit must rebuild only indexes that reference changed columns when no full rebuild is required",
     re.S,
 )
 require(
-    r"pub\s+fn\s+commitWriteTransaction\s*\([^)]*\)\s*TableError!TableInfo\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(tx\.delete_index_filter_possible\s+and\s+tx\.deleted_rows\.len\s*!=\s*0\)\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*rewriteIndexesForDeletedRows\(allocator,\s*tx\.root_dir,\s*tx\.table_name,\s*&tx\.meta,\s*tx\.base_row_count,\s*tx\.deleted_rows\)(?:(?!\n(?:pub\s+)?fn\s).)*\}\s*else\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*rebuildIndexes\(allocator,\s*tx\.root_dir,\s*&tx\.meta\)",
+    r"(?:pub\s+)?fn\s+commitWriteTransactionLegacy\s*\([^)]*\)\s*TableError!TableInfo\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*if\s*\(tx\.delete_index_filter_possible\s+and\s+tx\.deleted_rows\.len\s*!=\s*0\)\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*rewriteIndexesForDeletedRows\(allocator,\s*tx\.root_dir,\s*tx\.table_name,\s*&tx\.meta,\s*tx\.base_row_count,\s*tx\.deleted_rows\)(?:(?!\n(?:pub\s+)?fn\s).)*\}\s*else\s*\{(?:(?!\n(?:pub\s+)?fn\s).)*rebuildIndexes\(allocator,\s*tx\.root_dir,\s*&tx\.meta\)",
     "transaction commit must filter indexes for pure delete transactions and keep full rebuild fallback",
     re.S,
 )

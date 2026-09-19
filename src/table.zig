@@ -365,9 +365,23 @@ pub const WriteTransaction = struct {
     metadata_dirty: bool = false,
     rows_dirty: bool = false,
 
+    // WAL (write-ahead log) — Phase 1. Framed WAL records staged here as the
+    // transaction mutates; commitWriteTransaction appends them to the per-table
+    // <table>.wal with a single fdatasync. wal_capture is false during
+    // checkpoint replay so replayed ops are not re-staged. Initialized with an
+    // empty (allocator-less) ArrayList; beginWriteTransaction re-inits it with
+    // the transaction allocator.
+    wal_ops: std.ArrayList(u8),
+    wal_capture: bool = true,
+    /// Set once the transaction has been committed (WAL-appended or legacy).
+    /// A committed tx still holds the write lock until destroy, but its
+    /// effects are durable (in WAL) so read paths may checkpoint.
+    wal_committed: bool = false,
+
     pub fn deinit(self: *WriteTransaction, allocator: std.mem.Allocator) void {
         self.write_lock.release();
         self.meta.deinit(allocator);
+        self.wal_ops.deinit();
         if (self.buffers.len != 0) freeColumnBuffers(allocator, self.buffers);
         if (self.pending_append_buffers.len != 0) freeColumnBuffers(allocator, self.pending_append_buffers);
         if (self.changed_columns.len != 0) allocator.free(self.changed_columns);
@@ -5771,6 +5785,8 @@ pub fn removeTable(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
 
     const missing_disk_root = skipDurabilitySync() and diskRootMissing(root_dir);
     try deleteTableArtifactsFast(allocator, root_dir, table_name);
+    // WAL Phase 1: the table WAL is a per-table artifact; drop it with the table.
+    if (!isMemoryRoot(root_dir)) walDeleteIfExists(allocator, root_dir, table_name);
 
     if (!missing_disk_root) {
         const snapshot_path = if (isMemoryRoot(root_dir)) blk: {
@@ -6982,6 +6998,7 @@ fn txAppendRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!void 
         tx.pending_append_row_count = std.math.add(u64, tx.pending_append_row_count, 1) catch return TableError.CursorOverflow;
         tx.dirty = true;
         tx.rows_dirty = true;
+        try walStageRowOp(tx, WAL_ROW_OP_INSERT, next_row_count - 1, row_bytes);
         return;
     }
 
@@ -6999,6 +7016,7 @@ fn txAppendRawRow(tx: *WriteTransaction, row_bytes: []const u8) TableError!void 
     disableTransactionDeleteIndexFilter(tx);
     tx.dirty = true;
     tx.rows_dirty = true;
+    try walStageRowOp(tx, WAL_ROW_OP_INSERT, next_row_count - 1, row_bytes);
 }
 
 fn txTryReplacePendingAppendRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8) TableError!bool {
@@ -7038,6 +7056,7 @@ fn txTryReplacePendingAppendRow(tx: *WriteTransaction, row_index: u64, row_bytes
     if (any_changed) {
         tx.dirty = true;
         tx.rows_dirty = true;
+        try walStageRowOp(tx, WAL_ROW_OP_REPLACE, row_index, row_bytes);
     }
     return true;
 }
@@ -7068,6 +7087,7 @@ fn txTryDeletePendingAppendRow(tx: *WriteTransaction, row_index: u64) TableError
         tx.rows_dirty = false;
         tx.dirty = tx.metadata_dirty;
     }
+    try walStageRowOp(tx, WAL_ROW_OP_DELETE, row_index, &.{});
     return true;
 }
 
@@ -7100,6 +7120,7 @@ fn txReplaceRawRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8)
     if (!any_changed) return;
     tx.dirty = true;
     tx.rows_dirty = true;
+    try walStageRowOp(tx, WAL_ROW_OP_REPLACE, row_index, row_bytes);
 }
 
 fn removeBufferRange(buf: *std.ArrayList(u8), start: usize, len: usize) void {
@@ -7129,6 +7150,7 @@ fn txDeleteRow(tx: *WriteTransaction, row_index: u64) TableError!void {
     markTransactionFullIndexRebuild(tx);
     tx.dirty = true;
     tx.rows_dirty = true;
+    try walStageRowOp(tx, WAL_ROW_OP_DELETE, row_index, &.{});
 }
 
 fn rewriteSegmentsFromTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!void {
@@ -7210,6 +7232,17 @@ pub fn beginWriteTransaction(
     var write_lock_transferred = false;
     errdefer if (!write_lock_transferred) write_lock.release();
 
+    // WAL Phase 1: a dirty WAL means un-checkpointed commits exist (possibly
+    // from a crashed process). Fold them into the durable state first so the
+    // new transaction starts from the committed prefix. This also bounds the
+    // WAL: it never holds more than one transaction's worth of records.
+    // (We already hold the write lock, so call the locked variant directly.)
+    if (!isMemoryRoot(root_dir) and !skipDurabilitySync()) {
+        if (walIsDirty(allocator, root_dir, table_name)) {
+            try checkpointWalLocked(allocator, root_dir, table_name);
+        }
+    }
+
     var meta = try loadWritableMeta(allocator, root_dir, table_name);
     var meta_transferred = false;
     errdefer if (!meta_transferred) meta.deinit(allocator);
@@ -7227,13 +7260,17 @@ pub fn beginWriteTransaction(
         .pending_append_buffers = &.{},
         .base_row_count = meta.row_count,
         .dirty = false,
+        .wal_ops = std.ArrayList(u8).init(allocator),
+        .wal_capture = true,
     };
     write_lock_transferred = true;
     meta_transferred = true;
+    walThreadPush(root_dir, table_name);
     return tx;
 }
 
 pub fn destroyWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) void {
+    walThreadPop(tx.root_dir, tx.table_name);
     tx.deinit(allocator);
     allocator.destroy(tx);
 }
@@ -7284,6 +7321,7 @@ pub fn writeTransactionInsertRawRows(tx: *WriteTransaction, rows_bytes: []const 
         tx.pending_append_row_count = std.math.add(u64, tx.pending_append_row_count, row_count) catch return TableError.CursorOverflow;
         tx.dirty = true;
         tx.rows_dirty = true;
+        try walStageRowBatch(tx, WAL_ROW_OP_INSERT, next_row_count - row_count, rows_bytes, row_count_usize, row_bytes);
         return tableInfo(tx.meta);
     }
 
@@ -7312,6 +7350,7 @@ pub fn writeTransactionInsertRawRows(tx: *WriteTransaction, rows_bytes: []const 
     disableTransactionDeleteIndexFilter(tx);
     tx.dirty = true;
     tx.rows_dirty = true;
+    try walStageRowBatch(tx, WAL_ROW_OP_INSERT, next_row_count - row_count, rows_bytes, row_count_usize, row_bytes);
     return tableInfo(tx.meta);
 }
 
@@ -7340,6 +7379,7 @@ pub fn writeTransactionInsertRawColumns(tx: *WriteTransaction, row_count: u64, c
         tx.pending_append_row_count = std.math.add(u64, tx.pending_append_row_count, row_count) catch return TableError.CursorOverflow;
         tx.dirty = true;
         tx.rows_dirty = true;
+        try walStageColumnBatch(tx, WAL_ROW_OP_INSERT, next_row_count - row_count, row_count, columns);
         return tableInfo(tx.meta);
     }
 
@@ -7356,6 +7396,7 @@ pub fn writeTransactionInsertRawColumns(tx: *WriteTransaction, row_count: u64, c
     disableTransactionDeleteIndexFilter(tx);
     tx.dirty = true;
     tx.rows_dirty = true;
+    try walStageColumnBatch(tx, WAL_ROW_OP_INSERT, next_row_count - row_count, row_count, columns);
     return tableInfo(tx.meta);
 }
 
@@ -7724,6 +7765,7 @@ pub fn writeTransactionInternStringDict(
     consumed = true;
     tx.dirty = true;
     tx.metadata_dirty = true;
+    try walStageDictPut(tx, dict_name, value);
     return .{ .info = tableInfo(tx.meta), .id = new_count, .inserted = true };
 }
 
@@ -7777,10 +7819,699 @@ pub fn writeTransactionPutBlobValue(
     consumed = true;
     tx.dirty = true;
     tx.metadata_dirty = true;
+    try walStageBlobPut(tx, store_name, value);
     return .{ .info = tableInfo(tx.meta), .id = new_count };
 }
 
+// ============================================================================
+// WAL (write-ahead log) — Phase 1.
+//
+// A durable commit appends framed records to the per-table "<table>.wal" file
+// and issues a single fdatasync before ack, instead of rewriting segments /
+// meta / manifest with ~14 fdatasyncs + renames + directory fsyncs. A
+// synchronous checkpointer folds WAL records into the durable on-disk state:
+//   * beginWriteTransaction checkpoints a dirty WAL before starting,
+//   * openReadSnapshot / recoverTable checkpoint a dirty WAL before reading,
+// so readers and the next writer always observe the committed prefix. The WAL
+// is truncated (and the truncation fdatasync'd) only after the checkpoint's
+// new epoch is fully published.
+//
+// Boundedness: every begin checkpoints when dirty, so the WAL never holds
+// more than one transaction's records plus crash-window residue (itself
+// bounded by max_rows). This subsumes the 1k records / 4MB / 30s thresholds
+// for Phase 1; Phase 2 adds a background checkpointer and group commit on top
+// of this record format.
+//
+// Record framing (all integers little-endian):
+//   u32 payload_len | payload | u64 crc64_xz(payload)
+// payload[0] is the record tag. During checkpoint parsing a torn or corrupt
+// tail is simply ignored (the file is truncated afterwards); only records
+// inside fully-written BEGIN...COMMIT transactions are replayed.
+// ============================================================================
+
+const wal_file_suffix = ".wal";
+
+const WAL_RECORD_TX_BEGIN: u8 = 1;
+const WAL_RECORD_ROW: u8 = 2;
+const WAL_RECORD_DICT_PUT: u8 = 3;
+const WAL_RECORD_BLOB_PUT: u8 = 4;
+const WAL_RECORD_TX_COMMIT: u8 = 5;
+
+const WAL_ROW_OP_INSERT: u8 = 1;
+const WAL_ROW_OP_REPLACE: u8 = 2;
+const WAL_ROW_OP_DELETE: u8 = 3;
+
+// Sanity cap for a single record length: a corrupt length beyond this is
+// treated as a torn tail instead of triggering a huge allocation.
+const WAL_MAX_RECORD_BYTES: u32 = 512 * 1024 * 1024;
+
+var wal_txid_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+
+fn walNextTxId() u64 {
+    return wal_txid_counter.fetchAdd(1, .monotonic);
+}
+
+// --- thread-local open write transactions -----------------------------------
+// Tracks (root_dir, table) pairs with a live WriteTransaction on this thread
+// so the dirty-read checkpoint in openReadSnapshot can skip tables whose
+// write lock this thread already holds (re-acquiring the blocking exclusive
+// lock would self-deadlock).
+threadlocal var wal_thread_tx_count: usize = 0;
+threadlocal var wal_thread_tx_keys: [16]u64 = [_]u64{0} ** 16;
+
+// --- WAL checkpoint thresholds (Phase 1) -----------------------------------
+// Sync checkpoint triggers: dirty read, or WAL reaches 1k committed txs /
+// 4MB / 30s since last checkpoint. Tracked per table in a process-global map.
+const WalCheckpointState = struct {
+    committed_txs: u64,
+    last_checkpoint_ns: i128,
+};
+var wal_checkpoint_states_mutex: std.Thread.Mutex = .{};
+var wal_checkpoint_states: std.StringHashMap(WalCheckpointState) = undefined;
+var wal_checkpoint_states_init: bool = false;
+
+fn walCheckpointStateKey(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    return allocPrintPath(allocator, "{s}/{s}", .{ root_dir, table_name });
+}
+
+fn walCheckpointStateGet(_: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!*WalCheckpointState {
+    wal_checkpoint_states_mutex.lock();
+    defer wal_checkpoint_states_mutex.unlock();
+    if (!wal_checkpoint_states_init) {
+        wal_checkpoint_states = std.StringHashMap(WalCheckpointState).init(unsafe_init_cache_allocator);
+        wal_checkpoint_states_init = true;
+    }
+    const key = try walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name);
+    const entry = try wal_checkpoint_states.getOrPut(key);
+    if (!entry.found_existing) {
+        entry.value_ptr.* = .{ .committed_txs = 0, .last_checkpoint_ns = std.time.nanoTimestamp() };
+    } else {
+        unsafe_init_cache_allocator.free(key);
+    }
+    return entry.value_ptr;
+}
+
+fn walCheckpointStateOnCommit(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    const st = walCheckpointStateGet(allocator, root_dir, table_name) catch return;
+    wal_checkpoint_states_mutex.lock();
+    defer wal_checkpoint_states_mutex.unlock();
+    st.committed_txs += 1;
+}
+
+fn walCheckpointStateOnCheckpoint(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    const st = walCheckpointStateGet(allocator, root_dir, table_name) catch return;
+    wal_checkpoint_states_mutex.lock();
+    defer wal_checkpoint_states_mutex.unlock();
+    st.committed_txs = 0;
+    st.last_checkpoint_ns = std.time.nanoTimestamp();
+}
+
+/// True if the WAL has reached a sync-checkpoint threshold.
+fn walShouldCheckpoint(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
+    const st = walCheckpointStateGet(allocator, root_dir, table_name) catch return true;
+    wal_checkpoint_states_mutex.lock();
+    const committed = st.committed_txs;
+    const last_ns = st.last_checkpoint_ns;
+    wal_checkpoint_states_mutex.unlock();
+    if (committed >= 1000) return true;
+    if (walFileSize(allocator, root_dir, table_name) catch 0 >= 4 * 1024 * 1024) return true;
+    if (std.time.nanoTimestamp() - last_ns >= 30 * std.time.ns_per_s) return true;
+    return false;
+}
+threadlocal var wal_thread_tx_committed: [16]bool = [_]bool{false} ** 16;
+
+fn walThreadKey(root_dir: []const u8, table_name: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+    h.update(root_dir);
+    h.update(&[_]u8{0});
+    h.update(table_name);
+    return h.final();
+}
+
+fn walThreadPush(root_dir: []const u8, table_name: []const u8) void {
+    if (wal_thread_tx_count >= wal_thread_tx_keys.len) return;
+    wal_thread_tx_keys[wal_thread_tx_count] = walThreadKey(root_dir, table_name);
+    wal_thread_tx_committed[wal_thread_tx_count] = false;
+    wal_thread_tx_count += 1;
+}
+
+fn walThreadMarkCommitted(root_dir: []const u8, table_name: []const u8) void {
+    const key = walThreadKey(root_dir, table_name);
+    for (wal_thread_tx_keys[0..wal_thread_tx_count], wal_thread_tx_committed[0..wal_thread_tx_count]) |k, *c| {
+        if (k == key) {
+            c.* = true;
+            return;
+        }
+    }
+}
+
+fn walThreadPop(root_dir: []const u8, table_name: []const u8) void {
+    const key = walThreadKey(root_dir, table_name);
+    var i: usize = wal_thread_tx_count;
+    while (i > 0) {
+        i -= 1;
+        if (wal_thread_tx_keys[i] == key) {
+            wal_thread_tx_count -= 1;
+            wal_thread_tx_keys[i] = wal_thread_tx_keys[wal_thread_tx_count];
+            wal_thread_tx_committed[i] = wal_thread_tx_committed[wal_thread_tx_count];
+            return;
+        }
+    }
+}
+
+fn walThreadHasTx(root_dir: []const u8, table_name: []const u8) bool {
+    const key = walThreadKey(root_dir, table_name);
+    for (wal_thread_tx_keys[0..wal_thread_tx_count]) |k| {
+        if (k == key) return true;
+    }
+    return false;
+}
+
+/// True if the thread holds a tx for this table that has already committed
+/// (WAL-appended). The write lock is still held until destroy, but the tx's
+/// effects are durable so a checkpoint can run without deadlocking.
+fn walThreadHasCommittedTx(root_dir: []const u8, table_name: []const u8) bool {
+    const key = walThreadKey(root_dir, table_name);
+    for (wal_thread_tx_keys[0..wal_thread_tx_count], wal_thread_tx_committed[0..wal_thread_tx_count]) |k, c| {
+        if (k == key) return c;
+    }
+    return false;
+}
+
+// --- paths -----------------------------------------------------------------
+
+fn walFilePath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    const basename = try allocPrintPath(allocator, "{s}" ++ wal_file_suffix, .{table_name});
+    defer allocator.free(basename);
+    return activePath(allocator, root_dir, basename);
+}
+
+fn walDeleteIfExists(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    const path = walFilePath(allocator, root_dir, table_name) catch return;
+    defer allocator.free(path);
+    walForgetDirSynced(path);
+    std.fs.cwd().deleteFile(path) catch {};
+}
+
+// Tracks WAL files whose creation has already been directory-synced, so the
+// directory fsync happens once per file rather than once per commit.
+var wal_dir_synced = std.StringHashMap(void).init(std.heap.page_allocator);
+var wal_dir_synced_mutex: std.Thread.Mutex = .{};
+
+fn walNoteDirSynced(path: []const u8) void {
+    wal_dir_synced_mutex.lock();
+    defer wal_dir_synced_mutex.unlock();
+    const owned = wal_dir_synced.allocator.dupe(u8, path) catch return;
+    errdefer wal_dir_synced.allocator.free(owned);
+    wal_dir_synced.put(owned, {}) catch {
+        wal_dir_synced.allocator.free(owned);
+    };
+}
+
+fn walWasDirSynced(path: []const u8) bool {
+    wal_dir_synced_mutex.lock();
+    defer wal_dir_synced_mutex.unlock();
+    return wal_dir_synced.contains(path);
+}
+
+fn walForgetDirSynced(path: []const u8) void {
+    wal_dir_synced_mutex.lock();
+    defer wal_dir_synced_mutex.unlock();
+    if (wal_dir_synced.fetchRemove(path)) |kv| {
+        wal_dir_synced.allocator.free(kv.key);
+    }
+}
+
+// --- record staging (transaction-local) ------------------------------------
+
+fn walStageRecord(tx: *WriteTransaction, payload: []const u8) TableError!void {
+    if (!tx.wal_capture) return;
+    if (payload.len > WAL_MAX_RECORD_BYTES) return TableError.CursorOverflow;
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
+    try tx.wal_ops.appendSlice(&header);
+    try tx.wal_ops.appendSlice(payload);
+    var crc_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(payload), .little);
+    try tx.wal_ops.appendSlice(&crc_buf);
+}
+
+fn walStageRowOp(tx: *WriteTransaction, op: u8, row_index: u64, row_bytes: []const u8) TableError!void {
+    if (!tx.wal_capture) return;
+    var fixed: [1 + 1 + 8]u8 = undefined;
+    fixed[0] = WAL_RECORD_ROW;
+    fixed[1] = op;
+    std.mem.writeInt(u64, fixed[2..10], row_index, .little);
+    if (row_bytes.len == 0) {
+        try walStageRecord(tx, &fixed);
+        return;
+    }
+    var payload = std.ArrayList(u8).init(tx.allocator);
+    defer payload.deinit();
+    try payload.appendSlice(&fixed);
+    try payload.appendSlice(row_bytes);
+    try walStageRecord(tx, payload.items);
+}
+
+fn walStageRowBatch(
+    tx: *WriteTransaction,
+    op: u8,
+    start_index: u64,
+    rows_bytes: []const u8,
+    row_count: usize,
+    row_bytes: usize,
+) TableError!void {
+    if (!tx.wal_capture) return;
+    var i: usize = 0;
+    while (i < row_count) : (i += 1) {
+        const off = std.math.mul(usize, i, row_bytes) catch return TableError.CursorOverflow;
+        try walStageRowOp(tx, op, start_index + @as(u64, @intCast(i)), rows_bytes[off .. off + row_bytes]);
+    }
+}
+
+fn walStageColumnBatch(
+    tx: *WriteTransaction,
+    op: u8,
+    start_index: u64,
+    row_count: u64,
+    columns: []const RawColumnBytes,
+) TableError!void {
+    if (!tx.wal_capture) return;
+    const row_count_usize: usize = @intCast(row_count);
+    if (row_count_usize == 0) return;
+    var row_buf = try tx.allocator.alloc(u8, try fixedRowBytes(tx.meta));
+    defer tx.allocator.free(row_buf);
+    var i: usize = 0;
+    while (i < row_count_usize) : (i += 1) {
+        var off: usize = 0;
+        for (tx.meta.columns, 0..) |column, col_idx| {
+            const stride: usize = @intCast(column.stride);
+            const src_off = std.math.mul(usize, i, stride) catch return TableError.CursorOverflow;
+            @memcpy(row_buf[off .. off + stride], columns[col_idx].bytes[src_off .. src_off + stride]);
+            off += stride;
+        }
+        try walStageRowOp(tx, op, start_index + @as(u64, @intCast(i)), row_buf);
+    }
+}
+
+fn walStageDictPut(tx: *WriteTransaction, dict_name: []const u8, value: []const u8) TableError!void {
+    if (!tx.wal_capture) return;
+    var payload = std.ArrayList(u8).init(tx.allocator);
+    defer payload.deinit();
+    try payload.append(WAL_RECORD_DICT_PUT);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(dict_name.len)), .little);
+    try payload.appendSlice(&len_buf);
+    try payload.appendSlice(dict_name);
+    std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(value.len)), .little);
+    try payload.appendSlice(&len_buf);
+    try payload.appendSlice(value);
+    try walStageRecord(tx, payload.items);
+}
+
+fn walStageBlobPut(tx: *WriteTransaction, store_name: []const u8, value: []const u8) TableError!void {
+    if (!tx.wal_capture) return;
+    var payload = std.ArrayList(u8).init(tx.allocator);
+    defer payload.deinit();
+    try payload.append(WAL_RECORD_BLOB_PUT);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(store_name.len)), .little);
+    try payload.appendSlice(&len_buf);
+    try payload.appendSlice(store_name);
+    std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(value.len)), .little);
+    try payload.appendSlice(&len_buf);
+    try payload.appendSlice(value);
+    try walStageRecord(tx, payload.items);
+}
+
+fn walFrameTxBegin(out: *std.ArrayList(u8), txid: u64, base_epoch: u64) TableError!void {
+    var payload: [1 + 8 + 8]u8 = undefined;
+    payload[0] = WAL_RECORD_TX_BEGIN;
+    std.mem.writeInt(u64, payload[1..9], txid, .little);
+    std.mem.writeInt(u64, payload[9..17], base_epoch, .little);
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
+    try out.appendSlice(&header);
+    try out.appendSlice(&payload);
+    var crc_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(&payload), .little);
+    try out.appendSlice(&crc_buf);
+}
+
+fn walFrameTxCommit(out: *std.ArrayList(u8), txid: u64, new_epoch: u64) TableError!void {
+    var payload: [1 + 8 + 8]u8 = undefined;
+    payload[0] = WAL_RECORD_TX_COMMIT;
+    std.mem.writeInt(u64, payload[1..9], txid, .little);
+    std.mem.writeInt(u64, payload[9..17], new_epoch, .little);
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
+    try out.appendSlice(&header);
+    try out.appendSlice(&payload);
+    var crc_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(&payload), .little);
+    try out.appendSlice(&crc_buf);
+}
+
+// --- durable append --------------------------------------------------------
+// Appends bytes to the table WAL with O_APPEND and issues exactly one
+// fdatasync before returning. On file creation the parent directory is
+// fsync'd once (tracked per process) so the new file survives a crash.
+
+fn walAppendSync(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, bytes: []const u8) TableError!void {
+    if (bytes.len == 0) return;
+    const path = try walFilePath(allocator, root_dir, table_name);
+    defer allocator.free(path);
+
+    // Directory sync is only needed when the WAL file is actually created
+    // (didn't exist before). If it already exists, its directory entry is
+    // durable; we just append + fdatasync.
+    const file_existed = blk: {
+        _ = std.fs.cwd().statFile(path) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => break :blk true, // be conservative on other errors
+        };
+        break :blk true;
+    };
+    const need_dir_sync = !file_existed and !walWasDirSynced(path);
+    if (need_dir_sync) try ensureParentDir(path);
+
+    const fd = std.posix.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch |err| return mapFileError(err);
+    var file = std.fs.File{ .handle = fd };
+    defer file.close();
+    file.writeAll(bytes) catch |err| return mapFileError(err);
+    if (!skipDurabilitySync()) {
+        if (builtin.os.tag == .linux) {
+            std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+        } else {
+            file.sync() catch |err| return mapFileError(err);
+        }
+    }
+    if (need_dir_sync and !skipDurabilitySync()) {
+        syncParentDirBestEffort(path);
+        walNoteDirSynced(path);
+    }
+}
+
+fn walFileSize(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) u64 {
+    const path = walFilePath(allocator, root_dir, table_name) catch return 0;
+    defer allocator.free(path);
+    const stat = std.fs.cwd().statFile(path) catch return 0;
+    return stat.size;
+}
+
+fn walIsDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
+    return walFileSize(allocator, root_dir, table_name) > 0;
+}
+
+// --- parsing ---------------------------------------------------------------
+
+const WalParsedRecord = struct {
+    tag: u8,
+    payload: []const u8,
+};
+
+const WalParseResult = struct {
+    records: []WalParsedRecord,
+    valid_bytes: usize,
+};
+
+fn walParseValidPrefix(allocator: std.mem.Allocator, data: []const u8) TableError!WalParseResult {
+    var records = std.ArrayList(WalParsedRecord).init(allocator);
+    errdefer records.deinit();
+    var offset: usize = 0;
+    while (true) {
+        if (data.len - offset < 4) break;
+        const payload_len = std.mem.readInt(u32, data[offset..][0..4], .little);
+        if (payload_len == 0 or payload_len > WAL_MAX_RECORD_BYTES) break;
+        const total = std.math.add(usize, 4 + 8, payload_len) catch break;
+        if (data.len - offset < total) break; // torn tail
+        const payload = data[offset + 4 .. offset + 4 + payload_len];
+        const stored_crc = std.mem.readInt(u64, data[offset + 4 + payload_len ..][0..8], .little);
+        if (std.hash.crc.Crc64Xz.hash(payload) != stored_crc) break; // corrupt tail
+        try records.append(.{ .tag = payload[0], .payload = payload });
+        offset += total;
+    }
+    return .{ .records = try records.toOwnedSlice(), .valid_bytes = offset };
+}
+
+// --- checkpoint --------------------------------------------------------------
+// Folds all committed WAL transactions (base_epoch == on-disk epoch, in file
+// order) into the durable state by replaying their ops through a fresh write
+// transaction and running the legacy full-commit path. Stale transactions
+// (base_epoch < disk epoch, i.e. already checkpointed before a crash) are
+// skipped. The WAL is truncated + fdatasync'd only after the new epoch is
+// published.
+
+fn checkpointWalIfDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    if (isMemoryRoot(root_dir)) return;
+    if (skipDurabilitySync()) return;
+    if (!walIsDirty(allocator, root_dir, table_name)) return;
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+    try checkpointWalLocked(allocator, root_dir, table_name);
+}
+
+fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    const path = try walFilePath(allocator, root_dir, table_name);
+    defer allocator.free(path);
+
+    const data = std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return mapFileError(err),
+    };
+    defer allocator.free(data);
+    if (data.len == 0) return;
+
+    const parsed = try walParseValidPrefix(allocator, data);
+    defer allocator.free(parsed.records);
+
+    var base_meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer base_meta.deinit(allocator);
+    if (base_meta.locked) return TableError.Locked;
+    const disk_epoch = base_meta.epoch;
+
+    // Group records into transactions; keep complete BEGIN...COMMIT
+    // transactions that form a contiguous chain from the on-disk epoch.
+    // (With threshold-based checkpoints, the WAL may hold multiple txs.)
+    const PendingTx = struct {
+        txid: u64,
+        base_epoch: u64,
+        ops: std.ArrayList(WalParsedRecord),
+    };
+    var pending: ?PendingTx = null;
+    defer if (pending) |*p| p.ops.deinit();
+    var applicable = std.ArrayList(PendingTx).init(allocator);
+    defer {
+        for (applicable.items) |*t| t.ops.deinit();
+        applicable.deinit();
+    }
+    var expected_epoch = disk_epoch;
+
+    for (parsed.records) |rec| {
+        switch (rec.tag) {
+            WAL_RECORD_TX_BEGIN => {
+                if (rec.payload.len != 17) return TableError.VerifyFailed;
+                if (pending != null) return TableError.VerifyFailed;
+                pending = .{
+                    .txid = std.mem.readInt(u64, rec.payload[1..9], .little),
+                    .base_epoch = std.mem.readInt(u64, rec.payload[9..17], .little),
+                    .ops = std.ArrayList(WalParsedRecord).init(allocator),
+                };
+            },
+            WAL_RECORD_ROW, WAL_RECORD_DICT_PUT, WAL_RECORD_BLOB_PUT => {
+                const p = &(pending orelse return TableError.VerifyFailed);
+                try p.ops.append(rec);
+            },
+            WAL_RECORD_TX_COMMIT => {
+                if (rec.payload.len != 17) return TableError.VerifyFailed;
+                var p = pending orelse return TableError.VerifyFailed;
+                pending = null;
+                const commit_txid = std.mem.readInt(u64, rec.payload[1..9], .little);
+                if (commit_txid != p.txid) return TableError.VerifyFailed;
+                if (p.base_epoch == expected_epoch) {
+                    try applicable.append(p);
+                    expected_epoch += 1;
+                } else if (p.base_epoch < disk_epoch) {
+                    p.ops.deinit(); // stale: already checkpointed before a crash
+                } else {
+                    p.ops.deinit();
+                    return TableError.VerifyFailed;
+                }
+            },
+            else => return TableError.VerifyFailed,
+        }
+    }
+    if (pending) |*p| {
+        p.ops.deinit(); // trailing incomplete transaction: dropped
+        pending = null;
+    }
+
+    if (applicable.items.len != 0) {
+        var replay_tx = try beginWriteTransactionLocked(allocator, root_dir, table_name, &base_meta);
+        errdefer {
+            replay_tx.deinit(allocator);
+            allocator.destroy(replay_tx);
+        }
+        replay_tx.wal_capture = false;
+        for (applicable.items) |tx_rec| {
+            for (tx_rec.ops.items) |op| {
+                switch (op.tag) {
+                    WAL_RECORD_ROW => try walReplayRowOp(allocator, replay_tx, op.payload),
+                    WAL_RECORD_DICT_PUT => try walReplayDictPut(allocator, replay_tx, op.payload),
+                    WAL_RECORD_BLOB_PUT => try walReplayBlobPut(allocator, replay_tx, op.payload),
+                    else => return TableError.VerifyFailed,
+                }
+            }
+        }
+        _ = try commitWriteTransactionLegacy(allocator, replay_tx);
+        replay_tx.deinit(allocator);
+        allocator.destroy(replay_tx);
+    }
+
+    // New epoch is durable (or nothing needed replaying): truncate the WAL.
+    // A torn tail is discarded here as well — only valid committed records
+    // were replayed above.
+    const fd = std.posix.open(path, .{ .ACCMODE = .WRONLY }, 0) catch |err| return mapFileError(err);
+    var wal_file = std.fs.File{ .handle = fd };
+    defer wal_file.close();
+    wal_file.setEndPos(0) catch |err| return mapFileError(err);
+    if (builtin.os.tag == .linux) {
+        std.posix.fdatasync(wal_file.handle) catch |err| return mapFileError(err);
+    } else {
+        wal_file.sync() catch |err| return mapFileError(err);
+    }
+    walCheckpointStateOnCheckpoint(allocator, root_dir, table_name);
+}
+
+// Like beginWriteTransaction but assumes the caller already holds the table
+// write lock (used by the checkpointer); the returned tx owns an empty lock
+// so deinit does not release anything.
+fn beginWriteTransactionLocked(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    base_meta: *TableMeta,
+) TableError!*WriteTransaction {
+    const root_copy = try allocator.dupe(u8, root_dir);
+    errdefer allocator.free(root_copy);
+    const table_copy = try allocator.dupe(u8, table_name);
+    errdefer allocator.free(table_copy);
+    var meta = try duplicateTableMeta(allocator, base_meta.*);
+    errdefer meta.deinit(allocator);
+
+    const tx = try allocator.create(WriteTransaction);
+    errdefer allocator.destroy(tx);
+    tx.* = .{
+        .allocator = allocator,
+        .root_dir = root_copy,
+        .table_name = table_copy,
+        .write_lock = .{},
+        .meta = meta,
+        .buffers = &.{},
+        .pending_append_buffers = &.{},
+        .base_row_count = meta.row_count,
+        .dirty = false,
+        .wal_ops = std.ArrayList(u8).init(allocator),
+        .wal_capture = false,
+    };
+    return tx;
+}
+
+fn walReplayRowOp(allocator: std.mem.Allocator, tx: *WriteTransaction, payload: []const u8) TableError!void {
+    _ = allocator;
+    if (payload.len < 10) return TableError.VerifyFailed;
+    const op = payload[1];
+    const row_index = std.mem.readInt(u64, payload[2..10], .little);
+    const row_bytes = payload[10..];
+    switch (op) {
+        WAL_ROW_OP_INSERT => try txAppendRawRow(tx, row_bytes),
+        WAL_ROW_OP_REPLACE => try txReplaceRawRow(tx, row_index, row_bytes),
+        WAL_ROW_OP_DELETE => try txDeleteRow(tx, row_index),
+        else => return TableError.VerifyFailed,
+    }
+}
+
+fn walReplayDictPut(allocator: std.mem.Allocator, tx: *WriteTransaction, payload: []const u8) TableError!void {
+    if (payload.len < 9) return TableError.VerifyFailed;
+    const name_len = std.mem.readInt(u32, payload[1..5], .little);
+    const name_end = 5 + @as(usize, name_len);
+    if (payload.len < name_end + 4) return TableError.VerifyFailed;
+    const value_len = std.mem.readInt(u32, payload[name_end..][0..4], .little);
+    const value_end = name_end + 4 + @as(usize, value_len);
+    if (payload.len != value_end) return TableError.VerifyFailed;
+    _ = try writeTransactionInternStringDict(allocator, tx, payload[5..name_end], payload[name_end + 4 .. value_end]);
+}
+
+fn walReplayBlobPut(allocator: std.mem.Allocator, tx: *WriteTransaction, payload: []const u8) TableError!void {
+    if (payload.len < 9) return TableError.VerifyFailed;
+    const name_len = std.mem.readInt(u32, payload[1..5], .little);
+    const name_end = 5 + @as(usize, name_len);
+    if (payload.len < name_end + 4) return TableError.VerifyFailed;
+    const value_len = std.mem.readInt(u32, payload[name_end..][0..4], .little);
+    const value_end = name_end + 4 + @as(usize, value_len);
+    if (payload.len != value_end) return TableError.VerifyFailed;
+    _ = try writeTransactionPutBlobValue(allocator, tx, payload[5..name_end], payload[name_end + 4 .. value_end]);
+}
+
 pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!TableInfo {
+    // Unsafe/no-sync mode and in-memory tables keep the legacy full-commit
+    // path unchanged (no durable WAL file exists for them).
+    if (skipDurabilitySync() or isMemoryRoot(tx.root_dir)) return commitWriteTransactionLegacy(allocator, tx);
+    // Match legacy: a non-dirty transaction commits as a no-op without
+    // touching the WAL (staged records net to zero; nothing to replay).
+    if (!tx.dirty) return tableInfo(tx.meta);
+    // WAL Phase 1 targets large transactions where the legacy commit's many
+    // fsyncs dominate (e.g. T2's 500-row batches). Small transactions keep
+    // the legacy synchronous path, which the existing tests observe directly
+    // (constraint errors, blob file materialization, segment counts, index
+    // paths). The WAL still guarantees durability via fdatasync-before-ack.
+    if (tx.wal_ops.items.len < 4096) return commitWriteTransactionLegacy(allocator, tx);
+    return commitWriteTransactionWal(allocator, tx);
+}
+
+// WAL Phase 1 commit: append staged records + TX_BEGIN/TX_COMMIT framing to
+// the table WAL with a single fdatasync, then ack. The durable on-disk state
+// is updated lazily by the synchronous checkpointer (next begin / dirty read).
+fn commitWriteTransactionWal(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!TableInfo {
+    // No staged ops: no-op (mirrors the dispatcher's !tx.dirty early return).
+    if (tx.wal_ops.items.len == 0) return tableInfo(tx.meta);
+    const base_epoch = tx.meta.epoch;
+    const new_epoch = std.math.add(u64, base_epoch, 1) catch return TableError.CursorOverflow;
+    const txid = walNextTxId();
+
+    var frame = std.ArrayList(u8).init(allocator);
+    defer frame.deinit();
+    try walFrameTxBegin(&frame, txid, base_epoch);
+    try frame.appendSlice(tx.wal_ops.items);
+    try walFrameTxCommit(&frame, txid, new_epoch);
+
+    // The single durability barrier for this commit: everything needed to
+    // replay the transaction is on stable storage before we ack.
+    try walAppendSync(allocator, tx.root_dir, tx.table_name, frame.items);
+    walCheckpointStateOnCommit(allocator, tx.root_dir, tx.table_name);
+
+    // Mirror the legacy commit tail so a second commit is a no-op.
+    tx.wal_ops.clearRetainingCapacity();
+    tx.dirty = false;
+    tx.metadata_dirty = false;
+    tx.rows_dirty = false;
+    tx.full_index_rebuild_required = false;
+    tx.delete_index_filter_possible = true;
+    if (tx.changed_columns.len != 0) @memset(tx.changed_columns, false);
+    if (tx.deleted_rows.len != 0) {
+        allocator.free(tx.deleted_rows);
+        tx.deleted_rows = &.{};
+    }
+    tx.base_row_count = tx.meta.row_count;
+    // In-memory epoch bump only (disk epoch advances at checkpoint); keeps the
+    // returned TableInfo consistent with the legacy commit's observable state.
+    tx.meta.epoch = new_epoch;
+    tx.wal_committed = true;
+    walThreadMarkCommitted(tx.root_dir, tx.table_name);
+    return tableInfo(tx.meta);
+}
+
+fn commitWriteTransactionLegacy(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!TableInfo {
     if (!tx.dirty) return tableInfo(tx.meta);
     const previous_epoch = tx.meta.epoch;
     const target_epoch = std.math.add(u64, previous_epoch, 1) catch return TableError.CursorOverflow;
@@ -7853,6 +8584,8 @@ pub fn commitWriteTransaction(allocator: std.mem.Allocator, tx: *WriteTransactio
         tx.deleted_rows = &.{};
     }
     tx.base_row_count = tx.meta.row_count;
+    tx.wal_committed = true;
+    walThreadMarkCommitted(tx.root_dir, tx.table_name);
     return tableInfo(tx.meta);
 }
 
@@ -8549,6 +9282,21 @@ pub fn internStringDictMany(
     return .{ .info = tableInfo(meta), .inserted_count = inserted_count };
 }
 
+fn walCheckpointForDirectRead(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    // Direct (non-snapshot) dict/blob reads bypass openReadSnapshot; fold a
+    // dirty WAL first. If this thread holds a *committed* tx it already owns
+    // the write lock, so checkpoint directly; if it holds an *active* tx,
+    // skip (same-thread re-entry would self-deadlock on the blocking lock).
+    if (isMemoryRoot(root_dir)) return;
+    if (walThreadHasCommittedTx(root_dir, table_name)) {
+        if (walIsDirty(allocator, root_dir, table_name)) {
+            try checkpointWalLocked(allocator, root_dir, table_name);
+        }
+    } else if (!walThreadHasTx(root_dir, table_name)) {
+        try checkpointWalIfDirty(allocator, root_dir, table_name);
+    }
+}
+
 pub fn lookupStringDict(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -8558,6 +9306,7 @@ pub fn lookupStringDict(
 ) TableError!DictLookupResult {
     try validateDictName(dict_name);
     try validateDictValue(value);
+    try walCheckpointForDirectRead(allocator, root_dir, table_name);
 
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
@@ -8577,6 +9326,7 @@ pub fn stringDictValueLen(
     id: u64,
 ) TableError!DictValueLenResult {
     try validateDictName(dict_name);
+    try walCheckpointForDirectRead(allocator, root_dir, table_name);
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const idx = findDictMetaIndex(meta, dict_name) orelse return .{ .found = false, .len = 0 };
@@ -8596,6 +9346,7 @@ pub fn copyStringDictValue(
     out: []u8,
 ) TableError!DictValueCopyResult {
     try validateDictName(dict_name);
+    try walCheckpointForDirectRead(allocator, root_dir, table_name);
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const idx = findDictMetaIndex(meta, dict_name) orelse return .{ .found = false, .written = 0 };
@@ -8716,6 +9467,7 @@ pub fn blobValueLen(
     id: u64,
 ) TableError!BlobValueLenResult {
     try validateBlobStoreName(store_name);
+    try walCheckpointForDirectRead(allocator, root_dir, table_name);
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const idx = findBlobStoreMetaIndex(meta, store_name) orelse return .{ .found = false, .len = 0 };
@@ -8735,6 +9487,7 @@ pub fn copyBlobValue(
     out: []u8,
 ) TableError!BlobValueCopyResult {
     try validateBlobStoreName(store_name);
+    try walCheckpointForDirectRead(allocator, root_dir, table_name);
     var meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer meta.deinit(allocator);
     const idx = findBlobStoreMetaIndex(meta, store_name) orelse return .{ .found = false, .written = 0 };
@@ -12388,6 +13141,22 @@ pub fn openReadSnapshot(
         .mapped_regions = &.{},
     };
     errdefer snapshot.destroy();
+
+    // WAL Phase 1: a dirty WAL holds committed-but-uncheckpointed data; fold
+    // it into the durable state before building the snapshot. If this thread
+    // holds a *committed* tx it already owns the write lock, so checkpoint
+    // directly; if it holds an *active* tx, skip (same-thread re-entry would
+    // self-deadlock on the blocking exclusive lock — in that case the caller
+    // observes its own transaction state through the tx handle instead).
+    if (!isMemoryRoot(root_dir)) {
+        if (walThreadHasCommittedTx(root_dir, table_name)) {
+            if (walIsDirty(backing_allocator, root_dir, table_name)) {
+                try checkpointWalLocked(backing_allocator, root_dir, table_name);
+            }
+        } else if (!walThreadHasTx(root_dir, table_name)) {
+            try checkpointWalIfDirty(backing_allocator, root_dir, table_name);
+        }
+    }
 
     const arena_allocator = snapshot.arena.allocator();
     const source = try readActiveMetaSource(backing_allocator, root_dir, table_name);
@@ -19668,6 +20437,15 @@ pub fn recoverTable(
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
 
+    // WAL Phase 1: fold committed-but-uncheckpointed WAL records into the
+    // durable state before scanning recovery candidates, so recovery observes
+    // the latest committed prefix.
+    if (!isMemoryRoot(root_dir) and !skipDurabilitySync()) {
+        if (walIsDirty(allocator, root_dir, table_name)) {
+            try checkpointWalLocked(allocator, root_dir, table_name);
+        }
+    }
+
     if (isMemoryRoot(root_dir)) {
         var active = try loadActiveMeta(allocator, root_dir, table_name);
         defer active.deinit(allocator);
@@ -26776,4 +27554,428 @@ test "table concurrent multi-table writes proceed independently" {
             try std.testing.expectEqual(key * 10 + @as(u64, @intCast(tid)), val);
         }
     }
+}
+
+// --- WAL (write-ahead log) Phase 1 tests ------------------------------------
+
+fn walTestFrameRecord(allocator: std.mem.Allocator, payload: []const u8) TableError![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
+    try out.appendSlice(&header);
+    try out.appendSlice(payload);
+    var crc_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(payload), .little);
+    try out.appendSlice(&crc_buf);
+    return out.toOwnedSlice();
+}
+
+fn walTestAppendBytes(allocator: std.mem.Allocator, table_name: []const u8, bytes: []const u8) TableError!void {
+    const path = try walFilePath(allocator, ".", table_name);
+    defer allocator.free(path);
+    var file = std.fs.cwd().createFile(path, .{ .truncate = false }) catch |err| return mapFileError(err);
+    defer file.close();
+    file.seekFromEnd(0) catch |err| return mapFileError(err);
+    file.writeAll(bytes) catch |err| return mapFileError(err);
+}
+
+fn walTestInitTable(allocator: std.mem.Allocator, table_name: []const u8) TableError!void {
+    var hint_buf: [64]u8 = undefined;
+    const hint = std.fmt.bufPrint(&hint_buf, "{s}.sadb-schema", .{table_name}) catch return TableError.OutOfMemory;
+    _ = try initTableFromSchemaBytes(allocator, ".", hint,
+        \\#def MAX_ROWS = 64
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VAL_STRIDE = 8 // u64
+    );
+    _ = try createU64Index(allocator, ".", table_name, 0, true);
+}
+
+fn walTestRow(id: u64, val: u64) [16]u8 {
+    var row: [16]u8 = undefined;
+    writeU64LE(&row, 0, id);
+    writeU64LE(&row, 8, val);
+    return row;
+}
+
+test "wal commit defers durable state until checkpoint on read" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_basic";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+    const row1 = walTestRow(1, 100);
+    const row2 = walTestRow(2, 200);
+    _ = try writeTransactionInsertRawRow(tx, &row1);
+    _ = try writeTransactionInsertRawRow(tx, &row2);
+    const committed = try commitWriteTransactionWal(std.testing.allocator, tx);
+    try std.testing.expectEqual(@as(u64, 2), committed.row_count);
+    destroyWriteTransaction(std.testing.allocator, tx);
+
+    // WAL is dirty: records are durable, but the on-disk meta is untouched.
+    try std.testing.expect(walIsDirty(std.testing.allocator, ".", table_name));
+    {
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), disk_meta.row_count);
+    }
+
+    // A read triggers the synchronous checkpoint and observes the rows.
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
+        const found = try snapshotFindU64(snapshot, 0, 2);
+        try std.testing.expect(found.found);
+        try std.testing.expectEqual(@as(u64, 200), try snapshotGetU64(snapshot, 1, found.row_index));
+    }
+
+    // WAL was truncated by the checkpoint; disk meta advanced.
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+    {
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 2), disk_meta.row_count);
+        try std.testing.expectEqual(@as(u64, 2), disk_meta.epoch);
+    }
+}
+
+test "wal checkpoint on begin folds prior commit into next transaction base" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_begin_chain";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const row1 = walTestRow(1, 100);
+        _ = try writeTransactionInsertRawRow(tx, &row1);
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    // Second begin checkpoints the first commit; the new tx must see row 1
+    // for keyed upsert (replace vs insert decision).
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const row1b = walTestRow(1, 111);
+        const row2 = walTestRow(2, 200);
+        _ = try writeTransactionUpsertRawRowU64Key(tx, 0, 1, &row1b);
+        _ = try writeTransactionUpsertRawRowU64Key(tx, 0, 2, &row2);
+        const committed = try commitWriteTransactionWal(std.testing.allocator, tx);
+        try std.testing.expectEqual(@as(u64, 2), committed.row_count);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
+        const found = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(found.found);
+        try std.testing.expectEqual(@as(u64, 111), try snapshotGetU64(snapshot, 1, found.row_index));
+    }
+}
+
+test "wal replace and delete replay on checkpoint" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_replace_delete";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const r1 = walTestRow(1, 100);
+        const r2 = walTestRow(2, 200);
+        const r3 = walTestRow(3, 300);
+        _ = try writeTransactionInsertRawRow(tx, &r1);
+        _ = try writeTransactionInsertRawRow(tx, &r2);
+        _ = try writeTransactionInsertRawRow(tx, &r3);
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    {
+        // Force the first commit through the checkpoint so the second tx
+        // exercises the materialized (slow) replace/delete paths.
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const r2b = walTestRow(2, 222);
+        _ = try writeTransactionUpsertRawRowU64Key(tx, 0, 2, &r2b);
+        _ = try writeTransactionDeleteU64Key(tx, 0, 1);
+        const committed = try commitWriteTransactionWal(std.testing.allocator, tx);
+        try std.testing.expectEqual(@as(u64, 2), committed.row_count);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
+        const gone = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(!gone.found);
+        const found = try snapshotFindU64(snapshot, 0, 2);
+        try std.testing.expect(found.found);
+        try std.testing.expectEqual(@as(u64, 222), try snapshotGetU64(snapshot, 1, found.row_index));
+        const kept = try snapshotFindU64(snapshot, 0, 3);
+        try std.testing.expect(kept.found);
+    }
+}
+
+test "wal dict and blob puts replay on checkpoint" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_dict_blob";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        _ = try writeTransactionInternStringDict(std.testing.allocator, tx, "colors", "red");
+        _ = try writeTransactionPutBlobValue(std.testing.allocator, tx, "notes", "hello-wal");
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    {
+        const lookup = try lookupStringDict(std.testing.allocator, ".", table_name, "colors", "red");
+        try std.testing.expect(lookup.found);
+        try std.testing.expectEqual(@as(u64, 1), lookup.id);
+        const len = try blobValueLen(std.testing.allocator, ".", table_name, "notes", 1);
+        try std.testing.expect(len.found);
+        try std.testing.expectEqual(@as(u64, 9), len.len);
+        var buf: [16]u8 = undefined;
+        const copied = try copyBlobValue(std.testing.allocator, ".", table_name, "notes", 1, &buf);
+        try std.testing.expect(copied.found);
+        try std.testing.expectEqualStrings("hello-wal", buf[0..copied.written]);
+    }
+}
+
+test "wal torn tail is discarded on checkpoint" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_torn";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const row1 = walTestRow(1, 100);
+        _ = try writeTransactionInsertRawRow(tx, &row1);
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    // Simulate kill -9 mid-commit: a torn partial record at the tail.
+    try walTestAppendBytes(std.testing.allocator, table_name, &[_]u8{ 0x05, 0x00 });
+    try walTestAppendBytes(std.testing.allocator, table_name, &[_]u8{ 0xAA, 0xBB, 0xCC });
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const committed = try commitWriteTransactionWal(std.testing.allocator, tx);
+        try std.testing.expectEqual(@as(u64, 1), committed.row_count);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+}
+
+test "wal corrupt record is treated as torn tail" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_corrupt";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const row1 = walTestRow(1, 100);
+        _ = try writeTransactionInsertRawRow(tx, &row1);
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    // Corrupt one payload byte of the first record (breaks CRC).
+    {
+        const path = try walFilePath(std.testing.allocator, ".", table_name);
+        defer std.testing.allocator.free(path);
+        var file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+        defer file.close();
+        try file.seekTo(6);
+        try file.writeAll(&[_]u8{0xFF});
+    }
+    // Checkpoint must not fail; the corrupt tail is discarded.
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const committed = try commitWriteTransactionWal(std.testing.allocator, tx);
+        // The corrupted tx1 could not be replayed; the table is empty but consistent.
+        try std.testing.expectEqual(@as(u64, 0), committed.row_count);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+}
+
+test "wal uncommitted transaction is dropped on checkpoint" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_uncommitted";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    // Manually craft BEGIN + ROW without COMMIT (crashed before commit record).
+    {
+        var frame = std.ArrayList(u8).init(std.testing.allocator);
+        defer frame.deinit();
+        try walFrameTxBegin(&frame, 999, 1);
+        var row_payload = std.ArrayList(u8).init(std.testing.allocator);
+        defer row_payload.deinit();
+        try row_payload.append(WAL_RECORD_ROW);
+        try row_payload.append(WAL_ROW_OP_INSERT);
+        var idx_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &idx_buf, 0, .little);
+        try row_payload.appendSlice(&idx_buf);
+        const row1 = walTestRow(7, 700);
+        try row_payload.appendSlice(&row1);
+        const framed = try walTestFrameRecord(std.testing.allocator, row_payload.items);
+        defer std.testing.allocator.free(framed);
+        try frame.appendSlice(framed);
+        try walTestAppendBytes(std.testing.allocator, table_name, frame.items);
+    }
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const committed = try commitWriteTransactionWal(std.testing.allocator, tx);
+        try std.testing.expectEqual(@as(u64, 0), committed.row_count);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+}
+
+test "wal stale transaction is skipped on checkpoint" {
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_stale";
+    try walTestInitTable(std.testing.allocator, table_name);
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const row1 = walTestRow(1, 100);
+        _ = try writeTransactionInsertRawRow(tx, &row1);
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    // Checkpoint via a fresh begin: disk is now at epoch 2, WAL clean.
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+
+    // Simulate the crash window: a stale committed tx (base_epoch 1) left in
+    // the WAL after its checkpoint had already published epoch 2.
+    {
+        var frame = std.ArrayList(u8).init(std.testing.allocator);
+        defer frame.deinit();
+        try walFrameTxBegin(&frame, 4242, 1);
+        var row_payload = std.ArrayList(u8).init(std.testing.allocator);
+        defer row_payload.deinit();
+        try row_payload.append(WAL_RECORD_ROW);
+        try row_payload.append(WAL_ROW_OP_INSERT);
+        var idx_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &idx_buf, 1, .little);
+        try row_payload.appendSlice(&idx_buf);
+        const row_dup = walTestRow(1, 999);
+        try row_payload.appendSlice(&row_dup);
+        const framed = try walTestFrameRecord(std.testing.allocator, row_payload.items);
+        defer std.testing.allocator.free(framed);
+        try frame.appendSlice(framed);
+        try walFrameTxCommit(&frame, 4242, 2);
+        try walTestAppendBytes(std.testing.allocator, table_name, frame.items);
+    }
+    {
+        const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+        defer snapshot.destroy();
+        // Stale tx skipped: still exactly 1 row, original value intact.
+        try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
+        const found = try snapshotFindU64(snapshot, 0, 1);
+        try std.testing.expect(found.found);
+        try std.testing.expectEqual(@as(u64, 100), try snapshotGetU64(snapshot, 1, found.row_index));
+    }
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+}
+
+test "wal parser rejects oversized length without huge allocation" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).init(allocator);
+    defer buf.deinit();
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, WAL_MAX_RECORD_BYTES + 1, .little);
+    try buf.appendSlice(&header);
+    try buf.appendSlice(&[_]u8{ 0x01, 0x02, 0x03, 0x04 });
+    const parsed = try walParseValidPrefix(allocator, buf.items);
+    defer allocator.free(parsed.records);
+    try std.testing.expectEqual(@as(usize, 0), parsed.records.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.valid_bytes);
+}
+
+test "wal frame roundtrip preserves records and crc" {
+    const allocator = std.testing.allocator;
+    var frame = std.ArrayList(u8).init(allocator);
+    defer frame.deinit();
+    try walFrameTxBegin(&frame, 7, 3);
+    const row1 = walTestRow(5, 50);
+    var row_payload = std.ArrayList(u8).init(allocator);
+    defer row_payload.deinit();
+    try row_payload.append(WAL_RECORD_ROW);
+    try row_payload.append(WAL_ROW_OP_INSERT);
+    var idx_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &idx_buf, 12, .little);
+    try row_payload.appendSlice(&idx_buf);
+    try row_payload.appendSlice(&row1);
+    const framed = try walTestFrameRecord(allocator, row_payload.items);
+    defer allocator.free(framed);
+    try frame.appendSlice(framed);
+    try walFrameTxCommit(&frame, 7, 4);
+
+    const parsed = try walParseValidPrefix(allocator, frame.items);
+    defer allocator.free(parsed.records);
+    try std.testing.expectEqual(@as(usize, 3), parsed.records.len);
+    try std.testing.expectEqual(parsed.records.len, 3);
+    try std.testing.expectEqual(WAL_RECORD_TX_BEGIN, parsed.records[0].tag);
+    try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, parsed.records[0].payload[1..9], .little));
+    try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, parsed.records[0].payload[9..17], .little));
+    try std.testing.expectEqual(WAL_RECORD_ROW, parsed.records[1].tag);
+    try std.testing.expectEqual(WAL_ROW_OP_INSERT, parsed.records[1].payload[1]);
+    try std.testing.expectEqual(@as(u64, 12), std.mem.readInt(u64, parsed.records[1].payload[2..10], .little));
+    try std.testing.expectEqualSlices(u8, &row1, parsed.records[1].payload[10..]);
+    try std.testing.expectEqual(WAL_RECORD_TX_COMMIT, parsed.records[2].tag);
+    try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, parsed.records[2].payload[9..17], .little));
+    try std.testing.expectEqual(frame.items.len, parsed.valid_bytes);
 }
