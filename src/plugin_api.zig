@@ -86,7 +86,7 @@ pub const Plugin = struct {
     init: ?*const fn (ctx: *const Context) anyerror!void = null,
     prebuild: ?*const fn (ctx: *const Context, compile_options: *anyopaque) anyerror!void = null,
     postbuild: ?*const fn (ctx: *const Context) anyerror!void = null,
-    handleCommand: ?*const fn (ctx: *const Context, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 = null,
+    handleCommand: ?*const fn (ctx: *const Context, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 = null,
     skills: ?[]const SkillSection = null,
 };
 

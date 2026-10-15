@@ -1,9 +1,329 @@
 const std = @import("std");
+const sio = @import("sio");
 const plugin = @import("plugin_api");
 const qmod = @import("db_stub.zig");
 const schema = @import("schema.zig");
 const table = @import("table.zig");
-pub usingnamespace @import("db_saasm_api.zig");
+const _db_api = @import("db_saasm_api.zig");
+// NOTE(Zig 0.17): usingnamespace removed; explicit re-exports preserve plugin.* ABI.
+pub const SaDbTableInfo = _db_api.SaDbTableInfo;
+pub const SaDbSnapshotInfo = _db_api.SaDbSnapshotInfo;
+pub const SaDbColumnInfo = _db_api.SaDbColumnInfo;
+pub const SaDbColumnLogicalInfo = _db_api.SaDbColumnLogicalInfo;
+pub const SaDbPlanInfo = _db_api.SaDbPlanInfo;
+pub const SaDbPlan3Info = _db_api.SaDbPlan3Info;
+pub const SaDbColumnInput = _db_api.SaDbColumnInput;
+pub const SaDbBytesInput = _db_api.SaDbBytesInput;
+pub const sa_db_blob_put_many = _db_api.sa_db_blob_put_many;
+pub const sa_db_blob_put = _db_api.sa_db_blob_put;
+pub const SaDbCreateIndexRequest = _db_api.SaDbCreateIndexRequest;
+pub const sa_db_decimal_from_parts = _db_api.sa_db_decimal_from_parts;
+pub const sa_db_decimal_to_parts = _db_api.sa_db_decimal_to_parts;
+pub const sa_db_date_from_ymd = _db_api.sa_db_date_from_ymd;
+pub const sa_db_date_to_ymd = _db_api.sa_db_date_to_ymd;
+pub const sa_db_timestamp_ms_from_parts = _db_api.sa_db_timestamp_ms_from_parts;
+pub const sa_db_timestamp_ms_to_parts = _db_api.sa_db_timestamp_ms_to_parts;
+pub const sa_db_timestamp_us_from_parts = _db_api.sa_db_timestamp_us_from_parts;
+pub const sa_db_timestamp_us_to_parts = _db_api.sa_db_timestamp_us_to_parts;
+pub const sa_db_bool_encode = _db_api.sa_db_bool_encode;
+pub const sa_db_bool_decode = _db_api.sa_db_bool_decode;
+pub const sa_db_null_bitmap_required_bytes = _db_api.sa_db_null_bitmap_required_bytes;
+pub const sa_db_null_bitmap_clear = _db_api.sa_db_null_bitmap_clear;
+pub const sa_db_null_bitmap_set = _db_api.sa_db_null_bitmap_set;
+pub const sa_db_null_bitmap_get = _db_api.sa_db_null_bitmap_get;
+pub const sa_db_init_schema = _db_api.sa_db_init_schema;
+pub const sa_db_remove_table = _db_api.sa_db_remove_table;
+pub const sa_db_ingest_columns = _db_api.sa_db_ingest_columns;
+pub const sa_db_insert_row = _db_api.sa_db_insert_row;
+pub const sa_db_upsert_row_u64_key = _db_api.sa_db_upsert_row_u64_key;
+pub const sa_db_upsert_many_u64_key = _db_api.sa_db_upsert_many_u64_key;
+pub const sa_db_update_row_u64_key = _db_api.sa_db_update_row_u64_key;
+pub const sa_db_upsert_row_u32_key = _db_api.sa_db_upsert_row_u32_key;
+pub const sa_db_update_row_u32_key = _db_api.sa_db_update_row_u32_key;
+pub const sa_db_upsert_row_i32_key = _db_api.sa_db_upsert_row_i32_key;
+pub const sa_db_update_row_i32_key = _db_api.sa_db_update_row_i32_key;
+pub const sa_db_upsert_row_u8_key = _db_api.sa_db_upsert_row_u8_key;
+pub const sa_db_update_row_u8_key = _db_api.sa_db_update_row_u8_key;
+pub const sa_db_upsert_row_i8_key = _db_api.sa_db_upsert_row_i8_key;
+pub const sa_db_update_row_i8_key = _db_api.sa_db_update_row_i8_key;
+pub const sa_db_upsert_row_u16_key = _db_api.sa_db_upsert_row_u16_key;
+pub const sa_db_update_row_u16_key = _db_api.sa_db_update_row_u16_key;
+pub const sa_db_upsert_row_i16_key = _db_api.sa_db_upsert_row_i16_key;
+pub const sa_db_update_row_i16_key = _db_api.sa_db_update_row_i16_key;
+pub const sa_db_upsert_row_i64_key = _db_api.sa_db_upsert_row_i64_key;
+pub const sa_db_update_row_i64_key = _db_api.sa_db_update_row_i64_key;
+pub const sa_db_upsert_row_u64_pair_key = _db_api.sa_db_upsert_row_u64_pair_key;
+pub const sa_db_update_row_u64_pair_key = _db_api.sa_db_update_row_u64_pair_key;
+pub const sa_db_upsert_row_u64_i64_pair_key = _db_api.sa_db_upsert_row_u64_i64_pair_key;
+pub const sa_db_update_row_u64_i64_pair_key = _db_api.sa_db_update_row_u64_i64_pair_key;
+pub const sa_db_upsert_row_blob_eq_key = _db_api.sa_db_upsert_row_blob_eq_key;
+pub const sa_db_update_row_blob_eq_key = _db_api.sa_db_update_row_blob_eq_key;
+pub const sa_db_tx_begin = _db_api.sa_db_tx_begin;
+pub const sa_db_tx_insert_row = _db_api.sa_db_tx_insert_row;
+pub const sa_db_tx_insert_rows = _db_api.sa_db_tx_insert_rows;
+pub const sa_db_tx_add_columns = _db_api.sa_db_tx_add_columns;
+pub const sa_db_tx_dict_intern = _db_api.sa_db_tx_dict_intern;
+pub const sa_db_tx_blob_put = _db_api.sa_db_tx_blob_put;
+pub const sa_db_tx_upsert_row_u64_key = _db_api.sa_db_tx_upsert_row_u64_key;
+pub const sa_db_tx_update_row_u64_key = _db_api.sa_db_tx_update_row_u64_key;
+pub const sa_db_tx_upsert_row_u32_key = _db_api.sa_db_tx_upsert_row_u32_key;
+pub const sa_db_tx_update_row_u32_key = _db_api.sa_db_tx_update_row_u32_key;
+pub const sa_db_tx_upsert_row_i32_key = _db_api.sa_db_tx_upsert_row_i32_key;
+pub const sa_db_tx_update_row_i32_key = _db_api.sa_db_tx_update_row_i32_key;
+pub const sa_db_tx_upsert_row_u8_key = _db_api.sa_db_tx_upsert_row_u8_key;
+pub const sa_db_tx_update_row_u8_key = _db_api.sa_db_tx_update_row_u8_key;
+pub const sa_db_tx_upsert_row_i8_key = _db_api.sa_db_tx_upsert_row_i8_key;
+pub const sa_db_tx_update_row_i8_key = _db_api.sa_db_tx_update_row_i8_key;
+pub const sa_db_tx_upsert_row_u16_key = _db_api.sa_db_tx_upsert_row_u16_key;
+pub const sa_db_tx_update_row_u16_key = _db_api.sa_db_tx_update_row_u16_key;
+pub const sa_db_tx_upsert_row_i16_key = _db_api.sa_db_tx_upsert_row_i16_key;
+pub const sa_db_tx_update_row_i16_key = _db_api.sa_db_tx_update_row_i16_key;
+pub const sa_db_tx_upsert_row_i64_key = _db_api.sa_db_tx_upsert_row_i64_key;
+pub const sa_db_tx_update_row_i64_key = _db_api.sa_db_tx_update_row_i64_key;
+pub const sa_db_tx_upsert_row_u64_pair_key = _db_api.sa_db_tx_upsert_row_u64_pair_key;
+pub const sa_db_tx_update_row_u64_pair_key = _db_api.sa_db_tx_update_row_u64_pair_key;
+pub const sa_db_tx_upsert_row_u64_i64_pair_key = _db_api.sa_db_tx_upsert_row_u64_i64_pair_key;
+pub const sa_db_tx_update_row_u64_i64_pair_key = _db_api.sa_db_tx_update_row_u64_i64_pair_key;
+pub const sa_db_tx_upsert_row_blob_eq_key = _db_api.sa_db_tx_upsert_row_blob_eq_key;
+pub const sa_db_tx_update_row_blob_eq_key = _db_api.sa_db_tx_update_row_blob_eq_key;
+pub const sa_db_tx_delete_u64_key = _db_api.sa_db_tx_delete_u64_key;
+pub const sa_db_tx_delete_u32_key = _db_api.sa_db_tx_delete_u32_key;
+pub const sa_db_tx_delete_i32_key = _db_api.sa_db_tx_delete_i32_key;
+pub const sa_db_tx_delete_u8_key = _db_api.sa_db_tx_delete_u8_key;
+pub const sa_db_tx_delete_i8_key = _db_api.sa_db_tx_delete_i8_key;
+pub const sa_db_tx_delete_u16_key = _db_api.sa_db_tx_delete_u16_key;
+pub const sa_db_tx_delete_i16_key = _db_api.sa_db_tx_delete_i16_key;
+pub const sa_db_tx_delete_i64_key = _db_api.sa_db_tx_delete_i64_key;
+pub const sa_db_tx_delete_u64_pair_key = _db_api.sa_db_tx_delete_u64_pair_key;
+pub const sa_db_tx_delete_u64_i64_pair_key = _db_api.sa_db_tx_delete_u64_i64_pair_key;
+pub const sa_db_tx_delete_blob_eq_key = _db_api.sa_db_tx_delete_blob_eq_key;
+pub const sa_db_tx_commit = _db_api.sa_db_tx_commit;
+pub const sa_db_tx_rollback = _db_api.sa_db_tx_rollback;
+pub const sa_db_coltx_begin = _db_api.sa_db_coltx_begin;
+pub const sa_db_coltx_add_columns = _db_api.sa_db_coltx_add_columns;
+pub const sa_db_coltx_commit = _db_api.sa_db_coltx_commit;
+pub const sa_db_coltx_rollback = _db_api.sa_db_coltx_rollback;
+pub const sa_db_create_u64_index = _db_api.sa_db_create_u64_index;
+pub const sa_db_create_i64_index = _db_api.sa_db_create_i64_index;
+pub const sa_db_create_u32_index = _db_api.sa_db_create_u32_index;
+pub const sa_db_create_i32_index = _db_api.sa_db_create_i32_index;
+pub const sa_db_create_u8_index = _db_api.sa_db_create_u8_index;
+pub const sa_db_create_i8_index = _db_api.sa_db_create_i8_index;
+pub const sa_db_create_u16_index = _db_api.sa_db_create_u16_index;
+pub const sa_db_create_i16_index = _db_api.sa_db_create_i16_index;
+pub const sa_db_create_f32_index = _db_api.sa_db_create_f32_index;
+pub const sa_db_create_f64_index = _db_api.sa_db_create_f64_index;
+pub const sa_db_create_u64_pair_index = _db_api.sa_db_create_u64_pair_index;
+pub const sa_db_create_u64_i64_pair_index = _db_api.sa_db_create_u64_i64_pair_index;
+pub const sa_db_create_blob_eq_index = _db_api.sa_db_create_blob_eq_index;
+pub const sa_db_create_blob_token_index = _db_api.sa_db_create_blob_token_index;
+pub const sa_db_create_blob_prefix_index = _db_api.sa_db_create_blob_prefix_index;
+pub const sa_db_create_blob_contains_index = _db_api.sa_db_create_blob_contains_index;
+pub const sa_db_create_indexes = _db_api.sa_db_create_indexes;
+pub const sa_db_dict_intern = _db_api.sa_db_dict_intern;
+pub const sa_db_dict_intern_many = _db_api.sa_db_dict_intern_many;
+pub const sa_db_dict_lookup = _db_api.sa_db_dict_lookup;
+pub const sa_db_dict_value_len = _db_api.sa_db_dict_value_len;
+pub const sa_db_dict_value_copy = _db_api.sa_db_dict_value_copy;
+pub const sa_db_blob_value_len = _db_api.sa_db_blob_value_len;
+pub const sa_db_blob_value_copy = _db_api.sa_db_blob_value_copy;
+pub const sa_db_delete_u64_key = _db_api.sa_db_delete_u64_key;
+pub const sa_db_delete_u32_key = _db_api.sa_db_delete_u32_key;
+pub const sa_db_delete_i32_key = _db_api.sa_db_delete_i32_key;
+pub const sa_db_delete_u8_key = _db_api.sa_db_delete_u8_key;
+pub const sa_db_delete_i8_key = _db_api.sa_db_delete_i8_key;
+pub const sa_db_delete_u16_key = _db_api.sa_db_delete_u16_key;
+pub const sa_db_delete_i16_key = _db_api.sa_db_delete_i16_key;
+pub const sa_db_delete_i64_key = _db_api.sa_db_delete_i64_key;
+pub const sa_db_delete_u64_pair_key = _db_api.sa_db_delete_u64_pair_key;
+pub const sa_db_delete_u64_i64_pair_key = _db_api.sa_db_delete_u64_i64_pair_key;
+pub const sa_db_delete_blob_eq_key = _db_api.sa_db_delete_blob_eq_key;
+pub const sa_db_verify = _db_api.sa_db_verify;
+pub const sa_db_snapshot = _db_api.sa_db_snapshot;
+pub const sa_db_restore = _db_api.sa_db_restore;
+pub const sa_db_recover = _db_api.sa_db_recover;
+pub const sa_db_compact = _db_api.sa_db_compact;
+pub const sa_db_lock = _db_api.sa_db_lock;
+pub const sa_db_unlock = _db_api.sa_db_unlock;
+pub const sa_db_update_u64_add = _db_api.sa_db_update_u64_add;
+pub const sa_db_open_read_table = _db_api.sa_db_open_read_table;
+pub const sa_db_close_read_table = _db_api.sa_db_close_read_table;
+pub const sa_db_snapshot_info_handle = _db_api.sa_db_snapshot_info_handle;
+pub const sa_db_column_info_handle = _db_api.sa_db_column_info_handle;
+pub const sa_db_column_logical_info_handle = _db_api.sa_db_column_logical_info_handle;
+pub const sa_db_export_null_bitmap_handle = _db_api.sa_db_export_null_bitmap_handle;
+pub const sa_db_dict_lookup_handle = _db_api.sa_db_dict_lookup_handle;
+pub const sa_db_dict_value_len_handle = _db_api.sa_db_dict_value_len_handle;
+pub const sa_db_dict_value_copy_handle = _db_api.sa_db_dict_value_copy_handle;
+pub const sa_db_blob_value_len_handle = _db_api.sa_db_blob_value_len_handle;
+pub const sa_db_blob_value_copy_handle = _db_api.sa_db_blob_value_copy_handle;
+pub const sa_db_filter_blob_eq_handle = _db_api.sa_db_filter_blob_eq_handle;
+pub const sa_db_filter_blob_contains_handle = _db_api.sa_db_filter_blob_contains_handle;
+pub const sa_db_filter_blob_token_handle = _db_api.sa_db_filter_blob_token_handle;
+pub const sa_db_filter_blob_prefix_handle = _db_api.sa_db_filter_blob_prefix_handle;
+pub const sa_db_filter_rows_blob_eq_handle = _db_api.sa_db_filter_rows_blob_eq_handle;
+pub const sa_db_filter_rows_blob_contains_handle = _db_api.sa_db_filter_rows_blob_contains_handle;
+pub const sa_db_filter_rows_blob_token_handle = _db_api.sa_db_filter_rows_blob_token_handle;
+pub const sa_db_filter_rows_blob_prefix_handle = _db_api.sa_db_filter_rows_blob_prefix_handle;
+pub const sa_db_sum_u64_handle = _db_api.sa_db_sum_u64_handle;
+pub const sa_db_sum_i64_handle = _db_api.sa_db_sum_i64_handle;
+pub const sa_db_stats_rows_u64_handle = _db_api.sa_db_stats_rows_u64_handle;
+pub const sa_db_stats_rows_i64_handle = _db_api.sa_db_stats_rows_i64_handle;
+pub const sa_db_group_sum_i64_by_u64_handle = _db_api.sa_db_group_sum_i64_by_u64_handle;
+pub const sa_db_group_rows_sum_i64_by_u64_handle = _db_api.sa_db_group_rows_sum_i64_by_u64_handle;
+pub const sa_db_group_sum_i64_by_u64_sorted_handle = _db_api.sa_db_group_sum_i64_by_u64_sorted_handle;
+pub const sa_db_group_rows_sum_i64_by_u64_sorted_handle = _db_api.sa_db_group_rows_sum_i64_by_u64_sorted_handle;
+pub const sa_db_group_stats_i64_by_u64_handle = _db_api.sa_db_group_stats_i64_by_u64_handle;
+pub const sa_db_group_rows_stats_i64_by_u64_handle = _db_api.sa_db_group_rows_stats_i64_by_u64_handle;
+pub const sa_db_group_stats_i64_by_u64_sorted_handle = _db_api.sa_db_group_stats_i64_by_u64_sorted_handle;
+pub const sa_db_group_rows_stats_i64_by_u64_sorted_handle = _db_api.sa_db_group_rows_stats_i64_by_u64_sorted_handle;
+pub const sa_db_count_u64_eq_handle = _db_api.sa_db_count_u64_eq_handle;
+pub const sa_db_count_dict_eq_handle = _db_api.sa_db_count_dict_eq_handle;
+pub const sa_db_count_u64_cmp_handle = _db_api.sa_db_count_u64_cmp_handle;
+pub const sa_db_count_i64_cmp_handle = _db_api.sa_db_count_i64_cmp_handle;
+pub const sa_db_count_u32_cmp_handle = _db_api.sa_db_count_u32_cmp_handle;
+pub const sa_db_count_i32_cmp_handle = _db_api.sa_db_count_i32_cmp_handle;
+pub const sa_db_count_u8_cmp_handle = _db_api.sa_db_count_u8_cmp_handle;
+pub const sa_db_count_i8_cmp_handle = _db_api.sa_db_count_i8_cmp_handle;
+pub const sa_db_count_u16_cmp_handle = _db_api.sa_db_count_u16_cmp_handle;
+pub const sa_db_count_i16_cmp_handle = _db_api.sa_db_count_i16_cmp_handle;
+pub const sa_db_count_f32_cmp_handle = _db_api.sa_db_count_f32_cmp_handle;
+pub const sa_db_count_f64_cmp_handle = _db_api.sa_db_count_f64_cmp_handle;
+pub const sa_db_count_bool_handle = _db_api.sa_db_count_bool_handle;
+pub const sa_db_find_u64_handle = _db_api.sa_db_find_u64_handle;
+pub const sa_db_find_i64_handle = _db_api.sa_db_find_i64_handle;
+pub const sa_db_find_u32_handle = _db_api.sa_db_find_u32_handle;
+pub const sa_db_find_i32_handle = _db_api.sa_db_find_i32_handle;
+pub const sa_db_find_u8_handle = _db_api.sa_db_find_u8_handle;
+pub const sa_db_find_i8_handle = _db_api.sa_db_find_i8_handle;
+pub const sa_db_find_u16_handle = _db_api.sa_db_find_u16_handle;
+pub const sa_db_find_i16_handle = _db_api.sa_db_find_i16_handle;
+pub const sa_db_find_f32_handle = _db_api.sa_db_find_f32_handle;
+pub const sa_db_find_f64_handle = _db_api.sa_db_find_f64_handle;
+pub const sa_db_find_bool_handle = _db_api.sa_db_find_bool_handle;
+pub const sa_db_find_u64_pair_handle = _db_api.sa_db_find_u64_pair_handle;
+pub const sa_db_find_u64_i64_pair_handle = _db_api.sa_db_find_u64_i64_pair_handle;
+pub const sa_db_range_u64_handle = _db_api.sa_db_range_u64_handle;
+pub const sa_db_range_i64_handle = _db_api.sa_db_range_i64_handle;
+pub const sa_db_range_u32_handle = _db_api.sa_db_range_u32_handle;
+pub const sa_db_range_i32_handle = _db_api.sa_db_range_i32_handle;
+pub const sa_db_range_u8_handle = _db_api.sa_db_range_u8_handle;
+pub const sa_db_range_i8_handle = _db_api.sa_db_range_i8_handle;
+pub const sa_db_range_u16_handle = _db_api.sa_db_range_u16_handle;
+pub const sa_db_range_i16_handle = _db_api.sa_db_range_i16_handle;
+pub const sa_db_range_f32_handle = _db_api.sa_db_range_f32_handle;
+pub const sa_db_range_f64_handle = _db_api.sa_db_range_f64_handle;
+pub const sa_db_range_u64_null_bitmap_handle = _db_api.sa_db_range_u64_null_bitmap_handle;
+pub const sa_db_range_i64_null_bitmap_handle = _db_api.sa_db_range_i64_null_bitmap_handle;
+pub const sa_db_range_decimal_i64_handle = _db_api.sa_db_range_decimal_i64_handle;
+pub const sa_db_range_decimal_i64_null_bitmap_handle = _db_api.sa_db_range_decimal_i64_null_bitmap_handle;
+pub const sa_db_range_date_handle = _db_api.sa_db_range_date_handle;
+pub const sa_db_range_date_null_bitmap_handle = _db_api.sa_db_range_date_null_bitmap_handle;
+pub const sa_db_range_timestamp_ms_handle = _db_api.sa_db_range_timestamp_ms_handle;
+pub const sa_db_range_timestamp_ms_null_bitmap_handle = _db_api.sa_db_range_timestamp_ms_null_bitmap_handle;
+pub const sa_db_range_timestamp_us_handle = _db_api.sa_db_range_timestamp_us_handle;
+pub const sa_db_range_timestamp_us_null_bitmap_handle = _db_api.sa_db_range_timestamp_us_null_bitmap_handle;
+pub const sa_db_range_u64_pair_handle = _db_api.sa_db_range_u64_pair_handle;
+pub const sa_db_range_u64_i64_pair_handle = _db_api.sa_db_range_u64_i64_pair_handle;
+pub const sa_db_range_u64_date_pair_handle = _db_api.sa_db_range_u64_date_pair_handle;
+pub const sa_db_range_u64_timestamp_ms_pair_handle = _db_api.sa_db_range_u64_timestamp_ms_pair_handle;
+pub const sa_db_range_u64_timestamp_us_pair_handle = _db_api.sa_db_range_u64_timestamp_us_pair_handle;
+pub const sa_db_filter_u64_pair_key1_handle = _db_api.sa_db_filter_u64_pair_key1_handle;
+pub const sa_db_filter_u64_i64_pair_key1_handle = _db_api.sa_db_filter_u64_i64_pair_key1_handle;
+pub const sa_db_filter_bool_handle = _db_api.sa_db_filter_bool_handle;
+pub const sa_db_filter_dict_eq_handle = _db_api.sa_db_filter_dict_eq_handle;
+pub const sa_db_filter_rows_u64_range_handle = _db_api.sa_db_filter_rows_u64_range_handle;
+pub const sa_db_filter_rows_i64_range_handle = _db_api.sa_db_filter_rows_i64_range_handle;
+pub const sa_db_filter_rows_dict_eq_handle = _db_api.sa_db_filter_rows_dict_eq_handle;
+pub const sa_db_filter_rows_u64_range_null_bitmap_handle = _db_api.sa_db_filter_rows_u64_range_null_bitmap_handle;
+pub const sa_db_filter_rows_i64_range_null_bitmap_handle = _db_api.sa_db_filter_rows_i64_range_null_bitmap_handle;
+pub const sa_db_plan_u64_i64_ranges_handle = _db_api.sa_db_plan_u64_i64_ranges_handle;
+pub const sa_db_plan_u64_u64_ranges_handle = _db_api.sa_db_plan_u64_u64_ranges_handle;
+pub const sa_db_plan_i64_i64_ranges_handle = _db_api.sa_db_plan_i64_i64_ranges_handle;
+pub const sa_db_plan_u64_blob_eq_handle = _db_api.sa_db_plan_u64_blob_eq_handle;
+pub const sa_db_plan_u64_dict_eq_handle = _db_api.sa_db_plan_u64_dict_eq_handle;
+pub const sa_db_plan_i64_dict_eq_handle = _db_api.sa_db_plan_i64_dict_eq_handle;
+pub const sa_db_plan_i64_blob_eq_handle = _db_api.sa_db_plan_i64_blob_eq_handle;
+pub const sa_db_plan_u64_i64_blob_eq_handle = _db_api.sa_db_plan_u64_i64_blob_eq_handle;
+pub const sa_db_plan_u64_i64_dict_eq_handle = _db_api.sa_db_plan_u64_i64_dict_eq_handle;
+pub const sa_db_plan_u64_i64_bool_handle = _db_api.sa_db_plan_u64_i64_bool_handle;
+pub const sa_db_plan_u64_i64_i64_ranges_handle = _db_api.sa_db_plan_u64_i64_i64_ranges_handle;
+pub const sa_db_plan_u64_date_decimal_i64_handle = _db_api.sa_db_plan_u64_date_decimal_i64_handle;
+pub const sa_db_filter_rows_f32_range_handle = _db_api.sa_db_filter_rows_f32_range_handle;
+pub const sa_db_filter_rows_f64_range_handle = _db_api.sa_db_filter_rows_f64_range_handle;
+pub const sa_db_filter_rows_u32_range_handle = _db_api.sa_db_filter_rows_u32_range_handle;
+pub const sa_db_filter_rows_i32_range_handle = _db_api.sa_db_filter_rows_i32_range_handle;
+pub const sa_db_filter_rows_u8_range_handle = _db_api.sa_db_filter_rows_u8_range_handle;
+pub const sa_db_filter_rows_i8_range_handle = _db_api.sa_db_filter_rows_i8_range_handle;
+pub const sa_db_filter_rows_u16_range_handle = _db_api.sa_db_filter_rows_u16_range_handle;
+pub const sa_db_filter_rows_i16_range_handle = _db_api.sa_db_filter_rows_i16_range_handle;
+pub const sa_db_filter_rows_decimal_i64_range_handle = _db_api.sa_db_filter_rows_decimal_i64_range_handle;
+pub const sa_db_filter_rows_decimal_i64_range_null_bitmap_handle = _db_api.sa_db_filter_rows_decimal_i64_range_null_bitmap_handle;
+pub const sa_db_filter_rows_date_range_handle = _db_api.sa_db_filter_rows_date_range_handle;
+pub const sa_db_filter_rows_date_range_null_bitmap_handle = _db_api.sa_db_filter_rows_date_range_null_bitmap_handle;
+pub const sa_db_filter_rows_timestamp_ms_range_handle = _db_api.sa_db_filter_rows_timestamp_ms_range_handle;
+pub const sa_db_filter_rows_timestamp_ms_range_null_bitmap_handle = _db_api.sa_db_filter_rows_timestamp_ms_range_null_bitmap_handle;
+pub const sa_db_filter_rows_timestamp_us_range_handle = _db_api.sa_db_filter_rows_timestamp_us_range_handle;
+pub const sa_db_filter_rows_timestamp_us_range_null_bitmap_handle = _db_api.sa_db_filter_rows_timestamp_us_range_null_bitmap_handle;
+pub const sa_db_filter_rows_bool_handle = _db_api.sa_db_filter_rows_bool_handle;
+pub const sa_db_intersect_rows_handle = _db_api.sa_db_intersect_rows_handle;
+pub const sa_db_union_rows_handle = _db_api.sa_db_union_rows_handle;
+pub const sa_db_except_rows_handle = _db_api.sa_db_except_rows_handle;
+pub const sa_db_sort_rows_u64_handle = _db_api.sa_db_sort_rows_u64_handle;
+pub const sa_db_sort_rows_i64_handle = _db_api.sa_db_sort_rows_i64_handle;
+pub const sa_db_sort_rows_f32_handle = _db_api.sa_db_sort_rows_f32_handle;
+pub const sa_db_sort_rows_f64_handle = _db_api.sa_db_sort_rows_f64_handle;
+pub const sa_db_sort_rows_u32_handle = _db_api.sa_db_sort_rows_u32_handle;
+pub const sa_db_sort_rows_i32_handle = _db_api.sa_db_sort_rows_i32_handle;
+pub const sa_db_sort_rows_u8_handle = _db_api.sa_db_sort_rows_u8_handle;
+pub const sa_db_sort_rows_i8_handle = _db_api.sa_db_sort_rows_i8_handle;
+pub const sa_db_sort_rows_u16_handle = _db_api.sa_db_sort_rows_u16_handle;
+pub const sa_db_sort_rows_i16_handle = _db_api.sa_db_sort_rows_i16_handle;
+pub const sa_db_get_u64_handle = _db_api.sa_db_get_u64_handle;
+pub const sa_db_get_bool_handle = _db_api.sa_db_get_bool_handle;
+pub const sa_db_get_i64_handle = _db_api.sa_db_get_i64_handle;
+pub const sa_db_get_u32_handle = _db_api.sa_db_get_u32_handle;
+pub const sa_db_get_i32_handle = _db_api.sa_db_get_i32_handle;
+pub const sa_db_get_u8_handle = _db_api.sa_db_get_u8_handle;
+pub const sa_db_get_i8_handle = _db_api.sa_db_get_i8_handle;
+pub const sa_db_get_u16_handle = _db_api.sa_db_get_u16_handle;
+pub const sa_db_get_i16_handle = _db_api.sa_db_get_i16_handle;
+pub const sa_db_get_f32_handle = _db_api.sa_db_get_f32_handle;
+pub const sa_db_get_f64_handle = _db_api.sa_db_get_f64_handle;
+pub const sa_db_project_rows_handle = _db_api.sa_db_project_rows_handle;
+pub const sa_db_get_row_handle = _db_api.sa_db_get_row_handle;
+pub const sa_db_get_row_u64_key_handle = _db_api.sa_db_get_row_u64_key_handle;
+pub const sa_db_get_row_i64_key_handle = _db_api.sa_db_get_row_i64_key_handle;
+pub const sa_db_get_row_u32_key_handle = _db_api.sa_db_get_row_u32_key_handle;
+pub const sa_db_get_row_i32_key_handle = _db_api.sa_db_get_row_i32_key_handle;
+pub const sa_db_get_row_u8_key_handle = _db_api.sa_db_get_row_u8_key_handle;
+pub const sa_db_get_row_i8_key_handle = _db_api.sa_db_get_row_i8_key_handle;
+pub const sa_db_get_row_u16_key_handle = _db_api.sa_db_get_row_u16_key_handle;
+pub const sa_db_get_row_i16_key_handle = _db_api.sa_db_get_row_i16_key_handle;
+pub const sa_db_get_row_u64_pair_key_handle = _db_api.sa_db_get_row_u64_pair_key_handle;
+pub const sa_db_get_row_u64_i64_pair_key_handle = _db_api.sa_db_get_row_u64_i64_pair_key_handle;
+pub const sa_db_get_row_blob_eq_key_handle = _db_api.sa_db_get_row_blob_eq_key_handle;
+pub const sa_db_min_u64_handle = _db_api.sa_db_min_u64_handle;
+pub const sa_db_max_u64_handle = _db_api.sa_db_max_u64_handle;
+pub const sa_db_min_i64_handle = _db_api.sa_db_min_i64_handle;
+pub const sa_db_max_i64_handle = _db_api.sa_db_max_i64_handle;
+pub const sa_db_min_u32_handle = _db_api.sa_db_min_u32_handle;
+pub const sa_db_max_u32_handle = _db_api.sa_db_max_u32_handle;
+pub const sa_db_min_i32_handle = _db_api.sa_db_min_i32_handle;
+pub const sa_db_max_i32_handle = _db_api.sa_db_max_i32_handle;
+pub const sa_db_min_u8_handle = _db_api.sa_db_min_u8_handle;
+pub const sa_db_max_u8_handle = _db_api.sa_db_max_u8_handle;
+pub const sa_db_min_i8_handle = _db_api.sa_db_min_i8_handle;
+pub const sa_db_max_i8_handle = _db_api.sa_db_max_i8_handle;
+pub const sa_db_min_u16_handle = _db_api.sa_db_min_u16_handle;
+pub const sa_db_max_u16_handle = _db_api.sa_db_max_u16_handle;
+pub const sa_db_min_i16_handle = _db_api.sa_db_min_i16_handle;
+pub const sa_db_max_i16_handle = _db_api.sa_db_max_i16_handle;
+pub const sa_db_min_f32_handle = _db_api.sa_db_min_f32_handle;
+pub const sa_db_max_f32_handle = _db_api.sa_db_max_f32_handle;
+pub const sa_db_min_f64_handle = _db_api.sa_db_min_f64_handle;
+pub const sa_db_max_f64_handle = _db_api.sa_db_max_f64_handle;
+pub const sa_db_set_unsafe_no_sync = _db_api.sa_db_set_unsafe_no_sync;
 
 const skills = [_]plugin.SkillSection{
     .{
@@ -108,7 +428,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
     };
 }
 
-fn writeDbCliError(writer: std.io.AnyWriter, argv: []const []const u8, err: anyerror) !void {
+fn writeDbCliError(writer: *std.Io.Writer, argv: []const []const u8, err: anyerror) !void {
     const message = switch (err) {
         error.MissingSourcePath => "missing required DB operand",
         error.UnexpectedArgument => "unexpected DB argument",
@@ -141,13 +461,13 @@ fn writeDbCliError(writer: std.io.AnyWriter, argv: []const []const u8, err: anye
     try writer.print("  help: {s}\n", .{dbCliHint(argv, err)});
 }
 
-fn runDbInit(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 {
+fn runDbInit(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 {
     _ = stderr;
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
 
     const source_path = argv[3];
-    const source = std.fs.cwd().readFileAlloc(allocator, source_path, 16 * 1024 * 1024) catch |err| switch (err) {
+    const source = sio.cwd().readFileAlloc(allocator, source_path, 16 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         error.AccessDenied => return error.AccessDenied,
         error.IsDir => return error.NotDir,
@@ -165,14 +485,17 @@ fn runDbInit(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std
     const iface_path = try schema.ifaceFilePath(allocator, source_path);
     defer allocator.free(iface_path);
 
-    var file = std.fs.cwd().createFile(iface_path, .{ .truncate = true }) catch |err| switch (err) {
+    var file = sio.cwd().createFile(iface_path, .{ .truncate = true }) catch |err| switch (err) {
         error.PathAlreadyExists => unreachable,
         error.AccessDenied => return error.AccessDenied,
         error.IsDir => return error.InvalidPath,
         else => return error.InvalidPath,
     };
     defer file.close();
-    try schema.writeIface(file.writer(), parsed);
+    var wbuf: [8192]u8 = undefined;
+    var fw = file.writer(&wbuf);
+    try schema.writeIface(&fw.interface, parsed);
+    try fw.interface.flush();
     try stdout.print("{s}\n", .{iface_path});
     return 0;
 }
@@ -214,7 +537,7 @@ fn mapQmodError(err: qmod.ExecError) anyerror {
     };
 }
 
-fn writeHash(writer: std.io.AnyWriter, hash: [32]u8) !void {
+fn writeHash(writer: *std.Io.Writer, hash: [32]u8) !void {
     const hex = std.fmt.bytesToHex(hash, .lower);
     try writer.writeAll(hex[0..]);
 }
@@ -231,7 +554,7 @@ fn isHashLength(text: []const u8) bool {
     return text.len == 64;
 }
 
-fn printInfo(stdout: std.io.AnyWriter, info: table.TableInfo) !void {
+fn printInfo(stdout: *std.Io.Writer, info: table.TableInfo) !void {
     try stdout.print("row_count: {d}\nsegment_count: {d}\nepoch: {d}\nlocked: {s}\n", .{
         info.row_count,
         info.segment_count,
@@ -244,7 +567,7 @@ fn loadInfo(allocator: std.mem.Allocator, table_name: []const u8) anyerror!table
     return table.verifyTable(allocator, ".", table_name) catch |err| return mapTableError(err);
 }
 
-fn runDbRegister(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbRegister(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     var result = qmod.registerQuery(allocator, argv[3]) catch |err| return mapQmodError(err);
@@ -255,7 +578,7 @@ fn runDbRegister(allocator: std.mem.Allocator, argv: []const []const u8, stdout:
     return 0;
 }
 
-fn runDbExec(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbExec(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     var params_path: ?[]const u8 = null;
     if (argv.len == 6) {
@@ -275,7 +598,7 @@ fn runDbExec(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std
     }
 }
 
-fn runDbIngest(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbIngest(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 5) return error.MissingSourcePath;
     if (argv.len > 5) return error.UnexpectedArgument;
     const info = table.ingestTable(allocator, ".", argv[3], argv[4]) catch |err| return mapTableError(err);
@@ -283,7 +606,7 @@ fn runDbIngest(allocator: std.mem.Allocator, argv: []const []const u8, stdout: s
     return 0;
 }
 
-fn runDbIndexU64(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbIndexU64(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 5) return error.MissingSourcePath;
     if (argv.len > 6) return error.UnexpectedArgument;
     const column_index = std.fmt.parseInt(usize, argv[4], 10) catch return error.InvalidFormat;
@@ -296,7 +619,7 @@ fn runDbIndexU64(allocator: std.mem.Allocator, argv: []const []const u8, stdout:
     return 0;
 }
 
-fn runDbInspect(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbInspect(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     if (isHashText(argv[3])) {
@@ -311,7 +634,7 @@ fn runDbInspect(allocator: std.mem.Allocator, argv: []const []const u8, stdout: 
     return 0;
 }
 
-fn runDbSnapshot(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbSnapshot(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     const info = table.snapshotTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
@@ -319,7 +642,7 @@ fn runDbSnapshot(allocator: std.mem.Allocator, argv: []const []const u8, stdout:
     return 0;
 }
 
-fn runDbRestore(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbRestore(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 5) return error.MissingSourcePath;
     if (argv.len > 5) return error.UnexpectedArgument;
     const epoch = std.fmt.parseInt(u64, argv[4], 10) catch return error.InvalidFormat;
@@ -328,7 +651,7 @@ fn runDbRestore(allocator: std.mem.Allocator, argv: []const []const u8, stdout: 
     return 0;
 }
 
-fn runDbRecover(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbRecover(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     const info = table.recoverTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
@@ -336,7 +659,7 @@ fn runDbRecover(allocator: std.mem.Allocator, argv: []const []const u8, stdout: 
     return 0;
 }
 
-fn runDbVerify(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbVerify(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     const info = table.verifyTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
@@ -344,7 +667,7 @@ fn runDbVerify(allocator: std.mem.Allocator, argv: []const []const u8, stdout: s
     return 0;
 }
 
-fn runDbCompact(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbCompact(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     const info = table.compactTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
@@ -352,7 +675,7 @@ fn runDbCompact(allocator: std.mem.Allocator, argv: []const []const u8, stdout: 
     return 0;
 }
 
-fn runDbLock(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbLock(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     const info = table.lockTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
@@ -360,7 +683,7 @@ fn runDbLock(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std
     return 0;
 }
 
-fn runDbUnlock(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter) anyerror!?u8 {
+fn runDbUnlock(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     const info = table.unlockTable(allocator, ".", argv[3]) catch |err| return mapTableError(err);
@@ -368,7 +691,7 @@ fn runDbUnlock(allocator: std.mem.Allocator, argv: []const []const u8, stdout: s
     return 0;
 }
 
-fn runDbCommandImpl(allocator: std.mem.Allocator, argv: []const []const u8, stdout: std.io.AnyWriter, stderr: std.io.AnyWriter) anyerror!?u8 {
+fn runDbCommandImpl(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 2) return null;
     if (!std.mem.eql(u8, argv[1], "db")) return null;
     if (argv.len < 3) return error.MissingSourcePath;
@@ -400,30 +723,54 @@ fn cArgvToSlice(argv: [*]const [*:0]const u8, argv_len: usize, allocator: std.me
     return out;
 }
 
-fn makeAnyWriter(stream: plugin.HostStream, storage: *plugin.HostStream) ?std.io.AnyWriter {
-    if (stream.write_all == null or stream.ctx == null) return null;
-    storage.* = stream;
-    return .{ .context = storage, .writeFn = struct {
-        fn write(ctx: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const hs = @as(*const plugin.HostStream, @ptrCast(@alignCast(ctx)));
-            const write_all = hs.write_all orelse return error.WriteFailed;
-            if (write_all(hs.ctx, bytes.ptr, bytes.len) != @intFromEnum(plugin.AbiStatus.ok)) return error.WriteFailed;
-            return bytes.len;
+const StreamWriterCtx = struct {
+    stream: plugin.HostStream,
+    io_writer: std.Io.Writer = .{ .buffer = &.{}, .end = 0, .vtable = &vtable },
+    storage: [8192]u8 = std.mem.zeroes([8192]u8),
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *StreamWriterCtx = @fieldParentPtr("io_writer", w);
+        const write_all = self.stream.write_all orelse return error.WriteFailed;
+        const ctx = self.stream.ctx;
+        if (w.end != 0) {
+            if (write_all(ctx, w.buffer[0..w.end].ptr, w.end) != @intFromEnum(plugin.AbiStatus.ok)) return error.WriteFailed;
+            w.end = 0;
         }
-    }.write };
+        var total: usize = 0;
+        for (data, 0..) |slice, i| {
+            const reps: usize = if (i == data.len - 1) splat else 1;
+            var r: usize = 0;
+            while (r < reps) : (r += 1) {
+                if (slice.len == 0) continue;
+                if (write_all(ctx, slice.ptr, slice.len) != @intFromEnum(plugin.AbiStatus.ok)) return error.WriteFailed;
+                total += slice.len;
+            }
+        }
+        return total;
+    }
+};
+
+fn makeAnyWriter(stream: plugin.HostStream, storage: *StreamWriterCtx) ?*std.Io.Writer {
+    if (stream.write_all == null or stream.ctx == null) return null;
+    storage.* = .{ .stream = stream };
+    storage.io_writer.buffer = &storage.storage;
+    storage.io_writer.end = 0;
+    return &storage.io_writer;
 }
 
 fn runDbCommandAbi(ctx: *const plugin.Context, argv: [*]const [*:0]const u8, argv_len: usize, stdout: plugin.HostStream, stderr: plugin.HostStream, out_code: *u8) callconv(.c) u32 {
     _ = ctx;
     out_code.* = 0;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     const args = cArgvToSlice(argv, argv_len, allocator) catch return @intFromEnum(plugin.AbiStatus.failed);
     defer allocator.free(args);
 
-    var stdout_storage = stdout;
-    var stderr_storage = stderr;
+    var stdout_storage: StreamWriterCtx = undefined;
+    var stderr_storage: StreamWriterCtx = undefined;
     const stdout_writer = makeAnyWriter(stdout, &stdout_storage) orelse return @intFromEnum(plugin.AbiStatus.failed);
     const stderr_writer = makeAnyWriter(stderr, &stderr_storage) orelse return @intFromEnum(plugin.AbiStatus.failed);
 
@@ -441,7 +788,7 @@ fn runDbCommandAbi(ctx: *const plugin.Context, argv: [*]const [*:0]const u8, arg
 }
 
 const CaptureStream = struct {
-    buffer: *std.ArrayList(u8),
+    buffer: *std.array_list.Managed(u8),
 };
 
 fn captureWriteAll(ctx: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) u32 {
@@ -486,9 +833,9 @@ test "db plugin wrapper exports runtime descriptor" {
 
 test "db plugin wrapper abi maps missing init schema to cli diagnostic" {
     var ctx = plugin.Context{ .allocator = std.testing.allocator };
-    var stdout_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buffer.deinit();
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
     var stdout_ctx = CaptureStream{ .buffer = &stdout_buffer };
     var stderr_ctx = CaptureStream{ .buffer = &stderr_buffer };
@@ -498,9 +845,9 @@ test "db plugin wrapper abi maps missing init schema to cli diagnostic" {
         for (argv) |arg| std.testing.allocator.free(std.mem.sliceTo(arg, 0));
         std.testing.allocator.free(argv);
     }
-    argv[0] = try std.testing.allocator.dupeZ(u8, "sa");
-    argv[1] = try std.testing.allocator.dupeZ(u8, "db");
-    argv[2] = try std.testing.allocator.dupeZ(u8, "init");
+    argv[0] = try std.testing.allocator.dupeSentinel(u8, "sa", 0);
+    argv[1] = try std.testing.allocator.dupeSentinel(u8, "db", 0);
+    argv[2] = try std.testing.allocator.dupeSentinel(u8, "init", 0);
 
     var out_code: u8 = 255;
     const status = runDbCommandAbi(&ctx, argv.ptr, argv.len, captureHostStream(&stdout_ctx), captureHostStream(&stderr_ctx), &out_code);
@@ -513,7 +860,7 @@ test "db plugin wrapper abi maps missing init schema to cli diagnostic" {
 }
 
 test "db plugin wrapper renders invalid exec params diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>", "--params", "params.bin" };
@@ -524,7 +871,7 @@ test "db plugin wrapper renders invalid exec params diagnostic" {
 }
 
 test "db plugin wrapper renders invalid query hash diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "not-a-hash" };
@@ -535,7 +882,7 @@ test "db plugin wrapper renders invalid query hash diagnostic" {
 }
 
 test "db plugin wrapper renders corrupted registry metadata diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
@@ -546,7 +893,7 @@ test "db plugin wrapper renders corrupted registry metadata diagnostic" {
 }
 
 test "db plugin wrapper renders corrupted query payload diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
@@ -557,7 +904,7 @@ test "db plugin wrapper renders corrupted query payload diagnostic" {
 }
 
 test "db plugin wrapper renders duplicate register diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "register", "query.sa" };
@@ -568,7 +915,7 @@ test "db plugin wrapper renders duplicate register diagnostic" {
 }
 
 test "db plugin wrapper renders schema mismatch diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
@@ -579,7 +926,7 @@ test "db plugin wrapper renders schema mismatch diagnostic" {
 }
 
 test "db plugin wrapper renders column type mismatch diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "register", "query.sa" };
@@ -590,7 +937,7 @@ test "db plugin wrapper renders column type mismatch diagnostic" {
 }
 
 test "db plugin wrapper renders snapshot corrupted diagnostic" {
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
@@ -601,7 +948,7 @@ test "db plugin wrapper renders snapshot corrupted diagnostic" {
 }
 
 test "db inspect rejects malformed 64-byte hash text before table lookup" {
-    var stdout_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buffer.deinit();
 
     const bad_hash = "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
@@ -610,7 +957,7 @@ test "db inspect rejects malformed 64-byte hash text before table lookup" {
 }
 
 test "db plugin wrapper runs init command through ABI" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -627,9 +974,9 @@ test "db plugin wrapper runs init command through ABI" {
     );
 
     var ctx = plugin.Context{ .allocator = std.testing.allocator };
-    var stdout_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stdout_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stdout_buffer.deinit();
-    var stderr_buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
     defer stderr_buffer.deinit();
     var stdout_ctx = CaptureStream{ .buffer = &stdout_buffer };
     var stderr_ctx = CaptureStream{ .buffer = &stderr_buffer };
@@ -639,10 +986,10 @@ test "db plugin wrapper runs init command through ABI" {
         for (argv) |arg| std.testing.allocator.free(std.mem.sliceTo(arg, 0));
         std.testing.allocator.free(argv);
     }
-    argv[0] = try std.testing.allocator.dupeZ(u8, "sa");
-    argv[1] = try std.testing.allocator.dupeZ(u8, "db");
-    argv[2] = try std.testing.allocator.dupeZ(u8, "init");
-    argv[3] = try std.testing.allocator.dupeZ(u8, "flash_sale.sadb-schema");
+    argv[0] = try std.testing.allocator.dupeSentinel(u8, "sa", 0);
+    argv[1] = try std.testing.allocator.dupeSentinel(u8, "db", 0);
+    argv[2] = try std.testing.allocator.dupeSentinel(u8, "init", 0);
+    argv[3] = try std.testing.allocator.dupeSentinel(u8, "flash_sale.sadb-schema", 0);
 
     var out_code: u8 = 255;
     const status = runDbCommandAbi(&ctx, argv.ptr, argv.len, captureHostStream(&stdout_ctx), captureHostStream(&stderr_ctx), &out_code);

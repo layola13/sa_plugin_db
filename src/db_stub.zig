@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const schema = @import("schema.zig");
 const table_mod = @import("table.zig");
 
@@ -225,7 +226,7 @@ fn parseHashHex(text: []const u8) ExecError![32]u8 {
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ExecError![]u8 {
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    var file = sio.cwd().openFile(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return ExecError.FileNotFound,
         else => return ExecError.InvalidPath,
     };
@@ -266,7 +267,7 @@ fn validateQmodFileBytes(file_meta: table_mod.FileMeta, bytes: []const u8) ExecE
 }
 
 fn ensureRegistryDir() ExecError!void {
-    std.fs.cwd().makePath(".sa/db/qmods") catch return ExecError.InvalidPath;
+    sio.cwd().makePath(".sa/db/qmods") catch return ExecError.InvalidPath;
 }
 
 fn qmodPath(allocator: std.mem.Allocator, hash_hex: []const u8) ExecError![]u8 {
@@ -278,7 +279,7 @@ fn metaPath(allocator: std.mem.Allocator, hash_hex: []const u8) ExecError![]u8 {
 }
 
 fn writeFile(path: []const u8, bytes: []const u8) ExecError!void {
-    var file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return ExecError.InvalidPath;
+    var file = sio.cwd().createFile(path, .{ .truncate = true }) catch return ExecError.InvalidPath;
     defer file.close();
     file.writeAll(bytes) catch return ExecError.InvalidPath;
 }
@@ -440,7 +441,7 @@ fn parseAtomicBasePointer(line: []const u8) ExecError!?[]const u8 {
     const atomic_idx = std.mem.indexOf(u8, line, "atomic_rmw_") orelse return null;
     const rest = line[atomic_idx..];
     const split = std.mem.indexOfAny(u8, rest, " \t") orelse return ExecError.UnsupportedOperation;
-    const args = std.mem.trimLeft(u8, rest[split..], " \t");
+    const args = std.mem.trimStart(u8, rest[split..], " \t");
     const comma = std.mem.indexOfScalar(u8, args, ',') orelse return ExecError.UnsupportedOperation;
     const addr = std.mem.trim(u8, args[0..comma], " \t");
     const plus = std.mem.indexOfScalar(u8, addr, '+') orelse return ExecError.UnsupportedOperation;
@@ -451,7 +452,7 @@ fn parseAtomicOffsetToken(line: []const u8) ExecError!?[]const u8 {
     const atomic_idx = std.mem.indexOf(u8, line, "atomic_rmw_") orelse return null;
     const rest = line[atomic_idx..];
     const split = std.mem.indexOfAny(u8, rest, " \t") orelse return ExecError.UnsupportedOperation;
-    const args = std.mem.trimLeft(u8, rest[split..], " \t");
+    const args = std.mem.trimStart(u8, rest[split..], " \t");
     const comma = std.mem.indexOfScalar(u8, args, ',') orelse return ExecError.UnsupportedOperation;
     const addr = std.mem.trim(u8, args[0..comma], " \t");
     const plus = std.mem.indexOfScalar(u8, addr, '+') orelse return ExecError.UnsupportedOperation;
@@ -683,7 +684,7 @@ fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError
 
     for (parsed.value.columns, 0..) |meta_column, col_idx| {
         if (!isReadableColumn(meta_column.ty, meta_column.stride)) return ExecError.UnsupportedOperation;
-        var merged = std.ArrayList(u8).init(allocator);
+        var merged = std.array_list.Managed(u8).init(allocator);
         errdefer merged.deinit();
         for (parsed.value.segments) |segment| {
             if (segment.files.len != parsed.value.columns.len) return ExecError.SnapshotCorrupted;
@@ -835,7 +836,7 @@ fn countLinesWithPrefix(source: []const u8, prefix: []const u8) u64 {
     var count: u64 = 0;
     var it = std.mem.splitScalar(u8, source, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t\r");
+        const trimmed = std.mem.trimStart(u8, line, " \t\r");
         if (std.mem.startsWith(u8, trimmed, prefix)) count += 1;
     }
     return count;
@@ -864,14 +865,14 @@ fn trimLineComment(line: []const u8) []const u8 {
     return std.mem.trim(u8, body, " \t\r\n");
 }
 
-fn appendGrantEntry(allocator: std.mem.Allocator, entries: *std.ArrayList([]u8), entry: []const u8) ExecError!void {
+fn appendGrantEntry(allocator: std.mem.Allocator, entries: *std.array_list.Managed([]u8), entry: []const u8) ExecError!void {
     const trimmed = std.mem.trim(u8, entry, " \t\r\n");
     if (trimmed.len == 0) return;
     entries.append(allocator.dupe(u8, trimmed) catch return ExecError.OutOfMemory) catch return ExecError.OutOfMemory;
 }
 
 fn parseGrants(allocator: std.mem.Allocator, source: []const u8) ExecError!GrantSet {
-    var entries = std.ArrayList([]u8).init(allocator);
+    var entries = std.array_list.Managed([]u8).init(allocator);
     errdefer {
         for (entries.items) |entry| allocator.free(entry);
         entries.deinit();
@@ -921,7 +922,7 @@ fn findMainName(source: []const u8) []const u8 {
     var first_name: ?[]const u8 = null;
     var it = std.mem.splitScalar(u8, source, '\n');
     while (it.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t\r");
+        const trimmed = std.mem.trimStart(u8, line, " \t\r");
         if (!std.mem.startsWith(u8, trimmed, "@")) continue;
         const open = std.mem.indexOfScalar(u8, trimmed, '(') orelse continue;
         const name = trimmed[1..open];
@@ -941,7 +942,7 @@ fn parseFunctionSig(allocator: std.mem.Allocator, source: []const u8, expected_n
         const name = trimmed[1..open];
         if (!std.mem.eql(u8, name, expected_name)) continue;
         const params_text = trimmed[open + 1 .. open + 1 + close];
-        var params = std.ArrayList([]const u8).init(allocator);
+        var params = std.array_list.Managed([]const u8).init(allocator);
         errdefer params.deinit();
         var param_it = std.mem.splitScalar(u8, params_text, ',');
         while (param_it.next()) |raw_param| {
@@ -1090,7 +1091,7 @@ fn parseDbFunctionParams(allocator: std.mem.Allocator, source: []const u8, main_
             const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
             if (std.mem.startsWith(u8, raw_name, "&")) {
                 if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
-                const param_name = std.mem.trimLeft(u8, raw_name[1..], " \t");
+                const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
                 const column_name = columnNameFromPointer(param_name) orelse return ExecError.UnsupportedOperation;
                 const column = findColumn(read_table, column_name) orelse return ExecError.InvalidFormat;
                 pointers.put(param_name, column) catch return ExecError.OutOfMemory;
@@ -1127,7 +1128,7 @@ fn parseWriteDbFunctionParams(allocator: std.mem.Allocator, source: []const u8, 
             const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
             if (std.mem.startsWith(u8, raw_name, "&")) {
                 if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
-                const param_name = std.mem.trimLeft(u8, raw_name[1..], " \t");
+                const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
                 const column_name = columnNameFromPointer(param_name) orelse return ExecError.UnsupportedOperation;
                 const column = findWriteColumn(write_table, column_name) orelse return ExecError.InvalidFormat;
                 pointers.put(param_name, column) catch return ExecError.OutOfMemory;
@@ -1175,7 +1176,7 @@ fn parseCrossReadWriteDbFunctionParams(
             const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
             if (std.mem.startsWith(u8, raw_name, "&")) {
                 if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
-                const param_name = std.mem.trimLeft(u8, raw_name[1..], " \t");
+                const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
                 const column_name = columnNameFromPointer(param_name) orelse return ExecError.UnsupportedOperation;
                 var bound = false;
                 if (findColumn(read_table, column_name)) |column| {
@@ -1222,7 +1223,7 @@ fn parseAtomicDbFunctionParams(allocator: std.mem.Allocator, source: []const u8,
             const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
             if (std.mem.startsWith(u8, raw_name, "&")) {
                 if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
-                const param_name = std.mem.trimLeft(u8, raw_name[1..], " \t");
+                const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
                 if (std.mem.eql(u8, param_name, "cursor")) {
                     cursors.put(param_name, &write_table.columns[0]) catch return ExecError.OutOfMemory;
                 } else if (cursorColumnName(param_name)) |column_name| {
@@ -1244,7 +1245,7 @@ fn parseAtomicDbFunctionParams(allocator: std.mem.Allocator, source: []const u8,
 }
 
 fn collectExecutableLines(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, labels: *std.StringHashMap(usize)) ExecError![]const []const u8 {
-    var lines = std.ArrayList([]const u8).init(allocator);
+    var lines = std.array_list.Managed([]const u8).init(allocator);
     errdefer lines.deinit();
     var in_body = false;
     var it = std.mem.splitScalar(u8, source, '\n');
@@ -1421,17 +1422,17 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
 
 fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!void {
     var any_dirty = false;
-    var owned_paths = std.ArrayList([]const u8).init(allocator);
+    var owned_paths = std.array_list.Managed([]const u8).init(allocator);
     defer {
         for (owned_paths.items) |path| allocator.free(path);
         owned_paths.deinit();
     }
-    var owned_hashes = std.ArrayList([]const u8).init(allocator);
+    var owned_hashes = std.array_list.Managed([]const u8).init(allocator);
     defer {
         for (owned_hashes.items) |hash| allocator.free(hash);
         owned_hashes.deinit();
     }
-    var owned_block_hashes = std.ArrayList([][]const u8).init(allocator);
+    var owned_block_hashes = std.array_list.Managed([][]const u8).init(allocator);
     defer {
         for (owned_block_hashes.items) |hashes| {
             for (hashes) |hash| allocator.free(hash);
@@ -1831,7 +1832,7 @@ pub fn registerQuery(allocator: std.mem.Allocator, source_path: []const u8) Exec
         .grant_entries = grants.entries,
         .main = main_name,
     };
-    const json = std.json.stringifyAlloc(allocator, meta, .{}) catch return ExecError.OutOfMemory;
+    const json = std.json.Stringify.valueAlloc(allocator, meta, .{}) catch return ExecError.OutOfMemory;
     defer allocator.free(json);
     try writeFile(meta_path, json);
 
@@ -1877,17 +1878,17 @@ fn loadMeta(allocator: std.mem.Allocator, hash_text: []const u8) ExecError!std.j
 pub fn inspectRegistry(allocator: std.mem.Allocator, hash_text: []const u8) ExecError![]u8 {
     var parsed = try loadMeta(allocator, hash_text);
     defer parsed.deinit();
-    var out = std.ArrayList(u8).init(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
-    out.writer().print("hash: {s}\n", .{parsed.value.hash}) catch return ExecError.OutOfMemory;
-    out.writer().print("source: {s}\n", .{parsed.value.source_path}) catch return ExecError.OutOfMemory;
-    out.writer().print("qmod: {s}\n", .{parsed.value.qmod_path}) catch return ExecError.OutOfMemory;
-    out.writer().print("imports: {d}\n", .{parsed.value.imports}) catch return ExecError.OutOfMemory;
-    out.writer().print("grants: {d}\n", .{parsed.value.grants}) catch return ExecError.OutOfMemory;
+    out.print("hash: {s}\n", .{parsed.value.hash}) catch return ExecError.OutOfMemory;
+    out.print("source: {s}\n", .{parsed.value.source_path}) catch return ExecError.OutOfMemory;
+    out.print("qmod: {s}\n", .{parsed.value.qmod_path}) catch return ExecError.OutOfMemory;
+    out.print("imports: {d}\n", .{parsed.value.imports}) catch return ExecError.OutOfMemory;
+    out.print("grants: {d}\n", .{parsed.value.grants}) catch return ExecError.OutOfMemory;
     for (parsed.value.grant_entries) |entry| {
-        out.writer().print("grant: {s}\n", .{entry}) catch return ExecError.OutOfMemory;
+        out.print("grant: {s}\n", .{entry}) catch return ExecError.OutOfMemory;
     }
-    out.writer().print("main: {s}\n", .{parsed.value.main}) catch return ExecError.OutOfMemory;
+    out.print("main: {s}\n", .{parsed.value.main}) catch return ExecError.OutOfMemory;
     return out.toOwnedSlice() catch return ExecError.OutOfMemory;
 }
 
@@ -1947,7 +1948,7 @@ pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_pat
 }
 
 test "qmod register inspect and exec metadata round trip" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2006,7 +2007,7 @@ test "qmod exec distinguishes unknown query hash from malformed hash" {
 }
 
 test "qmod inspect rejects corrupted registry metadata" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2050,7 +2051,7 @@ test "qmod inspect rejects corrupted registry metadata" {
 }
 
 test "qmod exec rejects corrupted registry metadata" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2094,7 +2095,7 @@ test "qmod exec rejects corrupted registry metadata" {
 }
 
 test "qmod exec rejects corrupted query payload" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2121,7 +2122,7 @@ test "qmod exec rejects corrupted query payload" {
 }
 
 test "qmod exec rejects missing query payload" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2142,13 +2143,13 @@ test "qmod exec rejects missing query payload" {
     const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
     defer std.testing.allocator.free(hash_hex);
 
-    try std.fs.cwd().deleteFile(result.qmod_path);
+    try sio.cwd().deleteFile(result.qmod_path);
 
     try std.testing.expectError(ExecError.QueryPayloadCorrupted, execQuery(std.testing.allocator, hash_hex, null));
 }
 
 test "qmod register rejects duplicate hash from different source path" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2186,7 +2187,7 @@ test "qmod register rejects duplicate hash from different source path" {
 }
 
 test "qmod exec rejects trailing scalar params bytes" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2219,7 +2220,7 @@ test "qmod exec rejects trailing scalar params bytes" {
 }
 
 test "qmod exec supports scalar bitwise and shift ops" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2259,7 +2260,7 @@ test "qmod exec supports scalar bitwise and shift ops" {
 }
 
 test "qmod register rejects DB instructions without matching grants" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2304,7 +2305,7 @@ test "qmod register rejects DB instructions without matching grants" {
 }
 
 test "qmod register rejects columns outside db_read schema" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2332,7 +2333,7 @@ test "qmod register rejects columns outside db_read schema" {
 }
 
 test "qmod register rejects loads from undeclared DB pointers" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2360,7 +2361,7 @@ test "qmod register rejects loads from undeclared DB pointers" {
 }
 
 test "qmod register rejects load pointer smuggled through helper signature" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2390,7 +2391,7 @@ test "qmod register rejects load pointer smuggled through helper signature" {
 }
 
 test "qmod register rejects DB column pointer declared with non-ptr type" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2417,7 +2418,7 @@ test "qmod register rejects DB column pointer declared with non-ptr type" {
 }
 
 test "qmod register rejects stores outside db_write schema" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2444,7 +2445,7 @@ test "qmod register rejects stores outside db_write schema" {
 }
 
 test "qmod register rejects stores from undeclared DB pointers" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2471,7 +2472,7 @@ test "qmod register rejects stores from undeclared DB pointers" {
 }
 
 test "qmod register rejects atomic cursor from undeclared DB pointers" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2498,7 +2499,7 @@ test "qmod register rejects atomic cursor from undeclared DB pointers" {
 }
 
 test "qmod register accepts declared atomic cursor grant" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2527,7 +2528,7 @@ test "qmod register accepts declared atomic cursor grant" {
 }
 
 test "qmod register rejects atomic cursor nonzero offset" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2554,7 +2555,7 @@ test "qmod register rejects atomic cursor nonzero offset" {
 }
 
 test "qmod register rejects atomic cursor against non-u64 base column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2581,7 +2582,7 @@ test "qmod register rejects atomic cursor against non-u64 base column" {
 }
 
 test "qmod register rejects atomic named cursor against non-u64 column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2609,7 +2610,7 @@ test "qmod register rejects atomic named cursor against non-u64 column" {
 }
 
 test "qmod register rejects atomic cursor smuggled through helper signature" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2639,7 +2640,7 @@ test "qmod register rejects atomic cursor smuggled through helper signature" {
 }
 
 test "qmod exec reads u64 DB column segments" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2702,7 +2703,7 @@ test "qmod exec reads u64 DB column segments" {
 }
 
 test "qmod exec rejects table schema hash drift" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2765,7 +2766,7 @@ test "qmod exec rejects table schema hash drift" {
 }
 
 test "qmod exec rejects corrupted table snapshot segment" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2807,7 +2808,7 @@ test "qmod exec rejects corrupted table snapshot segment" {
     defer std.testing.allocator.free(meta_bytes);
     var parsed = try std.json.parseFromSlice(QmodTableMeta, std.testing.allocator, meta_bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    var file = try std.fs.cwd().openFile(parsed.value.segments[0].files[0].path, .{ .mode = .read_write });
+    var file = try sio.cwd().openFile(parsed.value.segments[0].files[0].path, .{ .mode = .read_write });
     defer file.close();
     const end_pos = try file.getEndPos();
     try file.seekTo(end_pos);
@@ -2817,7 +2818,7 @@ test "qmod exec rejects corrupted table snapshot segment" {
 }
 
 test "qmod exec rejects table snapshot block checksum metadata drift" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2866,7 +2867,7 @@ test "qmod exec rejects table snapshot block checksum metadata drift" {
 }
 
 test "qmod exec rejects corrupted table snapshot metadata" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2910,7 +2911,7 @@ test "qmod exec rejects corrupted table snapshot metadata" {
 }
 
 test "qmod write rejects corrupted table snapshot metadata" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2962,7 +2963,7 @@ test "qmod write rejects corrupted table snapshot metadata" {
 }
 
 test "qmod exec writes u64 DB column segments" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3047,7 +3048,7 @@ test "qmod exec writes u64 DB column segments" {
 }
 
 test "qmod exec read-modify-writes u64 DB column segments" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3134,7 +3135,7 @@ test "qmod exec read-modify-writes u64 DB column segments" {
 }
 
 test "qmod exec cross-table read-writes u64 DB column segments" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3237,7 +3238,7 @@ test "qmod exec cross-table read-writes u64 DB column segments" {
 }
 
 test "qmod exec atomic cursor add updates u64 DB column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3301,7 +3302,7 @@ test "qmod exec atomic cursor add updates u64 DB column" {
 }
 
 test "qmod register rejects atomic cursor dynamic offset expression" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3337,7 +3338,7 @@ test "qmod register rejects atomic cursor dynamic offset expression" {
 }
 
 test "qmod exec atomic cursor targets named DB column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3404,7 +3405,7 @@ test "qmod exec atomic cursor targets named DB column" {
 }
 
 test "qmod exec rejects writes against locked tables" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3461,7 +3462,7 @@ test "qmod exec rejects writes against locked tables" {
 }
 
 test "qmod write commit rejects stale table metadata" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3506,7 +3507,7 @@ test "qmod write commit rejects stale table metadata" {
 }
 
 test "qmod write commit rejects stale block checksum metadata" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3544,7 +3545,7 @@ test "qmod write commit rejects stale block checksum metadata" {
 }
 
 test "qmod exec filters u64 DB column values" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3606,7 +3607,7 @@ test "qmod exec filters u64 DB column values" {
 }
 
 test "qmod exec filters DB column values with bitwise ops" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3669,7 +3670,7 @@ test "qmod exec filters DB column values with bitwise ops" {
 }
 
 test "qmod exec reads compact unsigned DB columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3726,7 +3727,7 @@ test "qmod exec reads compact unsigned DB columns" {
 }
 
 test "qmod exec reads signed integer DB columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3782,7 +3783,7 @@ test "qmod exec reads signed integer DB columns" {
 }
 
 test "qmod exec filters DB column with u64 params" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3850,7 +3851,7 @@ test "qmod exec filters DB column with u64 params" {
 }
 
 test "qmod exec rejects trailing DB params bytes" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3916,7 +3917,7 @@ test "qmod exec rejects trailing DB params bytes" {
 }
 
 test "qmod exec filters f32 DB column values" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

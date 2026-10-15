@@ -20,7 +20,7 @@ const US_PER_DAY: u64 = 86_400_000_000;
 // (acquireTableWriteLock in table.zig); no global mutation mutex is needed.
 // Thread-local re-entrancy guard: prevents a thread from deadlocking itself
 // by beginning a second write tx on a table it already holds.
-threadlocal var active_tx_table_keys: [16]u64 = [_]u64{0} ** 16;
+threadlocal var active_tx_table_keys: [16]u64 = std.mem.zeroes([16]u64);
 threadlocal var active_tx_table_count: usize = 0;
 
 fn txTableKey(root: []const u8, table_name: []const u8) u64 {
@@ -57,14 +57,14 @@ fn txReentrancyPop(key: u64) void {
 // Sharded registry (32 shards) to reduce contention on concurrent reads.
 // Each shard has an independent lock; handles are assigned by hash.
 const READ_HANDLE_SHARDS: usize = 32;
-var read_shard_locks: [READ_HANDLE_SHARDS]std.Thread.Mutex = [_]std.Thread.Mutex{.{}} ** READ_HANDLE_SHARDS;
+var read_shard_locks: [READ_HANDLE_SHARDS]std.atomic.Mutex = std.mem.zeroes([READ_HANDLE_SHARDS]std.atomic.Mutex);
 var read_shard_maps: [READ_HANDLE_SHARDS]std.AutoHashMap(usize, ReadHandleEntry) = undefined;
 var read_shards_initialized: bool = false;
-var read_shards_init_lock: std.Thread.Mutex = .{};
+var read_shards_init_lock: std.atomic.Mutex = .unlocked;
 
 fn ensureReadShards() void {
     if (read_shards_initialized) return;
-    read_shards_init_lock.lock();
+    while (!read_shards_init_lock.tryLock()) std.atomic.spinLoopHint();
     defer read_shards_init_lock.unlock();
     if (read_shards_initialized) return;
     for (&read_shard_maps) |*m| {
@@ -84,9 +84,9 @@ fn readShardIndex(key: usize) usize {
     h ^= h >> 33;
     return @as(usize, @intCast(h % READ_HANDLE_SHARDS));
 }
-var tx_handle_mutex = std.Thread.Mutex{};
+var tx_handle_mutex: std.atomic.Mutex = .unlocked;
 var write_tx_handles = std.AutoHashMap(usize, *table.WriteTransaction).init(std.heap.page_allocator);
-var coltx_handle_lock = std.Thread.RwLock{};
+var coltx_handle_lock: std.atomic.Mutex = .unlocked;
 var coltx_handles = std.AutoHashMap(usize, ColtxHandleEntry).init(std.heap.page_allocator);
 var empty_output_bytes: [0]u8 = .{};
 var empty_output_u64s: [0]u64 = .{};
@@ -183,7 +183,7 @@ pub export fn sa_db_blob_put_many(
     const n: usize = @intCast(values_len);
     const values_in = (values_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const values = gpa.allocator().alloc([]const u8, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
     defer gpa.allocator().free(values);
@@ -216,7 +216,7 @@ pub export fn sa_db_blob_put(
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     id_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.putBlobValue(gpa.allocator(), root, table_name, store_name, value) catch |err| return tableStatus(err);
     id_slot.* = result.id;
@@ -446,7 +446,7 @@ fn registerReadSnapshot(snapshot: *table.ReadSnapshot) bool {
     ensureReadShards();
     const key = @intFromPtr(snapshot);
     const idx = readShardIndex(key);
-    read_shard_locks[idx].lock();
+    while (!read_shard_locks[idx].tryLock()) std.atomic.spinLoopHint();
     defer read_shard_locks[idx].unlock();
     read_shard_maps[idx].put(key, .{ .snapshot = snapshot, .refs = std.atomic.Value(usize).init(0) }) catch return false;
     return true;
@@ -456,7 +456,7 @@ fn acquireReadSnapshot(handle: ?*anyopaque) ?*table.ReadSnapshot {
     ensureReadShards();
     const key = readHandleKey(handle) orelse return null;
     const idx = readShardIndex(key);
-    read_shard_locks[idx].lock();
+    while (!read_shard_locks[idx].tryLock()) std.atomic.spinLoopHint();
     defer read_shard_locks[idx].unlock();
     const entry = read_shard_maps[idx].getPtr(key) orelse return null;
     _ = entry.refs.fetchAdd(1, .acq_rel);
@@ -466,7 +466,7 @@ fn acquireReadSnapshot(handle: ?*anyopaque) ?*table.ReadSnapshot {
 fn releaseReadSnapshot(snapshot: *table.ReadSnapshot) void {
     const key = @intFromPtr(snapshot);
     const idx = readShardIndex(key);
-    read_shard_locks[idx].lock();
+    while (!read_shard_locks[idx].tryLock()) std.atomic.spinLoopHint();
     defer read_shard_locks[idx].unlock();
     if (read_shard_maps[idx].getPtr(key)) |entry| {
         const previous = entry.refs.fetchSub(1, .acq_rel);
@@ -479,7 +479,7 @@ fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapsh
     out_snapshot.* = null;
     const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const idx = readShardIndex(key);
-    read_shard_locks[idx].lock();
+    while (!read_shard_locks[idx].tryLock()) std.atomic.spinLoopHint();
     defer read_shard_locks[idx].unlock();
     const entry = read_shard_maps[idx].getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (entry.refs.load(.acquire) != 0) return SA_DB_ERR_LOCKED;
@@ -489,7 +489,7 @@ fn unregisterReadSnapshot(handle: ?*anyopaque, out_snapshot: *?*table.ReadSnapsh
 }
 
 fn registerWriteTransaction(tx: *table.WriteTransaction) bool {
-    tx_handle_mutex.lock();
+    while (!tx_handle_mutex.tryLock()) std.atomic.spinLoopHint();
     defer tx_handle_mutex.unlock();
     const key = @intFromPtr(tx);
     write_tx_handles.put(key, tx) catch return false;
@@ -497,7 +497,7 @@ fn registerWriteTransaction(tx: *table.WriteTransaction) bool {
 }
 
 fn lockWriteTransaction(handle: ?*anyopaque) ?*table.WriteTransaction {
-    tx_handle_mutex.lock();
+    while (!tx_handle_mutex.tryLock()) std.atomic.spinLoopHint();
     const key = readHandleKey(handle) orelse {
         tx_handle_mutex.unlock();
         return null;
@@ -510,7 +510,7 @@ fn lockWriteTransaction(handle: ?*anyopaque) ?*table.WriteTransaction {
 
 fn registerColumnIngestSession(session: *table.ColumnIngestSession) bool {
     const key = @intFromPtr(session);
-    coltx_handle_lock.lock();
+    while (!coltx_handle_lock.tryLock()) std.atomic.spinLoopHint();
     defer coltx_handle_lock.unlock();
     coltx_handles.put(key, .{ .session = session, .refs = std.atomic.Value(usize).init(0) }) catch return false;
     return true;
@@ -518,8 +518,8 @@ fn registerColumnIngestSession(session: *table.ColumnIngestSession) bool {
 
 fn acquireColumnIngestSession(handle: ?*anyopaque) ?*table.ColumnIngestSession {
     const key = readHandleKey(handle) orelse return null;
-    coltx_handle_lock.lockShared();
-    defer coltx_handle_lock.unlockShared();
+    while (!coltx_handle_lock.tryLock()) std.atomic.spinLoopHint();
+    defer coltx_handle_lock.unlock();
     const entry = coltx_handles.getPtr(key) orelse return null;
     _ = entry.refs.fetchAdd(1, .acq_rel);
     return entry.session;
@@ -527,8 +527,8 @@ fn acquireColumnIngestSession(handle: ?*anyopaque) ?*table.ColumnIngestSession {
 
 fn releaseColumnIngestSession(session: *table.ColumnIngestSession) void {
     const key = @intFromPtr(session);
-    coltx_handle_lock.lockShared();
-    defer coltx_handle_lock.unlockShared();
+    while (!coltx_handle_lock.tryLock()) std.atomic.spinLoopHint();
+    defer coltx_handle_lock.unlock();
     if (coltx_handles.getPtr(key)) |entry| {
         const previous = entry.refs.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
@@ -537,7 +537,7 @@ fn releaseColumnIngestSession(session: *table.ColumnIngestSession) void {
 
 fn unregisterWriteTransaction(handle: ?*anyopaque, out_tx: *?*table.WriteTransaction) u32 {
     out_tx.* = null;
-    tx_handle_mutex.lock();
+    while (!tx_handle_mutex.tryLock()) std.atomic.spinLoopHint();
     defer tx_handle_mutex.unlock();
     const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const entry = write_tx_handles.fetchRemove(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
@@ -548,7 +548,7 @@ fn unregisterWriteTransaction(handle: ?*anyopaque, out_tx: *?*table.WriteTransac
 fn unregisterColumnIngestSession(handle: ?*anyopaque, out_session: *?*table.ColumnIngestSession) u32 {
     out_session.* = null;
     const key = readHandleKey(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    coltx_handle_lock.lock();
+    while (!coltx_handle_lock.tryLock()) std.atomic.spinLoopHint();
     defer coltx_handle_lock.unlock();
     const entry = coltx_handles.getPtr(key) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (entry.refs.load(.acquire) != 0) return SA_DB_ERR_LOCKED;
@@ -896,7 +896,7 @@ pub export fn sa_db_ingest_columns(
     const c_ptr = columns_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const inputs = c_ptr[0..n];
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     const raw_columns = allocator.alloc(table.RawColumnBytes, n) catch return SA_DB_ERR_OUT_OF_MEMORY;
@@ -922,7 +922,7 @@ pub export fn sa_db_insert_row(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.insertRawRow(gpa.allocator(), root, table_name, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -947,7 +947,7 @@ pub export fn sa_db_upsert_row_u64_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -979,7 +979,7 @@ pub export fn sa_db_upsert_many_u64_key(
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const expected = (expected_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
     const rows_in = (rows_ptr orelse return SA_DB_ERR_INVALID_ARGUMENT)[0..n];
@@ -1010,7 +1010,7 @@ pub export fn sa_db_update_row_u64_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1035,7 +1035,7 @@ pub export fn sa_db_upsert_row_u32_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowU32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1058,7 +1058,7 @@ pub export fn sa_db_update_row_u32_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowU32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1083,7 +1083,7 @@ pub export fn sa_db_upsert_row_i32_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1106,7 +1106,7 @@ pub export fn sa_db_update_row_i32_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1131,7 +1131,7 @@ pub export fn sa_db_upsert_row_u8_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1154,7 +1154,7 @@ pub export fn sa_db_update_row_u8_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1179,7 +1179,7 @@ pub export fn sa_db_upsert_row_i8_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1202,7 +1202,7 @@ pub export fn sa_db_update_row_i8_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1227,7 +1227,7 @@ pub export fn sa_db_upsert_row_u16_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1250,7 +1250,7 @@ pub export fn sa_db_update_row_u16_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1275,7 +1275,7 @@ pub export fn sa_db_upsert_row_i16_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1298,7 +1298,7 @@ pub export fn sa_db_update_row_i16_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1323,7 +1323,7 @@ pub export fn sa_db_upsert_row_i64_key(
     const inserted_slot = out_inserted orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1346,7 +1346,7 @@ pub export fn sa_db_update_row_i64_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1375,7 +1375,7 @@ pub export fn sa_db_upsert_row_u64_pair_key(
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowU64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1401,7 +1401,7 @@ pub export fn sa_db_update_row_u64_pair_key(
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowU64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1430,7 +1430,7 @@ pub export fn sa_db_upsert_row_u64_i64_pair_key(
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1456,7 +1456,7 @@ pub export fn sa_db_update_row_u64_i64_pair_key(
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -1487,7 +1487,7 @@ pub export fn sa_db_upsert_row_blob_eq_key(
     const info_slot = out_info orelse return SA_DB_ERR_INVALID_ARGUMENT;
     inserted_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.upsertRawRowBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
     inserted_slot.* = if (result.inserted) 1 else 0;
@@ -1515,7 +1515,7 @@ pub export fn sa_db_update_row_blob_eq_key(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const row = requiredBytes(row_ptr, row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.updateRawRowBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value, row) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2344,7 +2344,7 @@ pub export fn sa_db_create_u64_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createU64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2363,7 +2363,7 @@ pub export fn sa_db_create_i64_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createI64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2382,7 +2382,7 @@ pub export fn sa_db_create_u32_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createU32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2401,7 +2401,7 @@ pub export fn sa_db_create_i32_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createI32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2420,7 +2420,7 @@ pub export fn sa_db_create_u8_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createU8Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2439,7 +2439,7 @@ pub export fn sa_db_create_i8_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createI8Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2458,7 +2458,7 @@ pub export fn sa_db_create_u16_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createU16Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2477,7 +2477,7 @@ pub export fn sa_db_create_i16_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createI16Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2496,7 +2496,7 @@ pub export fn sa_db_create_f32_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createF32Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2515,7 +2515,7 @@ pub export fn sa_db_create_f64_index(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createF64Index(gpa.allocator(), root, table_name, @intCast(column_index), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2536,7 +2536,7 @@ pub export fn sa_db_create_u64_pair_index(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createU64PairIndex(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2557,7 +2557,7 @@ pub export fn sa_db_create_u64_i64_pair_index(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createU64I64PairIndex(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2579,7 +2579,7 @@ pub export fn sa_db_create_blob_eq_index(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createBlobEqIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name, unique != 0) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2600,7 +2600,7 @@ pub export fn sa_db_create_blob_token_index(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createBlobTokenIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2621,7 +2621,7 @@ pub export fn sa_db_create_blob_prefix_index(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createBlobPrefixIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2642,7 +2642,7 @@ pub export fn sa_db_create_blob_contains_index(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.createBlobContainsIndex(gpa.allocator(), root, table_name, @intCast(column_index), store_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2661,7 +2661,7 @@ pub export fn sa_db_create_indexes(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const requests_in = inputCreateIndexRequests(requests_ptr, requests_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     const requests = allocator.alloc(table.CreateIndexRequest, requests_in.len) catch return SA_DB_ERR_OUT_OF_MEMORY;
@@ -2774,7 +2774,7 @@ pub export fn sa_db_dict_lookup(
     found_slot.* = 0;
     id_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.lookupStringDict(gpa.allocator(), root, table_name, dict_name, value) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
@@ -2801,7 +2801,7 @@ pub export fn sa_db_dict_value_len(
     found_slot.* = 0;
     len_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.stringDictValueLen(gpa.allocator(), root, table_name, dict_name, id) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
@@ -2831,7 +2831,7 @@ pub export fn sa_db_dict_value_copy(
     found_slot.* = 0;
     written_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.copyStringDictValue(gpa.allocator(), root, table_name, dict_name, id, out_buf) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
@@ -2858,7 +2858,7 @@ pub export fn sa_db_blob_value_len(
     found_slot.* = 0;
     len_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.blobValueLen(gpa.allocator(), root, table_name, store_name, id) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
@@ -2888,7 +2888,7 @@ pub export fn sa_db_blob_value_copy(
     found_slot.* = 0;
     written_slot.* = 0;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.copyBlobValue(gpa.allocator(), root, table_name, store_name, id, out_buf) catch |err| return tableStatus(err);
     found_slot.* = if (result.found) 1 else 0;
@@ -2909,7 +2909,7 @@ pub export fn sa_db_delete_u64_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteU64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2928,7 +2928,7 @@ pub export fn sa_db_delete_u32_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteU32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2947,7 +2947,7 @@ pub export fn sa_db_delete_i32_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteI32Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2966,7 +2966,7 @@ pub export fn sa_db_delete_u8_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteU8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -2985,7 +2985,7 @@ pub export fn sa_db_delete_i8_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteI8Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3004,7 +3004,7 @@ pub export fn sa_db_delete_u16_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteU16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3023,7 +3023,7 @@ pub export fn sa_db_delete_i16_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteI16Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3042,7 +3042,7 @@ pub export fn sa_db_delete_i64_key(
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteI64Key(gpa.allocator(), root, table_name, @intCast(column_index), expected) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3064,7 +3064,7 @@ pub export fn sa_db_delete_u64_pair_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteU64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3086,7 +3086,7 @@ pub export fn sa_db_delete_u64_i64_pair_key(
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteU64I64PairKey(gpa.allocator(), root, table_name, @intCast(column_index), @intCast(column_index2), key1, key2) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3110,7 +3110,7 @@ pub export fn sa_db_delete_blob_eq_key(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.deleteBlobEqKey(gpa.allocator(), root, table_name, @intCast(column_index), store_name, value) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3142,7 +3142,7 @@ pub export fn sa_db_snapshot(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.snapshotTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3159,7 +3159,7 @@ pub export fn sa_db_restore(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.restoreTable(gpa.allocator(), root, table_name, epoch) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3175,7 +3175,7 @@ pub export fn sa_db_recover(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.recoverTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3191,7 +3191,7 @@ pub export fn sa_db_compact(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.compactTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3207,7 +3207,7 @@ pub export fn sa_db_lock(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.lockTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3223,7 +3223,7 @@ pub export fn sa_db_unlock(
     const root = rootBytes(root_ptr, root_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const table_name = requiredBytes(table_ptr, table_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const info = table.unlockTable(gpa.allocator(), root, table_name) catch |err| return tableStatus(err);
     return fillInfo(out_info, info);
@@ -3245,7 +3245,7 @@ pub export fn sa_db_update_u64_add(
     const updated_slot = out_updated orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const updated = table.updateU64ColumnAdd(gpa.allocator(), root, table_name, @intCast(column_index), start_row, update_count, delta) catch |err| return tableStatus(err);
     updated_slot.* = updated;
@@ -3468,7 +3468,7 @@ pub export fn sa_db_filter_blob_eq_handle(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3501,7 +3501,7 @@ pub export fn sa_db_filter_blob_contains_handle(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3534,7 +3534,7 @@ pub export fn sa_db_filter_blob_token_handle(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3567,7 +3567,7 @@ pub export fn sa_db_filter_blob_prefix_handle(
     const store_name = requiredBytes(store_ptr, store_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3604,7 +3604,7 @@ fn filterRowsBlobHandle(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3792,7 +3792,7 @@ pub export fn sa_db_group_sum_i64_by_u64_handle(
     const out_sums = outputI64sAllowEmpty(out_sums_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3827,7 +3827,7 @@ pub export fn sa_db_group_rows_sum_i64_by_u64_handle(
     const out_sums = outputI64sAllowEmpty(out_sums_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3863,7 +3863,7 @@ pub export fn sa_db_group_sum_i64_by_u64_sorted_handle(
     const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3902,7 +3902,7 @@ pub export fn sa_db_group_rows_sum_i64_by_u64_sorted_handle(
     const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (sum_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3938,7 +3938,7 @@ pub export fn sa_db_group_stats_i64_by_u64_handle(
     const out_maxs = outputI64sAllowEmpty(out_maxs_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (stats_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -3977,7 +3977,7 @@ pub export fn sa_db_group_rows_stats_i64_by_u64_handle(
     const out_maxs = outputI64sAllowEmpty(out_maxs_ptr, out_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (stats_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -4017,7 +4017,7 @@ pub export fn sa_db_group_stats_i64_by_u64_sorted_handle(
     const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (stats_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -4060,7 +4060,7 @@ pub export fn sa_db_group_rows_stats_i64_by_u64_sorted_handle(
     const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (group_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     if (stats_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -5335,7 +5335,7 @@ pub export fn sa_db_plan_u64_i64_ranges_handle(
     if (i64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64I64RangeRows(
         gpa.allocator(),
@@ -5374,7 +5374,7 @@ pub export fn sa_db_plan_u64_u64_ranges_handle(
     if (second_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64U64RangeRows(
         gpa.allocator(),
@@ -5413,7 +5413,7 @@ pub export fn sa_db_plan_i64_i64_ranges_handle(
     if (second_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanI64I64RangeRows(
         gpa.allocator(),
@@ -5456,7 +5456,7 @@ pub export fn sa_db_plan_u64_blob_eq_handle(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64BlobEqRows(
         gpa.allocator(),
@@ -5499,7 +5499,7 @@ pub export fn sa_db_plan_u64_dict_eq_handle(
     const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64DictEqRows(gpa.allocator(), snapshot, @intCast(u64_column_index), u64_min_value, u64_max_value, @intCast(dict_column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     return fillPlanInfo(out_info, result);
@@ -5530,7 +5530,7 @@ pub export fn sa_db_plan_i64_dict_eq_handle(
     const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanI64DictEqRows(gpa.allocator(), snapshot, @intCast(i64_column_index), i64_min_value, i64_max_value, @intCast(dict_column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     return fillPlanInfo(out_info, result);
@@ -5561,7 +5561,7 @@ pub export fn sa_db_plan_i64_blob_eq_handle(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanI64BlobEqRows(
         gpa.allocator(),
@@ -5617,7 +5617,7 @@ pub export fn sa_db_plan_u64_i64_blob_eq_handle(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64I64BlobEqRows(
         gpa.allocator(),
@@ -5667,7 +5667,7 @@ pub export fn sa_db_plan_u64_i64_dict_eq_handle(
     const value = requiredBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64I64DictEqRows(gpa.allocator(), snapshot, @intCast(u64_column_index), u64_min_value, u64_max_value, @intCast(i64_column_index), i64_min_value, i64_max_value, @intCast(dict_column_index), dict_name, value, offset, limit, rows) catch |err| return tableStatus(err);
     return fillPlan3Info(out_info, result);
@@ -5707,7 +5707,7 @@ pub export fn sa_db_plan_u64_i64_bool_handle(
     const expected_bool = boolFromAbi(expected) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64I64BoolRows(
         gpa.allocator(),
@@ -5761,7 +5761,7 @@ pub export fn sa_db_plan_u64_i64_i64_ranges_handle(
     if (second_i64_column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const result = table.snapshotPlanU64I64I64RangeRows(
         gpa.allocator(),
@@ -6359,7 +6359,7 @@ pub export fn sa_db_intersect_rows_handle(
     const left_rows = inputU64sAllowEmpty(left_rows_ptr, left_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const right_rows = inputU64sAllowEmpty(right_rows_ptr, right_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -6389,7 +6389,7 @@ pub export fn sa_db_union_rows_handle(
     const left_rows = inputU64sAllowEmpty(left_rows_ptr, left_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const right_rows = inputU64sAllowEmpty(right_rows_ptr, right_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -6419,7 +6419,7 @@ pub export fn sa_db_except_rows_handle(
     const left_rows = inputU64sAllowEmpty(left_rows_ptr, left_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const right_rows = inputU64sAllowEmpty(right_rows_ptr, right_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -6451,7 +6451,7 @@ fn sortRowsHandle(
     const rows = outputU64s(out_rows_ptr, out_rows_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     if (column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return SA_DB_ERR_INVALID_ARGUMENT;
     const sort_descending = boolFromAbi(descending) orelse return SA_DB_ERR_INVALID_ARGUMENT;
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
@@ -6948,7 +6948,7 @@ pub export fn sa_db_get_row_blob_eq_key_handle(
     const value = inputBytes(value_ptr, value_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     const out_row = outputBytes(out_row_ptr, out_row_len) orelse return SA_DB_ERR_INVALID_ARGUMENT;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const snapshot = acquireReadSnapshot(handle) orelse return SA_DB_ERR_INVALID_ARGUMENT;
     defer releaseReadSnapshot(snapshot);
