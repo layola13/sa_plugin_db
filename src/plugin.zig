@@ -5,6 +5,12 @@ const qmod = @import("db_stub.zig");
 const schema = @import("schema.zig");
 const table = @import("table.zig");
 const _db_api = @import("db_saasm_api.zig");
+// NOTE(Zig 0.17): force emission of the api module's `export fn` symbols
+// (plain `pub const` aliases alone are pruned, breaking `sa plugin install`
+// ABI verification).
+comptime {
+    _ = _db_api;
+}
 // NOTE(Zig 0.17): usingnamespace removed; explicit re-exports preserve plugin.* ABI.
 pub const SaDbTableInfo = _db_api.SaDbTableInfo;
 pub const SaDbSnapshotInfo = _db_api.SaDbSnapshotInfo;
@@ -777,9 +783,13 @@ fn runDbCommandAbi(ctx: *const plugin.Context, argv: [*]const [*:0]const u8, arg
     const result = runDbCommandImpl(allocator, args, stdout_writer, stderr_writer) catch |err| {
         if (!isDbCliError(err)) return @intFromEnum(plugin.AbiStatus.failed);
         writeDbCliError(stderr_writer, args, err) catch return @intFromEnum(plugin.AbiStatus.failed);
+        stdout_writer.flush() catch return @intFromEnum(plugin.AbiStatus.failed);
+        stderr_writer.flush() catch return @intFromEnum(plugin.AbiStatus.failed);
         out_code.* = 1;
         return @intFromEnum(plugin.AbiStatus.ok);
     };
+    stdout_writer.flush() catch return @intFromEnum(plugin.AbiStatus.failed);
+    stderr_writer.flush() catch return @intFromEnum(plugin.AbiStatus.failed);
     if (result) |code| {
         out_code.* = code;
         return @intFromEnum(plugin.AbiStatus.ok);

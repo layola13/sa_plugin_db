@@ -277,7 +277,7 @@ fn decodeCreateIndexRequest(request: SaDbCreateIndexRequest) ?table.CreateIndexR
     if (request.column_index > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
     if (request.column_index2 > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
 
-    const kind = std.meta.intToEnum(table.CreateIndexKind, request.kind) catch return null;
+    const kind = std.enums.fromInt(table.CreateIndexKind, request.kind) orelse return null;
     const store_name = inputBytes(request.store_name_ptr, request.store_name_len) orelse return null;
     const needs_second = switch (kind) {
         .u64_pair, .u64_i64_pair => true,
