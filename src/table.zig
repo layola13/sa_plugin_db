@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const builtin = @import("builtin");
 const schema = @import("schema.zig");
 
@@ -11,18 +12,18 @@ var unsafe_no_sync_state = std.atomic.Value(u8).init(0);
 // environment variable for the process lifetime. Read on every durability
 // decision, so the API takes effect immediately.
 var api_no_sync_override = std.atomic.Value(u8).init(0);
-var unsafe_init_meta_cache_mutex: std.Thread.Mutex = .{};
+var unsafe_init_meta_cache_mutex: std.atomic.Mutex = .unlocked;
 var unsafe_init_meta_cache_next_slot: usize = 0;
-var unsafe_init_meta_cache = [_]?UnsafeInitMetaCacheEntry{null} ** 4;
+var unsafe_init_meta_cache: [4]?UnsafeInitMetaCacheEntry = .{ null, null, null, null };
 var unsafe_init_meta_cache_generation = std.atomic.Value(u64).init(1);
-var unsafe_init_template_cache_mutex: std.Thread.Mutex = .{};
+var unsafe_init_template_cache_mutex: std.atomic.Mutex = .unlocked;
 var unsafe_init_template_cache_next_slot: usize = 0;
-var unsafe_init_template_cache = [_]?UnsafeInitTemplateCacheEntry{null} ** 4;
-var process_write_locks_mutex: std.Thread.Mutex = .{};
+var unsafe_init_template_cache: [4]?UnsafeInitTemplateCacheEntry = .{ null, null, null, null };
+var process_write_locks_mutex: std.atomic.Mutex = .unlocked;
 var process_write_locks: std.StringHashMapUnmanaged(void) = .{};
-var memory_fs_mutex: std.Thread.Mutex = .{};
+var memory_fs_mutex: std.atomic.Mutex = .unlocked;
 var memory_fs_files: std.StringHashMapUnmanaged([]u8) = .{};
-var deferred_init_mutex: std.Thread.Mutex = .{};
+var deferred_init_mutex: std.atomic.Mutex = .unlocked;
 var deferred_init_entries = std.StringHashMapUnmanaged(struct {
     schema_path_hint: []const u8,
     schema_source: []const u8,
@@ -50,11 +51,11 @@ fn isTruthyEnvValue(value: []const u8) bool {
 fn detectUnsafeNoSyncModeFromProc() bool {
     if (builtin.os.tag != .linux) return false;
 
-    var file = std.fs.openFileAbsolute("/proc/self/environ", .{}) catch return false;
+    var file = sio.openFileAbsolute("/proc/self/environ", .{}) catch return false;
     defer file.close();
 
     var buffer: [128 * 1024]u8 = undefined;
-    const bytes_read = file.readAll(&buffer) catch return false;
+    const bytes_read = file.read(&buffer) catch return false;
     var entries = std.mem.splitScalar(u8, buffer[0..bytes_read], 0);
     while (entries.next()) |entry| {
         if (entry.len <= UNSAFE_NO_SYNC_ENV.len) continue;
@@ -73,8 +74,8 @@ fn detectUnsafeNoSyncMode() bool {
     // Programmatic setenv()/unsetenv() (e.g. Python os.environ) after process
     // start is INVISIBLE to this detection. Hosts that need runtime control
     // must use the sa_db_set_unsafe_no_sync() API instead.
-    const value = std.posix.getenv(UNSAFE_NO_SYNC_ENV) orelse return detectUnsafeNoSyncModeFromProc();
-    return isTruthyEnvValue(value);
+    // NOTE(Zig 0.17): std.posix.getenv removed; /proc/self/environ is authoritative (see above).
+    return detectUnsafeNoSyncModeFromProc();
 }
 
 /// Programmatic override for unsafe no-sync mode (backing for the
@@ -352,17 +353,17 @@ pub const I64RowsStats = struct {
 };
 
 pub const TableWriteLock = struct {
-    file: ?std.fs.File = null,
+    file: ?sio.File = null,
     memory_path: ?[]u8 = null,
 
     pub fn release(self: *TableWriteLock) void {
         if (self.file) |file| {
             var owned = file;
-            owned.unlock();
+            owned.inner.unlock(sio.io());
             owned.close();
         }
         if (self.memory_path) |path| {
-            process_write_locks_mutex.lock();
+            while (!process_write_locks_mutex.tryLock()) std.atomic.spinLoopHint();
             defer process_write_locks_mutex.unlock();
             _ = process_write_locks.remove(path);
             unsafe_init_cache_allocator.free(path);
@@ -377,8 +378,8 @@ pub const WriteTransaction = struct {
     table_name: []const u8,
     write_lock: TableWriteLock,
     meta: TableMeta,
-    buffers: []std.ArrayList(u8),
-    pending_append_buffers: []std.ArrayList(u8),
+    buffers: []std.array_list.Managed(u8),
+    pending_append_buffers: []std.array_list.Managed(u8),
     pending_dict_writes: []PendingDictWrite = &.{},
     pending_blob_writes: []PendingBlobWrite = &.{},
     base_row_count: u64,
@@ -397,7 +398,7 @@ pub const WriteTransaction = struct {
     // checkpoint replay so replayed ops are not re-staged. Initialized with an
     // empty (allocator-less) ArrayList; beginWriteTransaction re-inits it with
     // the transaction allocator.
-    wal_ops: std.ArrayList(u8),
+    wal_ops: std.array_list.Managed(u8),
     wal_capture: bool = true,
     /// Set once the transaction has been committed (WAL-appended or legacy).
     /// A committed tx still holds the write lock until destroy, but its
@@ -449,7 +450,7 @@ pub const ColumnIngestSession = struct {
     max_rows_snapshot: u64,
     columns_len: usize,
     column_strides: []u32,
-    batches: std.ArrayList(ColumnBatch),
+    batches: std.array_list.Managed(ColumnBatch),
 
     pub fn deinit(self: *ColumnIngestSession, allocator: std.mem.Allocator) void {
         if (self.meta_snapshot) |*meta| meta.deinit(allocator);
@@ -729,7 +730,7 @@ fn cacheRootKey(allocator: std.mem.Allocator, root_dir: []const u8) TableError![
 
     const prefix = rootPrefix(trimmed);
     if (prefix.len == 0) {
-        return std.fs.cwd().realpathAlloc(allocator, ".") catch |err| switch (err) {
+        return sio.cwd().realpathAlloc(allocator, ".") catch |err| switch (err) {
             error.OutOfMemory => TableError.OutOfMemory,
             else => allocator.dupe(u8, ".") catch TableError.OutOfMemory,
         };
@@ -739,7 +740,7 @@ fn cacheRootKey(allocator: std.mem.Allocator, root_dir: []const u8) TableError![
         return allocator.dupe(u8, prefix) catch TableError.OutOfMemory;
     }
 
-    const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch |err| switch (err) {
+    const cwd = sio.cwd().realpathAlloc(allocator, ".") catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         else => return allocator.dupe(u8, prefix) catch TableError.OutOfMemory,
     };
@@ -922,9 +923,9 @@ pub fn acquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8,
         const path = try tableWriteLockPath(allocator, root_dir, table_name);
         defer allocator.free(path);
 
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = sio.nanoTimestamp();
         while (true) {
-            process_write_locks_mutex.lock();
+            while (!process_write_locks_mutex.tryLock()) std.atomic.spinLoopHint();
             const entry = process_write_locks.getOrPut(unsafe_init_cache_allocator, path) catch |err| {
                 process_write_locks_mutex.unlock();
                 return err;
@@ -940,15 +941,15 @@ pub fn acquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8,
             }
             process_write_locks_mutex.unlock();
 
-            if (std.time.nanoTimestamp() - start_ns >= @as(i128, PROCESS_WRITE_LOCK_WAIT_NS)) return TableError.Locked;
-            std.time.sleep(PROCESS_WRITE_LOCK_BACKOFF_NS);
+            if (sio.nanoTimestamp() - start_ns >= @as(i128, PROCESS_WRITE_LOCK_WAIT_NS)) return TableError.Locked;
+            sio.io().sleep(.fromNanoseconds(PROCESS_WRITE_LOCK_BACKOFF_NS), .awake) catch {};
         }
     }
 
     const path = try tableWriteLockPath(allocator, root_dir, table_name);
     defer allocator.free(path);
     try ensureParentDir(path);
-    const file = std.fs.cwd().createFile(path, .{
+    const file = sio.cwd().createFile(path, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
@@ -1023,36 +1024,36 @@ fn ensureParentDir(path: []const u8) TableError!void {
     if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return;
     if (std.fs.path.dirname(path)) |dir| {
         if (dir.len != 0) {
-            std.fs.cwd().makePath(dir) catch |err| return mapFileError(err);
+            sio.cwd().makePath(dir) catch |err| return mapFileError(err);
         }
     }
 }
 
 fn ensureDirPath(path: []const u8) TableError!void {
     if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return;
-    std.fs.cwd().makePath(path) catch |err| return mapFileError(err);
+    sio.cwd().makePath(path) catch |err| return mapFileError(err);
 }
 
 fn isParentMissing(err: anyerror) bool {
     return err == error.FileNotFound or err == error.PathAlreadyDoesNotExist;
 }
 
-fn createFileEnsuringParent(path: []const u8, flags: std.fs.File.CreateFlags) TableError!std.fs.File {
-    return std.fs.cwd().createFile(path, flags) catch |err| {
+fn createFileEnsuringParent(path: []const u8, flags: std.Io.Dir.CreateFileOptions) TableError!sio.File {
+    return sio.cwd().createFile(path, flags) catch |err| {
         if (!isParentMissing(err)) return mapFileError(err);
         try ensureParentDir(path);
-        return std.fs.cwd().createFile(path, flags) catch |retry_err| return mapFileError(retry_err);
+        return sio.cwd().createFile(path, flags) catch |retry_err| return mapFileError(retry_err);
     };
 }
 
 fn memoryFileExists(path: []const u8) bool {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
     return memory_fs_files.contains(path);
 }
 
 fn memoryReadFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) TableError![]u8 {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
     const bytes = memory_fs_files.get(path) orelse return TableError.NotFound;
     if (bytes.len > max_bytes) return TableError.InvalidFormat;
@@ -1060,13 +1061,13 @@ fn memoryReadFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes
 }
 
 fn memoryFileSlice(path: []const u8) TableError![]u8 {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
     return memory_fs_files.get(path) orelse TableError.NotFound;
 }
 
 fn memoryWriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
 
     const owned = try unsafe_init_cache_allocator.dupe(u8, bytes);
@@ -1083,7 +1084,7 @@ fn memoryWriteFile(allocator: std.mem.Allocator, path: []const u8, bytes: []cons
 }
 
 fn memoryAppendFile(allocator: std.mem.Allocator, path: []const u8, appended_bytes: []const u8) TableError!void {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
 
     const entry = memory_fs_files.getPtr(path) orelse return TableError.NotFound;
@@ -1108,7 +1109,7 @@ fn memoryAppendFile(allocator: std.mem.Allocator, path: []const u8, appended_byt
 }
 
 fn memoryExpandedFileBuffer(path: []const u8, old_len: usize, new_len: usize) TableError![]u8 {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
 
     const entry = memory_fs_files.getPtr(path) orelse return TableError.NotFound;
@@ -1128,7 +1129,7 @@ fn memoryExpandedFileBuffer(path: []const u8, old_len: usize, new_len: usize) Ta
 }
 
 fn memoryDeleteIfExists(path: []const u8) void {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
     if (memory_fs_files.fetchRemove(path)) |entry| {
         unsafe_init_cache_allocator.free(entry.key);
@@ -1137,10 +1138,10 @@ fn memoryDeleteIfExists(path: []const u8) void {
 }
 
 fn memoryDeleteTreeIfExists(path: []const u8) void {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
 
-    var to_remove = std.ArrayList([]const u8).init(unsafe_init_cache_allocator);
+    var to_remove = std.array_list.Managed([]const u8).init(unsafe_init_cache_allocator);
     defer to_remove.deinit();
 
     var it = memory_fs_files.iterator();
@@ -1160,10 +1161,10 @@ fn memoryDeleteTreeIfExists(path: []const u8) void {
 }
 
 fn memoryDeletePrefix(prefix: []const u8) void {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
 
-    var to_remove = std.ArrayList([]const u8).init(unsafe_init_cache_allocator);
+    var to_remove = std.array_list.Managed([]const u8).init(unsafe_init_cache_allocator);
     defer to_remove.deinit();
 
     var it = memory_fs_files.iterator();
@@ -1181,7 +1182,7 @@ fn memoryDeletePrefix(prefix: []const u8) void {
 }
 
 fn memoryRename(old_path: []const u8, new_path: []const u8) TableError!void {
-    memory_fs_mutex.lock();
+    while (!memory_fs_mutex.tryLock()) std.atomic.spinLoopHint();
     defer memory_fs_mutex.unlock();
 
     const removed = memory_fs_files.fetchRemove(old_path) orelse return TableError.NotFound;
@@ -1208,7 +1209,7 @@ fn renamePath(old_path: []const u8, new_path: []const u8) TableError!void {
     if (std.mem.startsWith(u8, old_path, MEMORY_PATH_PREFIX) or std.mem.startsWith(u8, new_path, MEMORY_PATH_PREFIX)) {
         return memoryRename(old_path, new_path);
     }
-    std.fs.cwd().rename(old_path, new_path) catch |err| return mapFileError(err);
+    sio.cwd().rename(old_path, sio.cwd(), new_path) catch |err| return mapFileError(err);
 }
 
 fn deleteIfExists(path: []const u8) TableError!void {
@@ -1216,7 +1217,7 @@ fn deleteIfExists(path: []const u8) TableError!void {
         memoryDeleteIfExists(path);
         return;
     }
-    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+    sio.cwd().deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return mapFileError(err),
     };
@@ -1227,12 +1228,12 @@ fn deleteTreeIfExists(path: []const u8) TableError!void {
         memoryDeleteTreeIfExists(path);
         return;
     }
-    std.fs.cwd().deleteTree(path) catch return;
+    sio.cwd().deleteTree(path) catch return;
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) TableError![]u8 {
     if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return memoryReadFileAlloc(allocator, path, max_bytes);
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
+    var file = sio.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
     defer file.close();
     return file.readToEndAlloc(allocator, max_bytes) catch |err| return mapFileError(err);
 }
@@ -1244,11 +1245,11 @@ fn mappedReadFile(path: []const u8, expected_len: usize) TableError!MappedReadRe
         if (bytes.len != expected_len) return TableError.VerifyFailed;
         return .{ .memory = bytes, .owned_by_mmap = false };
     }
-    var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
+    var file = sio.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
     defer file.close();
     const stat = file.stat() catch |err| return mapFileError(err);
     if (stat.size != expected_len) return TableError.VerifyFailed;
-    const mapped = std.posix.mmap(null, expected_len, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0) catch |err| switch (err) {
+    const mapped = std.posix.mmap(null, expected_len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.inner.handle, 0) catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
         else => return TableError.InvalidFormat,
@@ -1271,14 +1272,14 @@ fn mappedReadFileMaxOwned(allocator: std.mem.Allocator, path: []const u8, max_by
         return .{ .memory = bytes, .owned_by_mmap = false, .owned_by_allocator = true };
     }
 
-    var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
+    var file = sio.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
     defer file.close();
     const stat = file.stat() catch |err| return mapFileError(err);
     if (stat.size > max_bytes) return TableError.InvalidFormat;
     if (stat.size > @as(u64, @intCast(std.math.maxInt(usize)))) return TableError.CursorOverflow;
     const len: usize = @intCast(stat.size);
     if (len == 0) return .{ .memory = &[_]u8{} };
-    const mapped = std.posix.mmap(null, len, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0) catch |err| switch (err) {
+    const mapped = std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.inner.handle, 0) catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
         else => return TableError.InvalidFormat,
@@ -1297,13 +1298,12 @@ fn readFileTail(path: []const u8, expected_len: usize, tail: []u8) TableError!vo
         return;
     }
 
-    var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
+    var file = sio.cwd().openFile(path, .{ .mode = .read_only }) catch |err| return mapFileError(err);
     defer file.close();
     const stat = file.stat() catch |err| return mapFileError(err);
     if (stat.size != expected_len) return TableError.VerifyFailed;
     _ = file.seekTo(expected_len - tail.len) catch |err| return mapFileError(err);
-    const got = file.readAll(tail) catch |err| return mapFileError(err);
-    if (got != tail.len) return TableError.VerifyFailed;
+    file.readAll(tail) catch |err| return mapFileError(err);
 }
 
 fn mappedRegionBytes(region: MappedReadRegion) []const u8 {
@@ -1360,7 +1360,9 @@ fn tempWritePath(allocator: std.mem.Allocator, path: []const u8) TableError![]u8
     const parent = std.fs.path.dirname(path);
     const basename = std.fs.path.basename(path);
     const counter = temp_write_counter.fetchAdd(1, .monotonic);
-    const random = std.crypto.random.int(u64);
+    var rand_bytes: [8]u8 = undefined;
+    sio.io().random(&rand_bytes);
+    const random = std.mem.readInt(u64, &rand_bytes, .little);
     const temp_name = try allocPrintPath(allocator, ".{s}.tmp.{x}.{x}", .{ basename, random, counter });
     errdefer allocator.free(temp_name);
     if (parent) |dir| {
@@ -1385,19 +1387,19 @@ fn syncDirBestEffort(dir_path: []const u8) void {
     // NOTE: openDir defaults to O_PATH on Linux, and fsync on an O_PATH fd
     // always fails with EBADF. .iterate = true forces O_RDONLY so the fsync
     // below is a real durability barrier for the rename that precedes it.
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    var dir = sio.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     if (builtin.os.tag == .linux) {
-        _ = std.os.linux.fsync(dir.fd);
+        _ = std.os.linux.fsync(dir.fd());
     }
 }
 
 fn syncFile(path: []const u8) TableError!void {
     if (skipDurabilitySync()) return;
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
+    var file = sio.cwd().openFile(path, .{}) catch |err| return mapFileError(err);
     defer file.close();
     if (builtin.os.tag == .linux) {
-        std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+        std.posix.fdatasync(file.inner.handle) catch |err| return mapFileError(err);
     } else {
         file.sync() catch |err| return mapFileError(err);
     }
@@ -1424,7 +1426,7 @@ fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes
         file.writeAll(bytes) catch |err| return mapFileError(err);
         if (!skipDurabilitySync()) {
             if (builtin.os.tag == .linux) {
-                std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+                std.posix.fdatasync(file.inner.handle) catch |err| return mapFileError(err);
             } else {
                 file.sync() catch |err| return mapFileError(err);
             }
@@ -1437,7 +1439,7 @@ fn writeFileWithParentSync(allocator: std.mem.Allocator, path: []const u8, bytes
 
 fn writeFileChunkAndHash(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: sio.File,
     file_hasher: *std.crypto.hash.sha2.Sha256,
     block_hasher: *std.crypto.hash.sha2.Sha256,
     block_sha256: [][]const u8,
@@ -1452,7 +1454,7 @@ fn writeFileChunkAndHash(
 
 fn writeBytesToFileAndHashes(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: sio.File,
     bytes: []const u8,
     block_size: usize,
 ) TableError!FileHashes {
@@ -1526,7 +1528,7 @@ fn writeFileWithParentSyncAndHashes(
         hashes = try writeBytesToFileAndHashes(allocator, file, bytes, FILE_BLOCK_BYTES);
         hashes_ready = true;
         if (builtin.os.tag == .linux) {
-            std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+            std.posix.fdatasync(file.inner.handle) catch |err| return mapFileError(err);
         } else {
             file.sync() catch |err| return mapFileError(err);
         }
@@ -1562,7 +1564,7 @@ fn copyFile(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []cons
 
     try ensureParentDir(temp_path);
 
-    std.fs.Dir.copyFile(std.fs.cwd(), src_path, std.fs.cwd(), temp_path, .{}) catch |err| return mapFileError(err);
+    sio.Dir.copyFile(sio.cwd(), src_path, sio.cwd(), temp_path, .{}) catch |err| return mapFileError(err);
     try syncFile(temp_path);
     try renamePath(temp_path, dst_path);
     syncParentDirBestEffort(dst_path);
@@ -1578,9 +1580,9 @@ fn appendFileBytesUnsafe(allocator: std.mem.Allocator, root_dir: []const u8, rel
         return memoryAppendFile(allocator, path, appended_bytes);
     }
 
-    var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| return mapFileError(err);
+    var file = sio.cwd().openFile(path, .{ .mode = .read_write }) catch |err| return mapFileError(err);
     defer file.close();
-    _ = file.seekFromEnd(0) catch |err| return mapFileError(err);
+    { const st = file.stat() catch |err| return mapFileError(err); file.seekTo(st.size) catch |err| return mapFileError(err); }
     file.writeAll(appended_bytes) catch |err| return mapFileError(err);
 }
 
@@ -1629,7 +1631,7 @@ fn parseTxCommitMarker(allocator: std.mem.Allocator, source: []const u8) TableEr
 
 fn fileExists(path: []const u8) bool {
     if (std.mem.startsWith(u8, path, MEMORY_PATH_PREFIX)) return memoryFileExists(path);
-    std.fs.cwd().access(path, .{}) catch return false;
+    sio.cwd().access(path, .{}) catch return false;
     return true;
 }
 
@@ -1637,7 +1639,7 @@ fn diskRootMissing(root_dir: []const u8) bool {
     if (isMemoryRoot(root_dir)) return false;
     const prefix = rootPrefix(root_dir);
     if (prefix.len == 0) return false;
-    std.fs.cwd().access(prefix, .{}) catch |err| switch (err) {
+    sio.cwd().access(prefix, .{}) catch |err| switch (err) {
         error.FileNotFound => return true,
         else => return false,
     };
@@ -1657,7 +1659,7 @@ fn loadRecoveredActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const
     try maybeSelectRecoveryMeta(allocator, root_dir, table_name, compat_path, &best);
 
     const recovered = best orelse return TableError.NotFound;
-    return std.json.stringifyAlloc(allocator, recovered, .{}) catch |err| return mapJsonError(err);
+    return std.json.Stringify.valueAlloc(allocator, recovered, .{}) catch |err| return mapJsonError(err);
 }
 
 fn readCompatMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
@@ -2007,7 +2009,7 @@ fn unsafeInitCachePutOwnedWithPending(
     const owned_schema = try arena.allocator().dupe(u8, schema_source);
     const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2141,7 +2143,7 @@ fn unsafeInitCacheBuildInitialMetaOwned(
     try unsafeInitTemplateCachePutSource(root_dir, schema_obj.table_name, schema_path_hint, schema_source, source_fingerprint, owned_meta);
     const info = tableInfo(owned_meta);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2198,7 +2200,7 @@ fn unsafeInitCacheSchemaSource(allocator: std.mem.Allocator, root_dir: []const u
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2216,7 +2218,7 @@ fn unsafeInitCachePendingDictBytes(allocator: std.mem.Allocator, root_dir: []con
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2237,7 +2239,7 @@ fn unsafeInitCachePendingBlobBytes(allocator: std.mem.Allocator, root_dir: []con
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2262,7 +2264,7 @@ fn unsafeInitCachePendingDictWritesForTable(
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2284,7 +2286,7 @@ fn unsafeInitCachePendingBlobWritesForTable(
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2325,7 +2327,7 @@ fn unsafeInitCacheInternStringDictMany(
     const cache_root = try cacheRootKey(unsafe_init_cache_allocator, root_dir);
     defer unsafe_init_cache_allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2422,7 +2424,7 @@ fn unsafeInitCacheTake(allocator: std.mem.Allocator, root_dir: []const u8, table
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2442,7 +2444,7 @@ fn unsafeInitCachePeek(allocator: std.mem.Allocator, root_dir: []const u8, table
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2460,7 +2462,7 @@ fn unsafeInitCacheGeneration(allocator: std.mem.Allocator, root_dir: []const u8,
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2476,7 +2478,7 @@ fn unsafeInitCacheDelete(allocator: std.mem.Allocator, root_dir: []const u8, tab
     const cache_root = cacheRootKey(allocator, root_dir) catch return;
     defer allocator.free(cache_root);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
 
     for (&unsafe_init_meta_cache) |*slot| {
@@ -2536,7 +2538,7 @@ fn unsafeInitTemplateCachePut(root_dir: []const u8, table_name: []const u8, sche
     const owned_source = try arena.allocator().alloc(u8, 0);
     const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
 
-    unsafe_init_template_cache_mutex.lock();
+    while (!unsafe_init_template_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_template_cache_mutex.unlock();
 
     for (&unsafe_init_template_cache) |*slot| {
@@ -2582,7 +2584,7 @@ fn unsafeInitTemplateCachePutSource(
     const owned_source = try arena.allocator().dupe(u8, schema_source);
     const owned_meta = try duplicateTableMeta(arena.allocator(), meta);
 
-    unsafe_init_template_cache_mutex.lock();
+    while (!unsafe_init_template_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_template_cache_mutex.unlock();
 
     for (&unsafe_init_template_cache) |*slot| {
@@ -2617,7 +2619,7 @@ fn unsafeInitTemplateCachePeek(allocator: std.mem.Allocator, root_dir: []const u
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_template_cache_mutex.lock();
+    while (!unsafe_init_template_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_template_cache_mutex.unlock();
 
     for (&unsafe_init_template_cache) |*slot| {
@@ -2644,7 +2646,7 @@ fn unsafeInitTemplateCachePeekSource(
     const cache_root = try cacheRootKey(allocator, root_dir);
     defer allocator.free(cache_root);
 
-    unsafe_init_template_cache_mutex.lock();
+    while (!unsafe_init_template_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_template_cache_mutex.unlock();
 
     for (&unsafe_init_template_cache) |*slot| {
@@ -2664,7 +2666,7 @@ fn unsafeInitTemplateCacheDelete(root_dir: []const u8, table_name: []const u8) v
     const cache_root = cacheRootKey(unsafe_init_cache_allocator, root_dir) catch return;
     defer unsafe_init_cache_allocator.free(cache_root);
 
-    unsafe_init_template_cache_mutex.lock();
+    while (!unsafe_init_template_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_template_cache_mutex.unlock();
 
     for (&unsafe_init_template_cache) |*slot| {
@@ -2704,7 +2706,7 @@ fn buildInitialMeta(
 }
 
 fn deferredInitPut(root_dir: []const u8, table_name: []const u8, schema_path_hint: []const u8, schema_source: []const u8) void {
-    deferred_init_mutex.lock();
+    while (!deferred_init_mutex.tryLock()) std.atomic.spinLoopHint();
     defer deferred_init_mutex.unlock();
 
     var buf: [4096]u8 = undefined;
@@ -2748,7 +2750,7 @@ fn deferredInitPut(root_dir: []const u8, table_name: []const u8, schema_path_hin
 }
 
 fn deferredInitGetSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?[]u8 {
-    deferred_init_mutex.lock();
+    while (!deferred_init_mutex.tryLock()) std.atomic.spinLoopHint();
     defer deferred_init_mutex.unlock();
 
     var buf: [4096]u8 = undefined;
@@ -2758,7 +2760,7 @@ fn deferredInitGetSource(allocator: std.mem.Allocator, root_dir: []const u8, tab
 }
 
 fn deferredInitDelete(root_dir: []const u8, table_name: []const u8) void {
-    deferred_init_mutex.lock();
+    while (!deferred_init_mutex.tryLock()) std.atomic.spinLoopHint();
     defer deferred_init_mutex.unlock();
 
     var buf: [4096]u8 = undefined;
@@ -2778,7 +2780,7 @@ pub fn memoryGC(allocator: std.mem.Allocator, root_dir: []const u8) TableError!v
     const prefix = std.fmt.bufPrint(&buf, "{s}{s}/", .{ MEMORY_PATH_PREFIX, namespace }) catch return TableError.OutOfMemory;
     memoryDeletePrefix(prefix);
 
-    unsafe_init_meta_cache_mutex.lock();
+    while (!unsafe_init_meta_cache_mutex.tryLock()) std.atomic.spinLoopHint();
     defer unsafe_init_meta_cache_mutex.unlock();
     for (&unsafe_init_meta_cache) |*slot| {
         if (slot.*) |*entry| {
@@ -2789,10 +2791,10 @@ pub fn memoryGC(allocator: std.mem.Allocator, root_dir: []const u8) TableError!v
         }
     }
 
-    deferred_init_mutex.lock();
+    while (!deferred_init_mutex.tryLock()) std.atomic.spinLoopHint();
     defer deferred_init_mutex.unlock();
     var it = deferred_init_entries.iterator();
-    var keys_to_delete = std.ArrayList([]const u8).init(allocator);
+    var keys_to_delete = std.array_list.Managed([]const u8).init(allocator);
     defer keys_to_delete.deinit();
     while (it.next()) |entry| {
         if (std.mem.startsWith(u8, entry.key_ptr.*, root_dir)) {
@@ -3215,7 +3217,7 @@ fn writeSegmentFiles(
     root_dir: []const u8,
     table_name: []const u8,
     seg_id: u64,
-    buffers: []std.ArrayList(u8),
+    buffers: []std.array_list.Managed(u8),
 ) TableError![]FileMeta {
     const files = try allocator.alloc(FileMeta, buffers.len);
     initFileMetas(files);
@@ -3924,7 +3926,7 @@ fn appendSegmentToMeta(
     root_dir: []const u8,
     table_name: []const u8,
     meta: *TableMeta,
-    buffers: []std.ArrayList(u8),
+    buffers: []std.array_list.Managed(u8),
     row_count: u64,
 ) TableError!void {
     const old_segments = meta.segments;
@@ -4075,7 +4077,7 @@ fn mergeSegmentFiles(
     errdefer freeFileMetas(allocator, files);
 
     for (0..meta.columns.len) |col_idx| {
-        var merged = std.ArrayList(u8).init(allocator);
+        var merged = std.array_list.Managed(u8).init(allocator);
         errdefer merged.deinit();
         for (meta.segments) |segment| {
             const mapped_column = try mappedSegmentColumnBytes(allocator, root_dir, segment, col_idx, meta.columns[col_idx].stride);
@@ -4712,7 +4714,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(schema_path);
-    if (std.fs.cwd().openFile(schema_path, .{})) |file| {
+    if (sio.cwd().openFile(schema_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o444) catch {};
@@ -4723,7 +4725,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const meta_path = try tableMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(meta_path);
-    if (std.fs.cwd().openFile(meta_path, .{})) |file| {
+    if (sio.cwd().openFile(meta_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o444) catch {};
@@ -4734,7 +4736,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const manifest_path = try tableManifestPath(allocator, root_dir, meta.table_name);
     defer allocator.free(manifest_path);
-    if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
+    if (sio.cwd().openFile(manifest_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o444) catch {};
@@ -4745,7 +4747,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const versioned_meta_path = try tableVersionedMetaPath(allocator, root_dir, meta.table_name, meta.epoch);
     defer allocator.free(versioned_meta_path);
-    if (std.fs.cwd().openFile(versioned_meta_path, .{})) |file| {
+    if (sio.cwd().openFile(versioned_meta_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o444) catch {};
@@ -4758,7 +4760,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         for (segment.files) |file_meta| {
             const path = try activePath(allocator, root_dir, file_meta.path);
             defer allocator.free(path);
-            if (std.fs.cwd().openFile(path, .{})) |file| {
+            if (sio.cwd().openFile(path, .{})) |file| {
                 var f = file;
                 defer f.close();
                 f.chmod(0o444) catch {};
@@ -4772,7 +4774,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     for (meta.indexes) |index| {
         const path = try activePath(allocator, root_dir, index.path);
         defer allocator.free(path);
-        if (std.fs.cwd().openFile(path, .{})) |file| {
+        if (sio.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
             f.chmod(0o444) catch {};
@@ -4785,7 +4787,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     for (meta.dicts) |dict| {
         const path = try activePath(allocator, root_dir, dict.path);
         defer allocator.free(path);
-        if (std.fs.cwd().openFile(path, .{})) |file| {
+        if (sio.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
             f.chmod(0o444) catch {};
@@ -4798,7 +4800,7 @@ fn makeReadonlyRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     for (meta.blobs) |blob| {
         const path = try activePath(allocator, root_dir, blob.path);
         defer allocator.free(path);
-        if (std.fs.cwd().openFile(path, .{})) |file| {
+        if (sio.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
             f.chmod(0o444) catch {};
@@ -4862,7 +4864,7 @@ fn scanVersionedRecoveryMetas(
     best: *?TableMeta,
 ) TableError!void {
     const dir_path = rootPrefix(root_dir);
-    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
+    var dir = sio.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
     defer dir.close();
 
     const prefix = try allocPrintPath(allocator, "{s}.meta.", .{table_name});
@@ -4887,7 +4889,7 @@ fn scanUnsafeRemoveArtifactsAndRecovery(
     best: *?TableMeta,
 ) TableError!void {
     const dir_path = rootPrefix(root_dir);
-    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| switch (mapFileError(err)) {
+    var dir = sio.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| switch (mapFileError(err)) {
         TableError.NotFound => return,
         else => |mapped| return mapped,
     };
@@ -4900,7 +4902,7 @@ fn scanUnsafeRemoveArtifactsAndRecovery(
     const lock_name = try tableWriteLockName(allocator, table_name);
     defer allocator.free(lock_name);
 
-    var stale_files = std.ArrayList([]u8).init(allocator);
+    var stale_files = std.array_list.Managed([]u8).init(allocator);
     defer {
         for (stale_files.items) |name| allocator.free(name);
         stale_files.deinit();
@@ -4938,7 +4940,7 @@ fn scanUnsafeRemoveArtifactsAndRecovery(
 
 fn cleanupPendingTxMarkers(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
     const dir_path = rootPrefix(root_dir);
-    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
+    var dir = sio.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
     defer dir.close();
 
     const prefix = try allocPrintPath(allocator, "{s}.tx.", .{table_name});
@@ -4969,7 +4971,7 @@ fn deleteRootTableArtifacts(allocator: std.mem.Allocator, root_dir: []const u8, 
     }
 
     const dir_path = rootPrefix(root_dir);
-    var dir = std.fs.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
+    var dir = sio.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch |err| return mapFileError(err);
     defer dir.close();
 
     const prefix = try allocPrintPath(allocator, "{s}.", .{table_name});
@@ -5145,7 +5147,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const schema_path = try schemaMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(schema_path);
-    if (std.fs.cwd().openFile(schema_path, .{})) |file| {
+    if (sio.cwd().openFile(schema_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o644) catch {};
@@ -5156,7 +5158,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const meta_path = try tableMetaPath(allocator, root_dir, meta.table_name);
     defer allocator.free(meta_path);
-    if (std.fs.cwd().openFile(meta_path, .{})) |file| {
+    if (sio.cwd().openFile(meta_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o644) catch {};
@@ -5167,7 +5169,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const manifest_path = try tableManifestPath(allocator, root_dir, meta.table_name);
     defer allocator.free(manifest_path);
-    if (std.fs.cwd().openFile(manifest_path, .{})) |file| {
+    if (sio.cwd().openFile(manifest_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o644) catch {};
@@ -5178,7 +5180,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
 
     const versioned_meta_path = try tableVersionedMetaPath(allocator, root_dir, meta.table_name, meta.epoch);
     defer allocator.free(versioned_meta_path);
-    if (std.fs.cwd().openFile(versioned_meta_path, .{})) |file| {
+    if (sio.cwd().openFile(versioned_meta_path, .{})) |file| {
         var f = file;
         defer f.close();
         f.chmod(0o644) catch {};
@@ -5191,7 +5193,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
         for (segment.files) |file_meta| {
             const path = try activePath(allocator, root_dir, file_meta.path);
             defer allocator.free(path);
-            if (std.fs.cwd().openFile(path, .{})) |file| {
+            if (sio.cwd().openFile(path, .{})) |file| {
                 var f = file;
                 defer f.close();
                 f.chmod(0o644) catch {};
@@ -5205,7 +5207,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     for (meta.indexes) |index| {
         const path = try activePath(allocator, root_dir, index.path);
         defer allocator.free(path);
-        if (std.fs.cwd().openFile(path, .{})) |file| {
+        if (sio.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
             f.chmod(0o644) catch {};
@@ -5218,7 +5220,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     for (meta.dicts) |dict| {
         const path = try activePath(allocator, root_dir, dict.path);
         defer allocator.free(path);
-        if (std.fs.cwd().openFile(path, .{})) |file| {
+        if (sio.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
             f.chmod(0o644) catch {};
@@ -5231,7 +5233,7 @@ fn makeWritableRecursive(allocator: std.mem.Allocator, root_dir: []const u8, met
     for (meta.blobs) |blob| {
         const path = try activePath(allocator, root_dir, blob.path);
         defer allocator.free(path);
-        if (std.fs.cwd().openFile(path, .{})) |file| {
+        if (sio.cwd().openFile(path, .{})) |file| {
             var f = file;
             defer f.close();
             f.chmod(0o644) catch {};
@@ -5248,13 +5250,13 @@ fn parseDataFileFormat(path: []const u8) enum { csv, jsonl } {
 }
 
 fn parseCsvRecord(allocator: std.mem.Allocator, line: []const u8) TableError![]const []u8 {
-    var fields = std.ArrayList([]u8).init(allocator);
+    var fields = std.array_list.Managed([]u8).init(allocator);
     errdefer {
         for (fields.items) |field| allocator.free(field);
         fields.deinit();
     }
 
-    var field = std.ArrayList(u8).init(allocator);
+    var field = std.array_list.Managed(u8).init(allocator);
     errdefer field.deinit();
 
     var i: usize = 0;
@@ -5311,7 +5313,7 @@ fn freeCsvRecord(allocator: std.mem.Allocator, fields: []const []u8) void {
     allocator.free(fields);
 }
 
-fn appendTextValue(buf: *std.ArrayList(u8), ty: schema.PrimType, text: []const u8) TableError!void {
+fn appendTextValue(buf: *std.array_list.Managed(u8), ty: schema.PrimType, text: []const u8) TableError!void {
     const trimmed = trim(text);
     if (trimmed.len == 0) return TableError.InvalidFormat;
     switch (ty) {
@@ -5371,7 +5373,7 @@ fn appendTextValue(buf: *std.ArrayList(u8), ty: schema.PrimType, text: []const u
     }
 }
 
-fn writeScalarBytes(buf: *std.ArrayList(u8), ty: schema.PrimType, value: anytype) TableError!void {
+fn writeScalarBytes(buf: *std.array_list.Managed(u8), ty: schema.PrimType, value: anytype) TableError!void {
     var tmp: [16]u8 = undefined;
     switch (ty) {
         .i1 => {
@@ -5483,7 +5485,7 @@ fn writeScalarBytes(buf: *std.ArrayList(u8), ty: schema.PrimType, value: anytype
     }
 }
 
-fn appendJsonValue(buf: *std.ArrayList(u8), ty: schema.PrimType, value: std.json.Value) TableError!void {
+fn appendJsonValue(buf: *std.array_list.Managed(u8), ty: schema.PrimType, value: std.json.Value) TableError!void {
     switch (value) {
         .null => return TableError.InvalidFormat,
         .bool => |b| try writeScalarBytes(buf, ty, b),
@@ -5495,7 +5497,7 @@ fn appendJsonValue(buf: *std.ArrayList(u8), ty: schema.PrimType, value: std.json
     }
 }
 
-fn appendRowFromCsv(columns: []const ColumnMeta, fields: []const []u8, buffers: []std.ArrayList(u8)) TableError!void {
+fn appendRowFromCsv(columns: []const ColumnMeta, fields: []const []u8, buffers: []std.array_list.Managed(u8)) TableError!void {
     if (fields.len != columns.len) return TableError.InvalidFormat;
     for (columns, 0..) |column, idx| {
         const ty = try parsePrimTypeTable(column.ty);
@@ -5503,7 +5505,7 @@ fn appendRowFromCsv(columns: []const ColumnMeta, fields: []const []u8, buffers: 
     }
 }
 
-fn appendRowFromJson(columns: []const ColumnMeta, row: std.json.Value, buffers: []std.ArrayList(u8)) TableError!void {
+fn appendRowFromJson(columns: []const ColumnMeta, row: std.json.Value, buffers: []std.array_list.Managed(u8)) TableError!void {
     const object = switch (row) {
         .object => |obj| obj,
         else => return TableError.InvalidFormat,
@@ -5532,7 +5534,7 @@ fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
     defer if (owned_schema_hash) |hash| allocator.free(hash);
     try normalizePersistedMetaSchemaFields(allocator, root_dir, table_name, &persisted, &owned_schema_path, &owned_schema_hash);
 
-    const json = std.json.stringifyAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
+    const json = std.json.Stringify.valueAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
     errdefer allocator.free(json);
 
     const versioned_name = try tableVersionedMetaName(allocator, table_name, meta.epoch);
@@ -5577,7 +5579,7 @@ fn writeCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_nam
     defer if (owned_hash) |hash| allocator.free(hash);
     try normalizePersistedMetaSchemaFields(allocator, root_dir, table_name, &persisted, &owned_schema_path, &owned_hash);
 
-    const json = std.json.stringifyAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
+    const json = std.json.Stringify.valueAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(json);
 
     const meta_path = try tableMetaPath(allocator, root_dir, table_name);
@@ -5595,7 +5597,7 @@ fn publishWrittenMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_
         .meta_sha256 = written.meta_hash,
         .meta_bytes = written.meta_bytes,
     };
-    const manifest_json = std.json.stringifyAlloc(allocator, manifest, .{}) catch |err| return mapJsonError(err);
+    const manifest_json = std.json.Stringify.valueAlloc(allocator, manifest, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(manifest_json);
     const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
     defer allocator.free(manifest_path);
@@ -5624,7 +5626,7 @@ fn writeTxPendingMarker(allocator: std.mem.Allocator, root_dir: []const u8, tabl
         .previous_epoch = previous_epoch,
         .target_epoch = target_epoch,
     };
-    const json = std.json.stringifyAlloc(allocator, marker, .{}) catch |err| return mapJsonError(err);
+    const json = std.json.Stringify.valueAlloc(allocator, marker, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(json);
     const path = try txPendingMarkerPath(allocator, root_dir, table_name, target_epoch);
     defer allocator.free(path);
@@ -5641,7 +5643,7 @@ fn writeTxCommitMarker(allocator: std.mem.Allocator, root_dir: []const u8, table
         .meta_sha256 = written.meta_hash,
         .meta_bytes = written.meta_bytes,
     };
-    const json = std.json.stringifyAlloc(allocator, marker, .{}) catch |err| return mapJsonError(err);
+    const json = std.json.Stringify.valueAlloc(allocator, marker, .{}) catch |err| return mapJsonError(err);
     defer allocator.free(json);
     const path = try txCommitMarkerPath(allocator, root_dir, table_name, meta.epoch);
     defer allocator.free(path);
@@ -5714,9 +5716,11 @@ pub fn rewriteColumnFileForEpoch(
 }
 
 fn writeGeneratedIface(allocator: std.mem.Allocator, root_dir: []const u8, schema_obj: schema.Schema) TableError!void {
-    var iface = std.ArrayList(u8).init(allocator);
-    defer iface.deinit();
-    schema.writeIface(iface.writer(), schema_obj) catch |err| return mapFileError(err);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    schema.writeIface(&aw.writer, schema_obj) catch |err| return mapFileError(err);
+    var iface = aw.toArrayList();
+    defer iface.deinit(allocator);
 
     const basename = try allocPrintPath(allocator, "{s}.sai", .{schema_obj.table_name});
     defer allocator.free(basename);
@@ -5919,7 +5923,7 @@ pub fn beginColumnIngestSession(
         .max_rows_snapshot = meta.max_rows,
         .columns_len = meta.columns.len,
         .column_strides = column_strides,
-        .batches = std.ArrayList(ColumnBatch).init(allocator),
+        .batches = std.array_list.Managed(ColumnBatch).init(allocator),
     };
     meta_transferred = true;
     return session;
@@ -6208,17 +6212,17 @@ fn splitRawRowColumns(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: 
     return columns;
 }
 
-fn allocateColumnBuffers(allocator: std.mem.Allocator, column_count: usize) TableError![]std.ArrayList(u8) {
-    const buffers = try allocator.alloc(std.ArrayList(u8), column_count);
+fn allocateColumnBuffers(allocator: std.mem.Allocator, column_count: usize) TableError![]std.array_list.Managed(u8) {
+    const buffers = try allocator.alloc(std.array_list.Managed(u8), column_count);
     errdefer allocator.free(buffers);
-    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    for (buffers) |*buf| buf.* = std.array_list.Managed(u8).init(allocator);
     errdefer {
         for (buffers) |*buf| buf.deinit();
     }
     return buffers;
 }
 
-fn borrowRawColumnBytesFromBuffers(allocator: std.mem.Allocator, buffers: []std.ArrayList(u8)) TableError![]RawColumnBytes {
+fn borrowRawColumnBytesFromBuffers(allocator: std.mem.Allocator, buffers: []std.array_list.Managed(u8)) TableError![]RawColumnBytes {
     const columns = try allocator.alloc(RawColumnBytes, buffers.len);
     errdefer allocator.free(columns);
     for (buffers, 0..) |buffer, idx| columns[idx] = .{ .bytes = buffer.items };
@@ -6305,7 +6309,7 @@ fn recordTransactionDeletedRow(tx: *WriteTransaction, original_row: u64) TableEr
     tx.deleted_rows = next;
 }
 
-fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]std.ArrayList(u8) {
+fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, row_bytes: []const u8) TableError![]std.array_list.Managed(u8) {
     const columns = try splitRawRowColumns(allocator, meta, row_bytes);
     defer allocator.free(columns);
 
@@ -6318,7 +6322,7 @@ fn buildSingleRowColumnBuffers(allocator: std.mem.Allocator, meta: TableMeta, ro
     return buffers;
 }
 
-fn freeColumnBuffers(allocator: std.mem.Allocator, buffers: []std.ArrayList(u8)) void {
+fn freeColumnBuffers(allocator: std.mem.Allocator, buffers: []std.array_list.Managed(u8)) void {
     for (buffers) |*buf| buf.deinit();
     allocator.free(buffers);
 }
@@ -6340,7 +6344,7 @@ fn freeOwnedRawColumnBytes(allocator: std.mem.Allocator, columns: []RawColumnByt
     allocator.free(columns);
 }
 
-fn buildAllColumnBuffers(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError![]std.ArrayList(u8) {
+fn buildAllColumnBuffers(allocator: std.mem.Allocator, root_dir: []const u8, meta: TableMeta) TableError![]std.array_list.Managed(u8) {
     const buffers = try allocateColumnBuffers(allocator, meta.columns.len);
     errdefer freeColumnBuffers(allocator, buffers);
 
@@ -7156,7 +7160,7 @@ fn txReplaceRawRow(tx: *WriteTransaction, row_index: u64, row_bytes: []const u8)
     try walStageRowOp(tx, WAL_ROW_OP_REPLACE, row_index, row_bytes);
 }
 
-fn removeBufferRange(buf: *std.ArrayList(u8), start: usize, len: usize) void {
+fn removeBufferRange(buf: *std.array_list.Managed(u8), start: usize, len: usize) void {
     const end = start + len;
     const tail_len = buf.items.len - end;
     std.mem.copyForwards(u8, buf.items[start .. start + tail_len], buf.items[end..]);
@@ -7300,7 +7304,7 @@ pub fn beginWriteTransaction(
         .pending_append_buffers = &.{},
         .base_row_count = meta.row_count,
         .dirty = false,
-        .wal_ops = std.ArrayList(u8).init(allocator),
+        .wal_ops = std.array_list.Managed(u8).init(allocator),
         .wal_capture = true,
     };
     write_lock_transferred = true;
@@ -7327,7 +7331,7 @@ pub fn beginWriteTransaction(
 fn walOverlayReplayIntoTx(allocator: std.mem.Allocator, tx: *WriteTransaction) TableError!void {
     const path = try walFilePath(allocator, tx.root_dir, tx.table_name);
     defer allocator.free(path);
-    const data = std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
+    const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
         error.FileNotFound => return, // raced with a checkpoint; tx stays at disk state
         else => return mapFileError(err),
     };
@@ -7956,7 +7960,7 @@ fn walNextTxId() u64 {
 // write lock this thread already holds (re-acquiring the blocking exclusive
 // lock would self-deadlock).
 threadlocal var wal_thread_tx_count: usize = 0;
-threadlocal var wal_thread_tx_keys: [16]u64 = [_]u64{0} ** 16;
+threadlocal var wal_thread_tx_keys: [16]u64 = std.mem.zeroes([16]u64);
 
 // --- WAL checkpoint thresholds (Phase 1) -----------------------------------
 // Sync checkpoint triggers: dirty read, or WAL reaches 1k committed txs /
@@ -7965,7 +7969,7 @@ const WalCheckpointState = struct {
     committed_txs: u64,
     last_checkpoint_ns: i128,
 };
-var wal_checkpoint_states_mutex: std.Thread.Mutex = .{};
+var wal_checkpoint_states_mutex: std.atomic.Mutex = .unlocked;
 var wal_checkpoint_states: std.StringHashMap(WalCheckpointState) = undefined;
 var wal_checkpoint_states_init: bool = false;
 
@@ -7974,7 +7978,7 @@ fn walCheckpointStateKey(allocator: std.mem.Allocator, root_dir: []const u8, tab
 }
 
 fn walCheckpointStateGet(_: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!*WalCheckpointState {
-    wal_checkpoint_states_mutex.lock();
+    while (!wal_checkpoint_states_mutex.tryLock()) std.atomic.spinLoopHint();
     defer wal_checkpoint_states_mutex.unlock();
     if (!wal_checkpoint_states_init) {
         wal_checkpoint_states = std.StringHashMap(WalCheckpointState).init(unsafe_init_cache_allocator);
@@ -7983,7 +7987,7 @@ fn walCheckpointStateGet(_: std.mem.Allocator, root_dir: []const u8, table_name:
     const key = try walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name);
     const entry = try wal_checkpoint_states.getOrPut(key);
     if (!entry.found_existing) {
-        entry.value_ptr.* = .{ .committed_txs = 0, .last_checkpoint_ns = std.time.nanoTimestamp() };
+        entry.value_ptr.* = .{ .committed_txs = 0, .last_checkpoint_ns = sio.nanoTimestamp() };
     } else {
         unsafe_init_cache_allocator.free(key);
     }
@@ -7992,23 +7996,23 @@ fn walCheckpointStateGet(_: std.mem.Allocator, root_dir: []const u8, table_name:
 
 fn walCheckpointStateOnCommit(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
     const st = walCheckpointStateGet(allocator, root_dir, table_name) catch return;
-    wal_checkpoint_states_mutex.lock();
+    while (!wal_checkpoint_states_mutex.tryLock()) std.atomic.spinLoopHint();
     defer wal_checkpoint_states_mutex.unlock();
     st.committed_txs += 1;
 }
 
 fn walCheckpointStateOnCheckpoint(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
     const st = walCheckpointStateGet(allocator, root_dir, table_name) catch return;
-    wal_checkpoint_states_mutex.lock();
+    while (!wal_checkpoint_states_mutex.tryLock()) std.atomic.spinLoopHint();
     defer wal_checkpoint_states_mutex.unlock();
     st.committed_txs = 0;
-    st.last_checkpoint_ns = std.time.nanoTimestamp();
+    st.last_checkpoint_ns = sio.nanoTimestamp();
 }
 
 /// True if the WAL has reached a sync-checkpoint threshold.
 fn walShouldCheckpoint(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
     const st = walCheckpointStateGet(allocator, root_dir, table_name) catch return true;
-    wal_checkpoint_states_mutex.lock();
+    while (!wal_checkpoint_states_mutex.tryLock()) std.atomic.spinLoopHint();
     const committed = st.committed_txs;
     const last_ns = st.last_checkpoint_ns;
     wal_checkpoint_states_mutex.unlock();
@@ -8019,10 +8023,10 @@ fn walShouldCheckpoint(allocator: std.mem.Allocator, root_dir: []const u8, table
     if (committed >= 100) return true;
     const wal_size = walFileSize(allocator, root_dir, table_name);
     if (wal_size >= 4 * 1024 * 1024) return true;
-    if (std.time.nanoTimestamp() - last_ns >= 30 * std.time.ns_per_s) return true;
+    if (sio.nanoTimestamp() - last_ns >= 30 * std.time.ns_per_s) return true;
     return false;
 }
-threadlocal var wal_thread_tx_committed: [16]bool = [_]bool{false} ** 16;
+threadlocal var wal_thread_tx_committed: [16]bool = std.mem.zeroes([16]bool);
 
 fn walThreadKey(root_dir: []const u8, table_name: []const u8) u64 {
     var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
@@ -8094,16 +8098,16 @@ fn walDeleteIfExists(allocator: std.mem.Allocator, root_dir: []const u8, table_n
     const path = walFilePath(allocator, root_dir, table_name) catch return;
     defer allocator.free(path);
     walForgetDirSynced(path);
-    std.fs.cwd().deleteFile(path) catch {};
+    sio.cwd().deleteFile(path) catch {};
 }
 
 // Tracks WAL files whose creation has already been directory-synced, so the
 // directory fsync happens once per file rather than once per commit.
 var wal_dir_synced = std.StringHashMap(void).init(std.heap.page_allocator);
-var wal_dir_synced_mutex: std.Thread.Mutex = .{};
+var wal_dir_synced_mutex: std.atomic.Mutex = .unlocked;
 
 fn walNoteDirSynced(path: []const u8) void {
-    wal_dir_synced_mutex.lock();
+    while (!wal_dir_synced_mutex.tryLock()) std.atomic.spinLoopHint();
     defer wal_dir_synced_mutex.unlock();
     const owned = wal_dir_synced.allocator.dupe(u8, path) catch return;
     errdefer wal_dir_synced.allocator.free(owned);
@@ -8113,13 +8117,13 @@ fn walNoteDirSynced(path: []const u8) void {
 }
 
 fn walWasDirSynced(path: []const u8) bool {
-    wal_dir_synced_mutex.lock();
+    while (!wal_dir_synced_mutex.tryLock()) std.atomic.spinLoopHint();
     defer wal_dir_synced_mutex.unlock();
     return wal_dir_synced.contains(path);
 }
 
 fn walForgetDirSynced(path: []const u8) void {
-    wal_dir_synced_mutex.lock();
+    while (!wal_dir_synced_mutex.tryLock()) std.atomic.spinLoopHint();
     defer wal_dir_synced_mutex.unlock();
     if (wal_dir_synced.fetchRemove(path)) |kv| {
         wal_dir_synced.allocator.free(kv.key);
@@ -8136,7 +8140,7 @@ fn walStageRecord(tx: *WriteTransaction, payload: []const u8) TableError!void {
     try tx.wal_ops.appendSlice(&header);
     try tx.wal_ops.appendSlice(payload);
     var crc_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(payload), .little);
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(payload), .little);
     try tx.wal_ops.appendSlice(&crc_buf);
 }
 
@@ -8150,7 +8154,7 @@ fn walStageRowOp(tx: *WriteTransaction, op: u8, row_index: u64, row_bytes: []con
         try walStageRecord(tx, &fixed);
         return;
     }
-    var payload = std.ArrayList(u8).init(tx.allocator);
+    var payload = std.array_list.Managed(u8).init(tx.allocator);
     defer payload.deinit();
     try payload.appendSlice(&fixed);
     try payload.appendSlice(row_bytes);
@@ -8200,7 +8204,7 @@ fn walStageColumnBatch(
 
 fn walStageDictPut(tx: *WriteTransaction, dict_name: []const u8, value: []const u8) TableError!void {
     if (!tx.wal_capture) return;
-    var payload = std.ArrayList(u8).init(tx.allocator);
+    var payload = std.array_list.Managed(u8).init(tx.allocator);
     defer payload.deinit();
     try payload.append(WAL_RECORD_DICT_PUT);
     var len_buf: [4]u8 = undefined;
@@ -8215,7 +8219,7 @@ fn walStageDictPut(tx: *WriteTransaction, dict_name: []const u8, value: []const 
 
 fn walStageBlobPut(tx: *WriteTransaction, store_name: []const u8, value: []const u8) TableError!void {
     if (!tx.wal_capture) return;
-    var payload = std.ArrayList(u8).init(tx.allocator);
+    var payload = std.array_list.Managed(u8).init(tx.allocator);
     defer payload.deinit();
     try payload.append(WAL_RECORD_BLOB_PUT);
     var len_buf: [4]u8 = undefined;
@@ -8228,7 +8232,7 @@ fn walStageBlobPut(tx: *WriteTransaction, store_name: []const u8, value: []const
     try walStageRecord(tx, payload.items);
 }
 
-fn walFrameTxBegin(out: *std.ArrayList(u8), txid: u64, base_epoch: u64) TableError!void {
+fn walFrameTxBegin(out: *std.array_list.Managed(u8), txid: u64, base_epoch: u64) TableError!void {
     var payload: [1 + 8 + 8]u8 = undefined;
     payload[0] = WAL_RECORD_TX_BEGIN;
     std.mem.writeInt(u64, payload[1..9], txid, .little);
@@ -8238,11 +8242,11 @@ fn walFrameTxBegin(out: *std.ArrayList(u8), txid: u64, base_epoch: u64) TableErr
     try out.appendSlice(&header);
     try out.appendSlice(&payload);
     var crc_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(&payload), .little);
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(&payload), .little);
     try out.appendSlice(&crc_buf);
 }
 
-fn walFrameTxCommit(out: *std.ArrayList(u8), txid: u64, new_epoch: u64) TableError!void {
+fn walFrameTxCommit(out: *std.array_list.Managed(u8), txid: u64, new_epoch: u64) TableError!void {
     var payload: [1 + 8 + 8]u8 = undefined;
     payload[0] = WAL_RECORD_TX_COMMIT;
     std.mem.writeInt(u64, payload[1..9], txid, .little);
@@ -8252,7 +8256,7 @@ fn walFrameTxCommit(out: *std.ArrayList(u8), txid: u64, new_epoch: u64) TableErr
     try out.appendSlice(&header);
     try out.appendSlice(&payload);
     var crc_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(&payload), .little);
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(&payload), .little);
     try out.appendSlice(&crc_buf);
 }
 
@@ -8270,7 +8274,7 @@ fn walAppendSync(allocator: std.mem.Allocator, root_dir: []const u8, table_name:
     // (didn't exist before). If it already exists, its directory entry is
     // durable; we just append + fdatasync.
     const file_existed = blk: {
-        _ = std.fs.cwd().statFile(path) catch |err| switch (err) {
+        _ = sio.cwd().statFile(path) catch |err| switch (err) {
             error.FileNotFound => break :blk false,
             else => break :blk true, // be conservative on other errors
         };
@@ -8279,13 +8283,13 @@ fn walAppendSync(allocator: std.mem.Allocator, root_dir: []const u8, table_name:
     const need_dir_sync = !file_existed and !walWasDirSynced(path);
     if (need_dir_sync) try ensureParentDir(path);
 
-    const fd = std.posix.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch |err| return mapFileError(err);
-    var file = std.fs.File{ .handle = fd };
+    var file = sio.cwd().createFile(path, .{ .truncate = false }) catch |err| return mapFileError(err);
     defer file.close();
+    { const st = file.stat() catch |err| return mapFileError(err); file.seekTo(st.size) catch |err| return mapFileError(err); }
     file.writeAll(bytes) catch |err| return mapFileError(err);
     if (!skipDurabilitySync()) {
         if (builtin.os.tag == .linux) {
-            std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+            std.posix.fdatasync(file.inner.handle) catch |err| return mapFileError(err);
         } else {
             file.sync() catch |err| return mapFileError(err);
         }
@@ -8299,7 +8303,7 @@ fn walAppendSync(allocator: std.mem.Allocator, root_dir: []const u8, table_name:
 fn walFileSize(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) u64 {
     const path = walFilePath(allocator, root_dir, table_name) catch return 0;
     defer allocator.free(path);
-    const stat = std.fs.cwd().statFile(path) catch return 0;
+    const stat = sio.cwd().statFile(path) catch return 0;
     return stat.size;
 }
 
@@ -8320,7 +8324,7 @@ const WalParseResult = struct {
 };
 
 fn walParseValidPrefix(allocator: std.mem.Allocator, data: []const u8) TableError!WalParseResult {
-    var records = std.ArrayList(WalParsedRecord).init(allocator);
+    var records = std.array_list.Managed(WalParsedRecord).init(allocator);
     errdefer records.deinit();
     var offset: usize = 0;
     while (true) {
@@ -8331,7 +8335,7 @@ fn walParseValidPrefix(allocator: std.mem.Allocator, data: []const u8) TableErro
         if (data.len - offset < total) break; // torn tail
         const payload = data[offset + 4 .. offset + 4 + payload_len];
         const stored_crc = std.mem.readInt(u64, data[offset + 4 + payload_len ..][0..8], .little);
-        if (std.hash.crc.Crc64Xz.hash(payload) != stored_crc) break; // corrupt tail
+        if (std.hash.crc.@"CRC-64/XZ".hash(payload) != stored_crc) break; // corrupt tail
         try records.append(.{ .tag = payload[0], .payload = payload });
         offset += total;
     }
@@ -8362,7 +8366,7 @@ fn checkpointWalIfDirty(allocator: std.mem.Allocator, root_dir: []const u8, tabl
 const WalApplicableTx = struct {
     txid: u64,
     base_epoch: u64,
-    ops: std.ArrayList(WalParsedRecord),
+    ops: std.array_list.Managed(WalParsedRecord),
 };
 
 /// Group parsed WAL records into transactions; keep complete BEGIN...COMMIT
@@ -8373,10 +8377,10 @@ fn walCollectApplicableTxs(
     allocator: std.mem.Allocator,
     records: []const WalParsedRecord,
     disk_epoch: u64,
-) TableError!std.ArrayList(WalApplicableTx) {
+) TableError!std.array_list.Managed(WalApplicableTx) {
     var pending: ?WalApplicableTx = null;
     defer if (pending) |*p| p.ops.deinit();
-    var applicable = std.ArrayList(WalApplicableTx).init(allocator);
+    var applicable = std.array_list.Managed(WalApplicableTx).init(allocator);
     errdefer {
         for (applicable.items) |*t| t.ops.deinit();
         applicable.deinit();
@@ -8391,7 +8395,7 @@ fn walCollectApplicableTxs(
                 pending = .{
                     .txid = std.mem.readInt(u64, rec.payload[1..9], .little),
                     .base_epoch = std.mem.readInt(u64, rec.payload[9..17], .little),
-                    .ops = std.ArrayList(WalParsedRecord).init(allocator),
+                    .ops = std.array_list.Managed(WalParsedRecord).init(allocator),
                 };
             },
             WAL_RECORD_ROW, WAL_RECORD_DICT_PUT, WAL_RECORD_BLOB_PUT => {
@@ -8459,7 +8463,7 @@ fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table
     const path = try walFilePath(allocator, root_dir, table_name);
     defer allocator.free(path);
 
-    const data = std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
+    const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return mapFileError(err),
     };
@@ -8500,12 +8504,10 @@ fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table
     // New epoch is durable (or nothing needed replaying): truncate the WAL.
     // A torn tail is discarded here as well — only valid committed records
     // were replayed above.
-    const fd = std.posix.open(path, .{ .ACCMODE = .WRONLY }, 0) catch |err| return mapFileError(err);
-    var wal_file = std.fs.File{ .handle = fd };
+    var wal_file = sio.cwd().createFile(path, .{ .truncate = true }) catch |err| return mapFileError(err);
     defer wal_file.close();
-    wal_file.setEndPos(0) catch |err| return mapFileError(err);
     if (builtin.os.tag == .linux) {
-        std.posix.fdatasync(wal_file.handle) catch |err| return mapFileError(err);
+        std.posix.fdatasync(wal_file.inner.handle) catch |err| return mapFileError(err);
     } else {
         wal_file.sync() catch |err| return mapFileError(err);
     }
@@ -8540,7 +8542,7 @@ fn beginWriteTransactionLocked(
         .pending_append_buffers = &.{},
         .base_row_count = meta.row_count,
         .dirty = false,
-        .wal_ops = std.ArrayList(u8).init(allocator),
+        .wal_ops = std.array_list.Managed(u8).init(allocator),
         .wal_capture = false,
     };
     return tx;
@@ -8610,7 +8612,7 @@ fn commitWriteTransactionWal(allocator: std.mem.Allocator, tx: *WriteTransaction
     const new_epoch = std.math.add(u64, base_epoch, 1) catch return TableError.CursorOverflow;
     const txid = walNextTxId();
 
-    var frame = std.ArrayList(u8).init(allocator);
+    var frame = std.array_list.Managed(u8).init(allocator);
     defer frame.deinit();
     try walFrameTxBegin(&frame, txid, base_epoch);
     try frame.appendSlice(tx.wal_ops.items);
@@ -8929,7 +8931,7 @@ fn makeCountedArtifactHashes(
     return .{ .sha256 = sha256, .block_size = FILE_BLOCK_BYTES, .block_sha256 = block_sha256 };
 }
 
-fn writeCountedArtifactToFile(file: std.fs.File, old_bytes: []const u8, new_count: u64, values: []const []const u8) TableError!void {
+fn writeCountedArtifactToFile(file: sio.File, old_bytes: []const u8, new_count: u64, values: []const []const u8) TableError!void {
     var word: [8]u8 = undefined;
     writeU64LE(word[0..], 0, new_count);
     file.writeAll(word[0..]) catch |err| return mapFileError(err);
@@ -8947,7 +8949,7 @@ fn writeCountedArtifactToFile(file: std.fs.File, old_bytes: []const u8, new_coun
 
 fn writeCountedArtifactChunkAndHash(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: sio.File,
     file_hasher: *std.crypto.hash.sha2.Sha256,
     block_hasher: *std.crypto.hash.sha2.Sha256,
     block_sha256: [][]const u8,
@@ -8962,7 +8964,7 @@ fn writeCountedArtifactChunkAndHash(
 
 fn writeCountedArtifactToFileAndHashes(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: sio.File,
     old_bytes: []const u8,
     new_count: u64,
     values: []const []const u8,
@@ -9043,7 +9045,7 @@ fn writeCountedArtifactFile(
         defer file.close();
         try writeCountedArtifactToFile(file, old_bytes, new_count, values);
         if (builtin.os.tag == .linux) {
-            std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+            std.posix.fdatasync(file.inner.handle) catch |err| return mapFileError(err);
         } else {
             file.sync() catch |err| return mapFileError(err);
         }
@@ -9094,7 +9096,7 @@ fn writeCountedArtifactFileAndHashes(
         hashes = try writeCountedArtifactToFileAndHashes(allocator, file, old_bytes, new_count, values, total);
         hashes_ready = true;
         if (builtin.os.tag == .linux) {
-            std.posix.fdatasync(file.handle) catch |err| return mapFileError(err);
+            std.posix.fdatasync(file.inner.handle) catch |err| return mapFileError(err);
         } else {
             file.sync() catch |err| return mapFileError(err);
         }
@@ -10260,7 +10262,7 @@ fn radixSortIndexEntries(allocator: std.mem.Allocator, entries: []IndexEntry) Ta
 
     var shift: usize = 0;
     while (shift < 64) : (shift += 8) {
-        var counts = [_]usize{0} ** 256;
+        var counts: [256]usize = std.mem.zeroes([256]usize);
         for (src) |entry| counts[@intCast((entry.key >> @as(u6, @intCast(shift))) & 0xff)] += 1;
 
         var offsets: [256]usize = undefined;
@@ -10296,7 +10298,7 @@ fn radixSortU64PairIndexEntries(allocator: std.mem.Allocator, entries: []U64Pair
     inline for ([_][]const u8{ "key2", "key1" }) |field_name| {
         var shift: usize = 0;
         while (shift < 64) : (shift += 8) {
-            var counts = [_]usize{0} ** 256;
+            var counts: [256]usize = std.mem.zeroes([256]usize);
             for (src) |entry| {
                 const value = @field(entry, field_name);
                 counts[@intCast((value >> @as(u6, @intCast(shift))) & 0xff)] += 1;
@@ -10382,7 +10384,7 @@ fn blobContainsGramHash(gram: []const u8) u64 {
     return std.mem.readInt(u64, digest[0..8], .little);
 }
 
-fn appendBlobContainsEntriesForValue(entries: *std.ArrayList(IndexEntry), row: u64, value: []const u8) TableError!void {
+fn appendBlobContainsEntriesForValue(entries: *std.array_list.Managed(IndexEntry), row: u64, value: []const u8) TableError!void {
     if (value.len < BLOB_CONTAINS_GRAM_BYTES) return;
     var start: usize = 0;
     while (start + BLOB_CONTAINS_GRAM_BYTES <= value.len) : (start += 1) {
@@ -10447,7 +10449,7 @@ fn blobValueHasTokenPrefix(value: []const u8, query_prefix: []const u8) bool {
     return false;
 }
 
-fn appendBlobTokenEntriesForValue(entries: *std.ArrayList(IndexEntry), row: u64, value: []const u8) TableError!void {
+fn appendBlobTokenEntriesForValue(entries: *std.array_list.Managed(IndexEntry), row: u64, value: []const u8) TableError!void {
     var token_start: ?usize = null;
     for (value, 0..) |c, idx| {
         if (isBlobTokenChar(c)) {
@@ -10470,7 +10472,7 @@ fn appendBlobTokenEntriesForValue(entries: *std.ArrayList(IndexEntry), row: u64,
     }
 }
 
-fn appendBlobPrefixEntriesForToken(entries: *std.ArrayList(IndexEntry), row: u64, token: []const u8) TableError!void {
+fn appendBlobPrefixEntriesForToken(entries: *std.array_list.Managed(IndexEntry), row: u64, token: []const u8) TableError!void {
     const capped_len = @min(token.len, BLOB_PREFIX_MAX_BYTES);
     var prefix_len: usize = 1;
     while (prefix_len <= capped_len) : (prefix_len += 1) {
@@ -10478,7 +10480,7 @@ fn appendBlobPrefixEntriesForToken(entries: *std.ArrayList(IndexEntry), row: u64
     }
 }
 
-fn appendBlobPrefixEntriesForValue(entries: *std.ArrayList(IndexEntry), row: u64, value: []const u8) TableError!void {
+fn appendBlobPrefixEntriesForValue(entries: *std.array_list.Managed(IndexEntry), row: u64, value: []const u8) TableError!void {
     var token_start: ?usize = null;
     for (value, 0..) |c, idx| {
         if (isBlobTokenChar(c)) {
@@ -10655,7 +10657,7 @@ fn expectedU64PairIndexBytes(row_count: u64) TableError!usize {
 }
 
 fn shouldValidateMergedIndexes() bool {
-    return builtin.mode != .ReleaseFast;
+    return builtin.mode != .fast;
 }
 
 fn validateIndexBytesShape(bytes: []const u8, row_count: u64, unique: bool) TableError!void {
@@ -11217,7 +11219,7 @@ fn buildBlobTokenIndexBytes(
     defer if (has_blob_refs) allocator.free(blob_refs);
     defer if (has_mapped_blob) releaseMappedRegion(allocator, mapped_blob);
 
-    var entries = std.ArrayList(IndexEntry).init(allocator);
+    var entries = std.array_list.Managed(IndexEntry).init(allocator);
     defer entries.deinit();
 
     var row_base: u64 = 0;
@@ -11280,7 +11282,7 @@ fn buildBlobPrefixIndexBytes(
     defer if (has_blob_refs) allocator.free(blob_refs);
     defer if (has_mapped_blob) releaseMappedRegion(allocator, mapped_blob);
 
-    var entries = std.ArrayList(IndexEntry).init(allocator);
+    var entries = std.array_list.Managed(IndexEntry).init(allocator);
     defer entries.deinit();
 
     var row_base: u64 = 0;
@@ -11343,7 +11345,7 @@ fn buildBlobContainsIndexBytes(
     defer if (has_blob_refs) allocator.free(blob_refs);
     defer if (has_mapped_blob) releaseMappedRegion(allocator, mapped_blob);
 
-    var entries = std.ArrayList(IndexEntry).init(allocator);
+    var entries = std.array_list.Managed(IndexEntry).init(allocator);
     defer entries.deinit();
 
     var row_base: u64 = 0;
@@ -11896,7 +11898,7 @@ fn buildBlobTokenIndexBytesForSegment(
 
     const blob_refs = if (try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache)) |blob_store| blob_store.refs else &.{};
 
-    var entries = std.ArrayList(IndexEntry).init(allocator);
+    var entries = std.array_list.Managed(IndexEntry).init(allocator);
     defer entries.deinit();
 
     const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, in_memory_columns, column_cache);
@@ -11944,7 +11946,7 @@ fn buildBlobPrefixIndexBytesForSegment(
 
     const blob_refs = if (try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache)) |blob_store| blob_store.refs else &.{};
 
-    var entries = std.ArrayList(IndexEntry).init(allocator);
+    var entries = std.array_list.Managed(IndexEntry).init(allocator);
     defer entries.deinit();
 
     const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, in_memory_columns, column_cache);
@@ -11992,7 +11994,7 @@ fn buildBlobContainsIndexBytesForSegment(
 
     const blob_refs = if (try getCachedBlobStore(allocator, root_dir, meta, store_name, blob_cache)) |blob_store| blob_store.refs else &.{};
 
-    var entries = std.ArrayList(IndexEntry).init(allocator);
+    var entries = std.array_list.Managed(IndexEntry).init(allocator);
     defer entries.deinit();
 
     const bytes = try getCachedSegmentColumnBytes(allocator, root_dir, segment, column_index, 8, in_memory_columns, column_cache);
@@ -12086,13 +12088,13 @@ fn rewriteIndexMetaBytesUnsafeFields(allocator: std.mem.Allocator, index: *Index
     index.block_sha256 = &.{};
 }
 
-fn mapExpandedFileReadWrite(path: []const u8, old_len: usize, new_len: usize) TableError!struct { file: std.fs.File, mapped: MappedReadRegion } {
-    var file = std.fs.cwd().openFile(path, .{ .mode = .read_write }) catch |err| return mapFileError(err);
+fn mapExpandedFileReadWrite(path: []const u8, old_len: usize, new_len: usize) TableError!struct { file: sio.File, mapped: MappedReadRegion } {
+    var file = sio.cwd().openFile(path, .{ .mode = .read_write }) catch |err| return mapFileError(err);
     errdefer file.close();
     const stat = file.stat() catch |err| return mapFileError(err);
     if (stat.size != old_len) return TableError.VerifyFailed;
-    file.setEndPos(new_len) catch |err| return mapFileError(err);
-    const mapped = std.posix.mmap(null, new_len, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0) catch |err| switch (err) {
+    { const rc = std.os.linux.ftruncate(file.inner.handle, @as(i64, @intCast(new_len))); if (rc != 0) return mapFileError(error.AccessDenied); }
+    const mapped = std.posix.mmap(null, new_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.inner.handle, 0) catch |err| switch (err) {
         error.OutOfMemory => return TableError.OutOfMemory,
         error.MemoryMappingNotSupported, error.AccessDenied, error.PermissionDenied => return TableError.InvalidFormat,
         else => return TableError.InvalidFormat,
@@ -15967,10 +15969,10 @@ fn buildColumnBuffersWithoutRow(
     root_dir: []const u8,
     meta: TableMeta,
     delete_row_index: u64,
-) TableError![]std.ArrayList(u8) {
-    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+) TableError![]std.array_list.Managed(u8) {
+    const buffers = try allocator.alloc(std.array_list.Managed(u8), meta.columns.len);
     errdefer allocator.free(buffers);
-    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    for (buffers) |*buf| buf.* = std.array_list.Managed(u8).init(allocator);
     errdefer {
         for (buffers) |*buf| buf.deinit();
     }
@@ -15999,7 +16001,7 @@ fn buildColumnBuffersWithoutRow(
 }
 
 const ReplacedColumnBuffers = struct {
-    buffers: []std.ArrayList(u8),
+    buffers: []std.array_list.Managed(u8),
     changed_columns: []bool,
 
     fn deinit(self: ReplacedColumnBuffers, allocator: std.mem.Allocator) void {
@@ -16017,9 +16019,9 @@ fn buildColumnBuffersReplacingRow(
     row_bytes: []const u8,
 ) TableError!ReplacedColumnBuffers {
     if (row_bytes.len != try fixedRowBytes(meta)) return TableError.InvalidFormat;
-    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    const buffers = try allocator.alloc(std.array_list.Managed(u8), meta.columns.len);
     errdefer allocator.free(buffers);
-    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    for (buffers) |*buf| buf.* = std.array_list.Managed(u8).init(allocator);
     errdefer {
         for (buffers) |*buf| buf.deinit();
     }
@@ -16881,7 +16883,7 @@ pub fn snapshotStatsRowsI64(snapshot: *const ReadSnapshot, column_index: usize, 
 }
 
 fn addU64I64Group(
-    groups: *std.ArrayList(U64I64GroupAccumulator),
+    groups: *std.array_list.Managed(U64I64GroupAccumulator),
     group_index: *std.AutoHashMap(u64, usize),
     key: u64,
     amount: i64,
@@ -17025,8 +17027,8 @@ fn buildU64I64GroupsFromSnapshot(
     snapshot: *const ReadSnapshot,
     group_column_index: usize,
     sum_column_index: usize,
-) TableError!std.ArrayList(U64I64GroupAccumulator) {
-    var groups = std.ArrayList(U64I64GroupAccumulator).init(allocator);
+) TableError!std.array_list.Managed(U64I64GroupAccumulator) {
+    var groups = std.array_list.Managed(U64I64GroupAccumulator).init(allocator);
     errdefer groups.deinit();
     var group_index = std.AutoHashMap(u64, usize).init(allocator);
     defer group_index.deinit();
@@ -17051,8 +17053,8 @@ fn buildU64I64GroupsFromRows(
     group_column_index: usize,
     sum_column_index: usize,
     row_indices: []const u64,
-) TableError!std.ArrayList(U64I64GroupAccumulator) {
-    var groups = std.ArrayList(U64I64GroupAccumulator).init(allocator);
+) TableError!std.array_list.Managed(U64I64GroupAccumulator) {
+    var groups = std.array_list.Managed(U64I64GroupAccumulator).init(allocator);
     errdefer groups.deinit();
     var group_index = std.AutoHashMap(u64, usize).init(allocator);
     defer group_index.deinit();
@@ -20330,12 +20332,12 @@ pub fn ingestTable(
     defer releaseMappedRegion(allocator, mapped_data_source);
     const data_source = mappedRegionBytes(mapped_data_source);
 
-    const buffers = try allocator.alloc(std.ArrayList(u8), meta.columns.len);
+    const buffers = try allocator.alloc(std.array_list.Managed(u8), meta.columns.len);
     errdefer {
         for (buffers) |*buf| buf.deinit();
         allocator.free(buffers);
     }
-    for (buffers) |*buf| buf.* = std.ArrayList(u8).init(allocator);
+    for (buffers) |*buf| buf.* = std.array_list.Managed(u8).init(allocator);
     var row_count: u64 = 0;
 
     switch (parseDataFileFormat(data_path)) {
@@ -20583,14 +20585,14 @@ pub fn compactTable(
     return tableInfo(owned);
 }
 
-fn writeFileToTemp(dir: std.fs.Dir, path: []const u8, bytes: []const u8) !void {
+fn writeFileToTemp(dir: sio.Dir, path: []const u8, bytes: []const u8) !void {
     var file = try dir.createFile(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(bytes);
 }
 
 test "table atomic write replaces target and cleans temporary files" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20616,7 +20618,7 @@ test "table atomic write replaces target and cleans temporary files" {
 }
 
 test "table verify rejects segment byte-count metadata mismatch" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20652,7 +20654,7 @@ test "table verify rejects segment byte-count metadata mismatch" {
 }
 
 test "table segment files record block checksums and old metadata remains readable" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20706,7 +20708,7 @@ test "table segment files record block checksums and old metadata remains readab
 }
 
 test "table index files record block checksums and old metadata remains readable" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20766,7 +20768,7 @@ test "table index files record block checksums and old metadata remains readable
 }
 
 test "table dictionary files record block checksums and old metadata remains readable" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20817,7 +20819,7 @@ test "table dictionary files record block checksums and old metadata remains rea
 }
 
 test "table string dictionary is persisted snapshotted restored and verified" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20888,7 +20890,7 @@ test "table string dictionary is persisted snapshotted restored and verified" {
 }
 
 test "table blob store persists variable bytes and read snapshots are isolated" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -20975,7 +20977,7 @@ test "table blob store persists variable bytes and read snapshots are isolated" 
 }
 
 test "table blob handle filters exact and contains values" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21063,7 +21065,7 @@ test "table blob handle filters exact and contains values" {
 }
 
 test "table blob exact index is rebuilt when blob values are appended" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21099,7 +21101,7 @@ test "table blob exact index is rebuilt when blob values are appended" {
 }
 
 test "table blob append skips index rebuild until appended blob is referenced" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21172,7 +21174,7 @@ test "table blob append skips index rebuild until appended blob is referenced" {
 }
 
 test "table unique blob eq key copies full rows" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21236,7 +21238,7 @@ test "table unique blob eq key copies full rows" {
 }
 
 test "table blob token index filters ERP text tokens" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21339,7 +21341,7 @@ test "table blob token index filters ERP text tokens" {
 }
 
 test "table blob prefix index filters ERP text prefixes" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21439,7 +21441,7 @@ test "table blob prefix index filters ERP text prefixes" {
 }
 
 test "table blob contains index filters ERP substrings" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21531,7 +21533,7 @@ test "table blob contains index filters ERP substrings" {
 }
 
 test "table persistent u64 pair index supports ERP composite lookups" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21633,7 +21635,7 @@ test "table persistent u64 pair index supports ERP composite lookups" {
 }
 
 test "table u64 pair key row writes update upsert and delete" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21760,7 +21762,7 @@ test "table u64 pair key row writes update upsert and delete" {
 }
 
 test "table persistent u64 i64 pair index supports ERP date lookups" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21846,7 +21848,7 @@ test "table persistent u64 i64 pair index supports ERP date lookups" {
 }
 
 test "table u64 i64 pair key row writes update upsert and delete" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -21973,7 +21975,7 @@ test "table u64 i64 pair key row writes update upsert and delete" {
 }
 
 test "table filters candidate rows for ERP composite predicates" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -22517,7 +22519,7 @@ test "table filters candidate rows for ERP composite predicates" {
 }
 
 test "table write transaction commits atomically and preserves previous epoch on constraint failure" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -22609,7 +22611,7 @@ test "table write transaction commits atomically and preserves previous epoch on
 }
 
 test "table write transaction raw columns append unique indexes in place in unsafe mode" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -22787,11 +22789,11 @@ test "table memory write transaction appends unique indexes through unsafe fast 
     try std.testing.expect(line.found);
     try std.testing.expectEqual(@as(u64, 3), line.row_index);
 
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(root, .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(root, .{}));
 }
 
 test "table write transaction raw columns rewrite merged indexes in place in unsafe mode" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -22870,7 +22872,7 @@ test "table write transaction raw columns rewrite merged indexes in place in uns
 }
 
 test "table write transaction commits blob handles with rows atomically" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -22952,7 +22954,7 @@ test "table write transaction commits blob handles with rows atomically" {
 }
 
 test "table write transaction interns dictionaries with rows atomically" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23017,7 +23019,7 @@ test "table write transaction interns dictionaries with rows atomically" {
 }
 
 test "table intern string dict many batches inserts and reuses ids" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23060,7 +23062,7 @@ test "table intern string dict many batches inserts and reuses ids" {
 }
 
 test "table write transaction dictionary-only commit keeps indexes intact without rebuild" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23122,7 +23124,7 @@ test "table write transaction dictionary-only commit keeps indexes intact withou
 }
 
 test "table unsafe init defers empty meta until first write" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23180,7 +23182,7 @@ test "table unsafe init defers empty meta until first write" {
 }
 
 test "table unsafe init cache serves first write transaction bootstrap" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23254,7 +23256,7 @@ test "table api no-sync override beats env cache" {
 }
 
 test "table durable init refreshes the meta cache" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23291,7 +23293,7 @@ test "table durable init refreshes the meta cache" {
 }
 
 test "table unsafe init cache serves first coltx bootstrap" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23334,7 +23336,7 @@ test "table unsafe init cache serves first coltx bootstrap" {
 }
 
 test "table unsafe coltx sessions commit against latest meta" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23384,7 +23386,7 @@ test "table unsafe coltx sessions commit against latest meta" {
 }
 
 test "table unsafe init cache survives read before first write bootstrap" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23427,7 +23429,7 @@ test "table unsafe init cache survives read before first write bootstrap" {
 }
 
 test "table unsafe init cache survives init allocator teardown before ingest" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23465,7 +23467,7 @@ test "table unsafe init cache survives init allocator teardown before ingest" {
 }
 
 test "table unsafe init template cache reuses exact schema source" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23521,7 +23523,7 @@ test "table unsafe init template cache reuses exact schema source" {
 }
 
 test "table unsafe init cache serves first direct row insert bootstrap" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23558,7 +23560,7 @@ test "table unsafe init cache serves first direct row insert bootstrap" {
 }
 
 test "table unsafe init defers empty index artifacts until first indexed write" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23620,7 +23622,7 @@ test "table unsafe init defers empty index artifacts until first indexed write" 
 }
 
 test "table unsafe init defers empty blob store until first persisting write" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23671,7 +23673,7 @@ test "table unsafe init defers empty blob store until first persisting write" {
 }
 
 test "table unsafe init blob bootstrap persists latest pending blob epoch" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23722,7 +23724,7 @@ test "table unsafe init blob bootstrap persists latest pending blob epoch" {
 }
 
 test "table unsafe init defers indexed blob store until first row write" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23789,7 +23791,7 @@ test "table unsafe init defers indexed blob store until first row write" {
 }
 
 test "table unsafe init dict bootstrap reuses cache across batches without materialization" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -23858,7 +23860,7 @@ test "table unsafe init dict bootstrap reuses cache across batches without mater
 }
 
 test "table unsafe writes do not create write lock files" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24066,7 +24068,7 @@ test "table memory read snapshot survives table remove and reuse" {
 }
 
 test "table memory root snapshots and restores without filesystem directories" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24104,7 +24106,7 @@ test "table memory root snapshots and restores without filesystem directories" {
     try std.testing.expectEqual(@as(u64, 1), after_restore.row_count);
     try std.testing.expectEqual(@as(u64, 1), try snapshotGetU64(after_restore, 0, 0));
     try std.testing.expectEqual(@as(u64, 10), try snapshotGetU64(after_restore, 1, 0));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_snapshot_restore", .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(":memory:test_snapshot_restore", .{}));
 }
 
 test "table memory snapshot cleanup keeps prefix-neighbor tables isolated" {
@@ -24143,7 +24145,7 @@ test "table memory snapshot cleanup keeps prefix-neighbor tables isolated" {
 }
 
 test "table memory remove missing table does not touch filesystem" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24157,11 +24159,11 @@ test "table memory remove missing table does not touch filesystem" {
     try std.testing.expectEqual(@as(usize, 0), info.segment_count);
     try std.testing.expectEqual(@as(u64, 0), info.epoch);
     try std.testing.expect(!info.locked);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_remove", .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(":memory:test_missing_remove", .{}));
 }
 
 test "table memory recover validates active meta without filesystem directories" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24190,11 +24192,11 @@ test "table memory recover validates active meta without filesystem directories"
     try std.testing.expectEqual(@as(u64, 1), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 7), try snapshotGetU64(snapshot, 0, 0));
     try std.testing.expectEqual(@as(u64, 70), try snapshotGetU64(snapshot, 1, 0));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_recover_active", .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(":memory:test_recover_active", .{}));
 }
 
 test "table memory recover missing table does not touch filesystem" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24204,11 +24206,11 @@ test "table memory recover missing table does not touch filesystem" {
 
     const root = ":memory:test_missing_recover";
     try std.testing.expectError(TableError.NotFound, recoverTable(std.testing.allocator, root, "missing_table"));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_missing_recover", .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(":memory:test_missing_recover", .{}));
 }
 
 test "table memory lock unlock and compact stay in memory" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24252,11 +24254,11 @@ test "table memory lock unlock and compact stay in memory" {
     defer snapshot.destroy();
     try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
     try std.testing.expectEqual(@as(u64, 30), try snapshotSumU64(snapshot, 1));
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(":memory:test_lifecycle", .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(":memory:test_lifecycle", .{}));
 }
 
 test "table persistent u64 index tracks ingest update and corruption" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24503,7 +24505,7 @@ test "table persistent u64 index tracks ingest update and corruption" {
 }
 
 test "table u64 column add rebuilds only indexes that reference the updated column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24590,7 +24592,7 @@ test "table u64 column add rebuilds only indexes that reference the updated colu
 }
 
 test "table direct delete rewrites existing indexes by filtering deleted row" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24644,7 +24646,7 @@ test "table direct delete rewrites existing indexes by filtering deleted row" {
 }
 
 test "table write transaction delete rewrites existing indexes by filtering deleted rows" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24704,7 +24706,7 @@ test "table write transaction delete rewrites existing indexes by filtering dele
 }
 
 test "table write transaction delete rewrites blob indexes by filtering deleted rows" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24800,7 +24802,7 @@ fn expectAppendOnlyTransactionLookupDidNotMaterialize(tx: *const WriteTransactio
 }
 
 test "table clean transaction key lookup uses committed indexes without materializing buffers" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -24925,7 +24927,7 @@ test "table clean transaction key lookup uses committed indexes without material
 }
 
 test "table append-only transaction key lookup scans pending rows without materializing base" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -25174,7 +25176,7 @@ test "table append-only transaction key lookup scans pending rows without materi
 }
 
 test "table append-only transaction delete all pending rows stays unmaterialized no-op" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -25229,7 +25231,7 @@ test "table append-only transaction delete all pending rows stays unmaterialized
 }
 
 test "table raw row replace rebuilds only indexes for changed columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -25335,7 +25337,7 @@ test "table raw row replace rebuilds only indexes for changed columns" {
 }
 
 test "table write transaction row replace rebuilds only indexes for changed columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -25458,7 +25460,7 @@ test "table write transaction row replace rebuilds only indexes for changed colu
 }
 
 test "table i64 key row writes update upsert and delete" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -25572,7 +25574,7 @@ test "table i64 key row writes update upsert and delete" {
 }
 
 test "table u32 and i32 key row writes update upsert and delete" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -25770,7 +25772,7 @@ test "table u32 and i32 key row writes update upsert and delete" {
 }
 
 test "table u8 i8 u16 and i16 key row writes update upsert and delete" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26148,7 +26150,7 @@ test "table u8 i8 u16 and i16 key row writes update upsert and delete" {
 }
 
 test "table gets full rows by typed unique keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26240,7 +26242,7 @@ test "table gets full rows by typed unique keys" {
 }
 
 test "table unique u64 index rejects duplicate existing data" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26271,7 +26273,7 @@ test "table unique u64 index rejects duplicate existing data" {
 }
 
 test "table persistent i64 index uses signed ordering" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26320,7 +26322,7 @@ test "table persistent i64 index uses signed ordering" {
 }
 
 test "table exports packed null bitmap from logical null_bitmap column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26376,7 +26378,7 @@ test "table exports packed null bitmap from logical null_bitmap column" {
 }
 
 test "table persistent u32 and i32 indexes use compact typed ordering" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26445,7 +26447,7 @@ test "table persistent u32 and i32 indexes use compact typed ordering" {
 }
 
 test "table persistent u8 i8 u16 and i16 indexes use compact typed ordering" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26553,7 +26555,7 @@ test "table persistent u8 i8 u16 and i16 indexes use compact typed ordering" {
 }
 
 test "table persistent f32 and f64 indexes use finite float ordering" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26667,7 +26669,7 @@ test "table persistent f32 and f64 indexes use finite float ordering" {
 }
 
 test "table delete u64 key can empty a table" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26705,7 +26707,7 @@ test "table delete u64 key can empty a table" {
 }
 
 test "table manifest selects active epoch over compatibility meta" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26756,7 +26758,7 @@ test "table manifest selects active epoch over compatibility meta" {
 }
 
 test "table recover rebuilds manifest from highest valid versioned meta" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26806,7 +26808,7 @@ test "table recover rebuilds manifest from highest valid versioned meta" {
 }
 
 test "table recover skips corrupt highest segment artifact" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26859,7 +26861,7 @@ test "table recover skips corrupt highest segment artifact" {
 }
 
 test "table recover skips corrupt highest index artifact" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26903,7 +26905,7 @@ test "table recover skips corrupt highest index artifact" {
 }
 
 test "table recover skips corrupt highest dictionary artifact" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26941,7 +26943,7 @@ test "table recover skips corrupt highest dictionary artifact" {
 }
 
 test "table recover completes committed transaction marker when manifest is stale" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -26986,7 +26988,7 @@ test "table recover completes committed transaction marker when manifest is stal
 }
 
 test "table recover ignores incomplete transaction meta and cleans pending marker" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27030,7 +27032,7 @@ test "table recover ignores incomplete transaction meta and cleans pending marke
 }
 
 test "table remove clears stale versioned files before reuse" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27076,7 +27078,7 @@ test "table remove clears stale versioned files before reuse" {
 }
 
 test "table remove clears rewritten epoch column artifacts before reuse" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27125,7 +27127,7 @@ test "table remove clears rewritten epoch column artifacts before reuse" {
 }
 
 test "table remove preserves write lock file" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27154,17 +27156,17 @@ test "table remove preserves write lock file" {
 
     const lock_path = try tableWriteLockPath(std.testing.allocator, ".", table_name);
     defer std.testing.allocator.free(lock_path);
-    try std.fs.cwd().access(lock_path, .{});
+    try sio.cwd().access(lock_path, .{});
 
     _ = try removeTable(std.testing.allocator, ".", table_name);
-    try std.fs.cwd().access(lock_path, .{});
+    try sio.cwd().access(lock_path, .{});
 
     var next_lock = try acquireTableWriteLock(std.testing.allocator, ".", table_name);
     next_lock.release();
 }
 
 test "table unsafe remove not found clears stale artifacts and preserves lock" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27191,7 +27193,7 @@ test "table unsafe remove not found clears stale artifacts and preserves lock" {
 }
 
 test "table unsafe remove missing root is O(1) and clears bootstrap cache" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27217,7 +27219,7 @@ test "table unsafe remove missing root is O(1) and clears bootstrap cache" {
 }
 
 test "table ingest, verify, snapshot, restore, lock, unlock and compact are real" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27294,7 +27296,7 @@ test "table ingest, verify, snapshot, restore, lock, unlock and compact are real
     defer parsed.deinit();
     const corrupt_path = try activePath(std.testing.allocator, ".", parsed.value.segments[0].files[0].path);
     defer std.testing.allocator.free(corrupt_path);
-    var file = try std.fs.cwd().openFile(corrupt_path, .{ .mode = .read_write });
+    var file = try sio.cwd().openFile(corrupt_path, .{ .mode = .read_write });
     defer file.close();
     const end_pos = try file.getEndPos();
     try file.seekTo(end_pos);
@@ -27303,7 +27305,7 @@ test "table ingest, verify, snapshot, restore, lock, unlock and compact are real
 }
 
 test "table ingest accepts jsonl input" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27329,7 +27331,7 @@ test "table ingest accepts jsonl input" {
 }
 
 test "table csv ingest appends existing indexes incrementally" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27368,7 +27370,7 @@ test "table csv ingest appends existing indexes incrementally" {
 }
 
 test "table putBlobValues appends many blobs in one transaction" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27405,7 +27407,7 @@ test "table putBlobValues appends many blobs in one transaction" {
 }
 
 test "table upsertRawRowsU64Key batches inserts and updates atomically" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27495,7 +27497,7 @@ test "table concurrent same-table batch upserts lose no writes" {
 
     const worker = struct {
         fn run(c: *WorkerCtx) void {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            var gpa = std.heap.DebugAllocator(.{}){};
             defer _ = gpa.deinit();
             const alloc = gpa.allocator();
             var rows: [ROWS_PER_THREAD][16]u8 = undefined;
@@ -27557,7 +27559,7 @@ test "table concurrent multi-table writes proceed independently" {
 
     const worker = struct {
         fn run(c: *WorkerCtx) void {
-            var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+            var gpa = std.heap.DebugAllocator(.{}){};
             defer _ = gpa.deinit();
             const alloc = gpa.allocator();
             const table_name = table_names[c.tid];
@@ -27621,14 +27623,14 @@ test "table concurrent multi-table writes proceed independently" {
 // --- WAL (write-ahead log) Phase 1 tests ------------------------------------
 
 fn walTestFrameRecord(allocator: std.mem.Allocator, payload: []const u8) TableError![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
+    var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
     try out.appendSlice(&header);
     try out.appendSlice(payload);
     var crc_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &crc_buf, std.hash.crc.Crc64Xz.hash(payload), .little);
+    std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(payload), .little);
     try out.appendSlice(&crc_buf);
     return out.toOwnedSlice();
 }
@@ -27636,7 +27638,7 @@ fn walTestFrameRecord(allocator: std.mem.Allocator, payload: []const u8) TableEr
 fn walTestAppendBytes(allocator: std.mem.Allocator, table_name: []const u8, bytes: []const u8) TableError!void {
     const path = try walFilePath(allocator, ".", table_name);
     defer allocator.free(path);
-    var file = std.fs.cwd().createFile(path, .{ .truncate = false }) catch |err| return mapFileError(err);
+    var file = sio.cwd().createFile(path, .{ .truncate = false }) catch |err| return mapFileError(err);
     defer file.close();
     file.seekFromEnd(0) catch |err| return mapFileError(err);
     file.writeAll(bytes) catch |err| return mapFileError(err);
@@ -27661,7 +27663,7 @@ fn walTestRow(id: u64, val: u64) [16]u8 {
 }
 
 test "wal commit defers durable state until checkpoint on read" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27709,7 +27711,7 @@ test "wal commit defers durable state until checkpoint on read" {
 }
 
 test "wal overlay on begin folds prior commit into next transaction base" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27752,7 +27754,7 @@ test "wal overlay on begin folds prior commit into next transaction base" {
 }
 
 test "wal overlay chains three transactions without checkpoint" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27798,7 +27800,7 @@ test "wal overlay chains three transactions without checkpoint" {
 }
 
 test "wal replace and delete replay on checkpoint" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27845,7 +27847,7 @@ test "wal replace and delete replay on checkpoint" {
 }
 
 test "wal dict and blob puts replay on checkpoint" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27877,7 +27879,7 @@ test "wal dict and blob puts replay on checkpoint" {
 }
 
 test "wal torn tail is discarded on checkpoint" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27912,7 +27914,7 @@ test "wal torn tail is discarded on checkpoint" {
 }
 
 test "wal corrupt record is treated as torn tail" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27933,7 +27935,7 @@ test "wal corrupt record is treated as torn tail" {
     {
         const path = try walFilePath(std.testing.allocator, ".", table_name);
         defer std.testing.allocator.free(path);
-        var file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+        var file = try sio.cwd().openFile(path, .{ .mode = .write_only });
         defer file.close();
         try file.seekTo(6);
         try file.writeAll(&[_]u8{0xFF});
@@ -27951,7 +27953,7 @@ test "wal corrupt record is treated as torn tail" {
 }
 
 test "wal uncommitted transaction is dropped on checkpoint" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -27963,10 +27965,10 @@ test "wal uncommitted transaction is dropped on checkpoint" {
 
     // Manually craft BEGIN + ROW without COMMIT (crashed before commit record).
     {
-        var frame = std.ArrayList(u8).init(std.testing.allocator);
+        var frame = std.array_list.Managed(u8).init(std.testing.allocator);
         defer frame.deinit();
         try walFrameTxBegin(&frame, 999, 1);
-        var row_payload = std.ArrayList(u8).init(std.testing.allocator);
+        var row_payload = std.array_list.Managed(u8).init(std.testing.allocator);
         defer row_payload.deinit();
         try row_payload.append(WAL_RECORD_ROW);
         try row_payload.append(WAL_ROW_OP_INSERT);
@@ -27993,7 +27995,7 @@ test "wal uncommitted transaction is dropped on checkpoint" {
 }
 
 test "wal stale transaction is skipped on checkpoint" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -28019,10 +28021,10 @@ test "wal stale transaction is skipped on checkpoint" {
     // Simulate the crash window: a stale committed tx (base_epoch 1) left in
     // the WAL after its checkpoint had already published epoch 2.
     {
-        var frame = std.ArrayList(u8).init(std.testing.allocator);
+        var frame = std.array_list.Managed(u8).init(std.testing.allocator);
         defer frame.deinit();
         try walFrameTxBegin(&frame, 4242, 1);
-        var row_payload = std.ArrayList(u8).init(std.testing.allocator);
+        var row_payload = std.array_list.Managed(u8).init(std.testing.allocator);
         defer row_payload.deinit();
         try row_payload.append(WAL_RECORD_ROW);
         try row_payload.append(WAL_ROW_OP_INSERT);
@@ -28051,7 +28053,7 @@ test "wal stale transaction is skipped on checkpoint" {
 
 test "wal parser rejects oversized length without huge allocation" {
     const allocator = std.testing.allocator;
-    var buf = std.ArrayList(u8).init(allocator);
+    var buf = std.array_list.Managed(u8).init(allocator);
     defer buf.deinit();
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, WAL_MAX_RECORD_BYTES + 1, .little);
@@ -28065,11 +28067,11 @@ test "wal parser rejects oversized length without huge allocation" {
 
 test "wal frame roundtrip preserves records and crc" {
     const allocator = std.testing.allocator;
-    var frame = std.ArrayList(u8).init(allocator);
+    var frame = std.array_list.Managed(u8).init(allocator);
     defer frame.deinit();
     try walFrameTxBegin(&frame, 7, 3);
     const row1 = walTestRow(5, 50);
-    var row_payload = std.ArrayList(u8).init(allocator);
+    var row_payload = std.array_list.Managed(u8).init(allocator);
     defer row_payload.deinit();
     try row_payload.append(WAL_RECORD_ROW);
     try row_payload.append(WAL_ROW_OP_INSERT);

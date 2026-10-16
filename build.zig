@@ -1,5 +1,12 @@
 const std = @import("std");
 
+/// NOTE(Zig 0.17): `Build.pathFromRoot` was removed. Equivalent helper:
+/// resolve `sub_path` against the directory containing build.zig.
+fn pathFromRoot(b: *std.Build, sub_path: []const u8) []u8 {
+    const root_path = b.root.root_dir.path orelse ".";
+    return std.fs.path.resolve(b.allocator, &.{ root_path, sub_path }) catch @panic("OOM");
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -19,21 +26,27 @@ pub fn build(b: *std.Build) void {
         const smoke_home_opt = b.option([]const u8, "smoke-home", "SA_PLUGINS_HOME used by the install-smoke step.");
         if (smoke_home_opt) |smoke_home_value| {
             if (std.fs.path.isAbsolute(smoke_home_value)) break :blk smoke_home_value;
-            break :blk b.pathFromRoot(smoke_home_value);
+            break :blk pathFromRoot(b, smoke_home_value);
         }
-        break :blk b.pathFromRoot(".zig-cache/db-install-smoke-home");
+        break :blk pathFromRoot(b, ".zig-cache/db-install-smoke-home");
     };
     const bench_compare_home = blk: {
         const bench_home_opt = b.option([]const u8, "bench-compare-home", "SA_PLUGINS_HOME used by the bench-compare step.");
         if (bench_home_opt) |bench_home_value| {
             if (std.fs.path.isAbsolute(bench_home_value)) break :blk bench_home_value;
-            break :blk b.pathFromRoot(bench_home_value);
+            break :blk pathFromRoot(b, bench_home_value);
         }
-        break :blk b.pathFromRoot(".zig-cache/db-bench-compare-home");
+        break :blk pathFromRoot(b, ".zig-cache/db-bench-compare-home");
     };
 
     const plugin_api = b.createModule(.{
         .root_source_file = b.path("src/plugin_api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const sio_module = b.createModule(.{
+        .root_source_file = b.path("../sci/src/sa_io.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -44,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addImport("plugin_api", plugin_api);
+    root_module.addImport("sio", sio_module);
 
     const lib = b.addLibrary(.{
         .name = "db",
@@ -93,7 +107,7 @@ pub fn build(b: *std.Build) void {
     manifest_source_check.addFileArg(b.path("sap.json"));
     manifest_layout_step.dependOn(&manifest_source_check.step);
 
-    const smoke_home_lock = b.pathFromRoot(".zig-cache/db-install-smoke-home.lock");
+    const smoke_home_lock = pathFromRoot(b, ".zig-cache/db-install-smoke-home.lock");
     const install_smoke_step = b.step("install-smoke", "Install the db plugin into an isolated home and verify the installed commands.");
     const install_smoke = b.addSystemCommand(&.{ "flock", "-w", lock_wait_seconds_arg, smoke_home_lock, sa_bin, "plugin", "install", "--dev", "." });
     install_smoke.setEnvironmentVariable("SA_PLUGINS_HOME", smoke_home);
@@ -111,7 +125,7 @@ pub fn build(b: *std.Build) void {
     installed_layout.addArg(b.pathJoin(&.{ smoke_home, "installed", "db", "current" }));
     installed_layout.addFileArg(b.path("db.sai"));
     installed_layout.addFileArg(b.path("db.sal"));
-    installed_layout.addArg(b.pathFromRoot("zig-out/lib/libdb.so"));
+    installed_layout.addArg(pathFromRoot(b, "zig-out/lib/libdb.so"));
     installed_layout.step.dependOn(&install_smoke.step);
     install_smoke_step.dependOn(&installed_layout.step);
 
@@ -289,7 +303,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(hot_io_guards_step);
 
     const bench_step = b.step("bench", "Build the main db and SQLite control benchmark executables.");
-    const bench_compare_home_lock = b.pathFromRoot(".zig-cache/db-bench-compare-home.lock");
+    const bench_compare_home_lock = pathFromRoot(b, ".zig-cache/db-bench-compare-home.lock");
     const install_bench_compare = addDevInstallStep(b, sa_bin, bench_compare_home, bench_compare_home_lock, lock_wait_seconds_arg, lib);
     _ = addSaBenchStep(b, bench_step, sa_bin, bench_compare_home, bench_compare_home_lock, lock_wait_seconds_arg, &install_bench_compare.step, "benchmark_test/db_member_bench.sa", "db_member_bench.out");
     const db_concurrent_bench = addSaBenchStep(b, bench_step, sa_bin, bench_compare_home, bench_compare_home_lock, lock_wait_seconds_arg, &install_bench_compare.step, "benchmark_test/db_concurrent_bench.sa", "db_concurrent_bench.out");
@@ -317,7 +331,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_proof_step = b.step("sqlite-proof", "Run SQLite readiness audit plus the configured-run performance proof report (positive odd, default 7).");
     const sqlite_proof_strict_chain_step = b.step("sqlite-proof-strict-chain", "Run SQLite readiness audit plus the strict-chain configured-run performance proof (positive odd, default 7).");
     const benchmark_artifacts_step = b.step("check-benchmark-artifacts", "Verify protected tracked benchmark artifacts are clean.");
-    const benchmark_run_lock = b.pathFromRoot(".zig-cache/db-benchmark-run.lock");
+    const benchmark_run_lock = pathFromRoot(b, ".zig-cache/db-benchmark-run.lock");
     const benchmark_artifacts = addBenchmarkArtifactGuardStep(b, benchmark_run_lock, lock_wait_seconds_arg);
     benchmark_artifacts_step.dependOn(&benchmark_artifacts.step);
     test_step.dependOn(benchmark_artifacts_step);

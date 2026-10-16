@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 
 pub const PrimType = enum(u8) {
     void,
@@ -79,7 +80,7 @@ const InlineSeenDefSet = struct {
     const capacity = 64;
 
     allocator: std.mem.Allocator,
-    names: [capacity]?[]const u8 = [_]?[]const u8{null} ** capacity,
+    names: [capacity]?[]const u8 = std.mem.zeroes([capacity]?[]const u8),
     fallback: ?std.StringHashMap(void) = null,
 
     fn init(allocator: std.mem.Allocator) InlineSeenDefSet {
@@ -194,7 +195,7 @@ fn parseTableName(path: []const u8) []const u8 {
 
 fn parseDef(line: []const u8) ?Def {
     if (!std.mem.startsWith(u8, line, "#def")) return null;
-    var rest = std.mem.trimLeft(u8, line["#def".len..], " \t");
+    var rest = std.mem.trimStart(u8, line["#def".len..], " \t");
     if (rest.len == 0) return null;
 
     const eq = std.mem.indexOfScalar(u8, rest, '=');
@@ -224,7 +225,7 @@ fn isColumnDefName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "COL_") and std.mem.endsWith(u8, name, "_STRIDE");
 }
 
-fn appendDef(list: *std.ArrayList(Def), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+fn appendDef(list: *std.array_list.Managed(Def), allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
     try list.append(.{
         .name = try allocator.dupe(u8, name),
         .value = try allocator.dupe(u8, value),
@@ -377,13 +378,13 @@ fn compileWithOptions(
     var max_rows: ?u64 = null;
     var row_bytes: ?u64 = null;
 
-    var columns = std.ArrayList(Column).init(allocator);
+    var columns = std.array_list.Managed(Column).init(allocator);
     errdefer {
         for (columns.items) |column| allocator.free(column.name);
         columns.deinit();
     }
 
-    var defs = std.ArrayList(Def).init(allocator);
+    var defs = std.array_list.Managed(Def).init(allocator);
     defer if (!options.collect_defs) defs.deinit();
     errdefer if (options.collect_defs) {
         for (defs.items) |def| {
@@ -539,7 +540,7 @@ test "schema compiler computes row bytes and preserves table alias" {
     try std.testing.expectEqual(@as(usize, 3), schema.columns.len);
     try std.testing.expectEqualStrings("flash_sale", schema.table_name);
 
-    var out = std.ArrayList(u8).init(std.testing.allocator);
+    var out = std.array_list.Managed(u8).init(std.testing.allocator);
     defer out.deinit();
     try writeIface(out.writer(), schema);
     try std.testing.expect(std.mem.containsAtLeast(u8, out.items, 1, "#def TABLE_ROW_BYTES = 13"));
@@ -614,13 +615,13 @@ test "schema init fast compiler rejects duplicate defs" {
 }
 
 test "schema init fast compiler duplicate check falls back past inline capacity" {
-    var source = std.ArrayList(u8).init(std.testing.allocator);
+    var source = std.array_list.Managed(u8).init(std.testing.allocator);
     defer source.deinit();
 
     try source.appendSlice("#def MAX_ROWS = 16\n");
     var idx: usize = 0;
     while (idx < InlineSeenDefSet.capacity + 1) : (idx += 1) {
-        try source.writer().print("#def COL_C{d}_STRIDE = 8 // u64\n", .{idx});
+        try source.print("#def COL_C{d}_STRIDE = 8 // u64\n", .{idx});
     }
     try source.appendSlice("#def COL_C0_STRIDE = 8 // u64\n");
 
