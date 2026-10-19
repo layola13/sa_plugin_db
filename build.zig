@@ -589,6 +589,10 @@ fn addSaSmokeStep(
         \\
         \\set -euo pipefail
         \\exe="$1"
+        \\case "$exe" in
+        \\  /*) ;;
+        \\  *) exe="$PWD/$exe" ;;
+        \\esac
         \\tmp="$(mktemp -d)"
         \\trap 'rm -rf "$tmp"' EXIT
         \\(cd "$tmp" && "$exe")

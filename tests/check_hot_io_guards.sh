@@ -324,7 +324,7 @@ require(
     re.S,
 )
 require(
-    r"fn\s+buildAllColumnBuffers\s*\([^)]*\)\s*TableError!\[\]std\.ArrayList\(u8\)\s*\{(?:(?!\nfn\s).)*mappedSegmentColumnBytes\(",
+    r"fn\s+buildAllColumnBuffers\s*\([^)]*\)\s*TableError!\[\](?:std\.ArrayList\(u8\)|std\.array_list\.Managed\(u8\))\s*\{(?:(?!\nfn\s).)*mappedSegmentColumnBytes\(",
     "full column-buffer rebuild inputs must read through mappedSegmentColumnBytes",
     re.S,
 )

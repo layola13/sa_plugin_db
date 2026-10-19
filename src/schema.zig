@@ -542,7 +542,7 @@ test "schema compiler computes row bytes and preserves table alias" {
 
     var out = std.array_list.Managed(u8).init(std.testing.allocator);
     defer out.deinit();
-    try writeIface(out.writer(), schema);
+    try writeIface(sio.managedWriter(&out), schema);
     try std.testing.expect(std.mem.containsAtLeast(u8, out.items, 1, "#def TABLE_ROW_BYTES = 13"));
     try std.testing.expect(std.mem.containsAtLeast(u8, out.items, 1, "#def flash_sale_ROW_BYTES = 13"));
 }
