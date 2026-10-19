@@ -1952,10 +1952,10 @@ test "qmod register inspect and exec metadata round trip" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var query = try tmp.dir.createFile("simple.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\@import "simple.sadb-schema"
@@ -1979,7 +1979,7 @@ test "qmod register inspect and exec metadata round trip" {
     try std.testing.expect(std.mem.containsAtLeast(u8, inspect, 1, "grants: 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, inspect, 1, "grant: db_read:simple"));
 
-    var params = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 7, .little);
@@ -2011,17 +2011,17 @@ test "qmod inspect rejects corrupted registry metadata" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var first = try tmp.dir.createFile("first.query.sa", .{ .truncate = true });
+    var first = try (sio.Dir{ .inner = tmp.dir }).createFile("first.query.sa", .{ .truncate = true });
     defer first.close();
     try first.writeAll(
         \\@main() -> u64:
         \\L_ENTRY:
         \\return 1
     );
-    var second = try tmp.dir.createFile("second.query.sa", .{ .truncate = true });
+    var second = try (sio.Dir{ .inner = tmp.dir }).createFile("second.query.sa", .{ .truncate = true });
     defer second.close();
     try second.writeAll(
         \\@main() -> u64:
@@ -2055,17 +2055,17 @@ test "qmod exec rejects corrupted registry metadata" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var first = try tmp.dir.createFile("first.query.sa", .{ .truncate = true });
+    var first = try (sio.Dir{ .inner = tmp.dir }).createFile("first.query.sa", .{ .truncate = true });
     defer first.close();
     try first.writeAll(
         \\@main() -> u64:
         \\L_ENTRY:
         \\return 1
     );
-    var second = try tmp.dir.createFile("second.query.sa", .{ .truncate = true });
+    var second = try (sio.Dir{ .inner = tmp.dir }).createFile("second.query.sa", .{ .truncate = true });
     defer second.close();
     try second.writeAll(
         \\@main() -> u64:
@@ -2099,10 +2099,10 @@ test "qmod exec rejects corrupted query payload" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var query = try tmp.dir.createFile("simple.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\@main() -> u64:
@@ -2126,10 +2126,10 @@ test "qmod exec rejects missing query payload" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var query = try tmp.dir.createFile("simple.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\@main() -> u64:
@@ -2153,7 +2153,7 @@ test "qmod register rejects duplicate hash from different source path" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const query_text =
@@ -2163,11 +2163,11 @@ test "qmod register rejects duplicate hash from different source path" {
         \\return lhs
     ;
 
-    var first = try tmp.dir.createFile("first.query.sa", .{ .truncate = true });
+    var first = try (sio.Dir{ .inner = tmp.dir }).createFile("first.query.sa", .{ .truncate = true });
     defer first.close();
     try first.writeAll(query_text);
 
-    var second = try tmp.dir.createFile("second.query.sa", .{ .truncate = true });
+    var second = try (sio.Dir{ .inner = tmp.dir }).createFile("second.query.sa", .{ .truncate = true });
     defer second.close();
     try second.writeAll(query_text);
 
@@ -2191,10 +2191,10 @@ test "qmod exec rejects trailing scalar params bytes" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var query = try tmp.dir.createFile("scalar.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("scalar.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\@main(lhs: u64, rhs: u64) -> u64:
@@ -2208,7 +2208,7 @@ test "qmod exec rejects trailing scalar params bytes" {
     const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
     defer std.testing.allocator.free(hash_hex);
 
-    var params = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params.close();
     var param_bytes: [24]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 7, .little);
@@ -2224,10 +2224,10 @@ test "qmod exec supports scalar bitwise and shift ops" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var query = try tmp.dir.createFile("bitwise.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("bitwise.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\@main(lhs: u64, rhs: u64) -> u64:
@@ -2246,7 +2246,7 @@ test "qmod exec supports scalar bitwise and shift ops" {
     const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
     defer std.testing.allocator.free(hash_hex);
 
-    var params = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 0b1010, .little);
@@ -2264,11 +2264,11 @@ test "qmod register rejects DB instructions without matching grants" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     {
-        var query = try tmp.dir.createFile("missing_read.query.sa", .{ .truncate = true });
+        var query = try (sio.Dir{ .inner = tmp.dir }).createFile("missing_read.query.sa", .{ .truncate = true });
         defer query.close();
         try query.writeAll(
             \\@main(&col_id: ptr) -> u64:
@@ -2279,7 +2279,7 @@ test "qmod register rejects DB instructions without matching grants" {
         try std.testing.expectError(ExecError.DbCapabilityEscalation, registerQuery(std.testing.allocator, "missing_read.query.sa"));
     }
     {
-        var query = try tmp.dir.createFile("missing_write.query.sa", .{ .truncate = true });
+        var query = try (sio.Dir{ .inner = tmp.dir }).createFile("missing_write.query.sa", .{ .truncate = true });
         defer query.close();
         try query.writeAll(
             \\grants [db_read:simple]
@@ -2291,7 +2291,7 @@ test "qmod register rejects DB instructions without matching grants" {
         try std.testing.expectError(ExecError.DbCapabilityEscalation, registerQuery(std.testing.allocator, "missing_write.query.sa"));
     }
     {
-        var query = try tmp.dir.createFile("missing_cursor.query.sa", .{ .truncate = true });
+        var query = try (sio.Dir{ .inner = tmp.dir }).createFile("missing_cursor.query.sa", .{ .truncate = true });
         defer query.close();
         try query.writeAll(
             \\grants [db_write:simple]
@@ -2309,17 +2309,17 @@ test "qmod register rejects columns outside db_read schema" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("missing_column.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("missing_column.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2337,17 +2337,17 @@ test "qmod register rejects loads from undeclared DB pointers" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("wrong_pointer.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("wrong_pointer.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2365,17 +2365,17 @@ test "qmod register rejects load pointer smuggled through helper signature" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("helper_pointer.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("helper_pointer.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2395,17 +2395,17 @@ test "qmod register rejects DB column pointer declared with non-ptr type" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("bad_pointer_type.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("bad_pointer_type.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2422,17 +2422,17 @@ test "qmod register rejects stores outside db_write schema" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("bad_store_column.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("bad_store_column.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_write:simple]
@@ -2449,17 +2449,17 @@ test "qmod register rejects stores from undeclared DB pointers" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("bad_store_pointer.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("bad_store_pointer.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_write:simple]
@@ -2476,17 +2476,17 @@ test "qmod register rejects atomic cursor from undeclared DB pointers" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("bad_atomic_pointer.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("bad_atomic_pointer.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -2503,17 +2503,17 @@ test "qmod register accepts declared atomic cursor grant" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("atomic_ok.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_ok.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -2532,17 +2532,17 @@ test "qmod register rejects atomic cursor nonzero offset" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("atomic_offset.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_offset.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -2559,17 +2559,17 @@ test "qmod register rejects atomic cursor against non-u64 base column" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_COUNT_STRIDE = 4 // u32
         \\#def TABLE_ROW_BYTES = 4
     );
-    var query = try tmp.dir.createFile("atomic_u32_base.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_u32_base.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -2586,10 +2586,10 @@ test "qmod register rejects atomic named cursor against non-u64 column" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
@@ -2597,7 +2597,7 @@ test "qmod register rejects atomic named cursor against non-u64 column" {
         \\#def COL_SCORE_STRIDE = 4 // u32
         \\#def TABLE_ROW_BYTES = 12
     );
-    var query = try tmp.dir.createFile("atomic_u32_named.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_u32_named.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -2614,17 +2614,17 @@ test "qmod register rejects atomic cursor smuggled through helper signature" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var query = try tmp.dir.createFile("atomic_helper_pointer.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_helper_pointer.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -2644,24 +2644,24 @@ test "qmod exec reads u64 DB column segments" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv1 = try tmp.dir.createFile("rows1.csv", .{ .truncate = true });
+    var csv1 = try (sio.Dir{ .inner = tmp.dir }).createFile("rows1.csv", .{ .truncate = true });
     defer csv1.close();
     try csv1.writeAll(
         \\id
         \\1
         \\2
     );
-    var csv2 = try tmp.dir.createFile("rows2.csv", .{ .truncate = true });
+    var csv2 = try (sio.Dir{ .inner = tmp.dir }).createFile("rows2.csv", .{ .truncate = true });
     defer csv2.close();
     try csv2.writeAll(
         \\id
@@ -2670,7 +2670,7 @@ test "qmod exec reads u64 DB column segments" {
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows1.csv");
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows2.csv");
 
-    var query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2707,17 +2707,17 @@ test "qmod exec rejects table schema hash drift" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -2726,7 +2726,7 @@ test "qmod exec rejects table schema hash drift" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2753,7 +2753,7 @@ test "qmod exec rejects table schema hash drift" {
     const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
     defer std.testing.allocator.free(hash_hex);
 
-    var drifted_schema = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var drifted_schema = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer drifted_schema.close();
     try drifted_schema.writeAll(
         \\#def MAX_ROWS = 10
@@ -2770,17 +2770,17 @@ test "qmod exec rejects corrupted table snapshot segment" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -2789,7 +2789,7 @@ test "qmod exec rejects corrupted table snapshot segment" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2822,17 +2822,17 @@ test "qmod exec rejects table snapshot block checksum metadata drift" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -2841,7 +2841,7 @@ test "qmod exec rejects table snapshot block checksum metadata drift" {
     );
     _ = try table_mod.ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2871,17 +2871,17 @@ test "qmod exec rejects corrupted table snapshot metadata" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -2890,7 +2890,7 @@ test "qmod exec rejects corrupted table snapshot metadata" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -2915,17 +2915,17 @@ test "qmod write rejects corrupted table snapshot metadata" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -2934,14 +2934,14 @@ test "qmod write rejects corrupted table snapshot metadata" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 1, .little);
     std.mem.writeInt(u64, param_bytes[8..16], 9, .little);
     try params_file.writeAll(&param_bytes);
 
-    var write_query = try tmp.dir.createFile("write.query.sa", .{ .truncate = true });
+    var write_query = try (sio.Dir{ .inner = tmp.dir }).createFile("write.query.sa", .{ .truncate = true });
     defer write_query.close();
     try write_query.writeAll(
         \\grants [db_write:simple]
@@ -2967,17 +2967,17 @@ test "qmod exec writes u64 DB column segments" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -2986,14 +2986,14 @@ test "qmod exec writes u64 DB column segments" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 1, .little);
     std.mem.writeInt(u64, param_bytes[8..16], 9, .little);
     try params_file.writeAll(&param_bytes);
 
-    var write_query = try tmp.dir.createFile("write.query.sa", .{ .truncate = true });
+    var write_query = try (sio.Dir{ .inner = tmp.dir }).createFile("write.query.sa", .{ .truncate = true });
     defer write_query.close();
     try write_query.writeAll(
         \\grants [db_write:simple]
@@ -3015,7 +3015,7 @@ test "qmod exec writes u64 DB column segments" {
 
     _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
 
-    var read_query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer read_query.close();
     try read_query.writeAll(
         \\grants [db_read:simple]
@@ -3052,17 +3052,17 @@ test "qmod exec read-modify-writes u64 DB column segments" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3071,14 +3071,14 @@ test "qmod exec read-modify-writes u64 DB column segments" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 1, .little);
     std.mem.writeInt(u64, param_bytes[8..16], 7, .little);
     try params_file.writeAll(&param_bytes);
 
-    var update_query = try tmp.dir.createFile("update.query.sa", .{ .truncate = true });
+    var update_query = try (sio.Dir{ .inner = tmp.dir }).createFile("update.query.sa", .{ .truncate = true });
     defer update_query.close();
     try update_query.writeAll(
         \\grants [db_read:simple, db_write:simple]
@@ -3102,7 +3102,7 @@ test "qmod exec read-modify-writes u64 DB column segments" {
 
     _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
 
-    var read_query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer read_query.close();
     try read_query.writeAll(
         \\grants [db_read:simple]
@@ -3139,31 +3139,31 @@ test "qmod exec cross-table read-writes u64 DB column segments" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var src_schema = try tmp.dir.createFile("src.sadb-schema", .{ .truncate = true });
+    var src_schema = try (sio.Dir{ .inner = tmp.dir }).createFile("src.sadb-schema", .{ .truncate = true });
     defer src_schema.close();
     try src_schema.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var dst_schema = try tmp.dir.createFile("dst.sadb-schema", .{ .truncate = true });
+    var dst_schema = try (sio.Dir{ .inner = tmp.dir }).createFile("dst.sadb-schema", .{ .truncate = true });
     defer dst_schema.close();
     try dst_schema.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_SCORE_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var src_csv = try tmp.dir.createFile("src.csv", .{ .truncate = true });
+    var src_csv = try (sio.Dir{ .inner = tmp.dir }).createFile("src.csv", .{ .truncate = true });
     defer src_csv.close();
     try src_csv.writeAll(
         \\id
         \\1
         \\2
     );
-    var dst_csv = try tmp.dir.createFile("dst.csv", .{ .truncate = true });
+    var dst_csv = try (sio.Dir{ .inner = tmp.dir }).createFile("dst.csv", .{ .truncate = true });
     defer dst_csv.close();
     try dst_csv.writeAll(
         \\score
@@ -3173,14 +3173,14 @@ test "qmod exec cross-table read-writes u64 DB column segments" {
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "src", "src.csv");
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "dst", "dst.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 1, .little);
     std.mem.writeInt(u64, param_bytes[8..16], 10, .little);
     try params_file.writeAll(&param_bytes);
 
-    var copy_query = try tmp.dir.createFile("copy.query.sa", .{ .truncate = true });
+    var copy_query = try (sio.Dir{ .inner = tmp.dir }).createFile("copy.query.sa", .{ .truncate = true });
     defer copy_query.close();
     try copy_query.writeAll(
         \\grants [db_read:src, db_write:dst]
@@ -3205,7 +3205,7 @@ test "qmod exec cross-table read-writes u64 DB column segments" {
     _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "src");
     _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "dst");
 
-    var read_query = try tmp.dir.createFile("sum_dst.query.sa", .{ .truncate = true });
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum_dst.query.sa", .{ .truncate = true });
     defer read_query.close();
     try read_query.writeAll(
         \\grants [db_read:dst]
@@ -3242,17 +3242,17 @@ test "qmod exec atomic cursor add updates u64 DB column" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3260,7 +3260,7 @@ test "qmod exec atomic cursor add updates u64 DB column" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var atomic_query = try tmp.dir.createFile("atomic.query.sa", .{ .truncate = true });
+    var atomic_query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic.query.sa", .{ .truncate = true });
     defer atomic_query.close();
     try atomic_query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -3281,7 +3281,7 @@ test "qmod exec atomic cursor add updates u64 DB column" {
 
     _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
 
-    var read_query = try tmp.dir.createFile("sum.query.sa", .{ .truncate = true });
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
     defer read_query.close();
     try read_query.writeAll(
         \\grants [db_read:simple]
@@ -3306,17 +3306,17 @@ test "qmod register rejects atomic cursor dynamic offset expression" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3324,7 +3324,7 @@ test "qmod register rejects atomic cursor dynamic offset expression" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var atomic_query = try tmp.dir.createFile("atomic_dynamic_offset.query.sa", .{ .truncate = true });
+    var atomic_query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_dynamic_offset.query.sa", .{ .truncate = true });
     defer atomic_query.close();
     try atomic_query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -3342,10 +3342,10 @@ test "qmod exec atomic cursor targets named DB column" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
@@ -3353,7 +3353,7 @@ test "qmod exec atomic cursor targets named DB column" {
         \\#def COL_SCORE_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 16
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id,score
@@ -3361,7 +3361,7 @@ test "qmod exec atomic cursor targets named DB column" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var atomic_query = try tmp.dir.createFile("atomic_score.query.sa", .{ .truncate = true });
+    var atomic_query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic_score.query.sa", .{ .truncate = true });
     defer atomic_query.close();
     try atomic_query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -3382,7 +3382,7 @@ test "qmod exec atomic cursor targets named DB column" {
 
     _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
 
-    var read_query = try tmp.dir.createFile("read.query.sa", .{ .truncate = true });
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("read.query.sa", .{ .truncate = true });
     defer read_query.close();
     try read_query.writeAll(
         \\grants [db_read:simple]
@@ -3409,17 +3409,17 @@ test "qmod exec rejects writes against locked tables" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3428,7 +3428,7 @@ test "qmod exec rejects writes against locked tables" {
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
     _ = try @import("table.zig").lockTable(std.testing.allocator, ".", "simple");
 
-    var write_query = try tmp.dir.createFile("write.query.sa", .{ .truncate = true });
+    var write_query = try (sio.Dir{ .inner = tmp.dir }).createFile("write.query.sa", .{ .truncate = true });
     defer write_query.close();
     try write_query.writeAll(
         \\grants [db_write:simple]
@@ -3444,7 +3444,7 @@ test "qmod exec rejects writes against locked tables" {
     defer std.testing.allocator.free(write_hash);
     try std.testing.expectError(ExecError.Locked, execQuery(std.testing.allocator, write_hash, null));
 
-    var atomic_query = try tmp.dir.createFile("atomic.query.sa", .{ .truncate = true });
+    var atomic_query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic.query.sa", .{ .truncate = true });
     defer atomic_query.close();
     try atomic_query.writeAll(
         \\grants [db_atomic_cursor:simple]
@@ -3466,17 +3466,17 @@ test "qmod write commit rejects stale table metadata" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv1 = try tmp.dir.createFile("rows1.csv", .{ .truncate = true });
+    var csv1 = try (sio.Dir{ .inner = tmp.dir }).createFile("rows1.csv", .{ .truncate = true });
     defer csv1.close();
     try csv1.writeAll(
         \\id
@@ -3489,7 +3489,7 @@ test "qmod write commit rejects stale table metadata" {
     const id_column = findWriteColumn(&write_table, "id") orelse return ExecError.InvalidFormat;
     try storeColumnValue(id_column, 0, 9);
 
-    var csv2 = try tmp.dir.createFile("rows2.csv", .{ .truncate = true });
+    var csv2 = try (sio.Dir{ .inner = tmp.dir }).createFile("rows2.csv", .{ .truncate = true });
     defer csv2.close();
     try csv2.writeAll(
         \\id
@@ -3511,17 +3511,17 @@ test "qmod write commit rejects stale block checksum metadata" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3549,17 +3549,17 @@ test "qmod exec filters u64 DB column values" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3569,7 +3569,7 @@ test "qmod exec filters u64 DB column values" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var query = try tmp.dir.createFile("count_gt.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("count_gt.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -3611,17 +3611,17 @@ test "qmod exec filters DB column values with bitwise ops" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3631,7 +3631,7 @@ test "qmod exec filters DB column values with bitwise ops" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var query = try tmp.dir.createFile("count_odd.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("count_odd.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -3674,17 +3674,17 @@ test "qmod exec reads compact unsigned DB columns" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("compact.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("compact.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_SCORE_STRIDE = 4 // u32
         \\#def TABLE_ROW_BYTES = 4
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\score
@@ -3694,7 +3694,7 @@ test "qmod exec reads compact unsigned DB columns" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "compact", "rows.csv");
 
-    var query = try tmp.dir.createFile("sum_u32.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum_u32.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:compact]
@@ -3731,17 +3731,17 @@ test "qmod exec reads signed integer DB columns" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("signed.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("signed.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_DELTA_STRIDE = 4 // i32
         \\#def TABLE_ROW_BYTES = 4
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\delta
@@ -3750,7 +3750,7 @@ test "qmod exec reads signed integer DB columns" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "signed", "rows.csv");
 
-    var query = try tmp.dir.createFile("sum_i32.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum_i32.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:signed]
@@ -3787,17 +3787,17 @@ test "qmod exec filters DB column with u64 params" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3807,13 +3807,13 @@ test "qmod exec filters DB column with u64 params" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 1, .little);
     try params_file.writeAll(&param_bytes);
 
-    var query = try tmp.dir.createFile("count_param.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("count_param.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -3855,17 +3855,17 @@ test "qmod exec rejects trailing DB params bytes" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("simple.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def TABLE_ROW_BYTES = 8
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\id
@@ -3875,14 +3875,14 @@ test "qmod exec rejects trailing DB params bytes" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [16]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], 1, .little);
     std.mem.writeInt(u64, param_bytes[8..16], 99, .little);
     try params_file.writeAll(&param_bytes);
 
-    var query = try tmp.dir.createFile("count_param.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("count_param.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:simple]
@@ -3921,17 +3921,17 @@ test "qmod exec filters f32 DB column values" {
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var schema_file = try tmp.dir.createFile("prices.sadb-schema", .{ .truncate = true });
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("prices.sadb-schema", .{ .truncate = true });
     defer schema_file.close();
     try schema_file.writeAll(
         \\#def MAX_ROWS = 10
         \\#def COL_PRICE_STRIDE = 4 // f32
         \\#def TABLE_ROW_BYTES = 4
     );
-    var csv = try tmp.dir.createFile("rows.csv", .{ .truncate = true });
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
     defer csv.close();
     try csv.writeAll(
         \\price
@@ -3941,13 +3941,13 @@ test "qmod exec filters f32 DB column values" {
     );
     _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "prices", "rows.csv");
 
-    var params_file = try tmp.dir.createFile("params.bin", .{ .truncate = true });
+    var params_file = try (sio.Dir{ .inner = tmp.dir }).createFile("params.bin", .{ .truncate = true });
     defer params_file.close();
     var param_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, param_bytes[0..8], @as(u64, @bitCast(@as(f64, 10.0))), .little);
     try params_file.writeAll(&param_bytes);
 
-    var query = try tmp.dir.createFile("count_price.query.sa", .{ .truncate = true });
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("count_price.query.sa", .{ .truncate = true });
     defer query.close();
     try query.writeAll(
         \\grants [db_read:prices]

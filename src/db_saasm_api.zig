@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const table = @import("table.zig");
 
 const SA_DB_OK: u32 = 0;
@@ -7247,11 +7248,11 @@ test "db SA ABI logical type helpers" {
 }
 
 test "db SA ABI interns and reads string dictionaries" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -7322,11 +7323,11 @@ test "db SA ABI interns and reads string dictionaries" {
 }
 
 test "db SA ABI interns many dictionary values in one call" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -7375,11 +7376,11 @@ test "db SA ABI interns many dictionary values in one call" {
 }
 
 test "db SA ABI queries logical bool columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -7437,11 +7438,11 @@ test "db SA ABI queries logical bool columns" {
 }
 
 test "db SA ABI creates and queries u64 pair indexes" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -7506,11 +7507,11 @@ test "db SA ABI creates and queries u64 pair indexes" {
 }
 
 test "db SA ABI writes rows by i64 keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -7614,11 +7615,11 @@ test "db SA ABI writes rows by i64 keys" {
 }
 
 test "db SA ABI writes rows by u32 and i32 keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -7788,11 +7789,11 @@ test "db SA ABI writes rows by u32 and i32 keys" {
 }
 
 test "db SA ABI writes rows by u8 i8 u16 and i16 keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8028,11 +8029,11 @@ test "db SA ABI writes rows by u8 i8 u16 and i16 keys" {
 }
 
 test "db SA ABI gets full rows by typed unique keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8102,11 +8103,11 @@ test "db SA ABI gets full rows by typed unique keys" {
 }
 
 test "db SA ABI gets rows by unique blob eq key" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8155,11 +8156,11 @@ test "db SA ABI gets rows by unique blob eq key" {
 }
 
 test "db SA ABI writes rows by unique blob eq keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8287,11 +8288,11 @@ test "db SA ABI writes rows by unique blob eq keys" {
 }
 
 test "db SA ABI writes rows by u64 pair keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8414,11 +8415,11 @@ test "db SA ABI writes rows by u64 pair keys" {
 }
 
 test "db SA ABI creates and queries u64 i64 pair indexes" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8492,11 +8493,11 @@ test "db SA ABI creates and queries u64 i64 pair indexes" {
 }
 
 test "db SA ABI creates indexes in one batch call" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8573,11 +8574,11 @@ test "db SA ABI creates indexes in one batch call" {
 }
 
 test "db SA ABI writes rows by u64 i64 pair keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8692,11 +8693,11 @@ test "db SA ABI writes rows by u64 i64 pair keys" {
 }
 
 test "db SA ABI queries u64 timestamp pair ranges" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -8761,11 +8762,11 @@ test "db SA ABI queries u64 timestamp pair ranges" {
 }
 
 test "db SA ABI filters candidate rows for ERP predicates" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9446,11 +9447,11 @@ test "db SA ABI filters candidate rows for ERP predicates" {
 }
 
 test "db SA ABI filters and sorts float candidate rows" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9530,11 +9531,11 @@ test "db SA ABI filters and sorts float candidate rows" {
 }
 
 test "db SA ABI sums signed i64 columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9565,11 +9566,11 @@ test "db SA ABI sums signed i64 columns" {
 }
 
 test "db SA ABI groups signed sums by u64 keys" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9766,11 +9767,11 @@ test "db SA ABI groups signed sums by u64 keys" {
 }
 
 test "db SA ABI commits and rolls back write transactions" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9851,11 +9852,11 @@ test "db SA ABI commits and rolls back write transactions" {
 }
 
 test "db SA ABI inserts batched rows in a write transaction" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9890,11 +9891,11 @@ test "db SA ABI inserts batched rows in a write transaction" {
 }
 
 test "db SA ABI inserts raw columns in a write transaction" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9930,11 +9931,11 @@ test "db SA ABI inserts raw columns in a write transaction" {
 }
 
 test "db SA ABI rejects invalid batched write transaction inserts" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -9956,11 +9957,11 @@ test "db SA ABI rejects invalid batched write transaction inserts" {
 }
 
 test "db SA ABI commits and rolls back transaction blob handles" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10033,11 +10034,11 @@ test "db SA ABI commits and rolls back transaction blob handles" {
 }
 
 test "db SA ABI commits and rolls back transaction dictionaries" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10110,11 +10111,11 @@ test "db SA ABI commits and rolls back transaction dictionaries" {
 }
 
 test "db SA ABI creates and queries blob token indexes" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10225,11 +10226,11 @@ test "db SA ABI creates and queries blob token indexes" {
 }
 
 test "db SA ABI creates ingests updates and scans raw columns" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10413,11 +10414,11 @@ test "db SA ABI creates ingests updates and scans raw columns" {
 }
 
 test "db SA ABI memory root supports index write tx and coltx flows" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ":memory:abi_tx_coltx";
@@ -10486,15 +10487,15 @@ test "db SA ABI memory root supports index write tx and coltx flows" {
 
     try std.testing.expectEqual(SA_DB_OK, sa_db_verify(root.ptr, root.len, "mem_members".ptr, "mem_members".len, &info));
     try std.testing.expectEqual(@as(u64, 4), info.row_count);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(root, .{}));
+    try std.testing.expectError(error.FileNotFound, sio.cwd().access(root, .{}));
 }
 
 test "db SA ABI exports packed null bitmap from logical null_bitmap column" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10548,11 +10549,11 @@ test "db SA ABI exports packed null bitmap from logical null_bitmap column" {
 }
 
 test "db SA ABI column ingest session batches column writes and commits once" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10616,11 +10617,11 @@ test "db SA ABI column ingest session batches column writes and commits once" {
 }
 
 test "db SA ABI coltx commit waits for active add_columns refs" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10654,11 +10655,11 @@ test "db SA ABI coltx commit waits for active add_columns refs" {
 }
 
 test "db SA ABI read handle close waits for active query refs" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10697,11 +10698,11 @@ test "db SA ABI read handle close waits for active query refs" {
 }
 
 test "db SA ABI open read handle during active write transaction sees committed snapshot" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";
@@ -10743,11 +10744,11 @@ test "db SA ABI open read handle during active write transaction sees committed 
 }
 
 test "db SA ABI rejects nested tx begin with locked status instead of deadlocking" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const schema_source =
@@ -10782,11 +10783,11 @@ test "db SA ABI rejects nested tx begin with locked status instead of deadlockin
 }
 
 test "db SA ABI rejects stale write transaction handles after close" {
-    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ".";

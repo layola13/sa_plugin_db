@@ -434,7 +434,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
     };
 }
 
-fn writeDbCliError(writer: *std.Io.Writer, argv: []const []const u8, err: anyerror) !void {
+fn writeDbCliError(writer: anytype, argv: []const []const u8, err: anyerror) !void {
     const message = switch (err) {
         error.MissingSourcePath => "missing required DB operand",
         error.UnexpectedArgument => "unexpected DB argument",
@@ -560,7 +560,7 @@ fn isHashLength(text: []const u8) bool {
     return text.len == 64;
 }
 
-fn printInfo(stdout: *std.Io.Writer, info: table.TableInfo) !void {
+fn printInfo(stdout: anytype, info: table.TableInfo) !void {
     try stdout.print("row_count: {d}\nsegment_count: {d}\nepoch: {d}\nlocked: {s}\n", .{
         info.row_count,
         info.segment_count,
@@ -625,7 +625,7 @@ fn runDbIndexU64(allocator: std.mem.Allocator, argv: []const []const u8, stdout:
     return 0;
 }
 
-fn runDbInspect(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
+fn runDbInspect(allocator: std.mem.Allocator, argv: []const []const u8, stdout: anytype) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     if (argv.len > 4) return error.UnexpectedArgument;
     if (isHashText(argv[3])) {
@@ -874,7 +874,7 @@ test "db plugin wrapper renders invalid exec params diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>", "--params", "params.bin" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.InvalidParams);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.InvalidParams);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: invalid DB params format"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "check params.bin layout and byte length"));
@@ -885,7 +885,7 @@ test "db plugin wrapper renders invalid query hash diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "not-a-hash" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.InvalidQueryHash);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.InvalidQueryHash);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: invalid DB query hash"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "use a 64-character hexadecimal DB query hash"));
@@ -896,7 +896,7 @@ test "db plugin wrapper renders corrupted registry metadata diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.QueryRegistryCorrupted);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.QueryRegistryCorrupted);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB query registry metadata is corrupted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "re-register the query or repair the corrupted DB qmod registry metadata"));
@@ -907,7 +907,7 @@ test "db plugin wrapper renders corrupted query payload diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.QueryPayloadCorrupted);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.QueryPayloadCorrupted);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB query payload is corrupted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "re-register the query or restore the corrupted DB qmod payload"));
@@ -918,7 +918,7 @@ test "db plugin wrapper renders duplicate register diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "register", "query.sa" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.DuplicateRegister);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.DuplicateRegister);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB query hash is already registered with different metadata"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "keep the original source path, grants, and entrypoint for this registered hash"));
@@ -929,7 +929,7 @@ test "db plugin wrapper renders schema mismatch diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.SchemaMismatch);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.SchemaMismatch);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB schema hash mismatch"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "refresh or restore the table schema before running this query"));
@@ -940,7 +940,7 @@ test "db plugin wrapper renders column type mismatch diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "register", "query.sa" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.ColumnTypeMismatch);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.ColumnTypeMismatch);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB column type mismatch"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "use a u64 DB column for this atomic or typed DB operation"));
@@ -951,7 +951,7 @@ test "db plugin wrapper renders snapshot corrupted diagnostic" {
     defer stderr_buffer.deinit();
 
     const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
-    try writeDbCliError(stderr_buffer.writer().any(), &argv, error.SnapshotCorrupted);
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.SnapshotCorrupted);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB snapshot is corrupted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "verify, restore, or rebuild the corrupted table snapshot before exec"));
@@ -963,7 +963,7 @@ test "db inspect rejects malformed 64-byte hash text before table lookup" {
 
     const bad_hash = "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg";
     const argv = [_][]const u8{ "sa", "db", "inspect", bad_hash };
-    try std.testing.expectError(error.InvalidQueryHash, runDbInspect(std.testing.allocator, &argv, stdout_buffer.writer().any()));
+    try std.testing.expectError(error.InvalidQueryHash, runDbInspect(std.testing.allocator, &argv, sio.managedWriter(&stdout_buffer)));
 }
 
 test "db plugin wrapper runs init command through ABI" {
@@ -972,10 +972,10 @@ test "db plugin wrapper runs init command through ABI" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
-    var file = try tmp.dir.createFile("flash_sale.sadb-schema", .{ .truncate = true });
+    var file = try (sio.Dir{ .inner = tmp.dir }).createFile("flash_sale.sadb-schema", .{ .truncate = true });
     defer file.close();
     try file.writeAll(
         \\#def MAX_ROWS = 10
@@ -1009,7 +1009,7 @@ test "db plugin wrapper runs init command through ABI" {
     try std.testing.expectEqual(@as(usize, 0), stderr_buffer.items.len);
     try std.testing.expect(std.mem.containsAtLeast(u8, stdout_buffer.items, 1, "flash_sale.sai"));
 
-    const iface = try tmp.dir.readFileAlloc(std.testing.allocator, "flash_sale.sai", 1 << 20);
+    const iface = try (sio.Dir{ .inner = tmp.dir }).readFileAlloc(std.testing.allocator, "flash_sale.sai", 1 << 20);
     defer std.testing.allocator.free(iface);
     try std.testing.expect(std.mem.containsAtLeast(u8, iface, 1, "#def TABLE_ROW_BYTES = 12"));
 }

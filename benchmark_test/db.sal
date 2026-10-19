@@ -357,6 +357,12 @@
     %out_status = call @sa_db_update_row_i64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, &%row, %row_len, &%out_info)
 [END_MACRO]
 
+[MACRO] DB_UPSERT_MANY_U64_KEY %out_status, %out_inserted_count, %root, %root_len, %table_name, %table_name_len, %column_index, %expected, %rows, %rows_len, %out_info
+    __db_upsert_many_inserted_slot_%out_inserted_count = stack_alloc 8
+    %out_status = call @sa_db_upsert_many_u64_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %expected, %rows, %rows_len, &__db_upsert_many_inserted_slot_%out_inserted_count, &%out_info)
+    %out_inserted_count = load __db_upsert_many_inserted_slot_%out_inserted_count+0 as u64
+[END_MACRO]
+
 [MACRO] DB_UPSERT_ROW_U64_PAIR_KEY %out_status, %out_inserted, %root, %root_len, %table_name, %table_name_len, %column_index, %column_index2, %key1, %key2, %row, %row_len, %out_info
     __db_upsert_pair_inserted_slot_%out_inserted = stack_alloc 8
     %out_status = call @sa_db_upsert_row_u64_pair_key(&%root, %root_len, &%table_name, %table_name_len, %column_index, %column_index2, %key1, %key2, &%row, %row_len, &__db_upsert_pair_inserted_slot_%out_inserted, &%out_info)
@@ -707,6 +713,12 @@
     __db_blob_put_id_slot_%out_id = stack_alloc 8
     %out_status = call @sa_db_blob_put(&%root, %root_len, &%table_name, %table_name_len, &%store_name, %store_name_len, &%value, %value_len, &__db_blob_put_id_slot_%out_id, &%out_info)
     %out_id = load __db_blob_put_id_slot_%out_id+0 as u64
+[END_MACRO]
+
+[MACRO] DB_BLOB_PUT_MANY %out_status, %out_first_id, %root, %root_len, %table_name, %table_name_len, %store_name, %store_name_len, %values, %values_len, %out_info
+    __db_blob_put_many_first_slot_%out_first_id = stack_alloc 8
+    %out_status = call @sa_db_blob_put_many(&%root, %root_len, &%table_name, %table_name_len, &%store_name, %store_name_len, %values, %values_len, &__db_blob_put_many_first_slot_%out_first_id, &%out_info)
+    %out_first_id = load __db_blob_put_many_first_slot_%out_first_id+0 as u64
 [END_MACRO]
 
 [MACRO] DB_BLOB_VALUE_LEN %out_status, %out_found, %out_len, %root, %root_len, %table_name, %table_name_len, %store_name, %store_name_len, %id

@@ -20597,7 +20597,7 @@ test "table atomic write replaces target and cleans temporary files" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     try writeFile(std.testing.allocator, "data.bin", "old");
@@ -20607,10 +20607,10 @@ test "table atomic write replaces target and cleans temporary files" {
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualStrings("new", contents);
 
-    try tmp_dir.dir.makeDir("target_dir");
+    try (sio.Dir{ .inner = tmp_dir.dir }).makeDir("target_dir");
     try std.testing.expectError(TableError.InvalidFormat, writeFile(std.testing.allocator, "target_dir", "x"));
 
-    var iter = tmp_dir.dir.iterate();
+    var iter = (sio.Dir{ .inner = tmp_dir.dir }).iterate();
     while (try iter.next()) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".data.bin.tmp."));
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".target_dir.tmp."));
@@ -20623,16 +20623,16 @@ test "table verify rejects segment byte-count metadata mismatch" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "inventory_txn";
-    try writeFileToTemp(tmp_dir.dir, "inventory_txn.sadb-schema",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "inventory_txn.sadb-schema",
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def COL_QTY_STRIDE = 8 // u64
     );
-    try writeFileToTemp(tmp_dir.dir, "rows.csv",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "rows.csv",
         \\ID,QTY
         \\1,5
         \\2,8
@@ -20659,11 +20659,11 @@ test "table segment files record block checksums and old metadata remains readab
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "block_checked_orders";
-    try writeFileToTemp(tmp_dir.dir, "block_checked_orders.sadb-schema",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "block_checked_orders.sadb-schema",
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def COL_QTY_STRIDE = 8 // u64
@@ -20713,7 +20713,7 @@ test "table index files record block checksums and old metadata remains readable
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "block_checked_indexes";
@@ -20773,7 +20773,7 @@ test "table dictionary files record block checksums and old metadata remains rea
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "block_checked_dicts";
@@ -20824,7 +20824,7 @@ test "table string dictionary is persisted snapshotted restored and verified" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "dict_members";
@@ -20895,7 +20895,7 @@ test "table blob store persists variable bytes and read snapshots are isolated" 
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_items";
@@ -20982,7 +20982,7 @@ test "table blob handle filters exact and contains values" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_filter_items";
@@ -21070,7 +21070,7 @@ test "table blob exact index is rebuilt when blob values are appended" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_index_late_values";
@@ -21106,7 +21106,7 @@ test "table blob append skips index rebuild until appended blob is referenced" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_index_unreferenced_append";
@@ -21179,7 +21179,7 @@ test "table unique blob eq key copies full rows" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_key_rows";
@@ -21243,7 +21243,7 @@ test "table blob token index filters ERP text tokens" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_token_items";
@@ -21346,7 +21346,7 @@ test "table blob prefix index filters ERP text prefixes" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_prefix_items";
@@ -21446,7 +21446,7 @@ test "table blob contains index filters ERP substrings" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_contains_items";
@@ -21538,7 +21538,7 @@ test "table persistent u64 pair index supports ERP composite lookups" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "order_lines";
@@ -21640,7 +21640,7 @@ test "table u64 pair key row writes update upsert and delete" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "pair_write_lines";
@@ -21767,7 +21767,7 @@ test "table persistent u64 i64 pair index supports ERP date lookups" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "customer_orders";
@@ -21853,7 +21853,7 @@ test "table u64 i64 pair key row writes update upsert and delete" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "pair_i64_write_orders";
@@ -21980,7 +21980,7 @@ test "table filters candidate rows for ERP composite predicates" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "erp_candidate_filters";
@@ -22524,7 +22524,7 @@ test "table write transaction commits atomically and preserves previous epoch on
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_members";
@@ -22616,7 +22616,7 @@ test "table write transaction raw columns append unique indexes in place in unsa
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -22798,7 +22798,7 @@ test "table write transaction raw columns rewrite merged indexes in place in uns
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -22877,7 +22877,7 @@ test "table write transaction commits blob handles with rows atomically" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_blob_items";
@@ -22959,7 +22959,7 @@ test "table write transaction interns dictionaries with rows atomically" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_dict_members";
@@ -23024,7 +23024,7 @@ test "table intern string dict many batches inserts and reuses ids" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "dict_many_members";
@@ -23067,7 +23067,7 @@ test "table write transaction dictionary-only commit keeps indexes intact withou
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_dict_only_indexed";
@@ -23129,7 +23129,7 @@ test "table unsafe init defers empty meta until first write" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23187,7 +23187,7 @@ test "table unsafe init cache serves first write transaction bootstrap" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23261,7 +23261,7 @@ test "table durable init refreshes the meta cache" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23298,7 +23298,7 @@ test "table unsafe init cache serves first coltx bootstrap" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23341,7 +23341,7 @@ test "table unsafe coltx sessions commit against latest meta" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23391,7 +23391,7 @@ test "table unsafe init cache survives read before first write bootstrap" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23434,7 +23434,7 @@ test "table unsafe init cache survives init allocator teardown before ingest" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23472,7 +23472,7 @@ test "table unsafe init template cache reuses exact schema source" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23528,7 +23528,7 @@ test "table unsafe init cache serves first direct row insert bootstrap" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23565,7 +23565,7 @@ test "table unsafe init defers empty index artifacts until first indexed write" 
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23627,7 +23627,7 @@ test "table unsafe init defers empty blob store until first persisting write" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23678,7 +23678,7 @@ test "table unsafe init blob bootstrap persists latest pending blob epoch" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23729,7 +23729,7 @@ test "table unsafe init defers indexed blob store until first row write" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23796,7 +23796,7 @@ test "table unsafe init dict bootstrap reuses cache across batches without mater
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -23865,7 +23865,7 @@ test "table unsafe writes do not create write lock files" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -24073,7 +24073,7 @@ test "table memory root snapshots and restores without filesystem directories" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ":memory:test_snapshot_restore";
@@ -24150,7 +24150,7 @@ test "table memory remove missing table does not touch filesystem" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ":memory:test_missing_remove";
@@ -24168,7 +24168,7 @@ test "table memory recover validates active meta without filesystem directories"
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ":memory:test_recover_active";
@@ -24201,7 +24201,7 @@ test "table memory recover missing table does not touch filesystem" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ":memory:test_missing_recover";
@@ -24215,7 +24215,7 @@ test "table memory lock unlock and compact stay in memory" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const root = ":memory:test_lifecycle";
@@ -24263,7 +24263,7 @@ test "table persistent u64 index tracks ingest update and corruption" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "indexed_members";
@@ -24510,7 +24510,7 @@ test "table u64 column add rebuilds only indexes that reference the updated colu
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "column_scoped_update_indexes";
@@ -24597,7 +24597,7 @@ test "table direct delete rewrites existing indexes by filtering deleted row" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "delete_incremental_indexes";
@@ -24651,7 +24651,7 @@ test "table write transaction delete rewrites existing indexes by filtering dele
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_delete_incremental_indexes";
@@ -24711,7 +24711,7 @@ test "table write transaction delete rewrites blob indexes by filtering deleted 
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_delete_blob_incremental_indexes";
@@ -24807,7 +24807,7 @@ test "table clean transaction key lookup uses committed indexes without material
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_clean_key_lookup_indexes";
@@ -24932,7 +24932,7 @@ test "table append-only transaction key lookup scans pending rows without materi
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_append_only_key_lookup_indexes";
@@ -25181,7 +25181,7 @@ test "table append-only transaction delete all pending rows stays unmaterialized
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_append_delete_all_pending_noop";
@@ -25236,7 +25236,7 @@ test "table raw row replace rebuilds only indexes for changed columns" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "replace_changed_column_indexes";
@@ -25342,7 +25342,7 @@ test "table write transaction row replace rebuilds only indexes for changed colu
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "tx_replace_changed_column_indexes";
@@ -25465,7 +25465,7 @@ test "table i64 key row writes update upsert and delete" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "signed_day_rows";
@@ -25579,7 +25579,7 @@ test "table u32 and i32 key row writes update upsert and delete" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     {
@@ -25777,7 +25777,7 @@ test "table u8 i8 u16 and i16 key row writes update upsert and delete" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     {
@@ -26155,7 +26155,7 @@ test "table gets full rows by typed unique keys" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "typed_key_rows";
@@ -26247,7 +26247,7 @@ test "table unique u64 index rejects duplicate existing data" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "duplicate_members";
@@ -26278,7 +26278,7 @@ test "table persistent i64 index uses signed ordering" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "ledger_entries";
@@ -26327,7 +26327,7 @@ test "table exports packed null bitmap from logical null_bitmap column" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "packed_null_bitmap";
@@ -26383,7 +26383,7 @@ test "table persistent u32 and i32 indexes use compact typed ordering" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "compact_items";
@@ -26452,7 +26452,7 @@ test "table persistent u8 i8 u16 and i16 indexes use compact typed ordering" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "small_items";
@@ -26560,7 +26560,7 @@ test "table persistent f32 and f64 indexes use finite float ordering" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "float_items";
@@ -26674,7 +26674,7 @@ test "table delete u64 key can empty a table" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "single_member";
@@ -26712,7 +26712,7 @@ test "table manifest selects active epoch over compatibility meta" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "orders";
@@ -26763,7 +26763,7 @@ test "table recover rebuilds manifest from highest valid versioned meta" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "recover_orders";
@@ -26813,7 +26813,7 @@ test "table recover skips corrupt highest segment artifact" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "recover_bad_segment";
@@ -26866,7 +26866,7 @@ test "table recover skips corrupt highest index artifact" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "recover_bad_index";
@@ -26910,7 +26910,7 @@ test "table recover skips corrupt highest dictionary artifact" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "recover_bad_dict";
@@ -26948,7 +26948,7 @@ test "table recover completes committed transaction marker when manifest is stal
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "recover_committed_tx";
@@ -26993,7 +26993,7 @@ test "table recover ignores incomplete transaction meta and cleans pending marke
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "recover_incomplete_tx";
@@ -27037,7 +27037,7 @@ test "table remove clears stale versioned files before reuse" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "reused_orders";
@@ -27083,7 +27083,7 @@ test "table remove clears rewritten epoch column artifacts before reuse" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "reused_adjustments";
@@ -27132,7 +27132,7 @@ test "table remove preserves write lock file" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "locked_remove_orders";
@@ -27171,7 +27171,7 @@ test "table unsafe remove not found clears stale artifacts and preserves lock" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -27198,7 +27198,7 @@ test "table unsafe remove missing root is O(1) and clears bootstrap cache" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const previous_unsafe = unsafe_no_sync_state.load(.acquire);
@@ -27224,7 +27224,7 @@ test "table ingest, verify, snapshot, restore, lock, unlock and compact are real
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "flash_sale";
@@ -27233,21 +27233,21 @@ test "table ingest, verify, snapshot, restore, lock, unlock and compact are real
     const csv2 = "rows2.csv";
     const jsonl = "rows.jsonl";
 
-    try writeFileToTemp(tmp_dir.dir, schema_path,
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, schema_path,
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def COL_PRICE_STRIDE = 4 // f32
     );
-    try writeFileToTemp(tmp_dir.dir, csv1,
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, csv1,
         \\ID,PRICE
         \\1,9.5
         \\2,10.25
     );
-    try writeFileToTemp(tmp_dir.dir, csv2,
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, csv2,
         \\ID,PRICE
         \\3,11.75
     );
-    try writeFileToTemp(tmp_dir.dir, jsonl,
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, jsonl,
         \\{"ID":4,"PRICE":12.5}
         \\{"ID":5,"PRICE":13.25}
     );
@@ -27310,16 +27310,16 @@ test "table ingest accepts jsonl input" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "flash_sale";
-    try writeFileToTemp(tmp_dir.dir, "flash_sale.sadb-schema",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "flash_sale.sadb-schema",
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def COL_PRICE_STRIDE = 4 // f32
     );
-    try writeFileToTemp(tmp_dir.dir, "rows.jsonl",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "rows.jsonl",
         \\{"ID":10,"PRICE":1.5}
         \\{"ID":11,"PRICE":2.25}
     );
@@ -27336,21 +27336,21 @@ test "table csv ingest appends existing indexes incrementally" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "indexed_csv_ingest";
-    try writeFileToTemp(tmp_dir.dir, "indexed_csv_ingest.sadb-schema",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "indexed_csv_ingest.sadb-schema",
         \\#def MAX_ROWS = 10
         \\#def COL_ID_STRIDE = 8 // u64
         \\#def COL_POINTS_STRIDE = 8 // u64
     );
-    try writeFileToTemp(tmp_dir.dir, "first.csv",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "first.csv",
         \\ID,POINTS
         \\1,10
         \\2,20
     );
-    try writeFileToTemp(tmp_dir.dir, "second.csv",
+    try writeFileToTemp(sio.Dir{ .inner = tmp_dir.dir }, "second.csv",
         \\ID,POINTS
         \\3,30
     );
@@ -27375,7 +27375,7 @@ test "table putBlobValues appends many blobs in one transaction" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "blob_many";
@@ -27412,7 +27412,7 @@ test "table upsertRawRowsU64Key batches inserts and updates atomically" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "upsert_many";
@@ -27640,7 +27640,8 @@ fn walTestAppendBytes(allocator: std.mem.Allocator, table_name: []const u8, byte
     defer allocator.free(path);
     var file = sio.cwd().createFile(path, .{ .truncate = false }) catch |err| return mapFileError(err);
     defer file.close();
-    file.seekFromEnd(0) catch |err| return mapFileError(err);
+    const end = file.getEndPos() catch |err| return mapFileError(err);
+    file.seekTo(end) catch |err| return mapFileError(err);
     file.writeAll(bytes) catch |err| return mapFileError(err);
 }
 
@@ -27667,7 +27668,7 @@ test "wal commit defers durable state until checkpoint on read" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_basic";
@@ -27715,7 +27716,7 @@ test "wal overlay on begin folds prior commit into next transaction base" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_begin_chain";
@@ -27758,7 +27759,7 @@ test "wal overlay chains three transactions without checkpoint" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_overlay_chain3";
@@ -27804,7 +27805,7 @@ test "wal replace and delete replay on checkpoint" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_replace_delete";
@@ -27851,7 +27852,7 @@ test "wal dict and blob puts replay on checkpoint" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_dict_blob";
@@ -27883,7 +27884,7 @@ test "wal torn tail is discarded on checkpoint" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_torn";
@@ -27918,7 +27919,7 @@ test "wal corrupt record is treated as torn tail" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_corrupt";
@@ -27957,7 +27958,7 @@ test "wal uncommitted transaction is dropped on checkpoint" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_uncommitted";
@@ -27999,7 +28000,7 @@ test "wal stale transaction is skipped on checkpoint" {
     defer original_cwd.close();
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.setAsCwd();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
     defer original_cwd.setAsCwd() catch {};
 
     const table_name = "wal_stale";
