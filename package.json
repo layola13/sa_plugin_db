@@ -1,0 +1,32 @@
+{
+  "name": "sa-plugin-db",
+  "version": "0.1.0",
+  "description": "SA plugin: db. The plugin manifest is sap.json; install with: sa plugin install npm:sa-plugin-db@0.1.0",
+  "keywords": [
+    "sa-plugin",
+    "sa",
+    "sla"
+  ],
+  "files": [
+    "sap.json",
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "sa",
+    "*.sai",
+    "*.sal",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "benchmark_test",
+    "db.sai",
+    "db.sal",
+    "progress.md",
+    "tasks.md",
+    "tests"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {}
+}
