@@ -1001,9 +1001,16 @@ fn freeSnapshotAttachment(pin: *epoch_runtime.EpochPin) void {
     pin.attachment = null;
 }
 
+/// The segment reaper's floor source (docs §12.3): the
+/// oldest epoch any live pin can still read.
+fn livePinFloorForReaper(table_name: []const u8) ?u64 {
+    return epoch_runtime.oldestLiveEpoch(table_name);
+}
+
 fn ensureSnapshotHook() void {
     if (!snapshot_hook_installed.swap(true, .acq_rel)) {
         epoch_runtime.pin_free_hook = freeSnapshotAttachment;
+        table_mod.live_pin_floor_hook = &livePinFloorForReaper;
     }
 }
 
@@ -2738,6 +2745,12 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     // retires the previous epoch pin so in-process readers that pin
     // from now on adopt the new epoch and the old pin drains.
     epoch_runtime.noteCommitted(write_table.parsed.value.table_name, next_epoch);
+    // Segment reclamation (docs §12.3): a legacy publish is a
+    // quiescent point for this table — the write lock is held
+    // and the new epoch's files are all named by the active
+    // meta. The reaper's future-epoch protection covers
+    // lock-free group staging in flight on other threads.
+    _ = table_mod.reapSupersededSegmentFiles(allocator, ".", write_table.parsed.value.table_name);
 }
 
 // --- group commit (docs/vm_concurrency_epoch.md §11) -----------------------
@@ -8717,6 +8730,198 @@ test "qmod concurrent readers and single writer keep the epoch oracle" {
     try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
     try std.testing.expectEqual(@as(?u64, null), epoch_runtime.oldestLiveEpoch("conc"));
     try std.testing.expectEqual(@as(?u64, base_epoch + commits), epoch_runtime.currentEpoch("conc"));
+}
+
+fn churnIsSegmentFileName(table_name: []const u8, name: []const u8) bool {
+    // `<table>.col<i>.<seg>.dat` with optional `.e<epoch>`.
+    if (!std.mem.startsWith(u8, name, table_name)) return false;
+    var rest = name[table_name.len..];
+    if (!std.mem.startsWith(u8, rest, ".col")) return false;
+    rest = rest[4..];
+    var digits: usize = 0;
+    while (digits < rest.len and rest[digits] >= '0' and rest[digits] <= '9') : (digits += 1) {}
+    if (digits == 0) return false;
+    rest = rest[digits..];
+    if (rest.len == 0 or rest[0] != '.') return false;
+    rest = rest[1..];
+    digits = 0;
+    while (digits < rest.len and rest[digits] >= '0' and rest[digits] <= '9') : (digits += 1) {}
+    if (digits == 0) return false;
+    rest = rest[digits..];
+    if (std.mem.eql(u8, rest, ".dat")) return true;
+    if (std.mem.startsWith(u8, rest, ".dat.e")) {
+        const tail = rest[6..];
+        if (tail.len == 0) return false;
+        for (tail) |c| if (c < '0' or c > '9') return false;
+        return true;
+    }
+    return false;
+}
+
+fn churnSegmentFileCount(table_name: []const u8) u64 {
+    var dir = sio.cwd().openDir(".", .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var n: u64 = 0;
+    var it = dir.iterate();
+    while (it.next() catch return n) |entry| {
+        if (entry.kind == .file and churnIsSegmentFileName(table_name, entry.name)) n += 1;
+    }
+    return n;
+}
+
+test "qmod mixed churn keeps the epoch oracle and the segment retention bound" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 200;
+    const commits: u64 = 20;
+    const fixture = try concSetup(std.testing.allocator, tmp, @intCast(rows), 0);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    // Settle the ingest backlog; the settled table's segment
+    // files are exactly the active meta's — the retention
+    // bound the churn phase must return to.
+    table_mod.checkpointWalIfDirty(std.testing.allocator, ".", "conc") catch |err| return mapTableError(err);
+    const segment_bound = churnSegmentFileCount("conc");
+    try std.testing.expect(segment_bound > 0);
+
+    var param_names: [21][24]u8 = undefined;
+    for (0..commits + 1) |i| {
+        const name = try std.fmt.bufPrint(&param_names[i], "xparams{d}.bin", .{i + 1});
+        param_names[i][name.len] = 0;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, i + 1, .little);
+        try concWriteFile(tmp, name, &bytes);
+    }
+    {
+        var warm = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer warm.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), warm.ok.result_u64.?);
+    }
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    const WriterCtx = struct {
+        hash: []const u8,
+        names: *const [21][24]u8,
+        commits: u64,
+        done: u64 = 0,
+        bad: u64 = 0,
+    };
+    const writer_fn = struct {
+        fn work(ctx: *WriterCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var v: u64 = 1;
+            while (v <= ctx.commits) : (v += 1) {
+                const name = std.mem.sliceTo(&ctx.names[v - 1], 0);
+                var run = execQuery(alloc, ctx.hash, name) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0 or run.ok.result_u64.? != v) ctx.bad += 1;
+                ctx.done += 1;
+            }
+        }
+    }.work;
+    const ReaderCtx = struct {
+        hash: []const u8,
+        rows: u64,
+        max_v: u64,
+        execs: u64,
+        done: u64 = 0,
+        bad: u64 = 0,
+    };
+    const reader_fn = struct {
+        fn work(ctx: *ReaderCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var last_v: u64 = 0;
+            var i: u64 = 0;
+            while (i < ctx.execs) : (i += 1) {
+                var run = execQuery(alloc, ctx.hash, null) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                const sum = run.ok.result_u64.?;
+                // Same oracle as the concurrency test: a
+                // consistent read is exactly v*rows for a
+                // committed v, monotone per reader.
+                if (sum % ctx.rows != 0) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                const v = sum / ctx.rows;
+                if (v > ctx.max_v or v < last_v) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                last_v = v;
+                ctx.done += 1;
+            }
+        }
+    }.work;
+
+    var writer_ctx = WriterCtx{ .hash = fixture.setall_hash, .names = &param_names, .commits = commits };
+    var reader_ctxs: [3]ReaderCtx = undefined;
+    for (&reader_ctxs) |*ctx| ctx.* = .{ .hash = fixture.sum_hash, .rows = rows, .max_v = commits, .execs = 40 };
+    var writer_thread = try std.Thread.spawn(.{}, writer_fn, .{&writer_ctx});
+    var reader_threads: [3]std.Thread = undefined;
+    for (&reader_threads, &reader_ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, reader_fn, .{ctx});
+    }
+    writer_thread.join();
+    for (&reader_threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(@as(u64, 0), writer_ctx.bad);
+    try std.testing.expectEqual(commits, writer_ctx.done);
+    for (&reader_ctxs) |*ctx| {
+        try std.testing.expectEqual(@as(u64, 0), ctx.bad);
+        try std.testing.expectEqual(@as(u64, 40), ctx.done);
+    }
+    try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
+
+    // Retention during churn stays inside the declared
+    // envelope (docs §12.3): the active set plus at most one
+    // superseded val file per epoch since the live-pin floor
+    // — legacy commit tails reap as they publish, so in
+    // practice it rides far below this worst case.
+    try std.testing.expect(churnSegmentFileCount("conc") <= segment_bound + commits);
+
+    // One last commit and a final read of the new tip.
+    {
+        const name = std.mem.sliceTo(&param_names[commits], 0);
+        var run = try execQuery(std.testing.allocator, fixture.setall_hash, name);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(commits + 1, run.ok.result_u64.?);
+    }
+    table_mod.checkpointWalIfDirty(std.testing.allocator, ".", "conc") catch |err| return mapTableError(err);
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual((commits + 1) * rows, run.ok.result_u64.?);
+    }
+    // The final read re-adopted the tip into the registry
+    // (commits retire the current pin; reads adopt).
+    try std.testing.expectEqual(@as(?u64, base_epoch + commits + 1), epoch_runtime.currentEpoch("conc"));
+    // Steady state after a write: the active set plus the
+    // one superseded generation the last writer's own
+    // evaluation pin protected during its commit-tail reap
+    // (docs §12.3). A completing fold with no pins in flight
+    // returns retention to exactly the active set — proven
+    // deterministically by the table-level reaper test.
+    try std.testing.expectEqual(segment_bound + 1, churnSegmentFileCount("conc"));
+    _ = try table_mod.verifyTable(std.testing.allocator, ".", "conc");
 }
 
 test "qmod concurrent atomic cursor increments are exact" {

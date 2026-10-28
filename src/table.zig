@@ -9972,6 +9972,7 @@ fn checkpointWalLockedBudget(allocator: std.mem.Allocator, root_dir: []const u8,
         // later folds. Re-anchor the tip entry to the post-fold
         // manifest witness so its chain validation stays exact.
         reanchorTipAfterFold(allocator, root_dir, table_name);
+        _ = reapSupersededSegmentFiles(allocator, root_dir, table_name);
         return .{ .published_units = consumed, .complete = true };
     }
 
@@ -9987,6 +9988,7 @@ fn checkpointWalLockedBudget(allocator: std.mem.Allocator, root_dir: []const u8,
     }
     epochTipCacheDrop(root_dir, table_name);
     walCheckpointStateOnCheckpoint(allocator, root_dir, table_name);
+    _ = reapSupersededSegmentFiles(allocator, root_dir, table_name);
     return .{ .published_units = consumed, .complete = true };
 }
 
@@ -10006,6 +10008,160 @@ pub fn checkpointWalSlice(allocator: std.mem.Allocator, root_dir: []const u8, ta
     var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
     defer write_lock.release();
     return checkpointWalLockedBudget(allocator, root_dir, table_name, max_units);
+}
+
+// --- superseded segment reclamation (docs §12.3) -----------------------------
+// Every epoch that rewrites a segment leaves the previous
+// versioned file behind; before phase 3 nothing on the
+// commit/fold path ever deleted one, so retained files grew
+// linearly with epochs under write churn. The reaper runs at
+// quiescent publish points — completed folds and legacy
+// commit tails, under the write lock — and deletes segment
+// files no surviving meta names.
+
+/// The oldest epoch whose segment files must be retained,
+/// reported by the qmod layer's pin registry (docs §3.3:
+/// `epoch_runtime.oldestLiveEpoch` — the floor a reaper must
+/// respect). Installed by db_stub, following the
+/// `pin_free_hook` precedent; null in native-only processes,
+/// where the floor is simply the active epoch.
+pub var live_pin_floor_hook: ?*const fn (table_name: []const u8) ?u64 = null;
+
+/// If live pins span more epochs than this, the reap skips
+/// whole rather than walking unbounded history per fold
+/// (retention is always the safe direction).
+const REAP_META_SPAN_CAP: u64 = 4096;
+
+fn consumeDigitRun(s: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    if (i == 0) return null;
+    return s[i..];
+}
+
+/// `<table>.col<i>.<seg>.dat` with an optional `.e<epoch>`
+/// suffix — exactly the names `segmentFileName` and the
+/// epoch rewrite path produce. Index artifacts (`.idx.`)
+/// and everything else are not the reaper's business.
+fn isSegmentFileName(table_name: []const u8, name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, table_name)) return false;
+    var rest = name[table_name.len..];
+    if (!std.mem.startsWith(u8, rest, ".col")) return false;
+    rest = consumeDigitRun(rest[4..]) orelse return false;
+    if (rest.len == 0 or rest[0] != '.') return false;
+    rest = consumeDigitRun(rest[1..]) orelse return false;
+    if (std.mem.eql(u8, rest, ".dat")) return true;
+    if (std.mem.startsWith(u8, rest, ".dat.e")) {
+        const tail = consumeDigitRun(rest[6..]) orelse return false;
+        return tail.len == 0;
+    }
+    return false;
+}
+
+/// The epoch a segment file's `.e<epoch>` suffix declares,
+/// or null for the unsuffixed (creation-time) form.
+fn segmentFileEpoch(name: []const u8) ?u64 {
+    const idx = std.mem.lastIndexOf(u8, name, ".dat.e") orelse return null;
+    return std.fmt.parseInt(u64, name[idx + 6 ..], 10) catch null;
+}
+
+/// Delete the table's segment files that no meta in
+/// `[floor, active]` names, where floor is the live-pin
+/// floor (or the active epoch when nothing reports one).
+/// Two protections make this safe at any quiescent publish
+/// point, including while other writers stage lock-free:
+/// files named by a surviving meta are kept, and a file
+/// whose suffix declares an epoch NEWER than the active
+/// epoch is kept unconditionally — staged rewrites always
+/// target a future epoch, so an in-flight staging file is
+/// never deleted from under its writer. Best-effort by
+/// design: any failure aborts or skips a deletion rather
+/// than failing the caller — a retained file is inert, a
+/// wrongly deleted one would not be. Returns the number of
+/// files deleted. Caller holds the write lock.
+pub fn reapSupersededSegmentFiles(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) u64 {
+    if (isMemoryRoot(root_dir)) return 0;
+    var active = loadActiveMeta(allocator, root_dir, table_name) catch return 0;
+    defer active.deinit(allocator);
+
+    var floor = active.epoch;
+    if (live_pin_floor_hook) |hook| {
+        if (hook(table_name)) |live_floor| floor = @min(live_floor, active.epoch);
+    }
+    if (active.epoch - floor > REAP_META_SPAN_CAP) return 0;
+
+    // Keep set: segment paths named by the active meta plus
+    // every versioned meta in [floor, active). The parsed
+    // metas stay alive in `span_metas` until the walk ends;
+    // the keep set borrows their path strings.
+    var keep = std.StringHashMapUnmanaged(void){};
+    defer keep.deinit(allocator);
+    var span_metas = std.array_list.Managed(std.json.Parsed(TableMeta)).init(allocator);
+    var span_bytes = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (span_metas.items) |*parsed| parsed.deinit();
+        span_metas.deinit();
+        // Parsed metas borrow their source buffers in this
+        // toolchain's json parser, so the buffers live
+        // exactly as long as the parsed values.
+        for (span_bytes.items) |bytes| allocator.free(bytes);
+        span_bytes.deinit();
+    }
+    for (active.segments) |segment| {
+        for (segment.files) |file| {
+            keep.put(allocator, std.fs.path.basename(file.path), {}) catch return 0;
+        }
+    }
+    var epoch = floor;
+    while (epoch < active.epoch) : (epoch += 1) {
+        const meta_path = tableVersionedMetaPath(allocator, root_dir, table_name, epoch) catch return 0;
+        const bytes = sio.cwd().readFileAlloc(allocator, meta_path, 256 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(meta_path);
+                continue;
+            },
+            else => {
+                allocator.free(meta_path);
+                return 0;
+            },
+        };
+        allocator.free(meta_path);
+        var parsed = parseTableMeta(allocator, bytes) catch {
+            allocator.free(bytes);
+            return 0;
+        };
+        span_bytes.append(bytes) catch {
+            parsed.deinit();
+            allocator.free(bytes);
+            return 0;
+        };
+        span_metas.append(parsed) catch {
+            parsed.deinit();
+            return 0;
+        };
+        for (parsed.value.segments) |segment| {
+            for (segment.files) |file| {
+                keep.put(allocator, std.fs.path.basename(file.path), {}) catch return 0;
+            }
+        }
+    }
+
+    const dir_path = rootPrefix(root_dir);
+    var dir = sio.cwd().openDir(if (dir_path.len == 0) "." else dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var reaped: u64 = 0;
+    var it = dir.iterate();
+    while (it.next() catch return reaped) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isSegmentFileName(table_name, entry.name)) continue;
+        if (keep.contains(entry.name)) continue;
+        if (segmentFileEpoch(entry.name)) |file_epoch| {
+            if (file_epoch > active.epoch) continue;
+        }
+        dir.deleteFile(entry.name) catch continue;
+        reaped += 1;
+    }
+    return reaped;
 }
 
 // Like beginWriteTransaction but assumes the caller already holds the table
@@ -29808,6 +29964,102 @@ test "wal checkpoint fold honors a unit budget and resumes to completion" {
     try std.testing.expectEqual(@as(u64, 200), try snapshotGetU64(snapshot, 1, 1));
     const info = try verifyTable(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(base_epoch + 3, info.epoch);
+}
+
+var test_reap_floor: ?u64 = null;
+
+fn testReapFloorHook(_: []const u8) ?u64 {
+    return test_reap_floor;
+}
+
+fn countSegmentFilesForTest(table_name: []const u8) u64 {
+    var dir = sio.cwd().openDir(".", .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var n: u64 = 0;
+    var it = dir.iterate();
+    while (it.next() catch return n) |entry| {
+        if (entry.kind == .file and isSegmentFileName(table_name, entry.name)) n += 1;
+    }
+    return n;
+}
+
+fn segmentFileExistsForTest(name: []const u8) bool {
+    _ = sio.cwd().statFile(name) catch return false;
+    return true;
+}
+
+fn activeValSegmentName(allocator: std.mem.Allocator, table_name: []const u8) ![]u8 {
+    var meta = try loadActiveMeta(allocator, ".", table_name);
+    defer meta.deinit(allocator);
+    return allocator.dupe(u8, std.fs.path.basename(meta.segments[0].files[1].path));
+}
+
+test "wal fold completion reaps superseded segment files at the pin floor" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var original_dir = try sio.cwd().openDir(".", .{});
+    defer original_dir.close();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_dir.setAsCwd() catch {};
+    const allocator = std.testing.allocator;
+    const table_name = "wal_reap";
+    try walTestInitTable(allocator, table_name);
+    try walTestInsertLegacy(allocator, table_name, 1, 100);
+    try walTestInsertLegacy(allocator, table_name, 2, 200);
+    try checkpointWalIfDirty(allocator, ".", table_name);
+    const base = (try durableEpochTip(allocator, ".", table_name)).?.epoch;
+    var active_file_total: u64 = 0;
+    {
+        var meta = try loadActiveMeta(allocator, ".", table_name);
+        defer meta.deinit(allocator);
+        for (meta.segments) |segment| active_file_total += segment.files.len;
+    }
+    // The settled table starts fully reaped by definition:
+    // every segment file on disk is named by the base meta.
+    try std.testing.expectEqual(active_file_total, countSegmentFilesForTest(table_name));
+
+    // Phase A — no floor hook (nothing reports live pins):
+    // every completed fold reaps right up to the active
+    // epoch, so retained segment files == the active meta's.
+    try walTestAppendEpochUnit(allocator, table_name, base, 777);
+    try checkpointWalIfDirty(allocator, ".", table_name);
+    try walTestAppendEpochUnit(allocator, table_name, base + 1, 888);
+    try checkpointWalIfDirty(allocator, ".", table_name);
+    const val_at_2 = try activeValSegmentName(allocator, table_name);
+    defer allocator.free(val_at_2);
+    try std.testing.expectEqual(active_file_total, countSegmentFilesForTest(table_name));
+
+    // Phase B — a pin floor two epochs back: files named by
+    // metas inside [floor, active] survive the reap even
+    // though later epochs superseded them.
+    live_pin_floor_hook = &testReapFloorHook;
+    test_reap_floor = base + 2;
+    defer {
+        live_pin_floor_hook = null;
+        test_reap_floor = null;
+    }
+    try walTestAppendEpochUnit(allocator, table_name, base + 2, 999);
+    try checkpointWalIfDirty(allocator, ".", table_name);
+    const val_at_3 = try activeValSegmentName(allocator, table_name);
+    defer allocator.free(val_at_3);
+    try walTestAppendEpochUnit(allocator, table_name, base + 3, 111);
+    try checkpointWalIfDirty(allocator, ".", table_name);
+    // Active pair plus the two in-span superseded val files.
+    try std.testing.expectEqual(active_file_total + 2, countSegmentFilesForTest(table_name));
+    try std.testing.expect(segmentFileExistsForTest(val_at_2));
+    try std.testing.expect(segmentFileExistsForTest(val_at_3));
+
+    // Phase C — the floor clears: the next completed fold
+    // reaps the stragglers.
+    live_pin_floor_hook = null;
+    test_reap_floor = null;
+    try walTestAppendEpochUnit(allocator, table_name, base + 4, 222);
+    try checkpointWalIfDirty(allocator, ".", table_name);
+    try std.testing.expectEqual(active_file_total, countSegmentFilesForTest(table_name));
+    try std.testing.expect(!segmentFileExistsForTest(val_at_2));
+    try std.testing.expect(!segmentFileExistsForTest(val_at_3));
+    const info = try verifyTable(allocator, ".", table_name);
+    try std.testing.expectEqual(base + 5, info.epoch);
 }
 
 test "wal epoch unit with a chain gap fails the checkpoint loudly" {

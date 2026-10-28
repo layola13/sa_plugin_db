@@ -1293,9 +1293,15 @@ performs under one lock hold.
 
 ### 12.3 Retention bound: the superseded-segment reaper
 
-At every *completed* fold (either completion ending of
-§12.2, under the write lock), the checkpointer now reaps
-superseded segment files:
+The reaper (`reapSupersededSegmentFiles` in `table.zig`)
+runs at the quiescent publish points of the design, under
+the write lock: both completion endings of a fold (§12.2)
+and the tail of a legacy commit (in `commitWriteTable`,
+after the manifest publish). The legacy tail matters
+because small commits never touch the WAL at all — a
+fold-only reaper would miss the dominant small-write
+path entirely. At each run it deletes superseded segment
+files under two protections:
 
 - **Floor.** `table.zig` exposes a hook,
   `live_pin_floor_hook`, installed by the qmod layer to
@@ -1307,24 +1313,38 @@ superseded segment files:
   epoch in `[floor, active)`. (If that span exceeds a
   sanity cap the reap is skipped whole — retention is
   the safe direction.) Every disk file any in-process
-  consumer can still read is in this set: pin snapshots
+  reader can still read is in this set: pin snapshots
   load by their pinned meta's list (epoch ≥ floor), the
   legacy per-file load and native snapshots resolve the
-  active meta, and staging reads only files the active
-  meta names (the tip's non-carried entries) — the tip's
-  carried files are memory payloads, not disk files.
+  active meta.
+- **Future-epoch protection.** A file whose `.e<epoch>`
+  suffix declares an epoch *newer* than the active epoch
+  is kept unconditionally. Staged rewrites always target
+  a future epoch, so this covers everything lock-free
+  staging and the group queue have written but no meta
+  names yet — including the files a queued unit's fold
+  will later verify. A staging tip's remaining files are
+  carried from its base meta (an epoch ≥ floor), whose
+  unchanged entries the active meta also names.
 - **Reap set.** Directory entries matching the table's
   segment-file pattern (`<table>.col<i>.<seg>.dat` with
-  an optional `.e<epoch>` suffix) that are not in the
-  keep set. Deletion is best-effort per file and never
-  fails the fold.
+  an optional `.e<epoch>` suffix) that survive both
+  protections. Deletion is best-effort per file and never
+  fails the fold or the commit.
 
-**Declared bound.** After any completed fold, every
-segment file of the table on disk is named by the meta
-of some epoch in `[floor, active]`; with no live pins
-that is exactly the active meta's file set. Between
-folds, accumulation is bounded by the checkpoint
-thresholds' worth of new files, as before.
+**Declared bound.** After any reap, every retained
+segment file of the table is either named by the meta of
+some epoch in `[floor, active]` or carries a future-epoch
+suffix. With no live pins and no staging in flight that
+is exactly the active meta's file set. One consequence
+is worth stating plainly: a reap at a legacy commit tail
+runs while the committing writer's own evaluation pin
+(its base epoch) is still live, so the steady state after
+write churn is the active set plus that one protected
+generation; the next publish or fold after the pin drains
+collects it. Between publish points, accumulation is
+bounded by the checkpoint thresholds' worth of new
+files, as before.
 
 Scope honesty, matching §11.4's practice of listing
 what is *not* covered: versioned **meta** files are not
@@ -1369,8 +1389,9 @@ scenario; a pin completes while a checkpoint fold is
 parked between slices; a mixed churn pressure run
 (concurrent writers and readers, small scale) keeps the
 epoch oracle at zero violations throughout and ends with
-the retained segment-file count at the declared bound
-while the epoch count proves reclamation had work to do.
+the retained segment-file count at the declared
+steady-state bound of §12.3 (the active set plus the last
+writer's protected generation) after 21 epochs of churn.
 
 ### 12.6 Pending re-verification (box recovery)
 
