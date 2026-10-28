@@ -98,7 +98,8 @@ Schema 文件采用类似 C 语言宏定义的指令集（`#def`）：
 | **恢复快照** | `sa db restore <table> <epoch>` | 将表数据回滚至指定的 snapshot epoch。 |
 | **锁定表** | `sa db lock <table>` | 将表设为只读。锁定后，拒绝任何写入/导入操作，防止数据被意外篡改。 |
 | **解锁表** | `sa db unlock <table>` | 重新校验表数据一致性，清除只读标志，恢复表的写入和导入功能。 |
-| **注册 Query** | `sa db register <query.sa>` | 将编写的 `.sa` 查询代码（Qmod）进行编译注册，分配 SHA-256 唯一指纹。 |
+| **注册 Query** | `sa db register <query.sa>` | 将编写的 `.sa` 查询代码（Qmod）进行编译注册，分配 SHA-256 唯一指纹。带 `db_write`/`db_atomic_cursor` 授权的模块注册为写过程（kind: procedure），注册记录显式携带写能力。 |
+| **注册 AOT 库** | `sa db register-aot <hash> --lib <lib.so> [--symbol <name>] [--replace]` | 为已注册模块显式启用 AOT 逃生口：把经 `sa build-lib` 编译的原生库绑定到该哈希（记录库路径、SHA-256 与 ABI 版本）。此后该模块只走原生执行，库被篡改或缺失时显式报错、绝不回退解释执行；替换库必须显式传 `--replace`。 |
 | **执行 Query** | `sa db exec <hash> [--params <file>]` | 执行已注册的 Qmod。可通过可选的 `--params` 文件传递二进制运行参数。 |
 
 ---

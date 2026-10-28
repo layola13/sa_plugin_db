@@ -1,0 +1,37 @@
+// Write procedure (VM step 2): add `bonus` to AMOUNT on every
+// vm_orders row whose QTY == 5, returning the number of updated
+// rows. The module is a write procedure because its grants declare
+// db_write; its registry record carries kind=procedure and the
+// write capability explicitly.
+//
+// With docs/vm_examples/vm_orders.csv (QTY/AMOUNT rows
+// 2/100, 5/250, 1/40, 5/300, 3/150) and bonus = 100 the procedure
+// returns 2 and the AMOUNT total moves 840 -> 1040. Writes are
+// staged and commit atomically: cut the fuel budget mid-procedure
+// and no row changes.
+grants [db_read:vm_orders, db_write:vm_orders]
+@main(&col_qty: ptr, &col_amount: ptr, len: u64, bonus: u64) -> u64:
+L_ENTRY:
+idx = add 0, 0
+count = add 0, 0
+jmp L_COND
+L_COND:
+cond = ult idx, len
+br cond -> L_BODY, L_EXIT
+L_BODY:
+qoff = mul idx, 8
+qty = load col_qty+qoff as u64
+hit = eq qty, 5
+br hit -> L_MATCH, L_NEXT
+L_MATCH:
+aoff = mul idx, 8
+amt = load col_amount+aoff as u64
+new_amt = add amt, bonus
+store col_amount+aoff, new_amt as u64
+count = add count, 1
+jmp L_NEXT
+L_NEXT:
+idx = add idx, 1
+jmp L_COND
+L_EXIT:
+return count

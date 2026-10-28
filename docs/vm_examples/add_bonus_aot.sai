@@ -1,0 +1,8 @@
+// Export contract for the AOT build of add_bonus.proc.sa. Build
+// with:
+//   sa build-lib add_bonus.aot.sa --contract add_bonus_aot.sai \
+//     --kind shared -o libadd_bonus_aot.so
+// The two exports are the SA AOT ABI v1 surface the db plugin
+// verifies at registration (see docs/vm_write_procedures.md).
+@export sa_db_aot_abi_version() -> i64
+@export sa_db_qmod_main(slots: ptr, slot_count: u64) -> u64

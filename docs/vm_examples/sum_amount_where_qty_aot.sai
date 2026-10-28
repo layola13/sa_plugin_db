@@ -1,0 +1,10 @@
+// Export contract for the AOT build of the step-1 loop query
+// (sum_amount_where_qty_loop.query.sa). Build with:
+//   sa build-lib sum_amount_where_qty.aot.sa \
+//     --contract sum_amount_where_qty_aot.sai --kind shared \
+//     -o libsum_amount_where_qty_aot.so
+// The two exports are the SA AOT ABI v1 surface the db plugin
+// verifies at registration: an ABI version handshake and the
+// descriptor entry point (see docs/vm_write_procedures.md).
+@export sa_db_aot_abi_version() -> i64
+@export sa_db_qmod_main(slots: ptr, slot_count: u64) -> u64

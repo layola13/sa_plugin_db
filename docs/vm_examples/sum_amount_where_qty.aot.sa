@@ -1,0 +1,75 @@
+// Native (AOT) counterpart of sum_amount_where_qty_loop.query.sa:
+// sum of AMOUNT over the rows whose QTY == 5, computed over the raw
+// column buffers instead of the qmod interpreter.
+//
+// Descriptor layout for the module signature
+//   @main(&col_qty: ptr, &col_amount: ptr, len: u64) -> u64
+// is, in signature order:
+//   slots[0] = col_qty buffer address    slots[1] = col_qty bytes
+//   slots[2] = col_amount buffer address slots[3] = col_amount bytes
+//   slots[4] = len (row count)
+// Loop state lives in stack slots because SA registers are
+// single-assignment; every register is released exactly once per
+// path, following the sa_std hand-written idiom (core/mem.sa).
+
+@export sa_db_aot_abi_version() -> i64:
+L_ENTRY:
+    v = 1 as i64
+    return v
+
+@export sa_db_qmod_main(slots: ptr, slot_count: u64) -> u64:
+L_ENTRY:
+    qty_addr = load slots+0 as u64
+    amt_addr = load slots+16 as u64
+    len = load slots+32 as u64
+    qty = bitcast qty_addr as ptr
+    amt = bitcast amt_addr as ptr
+    !qty_addr
+    !amt_addr
+    idx_slot = stack_alloc 8
+    sum_slot = stack_alloc 8
+    store idx_slot+0, 0 as u64
+    store sum_slot+0, 0 as u64
+    jmp L_LOOP
+L_LOOP:
+    idx = load idx_slot+0 as u64
+    done = uge idx, len
+    br done -> L_END, L_BODY
+L_BODY:
+    off = mul idx, 8
+    qp = ptr_add qty, off
+    q = load qp+0 as u64
+    hit = eq q, 5
+    !qp
+    !q
+    br hit -> L_MATCH, L_NEXT
+L_MATCH:
+    ap = ptr_add amt, off
+    a = load ap+0 as u64
+    sum_cur = load sum_slot+0 as u64
+    sum_new = add sum_cur, a
+    store sum_slot+0, sum_new as u64
+    !ap
+    !a
+    !sum_cur
+    !sum_new
+    jmp L_NEXT
+L_NEXT:
+    next_idx = add idx, 1
+    store idx_slot+0, next_idx as u64
+    !next_idx
+    !off
+    !idx
+    !done
+    !hit
+    jmp L_LOOP
+L_END:
+    result = load sum_slot+0 as u64
+    !done
+    !idx
+    !len
+    !qty
+    !amt
+    !slots
+    !slot_count
+    return result

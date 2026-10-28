@@ -196,6 +196,7 @@ this change are compared by failure name set (see §7).
 - REG-VM-4 (step 2, this repo): write-procedure modules (through
   the existing single-table transaction API only) and the AOT
   registration tier are step 2; they were not started here.
+  (Implemented in step 2 — see `docs/vm_write_procedures.md`.)
 
 ## 7. Verification record
 
