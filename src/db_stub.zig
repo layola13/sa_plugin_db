@@ -1229,7 +1229,56 @@ fn cachedQmodSource(allocator: std.mem.Allocator, hash: [32]u8, hash_hex: []cons
 const CachedProgram = struct {
     lines: []const []const u8,
     labels: std.StringHashMap(usize),
+    /// The procedure signature as (raw_name, ty) pairs, extracted
+    /// with exactly the scan `parseDbFunctionParams` used to run
+    /// per exec. `scan_error` preserves the scan's error ordering:
+    /// it is the error the scan would have raised at the point it
+    /// stopped (e.g. a missing colon in parameter k), to be
+    /// returned by the bind step only after parameters 0..k-1 have
+    /// been bound — the same order the interleaved scan+bind
+    /// produced. Only the read-path binder consumes this; the
+    /// other evaluators keep their own parsers.
+    params_spec: ParamSpec,
 };
+
+const ParamSpec = struct {
+    entries: []const ParamSpecEntry,
+    scan_error: ?ExecError,
+};
+
+const ParamSpecEntry = struct {
+    raw_name: []const u8,
+    ty: []const u8,
+};
+
+fn buildParamSpec(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8) ExecError!ParamSpec {
+    var entries = std.array_list.Managed(ParamSpecEntry).init(allocator);
+    errdefer entries.deinit();
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| {
+        const trimmed = trimLineComment(line);
+        if (!std.mem.startsWith(u8, trimmed, "@")) continue;
+        const open = std.mem.indexOfScalar(u8, trimmed, '(') orelse continue;
+        if (!std.mem.eql(u8, trimmed[1..open], main_name)) continue;
+        const close = std.mem.indexOfScalar(u8, trimmed[open + 1 ..], ')') orelse {
+            return .{ .entries = try entries.toOwnedSlice(), .scan_error = ExecError.InvalidFormat };
+        };
+        const params_text = trimmed[open + 1 .. open + 1 + close];
+        var param_it = std.mem.splitScalar(u8, params_text, ',');
+        while (param_it.next()) |raw_param| {
+            const param = std.mem.trim(u8, raw_param, " \t\r\n");
+            if (param.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, param, ':') orelse {
+                return .{ .entries = try entries.toOwnedSlice(), .scan_error = ExecError.InvalidFormat };
+            };
+            const raw_name = std.mem.trim(u8, param[0..colon], " \t\r\n");
+            const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
+            entries.append(.{ .raw_name = raw_name, .ty = ty }) catch return ExecError.OutOfMemory;
+        }
+        return .{ .entries = try entries.toOwnedSlice(), .scan_error = null };
+    }
+    return .{ .entries = try entries.toOwnedSlice(), .scan_error = ExecError.InvalidFormat };
+}
 
 var program_cache: std.StringHashMapUnmanaged(*CachedProgram) = .{};
 
@@ -1250,14 +1299,16 @@ fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []
     var labels = std.StringHashMap(usize).init(cache_allocator);
     errdefer labels.deinit();
     const lines = try collectExecutableLines(cache_allocator, source_copy, main_name, &labels);
+    const spec = try buildParamSpec(cache_allocator, source_copy, main_name);
     const program = cache_allocator.create(CachedProgram) catch return ExecError.OutOfMemory;
-    program.* = .{ .lines = lines, .labels = labels };
+    program.* = .{ .lines = lines, .labels = labels, .params_spec = spec };
     lockExecCache();
     defer exec_cache_mutex.unlock();
     if (program_cache.get(key)) |existing| {
         // Lost a build race: drop our copy, serve the winner.
         program.labels.deinit();
         cache_allocator.free(program.lines);
+        cache_allocator.free(program.params_spec.entries);
         cache_allocator.free(source_copy);
         cache_allocator.destroy(program);
         return existing;
@@ -1991,41 +2042,33 @@ fn evalScalarQmod(allocator: std.mem.Allocator, source: []const u8, main_name: [
     return ExecError.InvalidFormat;
 }
 
-fn parseDbFunctionParams(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, read_table: ReadTable, params_path: ?[]const u8, values: *ValueMap, pointers: *std.StringHashMap(*const TableColumn)) ExecError!void {
+/// Bind a read procedure's parameters from the cached signature
+/// spec. The branch logic and the order of side effects (cursor
+/// reads, map inserts, error precedence) are exactly the ones the
+/// former interleaved scan+bind performed per exec; the spec only
+/// pre-computes the scan (see ParamSpec).
+fn parseDbFunctionParams(allocator: std.mem.Allocator, program: *const CachedProgram, read_table: ReadTable, params_path: ?[]const u8, values: *ValueMap, pointers: *std.StringHashMap(*const TableColumn)) ExecError!void {
     var params = ParamCursor{ .allocator = allocator, .params_path = params_path };
     defer params.deinit();
-    var it = std.mem.splitScalar(u8, source, '\n');
-    while (it.next()) |line| {
-        const trimmed = trimLineComment(line);
-        if (!std.mem.startsWith(u8, trimmed, "@")) continue;
-        const open = std.mem.indexOfScalar(u8, trimmed, '(') orelse continue;
-        if (!std.mem.eql(u8, trimmed[1..open], main_name)) continue;
-        const close = std.mem.indexOfScalar(u8, trimmed[open + 1 ..], ')') orelse return ExecError.InvalidFormat;
-        const params_text = trimmed[open + 1 .. open + 1 + close];
-        var param_it = std.mem.splitScalar(u8, params_text, ',');
-        while (param_it.next()) |raw_param| {
-            const param = std.mem.trim(u8, raw_param, " \t\r\n");
-            if (param.len == 0) continue;
-            const colon = std.mem.indexOfScalar(u8, param, ':') orelse return ExecError.InvalidFormat;
-            const raw_name = std.mem.trim(u8, param[0..colon], " \t\r\n");
-            const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
-            if (std.mem.startsWith(u8, raw_name, "&")) {
-                if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
-                const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
-                const column_name = columnNameFromPointer(param_name) orelse return ExecError.UnsupportedOperation;
-                const column = findColumn(read_table, column_name) orelse return ExecError.InvalidFormat;
-                pointers.put(param_name, column) catch return ExecError.OutOfMemory;
-            } else if (std.mem.eql(u8, raw_name, "len") and std.mem.eql(u8, ty, "u64")) {
-                values.put(raw_name, read_table.row_count) catch return ExecError.OutOfMemory;
-            } else if (std.mem.eql(u8, ty, "u64")) {
-                const value = try params.readU64();
-                values.put(raw_name, value) catch return ExecError.OutOfMemory;
-            } else return ExecError.UnsupportedOperation;
-        }
-        try params.finish();
-        return;
+    const spec = program.params_spec;
+    for (spec.entries) |entry| {
+        const raw_name = entry.raw_name;
+        const ty = entry.ty;
+        if (std.mem.startsWith(u8, raw_name, "&")) {
+            if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
+            const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
+            const column_name = columnNameFromPointer(param_name) orelse return ExecError.UnsupportedOperation;
+            const column = findColumn(read_table, column_name) orelse return ExecError.InvalidFormat;
+            pointers.put(param_name, column) catch return ExecError.OutOfMemory;
+        } else if (std.mem.eql(u8, raw_name, "len") and std.mem.eql(u8, ty, "u64")) {
+            values.put(raw_name, read_table.row_count) catch return ExecError.OutOfMemory;
+        } else if (std.mem.eql(u8, ty, "u64")) {
+            const value = try params.readU64();
+            values.put(raw_name, value) catch return ExecError.OutOfMemory;
+        } else return ExecError.UnsupportedOperation;
     }
-    return ExecError.InvalidFormat;
+    if (spec.scan_error) |err| return err;
+    try params.finish();
 }
 
 fn parseWriteDbFunctionParams(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, write_table: *WriteTable, params_path: ?[]const u8, values: *ValueMap, pointers: *std.StringHashMap(*WriteColumn)) ExecError!void {
@@ -2519,16 +2562,16 @@ fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_nam
     defer values.deinit();
     var pointers = std.StringHashMap(*const TableColumn).init(allocator);
     defer pointers.deinit();
+    const t_lines = ScopedTimer.begin(.prog_lines);
+    const program = try cachedProgram(allocator, source, main_name);
+    t_lines.end();
     const t_params = ScopedTimer.begin(.prog_params);
-    parseDbFunctionParams(allocator, source, main_name, read_table, params_path, &values, &pointers) catch |err| switch (err) {
+    parseDbFunctionParams(allocator, program, read_table, params_path, &values, &pointers) catch |err| switch (err) {
         ExecError.UnsupportedOperation => return null,
         else => return err,
     };
     t_params.end();
 
-    const t_lines = ScopedTimer.begin(.prog_lines);
-    const program = try cachedProgram(allocator, source, main_name);
-    t_lines.end();
     const lines = program.lines;
     const labels = &program.labels;
 
