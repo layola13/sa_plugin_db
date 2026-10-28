@@ -1692,6 +1692,35 @@ fn loadCompatMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name
     return parseOwnedTableMeta(allocator, source, table_name);
 }
 
+/// The active manifest's published identity of the current meta:
+/// (epoch, meta SHA-256, meta byte length). The manifest is the
+/// storage layer's atomic publication record, so this triple is a
+/// sound freshness witness for the meta it names — the full
+/// readActiveMetaSource path re-derives and cross-checks exactly
+/// these values from the meta bytes whenever a snapshot is
+/// materialized. Returns NotFound where no manifest exists
+/// (compat/memory roots), in which case callers use the full path.
+pub const ActiveManifestWitness = struct {
+    epoch: u64,
+    meta_hash: [32]u8,
+    meta_bytes: u64,
+};
+
+pub fn readActiveManifestWitness(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!ActiveManifestWitness {
+    if (skipDurabilitySync()) return TableError.NotFound;
+    const manifest_path = try tableManifestPath(allocator, root_dir, table_name);
+    defer allocator.free(manifest_path);
+    const manifest_source = try readFileAlloc(allocator, manifest_path, 1024 * 1024);
+    defer allocator.free(manifest_source);
+    var manifest = try parseTableManifest(allocator, manifest_source);
+    defer manifest.deinit();
+    if (!std.mem.eql(u8, manifest.value.table_name, table_name)) return TableError.InvalidFormat;
+    var hash: [32]u8 = undefined;
+    const decoded = std.fmt.hexToBytes(&hash, manifest.value.meta_sha256) catch return TableError.InvalidFormat;
+    if (decoded.len != 32) return TableError.InvalidFormat;
+    return .{ .epoch = manifest.value.epoch, .meta_hash = hash, .meta_bytes = manifest.value.meta_bytes };
+}
+
 pub fn readActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
     if (skipDurabilitySync()) {
         return readCompatMetaSource(allocator, root_dir, table_name) catch |err| switch (err) {
@@ -5733,7 +5762,16 @@ pub fn rewriteColumnFileForEpoch(
     defer allocator.free(next_path);
     const active_next_path = try activePath(allocator, root_dir, next_path);
     defer allocator.free(active_next_path);
-    const written = try writeFileWithParentSyncAndHashes(allocator, active_next_path, bytes, true);
+    // No per-file parent-dir fsync (the writeArtifactFile rule): a
+    // versioned column file is an intermediate artifact that only
+    // becomes reachable when a later meta write publishes it, and
+    // publishWrittenMeta ends with the directory fsync that makes
+    // every pending entry in that directory durable at once. Both
+    // callers (the qmod commit path and the cursor-add path) always
+    // follow with writeMeta in the same directory. The file's own
+    // content fdatasync inside the write stays, so ordering —
+    // content durable before the manifest that names it — is kept.
+    const written = try writeFileWithParentSyncAndHashes(allocator, active_next_path, bytes, false);
     var hashes_consumed = false;
     errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
     const meta = try makeFileMetaFromWrite(allocator, next_path, written);

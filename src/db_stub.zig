@@ -404,6 +404,10 @@ const WriteColumn = struct {
 const WriteTable = struct {
     meta_path: []u8,
     parsed: std.json.Parsed(QmodTableMeta),
+    /// SHA-256 of the meta bytes this table was loaded from; the
+    /// commit-time freshness check compares the active meta's hash
+    /// against it (see tableMetaStillCurrent).
+    meta_hash: [32]u8,
     row_count: u64,
     columns: []WriteColumn,
 
@@ -1003,6 +1007,30 @@ fn snapshotForPin(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecErro
     return snapshot;
 }
 
+/// Build the borrowing ReadTable for a pinned snapshot. Takes
+/// ownership of the pin hold: released here on error, transferred
+/// to the ReadTable (released by its deinit) on success.
+fn readTableFromSnapshot(allocator: std.mem.Allocator, table_name: []const u8, pin: *epoch_runtime.EpochPin, snap: *Snapshot) ExecError!ReadTable {
+    errdefer epoch_runtime.release(table_name, pin);
+    const out = ReadTable{
+        .name = try allocator.dupe(u8, table_name),
+        .row_count = snap.row_count,
+        .columns = try allocator.alloc(TableColumn, snap.columns.len),
+        .pin = pin,
+        .pin_table_name = table_name,
+    };
+    for (snap.columns, out.columns) |*src_column, *dst_column| {
+        dst_column.* = .{
+            .name = src_column.name,
+            .ty = src_column.ty,
+            .stride = src_column.stride,
+            .bytes = src_column.bytes,
+            .owned = false,
+        };
+    }
+    return out;
+}
+
 /// Read-side load under the epoch protocol (docs/vm_concurrency_epoch.md
 /// §3.1): resolve the active meta through the manifest, pin that epoch
 /// in the in-process runtime, and serve the exec from the pinned
@@ -1013,7 +1041,32 @@ fn snapshotForPin(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecErro
 /// exec. Epochs whose snapshots exceed the cache cap take the
 /// legacy path: bytes are loaded and hash-validated per exec and
 /// the pin is released when the load window closes, as before.
+///
+/// Fast path: when the registry's current pin already matches the
+/// manifest's published (epoch, meta_sha256) witness, the meta file
+/// is not re-read at all — the manifest is the storage layer's
+/// atomic publication record and the pin's identity was verified
+/// against the full meta bytes when the pin was adopted, so the
+/// witness match proves the snapshot is the manifest's epoch. Any
+/// mismatch (or a missing manifest on compat/memory roots) takes
+/// the full resolution below, which also adopts newer epochs.
 fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!ReadTable {
+    {
+        const t_witness = ScopedTimer.begin(.table_meta_source);
+        const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
+        t_witness.end();
+        if (witness) |w| {
+            if (epoch_runtime.pinCurrentIf(table_name, w.epoch, w.meta_hash)) |pin| {
+                const snapshot = snapshotForPin(table_name, pin) catch |err| {
+                    epoch_runtime.release(table_name, pin);
+                    return err;
+                };
+                if (snapshot) |snap| return readTableFromSnapshot(allocator, table_name, pin, snap);
+                epoch_runtime.release(table_name, pin);
+                // Over the cache cap: fall through to the legacy load.
+            }
+        }
+    }
     const t_source = ScopedTimer.begin(.table_meta_source);
     const meta_bytes = try readActiveTableMetaSource(allocator, table_name);
     t_source.end();
@@ -1026,31 +1079,7 @@ fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError
         epoch_runtime.release(table_name, pin);
         return err;
     };
-    if (snapshot) |snap| {
-        const out = ReadTable{
-            .name = allocator.dupe(u8, table_name) catch {
-                epoch_runtime.release(table_name, pin);
-                return ExecError.OutOfMemory;
-            },
-            .row_count = snap.row_count,
-            .columns = allocator.alloc(TableColumn, snap.columns.len) catch {
-                epoch_runtime.release(table_name, pin);
-                return ExecError.OutOfMemory;
-            },
-            .pin = pin,
-            .pin_table_name = table_name,
-        };
-        for (snap.columns, out.columns) |*src_column, *dst_column| {
-            dst_column.* = .{
-                .name = src_column.name,
-                .ty = src_column.ty,
-                .stride = src_column.stride,
-                .bytes = src_column.bytes,
-                .owned = false,
-            };
-        }
-        return out;
-    }
+    if (snapshot) |snap| return readTableFromSnapshot(allocator, table_name, pin, snap);
     defer epoch_runtime.release(table_name, pin);
     return loadReadTableFromMeta(allocator, table_name, pin.meta_source);
 }
@@ -1133,6 +1162,7 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
     var out = WriteTable{
         .meta_path = meta_path,
         .parsed = parsed,
+        .meta_hash = hashBytes(meta_bytes),
         .row_count = parsed.value.row_count,
         .columns = allocator.alloc(WriteColumn, parsed.value.columns.len) catch return ExecError.OutOfMemory,
     };
@@ -1963,78 +1993,23 @@ fn evalAtomicRmwAdd(line: []const u8, values: *ValueMap, cursors: *std.StringHas
     return .{ .dst = dst, .old = old };
 }
 
-fn fileMetasEqual(current: table_mod.FileMeta, expected: table_mod.FileMeta) bool {
-    if (!std.mem.eql(u8, current.path, expected.path)) return false;
-    if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
-    if (current.bytes != expected.bytes) return false;
-    return blockHashMetadataEqual(current.block_size, current.block_sha256, expected.block_size, expected.block_sha256);
-}
-
-fn blockHashMetadataEqual(current_size: u64, current_hashes: []const []const u8, expected_size: u64, expected_hashes: []const []const u8) bool {
-    if (current_size != expected_size) return false;
-    if (current_hashes.len != expected_hashes.len) return false;
-    for (current_hashes, expected_hashes) |current_hash, expected_hash| {
-        if (!std.mem.eql(u8, current_hash, expected_hash)) return false;
-    }
-    return true;
-}
-
-fn indexMetasEqual(current: table_mod.IndexMeta, expected: table_mod.IndexMeta) bool {
-    if (!std.mem.eql(u8, current.name, expected.name)) return false;
-    if (!std.mem.eql(u8, current.kind, expected.kind)) return false;
-    if (current.column_index != expected.column_index) return false;
-    if (current.column_index2 != expected.column_index2) return false;
-    if (current.unique != expected.unique) return false;
-    if (!std.mem.eql(u8, current.path, expected.path)) return false;
-    if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
-    if (current.bytes != expected.bytes) return false;
-    return blockHashMetadataEqual(current.block_size, current.block_sha256, expected.block_size, expected.block_sha256);
-}
-
-fn dictMetasEqual(current: table_mod.DictMeta, expected: table_mod.DictMeta) bool {
-    if (!std.mem.eql(u8, current.name, expected.name)) return false;
-    if (!std.mem.eql(u8, current.path, expected.path)) return false;
-    if (!std.mem.eql(u8, current.sha256, expected.sha256)) return false;
-    if (current.bytes != expected.bytes) return false;
-    if (current.entries != expected.entries) return false;
-    return blockHashMetadataEqual(current.block_size, current.block_sha256, expected.block_size, expected.block_sha256);
-}
 
 fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!bool {
+    // Freshness is byte identity of the active meta with the meta
+    // this exec loaded, witnessed by SHA-256. The previous form
+    // re-parsed the meta and deep-compared every field; the hash
+    // compare is strictly stronger (any field change flips the
+    // hash) and cheaper. The one behavioral delta: a byte-different
+    // but value-equal meta (hand-reformatted outside the plugin)
+    // now counts as changed where the deep compare counted it as
+    // current — the conservative direction for an optimistic
+    // concurrency guard, and unreachable through the plugin's own
+    // deterministic serializer, where one logical meta has exactly
+    // one byte form.
     const meta_bytes = try readActiveTableMetaSource(allocator, write_table.parsed.value.table_name);
     defer allocator.free(meta_bytes);
-    var current = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.InvalidFormat;
-    defer current.deinit();
-    const expected = write_table.parsed.value;
-    if (!std.mem.eql(u8, current.value.magic, expected.magic) or current.value.version != expected.version) return false;
-    if (!std.mem.eql(u8, current.value.table_name, expected.table_name)) return false;
-    if (!std.mem.eql(u8, current.value.schema_hash, expected.schema_hash)) return false;
-    if (current.value.locked != expected.locked) return false;
-    if (current.value.epoch != expected.epoch) return false;
-    if (current.value.row_count != expected.row_count) return false;
-    if (current.value.max_rows != expected.max_rows) return false;
-    if (current.value.row_bytes != expected.row_bytes) return false;
-    if (current.value.next_segment_id != expected.next_segment_id) return false;
-    if (current.value.columns.len != expected.columns.len or current.value.segments.len != expected.segments.len or current.value.indexes.len != expected.indexes.len or current.value.dicts.len != expected.dicts.len) return false;
-    for (current.value.columns, expected.columns) |current_col, expected_col| {
-        if (!std.mem.eql(u8, current_col.name, expected_col.name)) return false;
-        if (!std.mem.eql(u8, current_col.ty, expected_col.ty)) return false;
-        if (current_col.stride != expected_col.stride) return false;
-    }
-    for (current.value.segments, expected.segments) |current_segment, expected_segment| {
-        if (current_segment.id != expected_segment.id or current_segment.rows != expected_segment.rows) return false;
-        if (current_segment.files.len != expected_segment.files.len) return false;
-        for (current_segment.files, expected_segment.files) |current_file, expected_file| {
-            if (!fileMetasEqual(current_file, expected_file)) return false;
-        }
-    }
-    for (current.value.indexes, expected.indexes) |current_index, expected_index| {
-        if (!indexMetasEqual(current_index, expected_index)) return false;
-    }
-    for (current.value.dicts, expected.dicts) |current_dict, expected_dict| {
-        if (!dictMetasEqual(current_dict, expected_dict)) return false;
-    }
-    return true;
+    const current_hash = hashBytes(meta_bytes);
+    return std.mem.eql(u8, &current_hash, &write_table.meta_hash);
 }
 
 fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!void {

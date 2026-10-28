@@ -148,6 +148,27 @@ pub fn pinLatest(
     return pin;
 }
 
+/// Take a hold on the registry's current pin iff it matches
+/// (epoch, meta_hash) exactly; return null otherwise. Backs the
+/// read fast path: the caller has just read the table manifest,
+/// whose published (epoch, meta_sha256) is the freshness witness,
+/// so a match proves the current pin IS the manifest's epoch
+/// without re-reading the meta file. A mismatch is not an error —
+/// the caller falls back to full manifest+meta resolution, which
+/// also adopts any newer epoch. Pins taken here are released with
+/// `release`, like `pinLatest` holds.
+pub fn pinCurrentIf(table_name: []const u8, epoch: u64, meta_hash: [32]u8) ?*EpochPin {
+    const state = stateForTable(table_name) catch return null;
+    while (!state.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer state.mutex.unlock();
+    const current = state.current orelse return null;
+    if (current.epoch != epoch) return null;
+    if (!std.mem.eql(u8, &current.meta_hash, &meta_hash)) return null;
+    noteLiveLocked(state, epoch) catch return null;
+    current.refs += 1;
+    return current;
+}
+
 fn noteLiveLocked(state: *TableState, epoch: u64) error{OutOfMemory}!void {
     const entry = try state.live_by_epoch.getOrPut(registry_allocator, epoch);
     if (!entry.found_existing) entry.value_ptr.* = 0;
