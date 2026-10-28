@@ -822,7 +822,292 @@ recover folds), unchanged.
 
 ### 10.4 Results
 
-(filled in after the same-window bench run — suite name-set
-comparison, crash-recovery tests, write/mixed ratios, and the
-read-path spot check.)
+Verified before the bench window was lost (Colab runtime
+`b5e506eb1e40`, 8 cores; suite logs' SHA-256 recorded by the
+main session: baseline `ad69f6ffc99217…`, this branch
+`58e767222f50…`):
+
+- Suite: baseline tree (perf tip `6bc54f0`) 222/222; this
+  branch 232/232. Name-set diff: zero missing, exactly the
+  ten new tests of §10 added (five table-level WAL tests, five
+  qmod tests including the three crash-recovery classes of
+  §10.3: kill -9 survival, torn tail, mid-file corruption).
+  The same 232/232 also passed on the local VM in a clean run;
+  the one timing-sensitive test (`qmod parallel exec surface
+  is ordered and scales readers`) flakes under local 2-core
+  load on the pristine baseline as well.
+- Bench ratios (write 1t / mixed vs SQLite and PG, readsum /
+  point spot checks): **pending re-verification**. The only
+  bench attempt on the new runtime died at the harness build
+  step (`zig` missing from the detached shell's PATH) and the
+  runtime was retired before a corrected run could finish.
+  No §10 performance number is claimed until the same-window
+  rerun listed in §11.8 lands.
+
+## 11. Group commit and mixed-load tuning (WAL phase 2)
+
+Phase 1 (§10) collapsed the per-commit cost to one synced WAL
+append, but the commit still runs *synchronously inside the
+table write lock*: a writer holds the lock across staging,
+evaluation, and the fdatasync wait, so concurrent writers
+serialize on the sync latency itself (≈2–6 ms per commit on
+the bench disk), and every commit advances the epoch (snapshot
+churn under mixed load). Phase 2 pipelines the commit: staging
+and evaluation leave the lock, epoch units queue in memory,
+and a leader appends a whole batch of units with **one**
+fdatasync. It changes no on-disk format and no durability
+semantic; it is a scheduling change inside the qmod write
+path (the write-only and read-write evaluators,
+`evalWriteDbQmod` and `evalReadWriteDbQmod` — the native row
+path and the atomic-cursor path keep the phase-1 shape).
+
+### 11.1 Why not OCC / rebase
+
+A staged epoch unit is bound to its base epoch in three
+places at once: the versioned segment file names, the meta
+JSON (epoch field, file table), and the WAL framing
+(base_epoch / new_epoch). Rebasing a staged unit onto a moved
+tip is therefore a re-serialization, and it is only sound if
+the writer's *read set* did not intersect the intervening
+writes — the qmod evaluator keeps no read-set tracking, and
+`loadWriteTable` materializes whole columns, so a conservative
+read set is the whole table. Rather than grow read tracking
+into the evaluator (a semantics-adjacent change), phase 2
+keeps phase 1's strict serial order and moves only the *wait*:
+
+- Writers stage and evaluate concurrently against deep-copied
+  (owned) tip snapshots (§11.2), in any order.
+- A unit may enter the commit queue only if its base is
+  exactly the queue's chain tip (epoch + meta SHA-256, checked
+  under the coordinator mutex). The queue therefore extends
+  the epoch chain in staging-completion order, one unit per
+  epoch, bit-for-bit the serial order phase 1 produced.
+- A writer whose base went stale while it evaluated re-runs
+  the whole exec against the new tip (bounded:
+  `GROUP_STALE_RETRIES = 2`), then falls back to the phase-1
+  locked flow, whose `ExecError.StaleMetadata` surface is the
+  pre-existing contract. Re-running is safe: a write exec has
+  no effect outside its staged table until commit.
+- The legacy locked flow and the group flow never mix for one
+  table while the queue is non-empty: *every* fallback to the
+  locked flow (a commit that is not WAL-eligible — oversized
+  segment, sub-threshold with an idle queue — or a writer
+  whose stale retries are exhausted) first takes the
+  coordinator's **exclusive token**, which is granted only
+  when the queue is empty and no leader is active, and which
+  makes new submissions decline (and queue up for the token
+  in turn) while it is held. Both directions need the guard:
+  without it, the locked flow stages from the manifest while
+  the staging tip is ahead of it and its freshness check
+  fails the exec spuriously; and a group batch submitted
+  while a fallback commit is in flight would append behind
+  the fallback's solo append, tripping the leader's
+  pre-length check and poisoning the batch. Other locked
+  commit paths (atomic cursor, AOT) need no token: they stage
+  from the manifest under the write lock, and with a queue
+  active the staging tip is ahead of any manifest base, so
+  their freshness check rejects the commit before anything
+  is appended.
+
+### 11.2 Staging without the write lock
+
+Phase 1 staged from the tip cache by *borrowing* its payloads,
+sound only because every tip retirement path needed the write
+lock the stager held. Group staging borrows nothing shared:
+`epochWalStagingOwned` deep-copies the tip (meta JSON + carried
+payloads, bounded by the checkpoint thresholds) under the
+tip-cache mutex; the copies live in the `WriteTable` and die
+with it. Non-carried segments are read from their versioned
+files as before — such files are immutable once written, and a
+concurrent fold can only unlink them (an open read is
+unaffected; a not-yet-open read fails and the exec re-stages).
+The fold-first cases of phase 1 (mixed WAL stream, checkpoint
+due at staging) first fold under the write lock — held for
+the fold only, never across staging or a sync wait — and
+then stage again; only a stream that is still not stageable
+afterwards (or a checkpoint already due) declines to the
+drained locked flow. While the queue is
+non-empty the staging tip is the in-memory chain state:
+`epochWalStaging` validates it against the coordinator's
+projected WAL length (file length + queued bytes) instead of
+the manifest witness, which folds may legitimately move under
+it (§11.4).
+
+### 11.3 The commit queue, the leader, and the ack contract
+
+Per (root, table) coordinator state (process-local, like the
+tip cache): a FIFO of pending units, the chain tip, the
+durable frontier (`visible_wal_len`, `visible_epoch`), a
+leader flag, and a poison flag (§11.5). A pending unit holds
+its framed bytes (serialized at staging time), the
+`EpochCommitFile` views and meta JSON (borrowed from the
+waiting writer's staged table, which outlives the wait), and a
+completion cell. Submission merges the unit into the staging
+tip (the phase-1 tip note-append, with projected lengths) and
+extends the chain tip atomically with the base check.
+
+The first submitter to find no active leader becomes the
+leader; leadership is a role of a writer thread, never a
+dedicated thread (no new lifecycle in the plugin). The leader
+loop:
+
+1. Collect the batch: up to `GROUP_COMMIT_MAX_BATCH = 32`
+   queued units, and at most `GROUP_COMMIT_MAX_BATCH_BYTES =
+   8 MiB` of framed bytes. One optional linger
+   (`GROUP_COMMIT_LINGER_US`, default **0**): if the batch is
+   a singleton *and* another writer is mid-staging, the leader
+   may wait that long for it. Default zero because under any
+   real contention the sync latency (ms) dwarfs the staging
+   gap, so batches form naturally during the previous sync;
+   a nonzero default would tax the uncontended writer — the
+   write-1t case — for batch-mates that do not exist.
+2. Take the table write lock (inter-process) for the append
+   section only. This keeps phase 1's cross-path invariant —
+   every WAL append in the process (row path included) is
+   serialized — with the hold shrunk from stage+eval+sync to
+   append+sync. Verify the WAL length equals the batch's
+   expected pre-length; a mismatch means a foreign process
+   appended, and the batch fails into the poison path.
+3. Append the concatenated unit bytes with **one**
+   `walAppendSync` — one fdatasync for the whole batch.
+4. Advance the durable frontier (still holding the write
+   lock, so no fold can observe synced-but-unfrontiered
+   bytes), release the lock, do the per-unit bookkeeping
+   (checkpoint counters, tip note-append bookkeeping,
+   `epoch_runtime.noteCommitted` once with the batch's final
+   epoch), and only then complete the cells: **ack strictly
+   after sync** — a caller is told "committed" only when its
+   batch's fdatasync has returned success.
+
+Visibility is the same order, stated as an invariant:
+**no pin can observe epoch E before the sync that made E
+durable has completed.** In-process readers resolve through
+the manifest or through a fold; the fold (§11.4) is clamped
+to the durable frontier, and the staging tip — the only
+structure that knows about queued units — is never a pin
+source. A cross-process reader has no coordinator; if it
+folds complete units whose writer has not finished syncing,
+the fold itself performs the full durable publish (segment
+syncs, meta sync, manifest sync, directory sync) before any
+pin can resolve the epoch, so the epoch still becomes
+visible only after *a* complete durable publish of it. The
+test suite pins this down in-process: with a batch's sync
+held open by the sync gate (§11.7), new pins keep resolving
+the old epoch, and the new epoch appears only after the gate
+opens and the batch acks.
+
+Pipelining (staging of batch *n+1* during the sync of batch
+*n*) needs no extra machinery and no extra durability
+argument: staging touches only private copies and immutable
+files, queued units are invisible and inert until appended,
+and a failed batch invalidates queued successors through the
+poison path rather than through any state a stager could
+have observed as committed.
+
+### 11.4 Folds, frontier clamp, and snapshot retention
+
+- `checkpointWalLocked` clamps its parse to the durable
+  frontier whenever the coordinator holds state for the
+  table: units past the frontier are not folded, full stop.
+- While the queue is non-empty (or a batch is in flight) the
+  fold additionally performs **no WAL truncate and no tip
+  drop**; it re-anchors the tip entry to the post-fold
+  manifest witness. Folded units left in the file become
+  stale (base < disk epoch) and are skipped by later folds —
+  the pre-existing stale rule. When the queue is idle, the
+  fold is the phase-1 fold verbatim (truncate + tip drop).
+- Reader-side fold skip: the coordinator publishes the
+  durable frontier epoch alongside the frontier length, and
+  a read whose witness already reaches the frontier skips
+  its fold entirely while the queue is active — readers
+  never queue behind the leader's (possibly slow) sync just
+  to confirm a state they can already see. A witness behind
+  the frontier still folds, clamped as above, and publishes
+  only durable units.
+- Epoch churn: one batch advances the epoch chain by its
+  unit count but publishes **one** newly pinnable tip per
+  sync, and `noteCommitted` retires the registry's current
+  pin once per batch, not once per writer.
+- Retention bounds (unchanged mechanisms, stated for the
+  record): in-process snapshots are bounded by the snapshot
+  cache size cap in `snapshotForPin` (over-cap snapshots fall
+  back to per-file loads); pending WAL state is bounded by
+  the checkpoint thresholds (100 units / 4 MiB / 30 s), which
+  the staging path enforces as in phase 1; the oldest live
+  pin (`epoch_runtime.oldestLiveEpoch`) remains the floor
+  any reaper must respect. Reclaiming orphaned on-disk
+  segment files of superseded epochs is *not* changed by
+  phase 2 and remains governed by fold cadence, as in
+  phase 1 — listed as not-covered, not silently implied.
+
+### 11.5 Failure semantics
+
+- Batch append or sync error: every unit in the batch fails
+  with that error; every unit queued behind it fails too
+  (its chain base never landed). No acks are granted. The
+  coordinator is poisoned and the tip entry dropped; the
+  next operation on the table folds first (under the write
+  lock), which adopts complete units and discards a torn
+  tail by the phase-1 rules — the standard outcome-unknown
+  resolution for a commit whose sync reported an error.
+- WAL length mismatch at the leader's check: the byte
+  offset is bookkeeping, not the invariant — the invariant
+  is that the durable tip equals the batch head's base. A
+  local fold can legitimately move the offset (it publishes
+  the very units the batch chains onto, then truncates), so
+  the leader re-proves the tip from disk
+  (`durableEpochTip`, the fold parser's read-only twin) and
+  resyncs the offset when the durable tip is exactly the
+  head's base and the file ends at the last complete frame.
+  Anything else — a foreign append, a torn tail, a different
+  tip — takes the poison path above; single-process
+  deployments, the plugin's design center as with the tip
+  cache, never produce a foreign append.
+- A writer thread that dies waiting (host-level fault) is
+  out of scope, exactly as a phase-1 writer dying mid-commit
+  was: its unit is either in a batch (completed by the
+  leader) or not yet queued (never existed).
+
+### 11.6 Parameters
+
+| Parameter | Default | Rationale |
+|---|---|---|
+| `GROUP_COMMIT_MAX_BATCH` | 32 units | Bounds one sync's blast radius and ack latency spread; at the §9 staging cost a 32-batch is ~50 ms of staging feeding ~one 2–6 ms sync — the sync stops being the bottleneck long before 32. |
+| `GROUP_COMMIT_MAX_BATCH_BYTES` | 8 MiB | Twice the 4 MiB checkpoint threshold: a batch can carry one full WAL's worth of units without the queue's memory footprint exceeding two checkpoints' worth. |
+| `GROUP_COMMIT_LINGER_US` | 0 | See §11.3: nonzero only helps bursty arrivals at the direct expense of the uncontended writer. Compile-time constant; revisit with bench data, not by default. |
+| `GROUP_STALE_RETRIES` | 2 | Each retry costs one re-evaluation; two retries absorb the common two-writer collision; beyond that the locked flow guarantees progress. |
+| Checkpoint thresholds | 100 units / 4 MiB / 30 s | Unchanged from the row WAL; they bound queue + tip memory and fold work per pin. |
+
+### 11.7 Tests
+
+Deterministic sync control uses a test seam in the WAL sync
+wrapper (`testSyncGate` in table.zig): when a test installs
+it, `walAppendSync` signals entry and waits for release
+before writing. It is never installed outside tests, and the
+recovery/fold logic has no test-only branches — the gate
+only stretches a real sync in time. New tests (six, in
+db_stub.zig): a batch of concurrent writers acked only
+after the sync lands, with chained epochs and a single
+final state; the visibility test of §11.3 (gate held: new
+pins see the old epoch; gate open: acks land, new pins see
+the new epoch); pipelining (a second writer finishes
+staging and queueing while the first batch's sync is
+gated); readers summing repeatedly while a sync is gated
+(never starved, always the old value); four ungated writers
+on one table all landing through the queue (base collisions
+absorbed by re-staging); kill -9 over a process whose three
+writer threads commit through the queue (acked commits all
+fold back on reopen, one whole final state, epoch +3).
+
+### 11.8 Pending re-verification (box recovery)
+
+All performance claims of phases 1–2 are unverified until
+the box returns: same-window `scripts/bench` rerun for
+write 1t, write multi-thread, and mixed (this branch vs
+062e0e2-era references, SQLite and PG untuned), readsum /
+point spot checks against §9.4 magnitudes, and the full
+suite on the 8-core box including the timing-sensitive
+parallel test. The local correctness evidence for phase 2
+is the suite subset runnable on the 2-core VM (§11.7 tests
+plus the WAL/qmod filters), reported with the change.
 
