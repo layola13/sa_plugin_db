@@ -451,3 +451,114 @@ differences and implementation gaps:
   capability/fuel safety posture of §7 plus verified snapshot
   consistency — but the snapshot-reuse gap above is recorded
   here as the honest first optimization target.
+
+## 9. Performance line: pinned snapshots and exec-path caches
+
+Target set by the user (2026-10-28): per-scenario throughput at
+≈99% of the same-machine SQLite/PostgreSQL references, higher if
+reachable. This section records what changed and the semantic
+equivalence argument for each change; §9.4 carries the measured
+table.
+
+### 9.1 Design
+
+- **Pinned snapshot cache** (`Snapshot` in `src/db_stub.zig`).
+  The first exec to pin a (table, epoch, meta-hash) materializes
+  the epoch's read columns through the unchanged legacy load —
+  manifest/meta resolution, schema-hash check, per-file length +
+  SHA-256 + block-hash validation — and attaches the result to
+  the epoch pin itself (`EpochPin.attachment`). Later execs on
+  the same pin borrow the immutable columns; the pin hold now
+  spans the exec (released by `ReadTable.deinit`), and the
+  snapshot is freed by the pin-free hook when the pin retires and
+  drains. Snapshots over 256 MiB are not cached; those execs take
+  the legacy load with identical results.
+- **Manifest-witness fast path.** When the registry's current
+  pin matches the manifest's published (epoch, meta_sha256)
+  (`readActiveManifestWitness` + `pinCurrentIf`), the exec skips
+  re-reading the meta file entirely. Any mismatch takes the full
+  resolution path, which is also what adopts newer epochs.
+- **Content-addressed exec caches.** Registry meta parses,
+  qmod payloads, and parsed programs (lines + labels) are cached
+  under the SHA-256 of the exact bytes they were built from; the
+  bytes are still read and hashed per exec wherever the uncached
+  path read them, so a hit proves byte identity. Payload entries
+  are keyed by the registry-verified hash and stored only after
+  the hash check passes. Meta entries are reference-counted so a
+  re-registration can retire an entry without freeing it under
+  a reader.
+- **Scan folds.** Column primitives fold over typed word slices
+  (with a runtime alignment check and an `align(1)` fallback),
+  letting the compiler vectorize; per-row conversions are the
+  exact expressions of the scalar path, so results are
+  bit-for-bit identical. `loadColumnValueKind` reads through
+  fixed-size array pointers (the runtime-slice form of `readInt`
+  compiled to a byte-wise fallback in this toolchain).
+- **`col_fill`.** The write-side counterpart of the read scan
+  primitives: row 0 encodes through `storeColumnValue` (identical
+  cast/range rules), the remaining rows reuse the encoded pattern.
+  Fuel is charged per row, as with read primitives.
+- **Commit diet.** Versioned column files no longer fsync their
+  parent directory per file (the `writeArtifactFile` rule):
+  publish always ends with one directory fsync in the same
+  directory, which is what makes the artifact reachable and
+  durable; per-file content fdatasync ordering is unchanged.
+  The commit freshness check compares the active meta's SHA-256
+  against the loaded meta's hash instead of re-parsing and
+  deep-comparing every field.
+
+### 9.2 Semantic changes and equivalence
+
+1. **Validation timing (segments, schema).** Validation happens
+   at snapshot materialization (once per epoch per process), not
+   per exec. Within the storage layer's own operations an
+   epoch's artifacts are immutable — commits write new files and
+   publish by manifest swap — so re-validating identical
+   content-addressed bytes per exec could only re-derive the
+   same verdict. Epoch advance/restore is adopted immediately
+   (manifest + pin identity are re-checked per exec). The delta
+   is confined to out-of-band edits of an already-pinned epoch's
+   files mid-flight, which the epoch model places outside its
+   consistency domain; a fresh process, or a fresh epoch,
+   materializes and validates from disk exactly as before.
+2. **Commit freshness.** Byte identity (SHA-256) replaces the
+   parsed deep-compare. It is strictly stronger — any field
+   change flips the hash. A byte-different but value-equal meta
+   (hand-reformatted outside the plugin) now counts as changed
+   where the deep compare counted it as current: the
+   conservative direction for an optimistic-concurrency guard,
+   and unreachable through the plugin's own deterministic
+   serializer, where one logical meta has one byte form.
+3. **Directory fsync merging.** Removing the per-segment dir
+   fsync does not reorder durability: segment content is
+   fdatasynced before the rename, the meta and manifest are
+   fdatasynced in turn, and the publish's closing dir fsync makes
+   every pending entry in the directory durable before the
+   commit is reported. A crash before that final sync can lose
+   the new entries together — in which case the old manifest,
+   hence the old epoch, is what survives, intact.
+4. **No safety-posture change.** Grants are still enforced from
+   the registry meta on every exec (the cache is keyed by the
+   meta file's own content hash, re-read per exec); register-time
+   static checks are untouched; fuel is charged per statement
+   and per scanned/filled row exactly as before. No network,
+   listener, SQL, or wire surface was added (the §7 census
+   still holds: zero `socket`/`listen` in `src/`).
+
+### 9.3 What did not change
+
+Benchmark methodology and reference parameters are the
+concurrency line's (§8): same harness (`scripts/bench/`), same
+datasets, same SQLite defaults (journal=delete,
+synchronous=FULL), same PG bench. One bench-side change: the
+set-all qmods use the new `col_fill` primitive — the scenario is
+unchanged ("set every row to a constant", the counterpart of
+SQL `UPDATE ... SET val = c`); the interpreted per-row store
+loop it replaces remains covered by the unit suite.
+
+### 9.4 Results
+
+(Filled in with the final clean-window, 3-round-median numbers
+at the end of the line: per-scenario ratios vs both references,
+per-optimization contributions, and profiling attribution for
+any row still under the 99% line.)

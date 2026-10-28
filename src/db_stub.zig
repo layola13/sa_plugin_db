@@ -381,10 +381,23 @@ const WriteColumnSegment = struct {
     rows: u64,
     bytes: []u8,
     dirty: bool = false,
+    /// True while `bytes` borrows from a pinned snapshot (write
+    /// COW, see loadWriteTable): the first write to the segment
+    /// copies the bytes into exec-owned memory, and deinit must
+    /// not free the borrowed slice.
+    borrowed: bool = false,
 
     pub fn deinit(self: *WriteColumnSegment, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
+        if (!self.borrowed) allocator.free(self.bytes);
         self.* = undefined;
+    }
+
+    /// Copy-on-write: make the segment's bytes privately owned
+    /// before the first mutation.
+    pub fn makeWritable(self: *WriteColumnSegment, allocator: std.mem.Allocator) ExecError!void {
+        if (!self.borrowed) return;
+        self.bytes = allocator.dupe(u8, self.bytes) catch return ExecError.OutOfMemory;
+        self.borrowed = false;
     }
 };
 
@@ -410,12 +423,20 @@ const WriteTable = struct {
     meta_hash: [32]u8,
     row_count: u64,
     columns: []WriteColumn,
+    /// Set when clean segments borrow from a pinned snapshot
+    /// (write COW): the pin hold is owned by this WriteTable and
+    /// released here, so borrowed bytes stay live for the whole
+    /// exec. `pin_table_name` borrows the caller's table name
+    /// slice (grant storage outlives the exec).
+    pin: ?*epoch_runtime.EpochPin = null,
+    pin_table_name: []const u8 = "",
 
     pub fn deinit(self: *WriteTable, allocator: std.mem.Allocator) void {
         allocator.free(self.meta_path);
         for (self.columns) |*column| column.deinit(allocator);
         allocator.free(self.columns);
         self.parsed.deinit();
+        if (self.pin) |pin| epoch_runtime.release(self.pin_table_name, pin);
         self.* = undefined;
     }
 };
@@ -1384,6 +1405,32 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
     errdefer out.deinit(allocator);
     for (out.columns) |*column| column.* = .{ .name = &.{}, .ty = &.{}, .stride = 0, .segments = &.{} };
 
+    // Write-side snapshot borrowing (COW): when the epoch registry's
+    // current pin is exactly the meta just loaded — same epoch and
+    // the pin's meta hash equals this meta's hash — its snapshot
+    // holds the very segment bytes the per-file load below would
+    // read and validate. Borrow them instead; each segment copies
+    // on first write (WriteColumnSegment.makeWritable) and the pin
+    // hold rides on the WriteTable. Any other case (no pin yet,
+    // over-cap snapshot, hash mismatch) takes the per-file load
+    // unchanged.
+    var snapshot: ?*Snapshot = null;
+    const write_pin = epoch_runtime.pinCurrentIf(table_name, parsed.value.epoch, out.meta_hash) orelse
+        (epoch_runtime.pinLatest(table_name, meta_bytes, parsed.value.epoch, out.meta_hash) catch null);
+    if (write_pin) |pin| {
+        const snap = snapshotForPin(table_name, pin) catch |err| {
+            epoch_runtime.release(table_name, pin);
+            return err;
+        };
+        if (snap) |s| {
+            snapshot = s;
+            out.pin = pin;
+            out.pin_table_name = table_name;
+        } else {
+            epoch_runtime.release(table_name, pin);
+        }
+    }
+
     for (out.parsed.value.columns, 0..) |meta_column, col_idx| {
         if (!isReadableColumn(meta_column.ty, meta_column.stride)) return ExecError.UnsupportedOperation;
         const segments = allocator.alloc(WriteColumnSegment, out.parsed.value.segments.len) catch return ExecError.OutOfMemory;
@@ -1392,6 +1439,15 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
         for (out.parsed.value.segments, 0..) |segment_meta, seg_idx| {
             if (segment_meta.files.len != out.parsed.value.columns.len) return ExecError.SnapshotCorrupted;
             const file_meta = segment_meta.files[col_idx];
+            if (snapshot) |snap| {
+                var offset: usize = 0;
+                for (out.parsed.value.segments[0..seg_idx]) |prior| {
+                    offset += @intCast(prior.rows * @as(u64, meta_column.stride));
+                }
+                const len: usize = @intCast(segment_meta.rows * @as(u64, meta_column.stride));
+                segments[seg_idx] = .{ .path = file_meta.path, .rows = segment_meta.rows, .bytes = snap.columns[col_idx].bytes[offset..][0..len], .borrowed = true };
+                continue;
+            }
             const bytes = try readFileAlloc(allocator, file_meta.path, 1 << 30);
             errdefer allocator.free(bytes);
             try validateQmodFileBytes(file_meta, bytes);
@@ -1614,7 +1670,7 @@ fn scanOp(kind: ColumnKind, bytes: []const u8, rows: u64, op: ScanOp) u64 {
     };
 }
 
-fn storeColumnValue(column: *WriteColumn, offset: u64, value: u64) ExecError!void {
+fn storeColumnValue(allocator: std.mem.Allocator, column: *WriteColumn, offset: u64, value: u64) ExecError!void {
     if (!isReadableColumn(column.ty, column.stride)) return ExecError.UnsupportedOperation;
     var base: u64 = 0;
     for (column.segments) |*segment| {
@@ -1623,6 +1679,7 @@ fn storeColumnValue(column: *WriteColumn, offset: u64, value: u64) ExecError!voi
             const local_offset = offset - base;
             if (local_offset > segment.bytes.len or segment.bytes.len - @as(usize, @intCast(local_offset)) < column.stride) return ExecError.InvalidFormat;
             const idx: usize = @intCast(local_offset);
+            try segment.makeWritable(allocator);
             if (std.mem.eql(u8, column.ty, "u64")) std.mem.writeInt(u64, segment.bytes[idx..][0..8], value, .little) else if (std.mem.eql(u8, column.ty, "u32")) std.mem.writeInt(u32, segment.bytes[idx..][0..4], std.math.cast(u32, value) orelse return ExecError.InvalidFormat, .little) else if (std.mem.eql(u8, column.ty, "u16")) std.mem.writeInt(u16, segment.bytes[idx..][0..2], std.math.cast(u16, value) orelse return ExecError.InvalidFormat, .little) else if (std.mem.eql(u8, column.ty, "u8")) segment.bytes[idx] = std.math.cast(u8, value) orelse return ExecError.InvalidFormat else if (std.mem.eql(u8, column.ty, "i64")) std.mem.writeInt(i64, segment.bytes[idx..][0..8], @bitCast(value), .little) else if (std.mem.eql(u8, column.ty, "i32")) std.mem.writeInt(i32, segment.bytes[idx..][0..4], std.math.cast(i32, @as(i64, @bitCast(value))) orelse return ExecError.InvalidFormat, .little) else if (std.mem.eql(u8, column.ty, "i16")) std.mem.writeInt(i16, segment.bytes[idx..][0..2], std.math.cast(i16, @as(i64, @bitCast(value))) orelse return ExecError.InvalidFormat, .little) else if (std.mem.eql(u8, column.ty, "i8")) segment.bytes[idx] = @bitCast(std.math.cast(i8, @as(i64, @bitCast(value))) orelse return ExecError.InvalidFormat) else if (std.mem.eql(u8, column.ty, "f64")) std.mem.writeInt(u64, segment.bytes[idx..][0..8], value, .little) else if (std.mem.eql(u8, column.ty, "f32")) std.mem.writeInt(u32, segment.bytes[idx..][0..4], @bitCast(@as(f32, @floatCast(@as(f64, @bitCast(value))))), .little) else return ExecError.UnsupportedOperation;
             segment.dirty = true;
             return;
@@ -1639,13 +1696,13 @@ fn storeColumnValue(column: *WriteColumn, offset: u64, value: u64) ExecError!voi
 /// per-type cast/range rules are exactly the interpreted store
 /// loop's; the remaining rows reuse the encoded byte pattern
 /// verbatim. Fuel is charged per row, like the read primitives.
-fn fillColumnValue(column: *WriteColumn, rows: u64, value: u64) ExecError!u64 {
+fn fillColumnValue(allocator: std.mem.Allocator, column: *WriteColumn, rows: u64, value: u64) ExecError!u64 {
     if (!isReadableColumn(column.ty, column.stride)) return ExecError.UnsupportedOperation;
     var total_rows: u64 = 0;
     for (column.segments) |segment| total_rows += segment.rows;
     if (rows > total_rows) return ExecError.InvalidFormat;
     if (rows == 0) return 0;
-    try storeColumnValue(column, 0, value);
+    try storeColumnValue(allocator, column, 0, value);
     const stride: usize = column.stride;
     var pattern: [8]u8 = @splat(0);
     for (column.segments) |segment| {
@@ -1661,6 +1718,7 @@ fn fillColumnValue(column: *WriteColumn, rows: u64, value: u64) ExecError!u64 {
         if (row_cursor < rows and seg_end > row_cursor) {
             const local_start: u64 = if (row_cursor > seg_base) row_cursor - seg_base else 0;
             const local_end: u64 = @min(segment.rows, rows - seg_base);
+            try segment.makeWritable(allocator);
             var i: usize = @intCast(local_start * stride);
             const end: usize = @intCast(local_end * stride);
             while (i < end) : (i += stride) {
@@ -1674,7 +1732,7 @@ fn fillColumnValue(column: *WriteColumn, rows: u64, value: u64) ExecError!u64 {
     return rows;
 }
 
-fn evalColumnFill(line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*WriteColumn), meter: *FuelMeter) ExecError!?struct { dst: []const u8, value: u64 } {
+fn evalColumnFill(allocator: std.mem.Allocator, line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*WriteColumn), meter: *FuelMeter) ExecError!?struct { dst: []const u8, value: u64 } {
     const eq = std.mem.indexOf(u8, line, " = ") orelse return null;
     const expr = std.mem.trim(u8, line[eq + 3 ..], " \t\r\n");
     var parts = std.mem.tokenizeAny(u8, expr, " ,\t");
@@ -1689,7 +1747,7 @@ fn evalColumnFill(line: []const u8, values: *ValueMap, pointers: *std.StringHash
     const rows = try lookupValue(values, len_name);
     const value = try lookupValue(values, value_name);
     try meter.charge(rows);
-    const filled = try fillColumnValue(column, rows, value);
+    const filled = try fillColumnValue(allocator, column, rows, value);
     return .{ .dst = dst, .value = filled };
 }
 
@@ -2169,7 +2227,7 @@ fn evalWriteLoad(line: []const u8, values: *ValueMap, pointers: *std.StringHashM
     return .{ .dst = dst, .value = try loadWriteColumnValue(column, offset) };
 }
 
-fn evalStore(line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*WriteColumn)) ExecError!bool {
+fn evalStore(allocator: std.mem.Allocator, line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*WriteColumn)) ExecError!bool {
     const rest = if (std.mem.startsWith(u8, line, "store "))
         line["store ".len..]
     else
@@ -2185,11 +2243,11 @@ fn evalStore(line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*
     const column = pointers.get(ptr_name) orelse return ExecError.UnsupportedOperation;
     const offset = try lookupValue(values, offset_name);
     const value = try lookupValue(values, value_name);
-    try storeColumnValue(column, offset, value);
+    try storeColumnValue(allocator, column, offset, value);
     return true;
 }
 
-fn evalAtomicRmwAdd(line: []const u8, values: *ValueMap, cursors: *std.StringHashMap(*WriteColumn)) ExecError!?struct { dst: []const u8, old: u64 } {
+fn evalAtomicRmwAdd(allocator: std.mem.Allocator, line: []const u8, values: *ValueMap, cursors: *std.StringHashMap(*WriteColumn)) ExecError!?struct { dst: []const u8, old: u64 } {
     const eq = std.mem.indexOf(u8, line, " = atomic_rmw_add ") orelse return null;
     const dst = std.mem.trim(u8, line[0..eq], " \t");
     const args = std.mem.trim(u8, line[eq + " = atomic_rmw_add ".len ..], " \t");
@@ -2204,7 +2262,7 @@ fn evalAtomicRmwAdd(line: []const u8, values: *ValueMap, cursors: *std.StringHas
     if (offset != 0) return ExecError.DbCapabilityEscalation;
     const delta = try lookupValue(values, delta_name);
     const old = try loadWriteColumnValue(column, offset);
-    try storeColumnValue(column, offset, old +% delta);
+    try storeColumnValue(allocator, column, offset, old +% delta);
     return .{ .dst = dst, .old = old };
 }
 
@@ -2583,12 +2641,12 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
             pc = labels.get(if ((try lookupValue(&values, cond_name)) != 0) true_label else false_label) orelse return ExecError.InvalidFormat;
             continue;
         }
-        if (try evalColumnFill(line, &values, &pointers, meter)) |filled| {
+        if (try evalColumnFill(allocator, line, &values, &pointers, meter)) |filled| {
             values.put(filled.dst, filled.value) catch return ExecError.OutOfMemory;
             pc += 1;
             continue;
         }
-        if (try evalStore(line, &values, &pointers)) {
+        if (try evalStore(allocator, line, &values, &pointers)) {
             pc += 1;
             continue;
         }
@@ -2683,12 +2741,12 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
                 continue;
             }
         }
-        if (try evalColumnFill(line, &values, &write_pointers, meter)) |filled| {
+        if (try evalColumnFill(allocator, line, &values, &write_pointers, meter)) |filled| {
             values.put(filled.dst, filled.value) catch return ExecError.OutOfMemory;
             pc += 1;
             continue;
         }
-        if (try evalStore(line, &values, &write_pointers)) {
+        if (try evalStore(allocator, line, &values, &write_pointers)) {
             pc += 1;
             continue;
         }
@@ -2759,7 +2817,7 @@ fn evalAtomicDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name:
             pc = labels.get(if ((try lookupValue(&values, cond_name)) != 0) true_label else false_label) orelse return ExecError.InvalidFormat;
             continue;
         }
-        if (try evalAtomicRmwAdd(line, &values, &cursors)) |atomic| {
+        if (try evalAtomicRmwAdd(allocator, line, &values, &cursors)) |atomic| {
             values.put(atomic.dst, atomic.old) catch return ExecError.OutOfMemory;
             pc += 1;
             continue;
@@ -4972,7 +5030,7 @@ test "qmod write commit rejects stale table metadata" {
     var write_table = try loadWriteTable(std.testing.allocator, "simple");
     defer write_table.deinit(std.testing.allocator);
     const id_column = findWriteColumn(&write_table, "id") orelse return ExecError.InvalidFormat;
-    try storeColumnValue(id_column, 0, 9);
+    try storeColumnValue(std.testing.allocator, id_column, 0, 9);
 
     var csv2 = try (sio.Dir{ .inner = tmp.dir }).createFile("rows2.csv", .{ .truncate = true });
     defer csv2.close();
@@ -5017,7 +5075,7 @@ test "qmod write commit rejects stale block checksum metadata" {
     var write_table = try loadWriteTable(std.testing.allocator, "simple");
     defer write_table.deinit(std.testing.allocator);
     const id_column = findWriteColumn(&write_table, "id") orelse return ExecError.InvalidFormat;
-    try storeColumnValue(id_column, 0, 9);
+    try storeColumnValue(std.testing.allocator, id_column, 0, 9);
 
     var meta = try table_mod.loadActiveMeta(std.testing.allocator, ".", "simple");
     defer meta.deinit(std.testing.allocator);

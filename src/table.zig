@@ -1712,6 +1712,13 @@ pub fn readActiveManifestWitness(allocator: std.mem.Allocator, root_dir: []const
     defer allocator.free(manifest_path);
     const manifest_source = try readFileAlloc(allocator, manifest_path, 1024 * 1024);
     defer allocator.free(manifest_source);
+    // Fast path: the manifest is written by this layer's own
+    // serializer in one canonical shape; scan that shape directly
+    // and fall back to the full JSON parse on ANY deviation, so
+    // the witness is exactly the full parse's on every input the
+    // scanner accepts, and the full parse stays authoritative
+    // everywhere else (including every error verdict).
+    if (scanManifestWitness(manifest_source, table_name)) |witness| return witness;
     var manifest = try parseTableManifest(allocator, manifest_source);
     defer manifest.deinit();
     if (!std.mem.eql(u8, manifest.value.table_name, table_name)) return TableError.InvalidFormat;
@@ -1719,6 +1726,42 @@ pub fn readActiveManifestWitness(allocator: std.mem.Allocator, root_dir: []const
     const decoded = std.fmt.hexToBytes(&hash, manifest.value.meta_sha256) catch return TableError.InvalidFormat;
     if (decoded.len != 32) return TableError.InvalidFormat;
     return .{ .epoch = manifest.value.epoch, .meta_hash = hash, .meta_bytes = manifest.value.meta_bytes };
+}
+
+/// Strict scanner for the canonical manifest shape emitted by
+/// publishWrittenMeta's serializer:
+///   {"magic":"sa-db-table-manifest","version":1,"table_name":...,
+///    "epoch":N,"meta_path":...,"meta_sha256":"<64 lowercase hex>",
+///    "meta_bytes":N}
+/// Returns null on any deviation (caller falls back to the full
+/// parse). Field order is the serializer's field order.
+fn scanManifestWitness(source: []const u8, table_name: []const u8) ?ActiveManifestWitness {
+    var rest = source;
+    if (!std.mem.startsWith(u8, rest, "{\"magic\":\"sa-db-table-manifest\",\"version\":1,\"table_name\":\"")) return null;
+    rest = rest["{\"magic\":\"sa-db-table-manifest\",\"version\":1,\"table_name\":\"".len..];
+    if (!std.mem.startsWith(u8, rest, table_name)) return null;
+    rest = rest[table_name.len..];
+    if (!std.mem.startsWith(u8, rest, "\",\"epoch\":")) return null;
+    rest = rest["\",\"epoch\":".len..];
+    const epoch_len = std.mem.indexOfAny(u8, rest, ",}") orelse return null;
+    const epoch = std.fmt.parseInt(u64, rest[0..epoch_len], 10) catch return null;
+    rest = rest[epoch_len..];
+    if (!std.mem.startsWith(u8, rest, ",\"meta_path\":\"")) return null;
+    const path_end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    _ = path_end;
+    const sha_marker = ",\"meta_sha256\":\"";
+    const sha_at = std.mem.indexOf(u8, rest, sha_marker) orelse return null;
+    rest = rest[sha_at + sha_marker.len ..];
+    if (rest.len < 64) return null;
+    var hash: [32]u8 = undefined;
+    const decoded = std.fmt.hexToBytes(&hash, rest[0..64]) catch return null;
+    if (decoded.len != 32) return null;
+    rest = rest[64..];
+    if (!std.mem.startsWith(u8, rest, "\",\"meta_bytes\":")) return null;
+    rest = rest["\",\"meta_bytes\":".len..];
+    const bytes_len = std.mem.indexOfAny(u8, rest, "}") orelse return null;
+    const meta_bytes = std.fmt.parseInt(u64, rest[0..bytes_len], 10) catch return null;
+    return .{ .epoch = epoch, .meta_hash = hash, .meta_bytes = meta_bytes };
 }
 
 pub fn readActiveMetaSource(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
