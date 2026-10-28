@@ -338,6 +338,7 @@ const skills = [_]plugin.SkillSection{
         .items = &.{
             "db init <schema.sadb-schema>",
             "db register <query.sa>",
+            "db register-aot <hash> --lib <lib.so> [--symbol <name>] [--replace]",
             "db exec <hash> [--params <file>] [--fuel <steps>]",
             "db ingest <table> <csv|jsonl>",
             "db index-u64 <table> <column-index> [unique]",
@@ -382,6 +383,11 @@ fn isDbCliError(err: anyerror) bool {
         error.ConstraintViolation,
         error.FuelExhausted,
         error.InvalidFuelLimit,
+        error.AotLibraryInvalid,
+        error.AotSymbolMissing,
+        error.AotAbiMismatch,
+        error.AotUnsupportedShape,
+        error.AotAlreadyRegistered,
         error.OutOfMemory,
         => true,
         else => false,
@@ -392,11 +398,13 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
     const sub = if (argv.len >= 3) argv[2] else "";
     return switch (err) {
         error.MissingSourcePath => if (sub.len == 0)
-            "usage: sa db <init|register|exec|ingest|index-u64|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ..."
+            "usage: sa db <init|register|register-aot|exec|ingest|index-u64|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ..."
         else if (std.mem.eql(u8, sub, "init"))
             "usage: sa db init <schema.sadb-schema>"
         else if (std.mem.eql(u8, sub, "register"))
             "usage: sa db register <query.sa>"
+        else if (std.mem.eql(u8, sub, "register-aot"))
+            "usage: sa db register-aot <hash> --lib <lib.so> [--symbol <name>] [--replace]"
         else if (std.mem.eql(u8, sub, "exec"))
             "usage: sa db exec <hash> [--params <file>] [--fuel <steps>]"
         else if (std.mem.eql(u8, sub, "ingest"))
@@ -408,7 +416,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
         else if (std.mem.eql(u8, sub, "recover"))
             "usage: sa db recover <table>"
         else
-            "usage: sa db <init|register|exec|ingest|index-u64|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ...",
+            "usage: sa db <init|register|register-aot|exec|ingest|index-u64|inspect|status|snapshot|restore|recover|verify|compact|lock|unlock> ...",
         error.UnexpectedArgument => "remove the extra DB argument",
         error.InvalidPath => "check the DB schema or table path",
         error.FileNotFound, error.NotDir => "check that the DB schema file exists",
@@ -432,6 +440,11 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
         error.ConstraintViolation => "use unique values for columns with unique DB indexes",
         error.FuelExhausted => "raise the limit with --fuel <steps> or SA_DB_QMOD_FUEL, or simplify the query module",
         error.InvalidFuelLimit => "use a positive integer step budget for --fuel or SA_DB_QMOD_FUEL",
+        error.AotLibraryInvalid => "check that the AOT library exists, is a valid shared library, and still matches the hash recorded at registration",
+        error.AotSymbolMissing => "rebuild the AOT library with the SA AOT ABI exports (sa_db_aot_abi_version and the entry symbol)",
+        error.AotAbiMismatch => "rebuild the AOT library against the current SA AOT ABI version",
+        error.AotUnsupportedShape => "this module shape (atomic cursor, blob grant, or multi-table) has no AOT tier; run it interpreted",
+        error.AotAlreadyRegistered => "the module already has a different AOT library; pass --replace to substitute it explicitly",
         error.UnsupportedOperation => "this DB operation is not implemented yet",
         error.OutOfMemory => "free memory and retry",
         else => "check DB command arguments",
@@ -465,6 +478,11 @@ fn writeDbCliError(writer: anytype, argv: []const []const u8, err: anyerror) !vo
         error.ConstraintViolation => "DB constraint violation",
         error.FuelExhausted => "DB query fuel exhausted",
         error.InvalidFuelLimit => "invalid DB fuel limit",
+        error.AotLibraryInvalid => "DB AOT library is invalid or changed since registration",
+        error.AotSymbolMissing => "DB AOT library is missing a required export",
+        error.AotAbiMismatch => "DB AOT library ABI version mismatch",
+        error.AotUnsupportedShape => "DB module shape is not supported by the AOT tier",
+        error.AotAlreadyRegistered => "DB query hash already has a registered AOT library",
         error.UnsupportedOperation => "DB operation is not implemented",
         error.OutOfMemory => "out of memory while processing DB command",
         else => @errorName(err),
@@ -548,6 +566,11 @@ fn mapQmodError(err: qmod.ExecError) anyerror {
         error.ConstraintViolation => error.ConstraintViolation,
         error.FuelExhausted => error.FuelExhausted,
         error.InvalidFuelLimit => error.InvalidFuelLimit,
+        error.AotLibraryInvalid => error.AotLibraryInvalid,
+        error.AotSymbolMissing => error.AotSymbolMissing,
+        error.AotAbiMismatch => error.AotAbiMismatch,
+        error.AotUnsupportedShape => error.AotUnsupportedShape,
+        error.AotAlreadyRegistered => error.AotAlreadyRegistered,
     };
 }
 
@@ -588,7 +611,36 @@ fn runDbRegister(allocator: std.mem.Allocator, argv: []const []const u8, stdout:
     defer result.deinit(allocator);
     try stdout.print("Compiled: {s}\nHash: ", .{result.source_path});
     try writeHash(stdout, result.hash);
-    try stdout.print("\nRegistered: {s}\nimports: {d}\ngrants: {d}\n", .{ result.qmod_path, result.imports, result.grants });
+    try stdout.print("\nRegistered: {s}\nimports: {d}\ngrants: {d}\nkind: {s}\nwrite_capability: {s}\n", .{ result.qmod_path, result.imports, result.grants, result.kind, if (result.write_capability) "true" else "false" });
+    return 0;
+}
+
+fn runDbRegisterAot(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
+    if (argv.len < 4) return error.MissingSourcePath;
+    var lib_path: ?[]const u8 = null;
+    var symbol: ?[]const u8 = null;
+    var replace = false;
+    var idx: usize = 4;
+    while (idx < argv.len) {
+        if (std.mem.eql(u8, argv[idx], "--lib")) {
+            if (idx + 1 >= argv.len) return error.UnexpectedArgument;
+            lib_path = argv[idx + 1];
+            idx += 2;
+        } else if (std.mem.eql(u8, argv[idx], "--symbol")) {
+            if (idx + 1 >= argv.len) return error.UnexpectedArgument;
+            symbol = argv[idx + 1];
+            idx += 2;
+        } else if (std.mem.eql(u8, argv[idx], "--replace")) {
+            replace = true;
+            idx += 1;
+        } else return error.UnexpectedArgument;
+    }
+    const lib = lib_path orelse return error.MissingSourcePath;
+    var result = qmod.registerAot(allocator, argv[3], lib, symbol, replace) catch |err| return mapQmodError(err);
+    defer result.deinit(allocator);
+    try stdout.print("AOT registered: ", .{});
+    try writeHash(stdout, result.hash);
+    try stdout.print("\nlibrary: {s}\nlib_sha256: {s}\nsymbol: {s}\nabi_version: {d}\n", .{ result.lib_path, result.lib_sha256, result.symbol, result.abi_version });
     return 0;
 }
 
@@ -616,6 +668,7 @@ fn runDbExec(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *st
         .ok => |ok| {
             if (ok.code == 0) {
                 try stdout.print("Executed: {s}\n", .{ok.function_name});
+                if (ok.aot) try stdout.print("engine: aot\n", .{});
                 if (ok.result_u64) |value| try stdout.print("result_u64: {d}\n", .{value});
                 try stdout.print("fuel_used: {d}\n", .{ok.fuel_used});
                 try stdout.print("fuel_limit: {d}\n", .{ok.fuel_limit});
@@ -728,6 +781,7 @@ fn runDbCommandImpl(allocator: std.mem.Allocator, argv: []const []const u8, stdo
         return try runDbInit(allocator, argv, stdout, stderr);
     }
     if (std.mem.eql(u8, sub, "register")) return try runDbRegister(allocator, argv, stdout);
+    if (std.mem.eql(u8, sub, "register-aot")) return try runDbRegisterAot(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "exec")) return try runDbExec(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "ingest")) return try runDbIngest(allocator, argv, stdout);
     if (std.mem.eql(u8, sub, "index-u64")) return try runDbIndexU64(allocator, argv, stdout);
@@ -855,11 +909,12 @@ test "db plugin wrapper exports runtime descriptor" {
     try std.testing.expectEqualStrings("db", std.mem.span(exported.name));
     try std.testing.expectEqual(@as(usize, 1), exported.skills_len);
     const items = exported.skills_ptr[0].items;
-    try std.testing.expectEqual(@as(usize, 14), items.len);
+    try std.testing.expectEqual(@as(usize, 15), items.len);
     try std.testing.expectEqualStrings("db init <schema.sadb-schema>", items[0]);
-    try std.testing.expectEqualStrings("db index-u64 <table> <column-index> [unique]", items[4]);
-    try std.testing.expectEqualStrings("db recover <table>", items[9]);
-    try std.testing.expectEqualStrings("db unlock <table>", items[13]);
+    try std.testing.expectEqualStrings("db register-aot <hash> --lib <lib.so> [--symbol <name>] [--replace]", items[2]);
+    try std.testing.expectEqualStrings("db index-u64 <table> <column-index> [unique]", items[5]);
+    try std.testing.expectEqualStrings("db recover <table>", items[10]);
+    try std.testing.expectEqualStrings("db unlock <table>", items[14]);
 }
 
 test "db plugin wrapper abi maps missing init schema to cli diagnostic" {
@@ -1003,6 +1058,28 @@ test "db plugin wrapper renders snapshot corrupted diagnostic" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB snapshot is corrupted"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "verify, restore, or rebuild the corrupted table snapshot before exec"));
+}
+
+test "db plugin wrapper renders aot library invalid diagnostic" {
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer stderr_buffer.deinit();
+
+    const argv = [_][]const u8{ "sa", "db", "register-aot", "<hash>", "--lib", "libx.so" };
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.AotLibraryInvalid);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB AOT library is invalid or changed since registration"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "still matches the hash recorded at registration"));
+}
+
+test "db plugin wrapper renders aot already registered diagnostic" {
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer stderr_buffer.deinit();
+
+    const argv = [_][]const u8{ "sa", "db", "register-aot", "<hash>", "--lib", "libx.so" };
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.AotAlreadyRegistered);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB query hash already has a registered AOT library"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "pass --replace to substitute it explicitly"));
 }
 
 test "db inspect rejects malformed 64-byte hash text before table lookup" {

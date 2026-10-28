@@ -25,6 +25,11 @@ pub const ExecError = error{
     ConstraintViolation,
     FuelExhausted,
     InvalidFuelLimit,
+    AotLibraryInvalid,
+    AotSymbolMissing,
+    AotAbiMismatch,
+    AotUnsupportedShape,
+    AotAlreadyRegistered,
 };
 
 pub const ExecResult = struct {
@@ -34,6 +39,8 @@ pub const ExecResult = struct {
     source_path: []u8,
     imports: u64,
     grants: u64,
+    kind: []const u8 = "query",
+    write_capability: bool = false,
 
     pub fn deinit(self: *ExecResult, allocator: std.mem.Allocator) void {
         allocator.free(self.qmod_path);
@@ -50,6 +57,7 @@ pub const ExecRunResult = struct {
     result_u64: ?u64 = null,
     fuel_used: u64 = 0,
     fuel_limit: u64 = 0,
+    aot: bool = false,
 
     pub fn deinit(self: *ExecRunResult, allocator: std.mem.Allocator) void {
         allocator.free(self.function_name);
@@ -137,7 +145,60 @@ const QueryMeta = struct {
     grants: u64,
     grant_entries: []const []const u8,
     main: []const u8,
+    // Step 2 (VM write procedures): the module class derived from the
+    // grant entries, recorded explicitly in the registry record.
+    // Version 1 records predate these fields; the defaults keep them
+    // parseable, and readers derive the class from grant_entries for
+    // such records instead of trusting the stored defaults.
+    kind: []const u8 = "query",
+    write_capability: bool = false,
+    write_tables: []const []const u8 = &.{},
+    // Step 2 AOT escape hatch: present only when a native library was
+    // explicitly registered for this module (per-module opt-in). Exec
+    // verifies the library bytes against lib_sha256 on every run and
+    // never falls back to the interpreter when an AOT record exists.
+    aot: ?AotRecord = null,
 };
+
+const AotRecord = struct {
+    lib_path: []const u8,
+    lib_sha256: []const u8,
+    symbol: []const u8,
+    abi_version: u32,
+};
+
+/// A registered module's class, derived from its grant entries. A
+/// module holding any table-writing grant (db_write /
+/// db_atomic_cursor) is a write procedure: a category separate from
+/// read-only query modules, whose registry record carries the write
+/// capability explicitly (kind / write_capability / write_tables).
+const ModuleClass = struct {
+    kind: []const u8,
+    write_capability: bool,
+    write_tables: []const []const u8,
+};
+
+fn deriveModuleClass(allocator: std.mem.Allocator, entries: []const []const u8) ExecError!ModuleClass {
+    var tables = std.array_list.Managed([]const u8).init(allocator);
+    errdefer tables.deinit();
+    for (entries) |entry| {
+        const table_name = parseWriteGrant(entry) orelse parseAtomicGrant(entry) orelse continue;
+        var seen = false;
+        for (tables.items) |existing| {
+            if (std.mem.eql(u8, existing, table_name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) tables.append(table_name) catch return ExecError.OutOfMemory;
+    }
+    const write_tables = tables.toOwnedSlice() catch return ExecError.OutOfMemory;
+    return .{
+        .kind = if (write_tables.len > 0) "procedure" else "query",
+        .write_capability = write_tables.len > 0,
+        .write_tables = write_tables,
+    };
+}
 
 const GrantSet = struct {
     entries: [][]u8,
@@ -381,6 +442,20 @@ fn verifyExistingRegistration(
         !std.mem.eql(u8, existing_meta.value.hash, hash_hex))
     {
         return ExecError.DuplicateRegister;
+    }
+
+    if (existing_meta.value.version >= 2) {
+        // A version 2 record's stored class fields must agree with the
+        // class derived from its own grant entries; a record that lies
+        // about its write capability is corrupted, not a duplicate.
+        const existing_class = try deriveModuleClass(allocator, existing_meta.value.grant_entries);
+        defer allocator.free(existing_class.write_tables);
+        if (!std.mem.eql(u8, existing_meta.value.kind, existing_class.kind) or
+            existing_meta.value.write_capability != existing_class.write_capability or
+            !grantEntriesEqual(existing_meta.value.write_tables, existing_class.write_tables))
+        {
+            return ExecError.QueryRegistryCorrupted;
+        }
     }
 
     const existing_qmod = try readFileAlloc(allocator, qmod_path, 16 * 1024 * 1024);
@@ -2010,9 +2085,12 @@ pub fn registerQuery(allocator: std.mem.Allocator, source_path: []const u8) Exec
     try verifyExistingRegistration(allocator, hash_hex, source_path, source, qmod_path, imports, grants, main_name);
     try writeFile(qmod_path, source);
 
+    const module_class = try deriveModuleClass(allocator, grants.entries);
+    defer allocator.free(module_class.write_tables);
+
     const meta = QueryMeta{
         .magic = "sa-db-qmod-meta",
-        .version = 1,
+        .version = 2,
         .hash = hash_hex,
         .source_path = source_path,
         .qmod_path = qmod_path,
@@ -2020,6 +2098,9 @@ pub fn registerQuery(allocator: std.mem.Allocator, source_path: []const u8) Exec
         .grants = grants.entries.len,
         .grant_entries = grants.entries,
         .main = main_name,
+        .kind = module_class.kind,
+        .write_capability = module_class.write_capability,
+        .write_tables = module_class.write_tables,
     };
     const json = std.json.Stringify.valueAlloc(allocator, meta, .{}) catch return ExecError.OutOfMemory;
     defer allocator.free(json);
@@ -2032,6 +2113,8 @@ pub fn registerQuery(allocator: std.mem.Allocator, source_path: []const u8) Exec
         .source_path = try allocator.dupe(u8, source_path),
         .imports = imports,
         .grants = grants.entries.len,
+        .kind = module_class.kind,
+        .write_capability = module_class.write_capability,
     };
 }
 
@@ -2049,7 +2132,7 @@ fn loadMeta(allocator: std.mem.Allocator, hash_text: []const u8) ExecError!std.j
     };
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(QueryMeta, allocator, bytes, .{ .allocate = .alloc_always }) catch return ExecError.InvalidFormat;
-    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-qmod-meta") or parsed.value.version != 1) {
+    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-qmod-meta") or (parsed.value.version != 1 and parsed.value.version != 2)) {
         parsed.deinit();
         return ExecError.InvalidFormat;
     }
@@ -2078,7 +2161,401 @@ pub fn inspectRegistry(allocator: std.mem.Allocator, hash_text: []const u8) Exec
         out.print("grant: {s}\n", .{entry}) catch return ExecError.OutOfMemory;
     }
     out.print("main: {s}\n", .{parsed.value.main}) catch return ExecError.OutOfMemory;
+    const module_class = try deriveModuleClass(allocator, parsed.value.grant_entries);
+    defer allocator.free(module_class.write_tables);
+    out.print("kind: {s}\n", .{module_class.kind}) catch return ExecError.OutOfMemory;
+    out.print("write_capability: {s}\n", .{if (module_class.write_capability) "true" else "false"}) catch return ExecError.OutOfMemory;
+    for (module_class.write_tables) |table_name| {
+        out.print("write_table: {s}\n", .{table_name}) catch return ExecError.OutOfMemory;
+    }
+    if (parsed.value.aot) |record| {
+        out.print("aot_lib: {s}\n", .{record.lib_path}) catch return ExecError.OutOfMemory;
+        out.print("aot_lib_sha256: {s}\n", .{record.lib_sha256}) catch return ExecError.OutOfMemory;
+        out.print("aot_symbol: {s}\n", .{record.symbol}) catch return ExecError.OutOfMemory;
+        out.print("aot_abi_version: {d}\n", .{record.abi_version}) catch return ExecError.OutOfMemory;
+    }
     return out.toOwnedSlice() catch return ExecError.OutOfMemory;
+}
+
+/// Exec-time capability revalidation (step 2). Registration already
+/// validated the module, but the registry record is data on disk: at
+/// exec time the payload (whose hash is verified by the caller) is the
+/// source of truth. The record's grant entries must match the grants
+/// declared in the payload itself, the payload's instructions must not
+/// exceed those grants, and a version 2 record's stored class fields
+/// must agree with the class derived from the payload grants. Any
+/// disagreement is an explicit error — a read-only-class module can
+/// never reach a writing evaluator through a tampered record, and a
+/// write procedure can never be silently demoted or escalated.
+fn validateExecPayload(allocator: std.mem.Allocator, meta: QueryMeta, source: []const u8) ExecError!void {
+    var payload_grants = try parseGrants(allocator, source);
+    defer payload_grants.deinit(allocator);
+    if (!grantEntriesEqual(meta.grant_entries, payload_grants.entries)) return ExecError.QueryRegistryCorrupted;
+    try verifyDbGrants(source, payload_grants);
+    if (meta.version >= 2) {
+        const derived = try deriveModuleClass(allocator, payload_grants.entries);
+        defer allocator.free(derived.write_tables);
+        if (!std.mem.eql(u8, meta.kind, derived.kind) or
+            meta.write_capability != derived.write_capability or
+            !grantEntriesEqual(meta.write_tables, derived.write_tables))
+        {
+            return ExecError.QueryRegistryCorrupted;
+        }
+    }
+}
+
+/// AOT escape hatch (step 2). A module opts in per-module when a
+/// native library — built from an SA source through the toolchain's
+/// normal AOT path (`sa build-lib` with an export contract) — is
+/// registered against its hash with `registerAot`. The library must
+/// export `sa_db_aot_abi_version` returning `aot_abi_version` and an
+/// entry point (default `sa_db_qmod_main`) with the descriptor
+/// signature `fn (slots: [*]const u64, slot_count: u64) -> u64`.
+///
+/// Slot layout follows the module signature in order: a column
+/// parameter (`&col_<name>: ptr`) takes two slots (buffer address,
+/// buffer byte length), `len: u64` takes one slot (row count), and
+/// each scalar `u64` parameter takes one slot (its value, read from
+/// the params file exactly as the interpreters read it). Write
+/// columns are staged into contiguous buffers the native code may
+/// mutate; on a clean return the staged bytes are written back and
+/// committed through the same single-table transaction commit as the
+/// interpreted write evaluators. Native code is trusted code — that
+/// is precisely why the tier is opt-in per module — and it is not
+/// instruction-metered; the interpreted tier keeps the fuel budget.
+pub const aot_abi_version: u32 = 1;
+pub const aot_abi_version_symbol = "sa_db_aot_abi_version";
+pub const aot_default_entry_symbol = "sa_db_qmod_main";
+pub const aot_max_slots: usize = 32;
+
+const AotMainFn = fn ([*]const u64, u64) callconv(.c) u64;
+const AotAbiFn = fn () callconv(.c) i64;
+
+pub const AotResult = struct {
+    hash: [32]u8,
+    lib_path: []u8,
+    lib_sha256: []u8,
+    symbol: []u8,
+    abi_version: u32,
+
+    pub fn deinit(self: *AotResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.lib_path);
+        allocator.free(self.lib_sha256);
+        allocator.free(self.symbol);
+        self.* = undefined;
+    }
+};
+
+const AotShape = struct {
+    read_table: ?[]const u8 = null,
+    write_table: ?[]const u8 = null,
+};
+
+fn aotShape(entries: []const []const u8) ExecError!AotShape {
+    var shape = AotShape{};
+    for (entries) |entry| {
+        if (parseReadGrant(entry)) |table_name| {
+            if (shape.read_table != null and !std.mem.eql(u8, shape.read_table.?, table_name)) return ExecError.AotUnsupportedShape;
+            shape.read_table = table_name;
+        } else if (parseWriteGrant(entry)) |table_name| {
+            if (shape.write_table != null and !std.mem.eql(u8, shape.write_table.?, table_name)) return ExecError.AotUnsupportedShape;
+            shape.write_table = table_name;
+        } else {
+            // db_atomic_cursor and db_alloc_blob grants have no AOT
+            // tier: the cursor discipline does not map onto the buffer
+            // descriptor, and blob allocation is not implemented by
+            // any evaluator. Refuse explicitly at registration time
+            // instead of silently covering a shape AOT cannot stage.
+            return ExecError.AotUnsupportedShape;
+        }
+    }
+    return shape;
+}
+
+const AotParam = union(enum) {
+    column: []const u8,
+    row_count,
+    scalar: []const u8,
+};
+
+fn parseAotParams(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8) ExecError![]AotParam {
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| {
+        const trimmed = trimLineComment(line);
+        if (!std.mem.startsWith(u8, trimmed, "@")) continue;
+        const open = std.mem.indexOfScalar(u8, trimmed, '(') orelse continue;
+        if (!std.mem.eql(u8, trimmed[1..open], main_name)) continue;
+        const close = std.mem.indexOfScalar(u8, trimmed[open + 1 ..], ')') orelse return ExecError.InvalidFormat;
+        const params_text = trimmed[open + 1 .. open + 1 + close];
+        var params = std.array_list.Managed(AotParam).init(allocator);
+        errdefer params.deinit();
+        var param_it = std.mem.splitScalar(u8, params_text, ',');
+        while (param_it.next()) |raw_param| {
+            const param = std.mem.trim(u8, raw_param, " \t\r\n");
+            if (param.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, param, ':') orelse return ExecError.InvalidFormat;
+            const raw_name = std.mem.trim(u8, param[0..colon], " \t\r\n");
+            const ty = std.mem.trim(u8, param[colon + 1 ..], " \t\r\n");
+            if (std.mem.startsWith(u8, raw_name, "&")) {
+                if (!std.mem.eql(u8, ty, "ptr")) return ExecError.UnsupportedOperation;
+                const param_name = std.mem.trimStart(u8, raw_name[1..], " \t");
+                const column_name = columnNameFromPointer(param_name) orelse return ExecError.UnsupportedOperation;
+                params.append(.{ .column = column_name }) catch return ExecError.OutOfMemory;
+            } else if (std.mem.eql(u8, raw_name, "len") and std.mem.eql(u8, ty, "u64")) {
+                params.append(.row_count) catch return ExecError.OutOfMemory;
+            } else if (std.mem.eql(u8, ty, "u64")) {
+                params.append(.{ .scalar = raw_name }) catch return ExecError.OutOfMemory;
+            } else return ExecError.UnsupportedOperation;
+        }
+        return params.toOwnedSlice() catch return ExecError.OutOfMemory;
+    }
+    return ExecError.InvalidFormat;
+}
+
+fn aotSlotCount(params: []const AotParam) usize {
+    var count: usize = 0;
+    for (params) |param| {
+        count += switch (param) {
+            .column => 2,
+            .row_count, .scalar => 1,
+        };
+    }
+    return count;
+}
+
+const OpenedAotLibrary = struct {
+    lib: std.DynLib,
+    main_fn: *const AotMainFn,
+};
+
+fn openAotLibrary(allocator: std.mem.Allocator, lib_path: []const u8, symbol: []const u8) ExecError!OpenedAotLibrary {
+    // A bare filename would be treated as a library *name* and
+    // searched in system paths only; prefixing ./ keeps a relative
+    // registration path anchored at the working directory.
+    const open_path = if (std.mem.indexOfScalar(u8, lib_path, '/') == null)
+        std.fmt.allocPrint(allocator, "./{s}", .{lib_path}) catch return ExecError.OutOfMemory
+    else
+        lib_path;
+    defer if (open_path.ptr != lib_path.ptr) allocator.free(open_path);
+    var lib = std.DynLib.open(open_path) catch return ExecError.AotLibraryInvalid;
+    errdefer lib.close();
+    const abi_fn = lib.lookup(*const AotAbiFn, aot_abi_version_symbol) orelse return ExecError.AotSymbolMissing;
+    if (abi_fn() != @as(i64, @intCast(aot_abi_version))) return ExecError.AotAbiMismatch;
+    const symbol_z = allocator.dupeSentinel(u8, symbol, 0) catch return ExecError.OutOfMemory;
+    defer allocator.free(symbol_z);
+    const main_fn = lib.lookup(*const AotMainFn, symbol_z) orelse return ExecError.AotSymbolMissing;
+    return .{ .lib = lib, .main_fn = main_fn };
+}
+
+fn readAotLibraryBytes(allocator: std.mem.Allocator, lib_path: []const u8) ExecError![]u8 {
+    return readFileAlloc(allocator, lib_path, 512 * 1024 * 1024) catch |err| switch (err) {
+        ExecError.FileNotFound => return ExecError.AotLibraryInvalid,
+        else => return err,
+    };
+}
+
+/// Register (or, with `replace`, explicitly substitute) the native
+/// AOT library for an already-registered module. Registration is the
+/// opt-in: without an AOT record the module always runs interpreted,
+/// and with one it always runs native — substitution requires the
+/// explicit replace flag, never a silent overwrite of native code.
+pub fn registerAot(allocator: std.mem.Allocator, hash_text: []const u8, lib_path: []const u8, symbol: ?[]const u8, replace: bool) ExecError!AotResult {
+    var parsed = try loadMeta(allocator, hash_text);
+    defer parsed.deinit();
+    const meta = parsed.value;
+    const entry_symbol = symbol orelse aot_default_entry_symbol;
+    const hash = try parseHashHex(meta.hash);
+
+    const payload = readFileAlloc(allocator, meta.qmod_path, 16 * 1024 * 1024) catch |err| switch (err) {
+        ExecError.FileNotFound => return ExecError.QueryPayloadCorrupted,
+        else => return err,
+    };
+    defer allocator.free(payload);
+    if (!std.mem.eql(u8, &hashBytes(payload), &hash)) return ExecError.QueryPayloadCorrupted;
+    try validateExecPayload(allocator, meta, payload);
+    _ = try aotShape(meta.grant_entries);
+    const params = try parseAotParams(allocator, payload, meta.main);
+    defer allocator.free(params);
+    if (aotSlotCount(params) > aot_max_slots) return ExecError.AotUnsupportedShape;
+
+    const lib_bytes = try readAotLibraryBytes(allocator, lib_path);
+    defer allocator.free(lib_bytes);
+    const lib_hash = hashHex(lib_bytes);
+
+    if (meta.aot) |existing| {
+        const same = std.mem.eql(u8, existing.lib_path, lib_path) and
+            std.mem.eql(u8, existing.lib_sha256, lib_hash[0..]) and
+            std.mem.eql(u8, existing.symbol, entry_symbol) and
+            existing.abi_version == aot_abi_version;
+        if (same) return aotResultAlloc(allocator, hash, lib_path, lib_hash[0..], entry_symbol);
+        if (!replace) return ExecError.AotAlreadyRegistered;
+    }
+
+    var opened = try openAotLibrary(allocator, lib_path, entry_symbol);
+    opened.lib.close();
+
+    const module_class = try deriveModuleClass(allocator, meta.grant_entries);
+    defer allocator.free(module_class.write_tables);
+    var new_meta = meta;
+    new_meta.version = 2;
+    new_meta.kind = module_class.kind;
+    new_meta.write_capability = module_class.write_capability;
+    new_meta.write_tables = module_class.write_tables;
+    new_meta.aot = .{
+        .lib_path = lib_path,
+        .lib_sha256 = lib_hash[0..],
+        .symbol = entry_symbol,
+        .abi_version = aot_abi_version,
+    };
+    const json = std.json.Stringify.valueAlloc(allocator, new_meta, .{}) catch return ExecError.OutOfMemory;
+    defer allocator.free(json);
+    const path = try metaPath(allocator, meta.hash);
+    defer allocator.free(path);
+    try writeFile(path, json);
+
+    return aotResultAlloc(allocator, hash, lib_path, lib_hash[0..], entry_symbol);
+}
+
+fn aotResultAlloc(allocator: std.mem.Allocator, hash: [32]u8, lib_path: []const u8, lib_sha256: []const u8, symbol: []const u8) ExecError!AotResult {
+    const path_copy = allocator.dupe(u8, lib_path) catch return ExecError.OutOfMemory;
+    errdefer allocator.free(path_copy);
+    const hash_copy = allocator.dupe(u8, lib_sha256) catch return ExecError.OutOfMemory;
+    errdefer allocator.free(hash_copy);
+    const symbol_copy = allocator.dupe(u8, symbol) catch return ExecError.OutOfMemory;
+    return .{
+        .hash = hash,
+        .lib_path = path_copy,
+        .lib_sha256 = hash_copy,
+        .symbol = symbol_copy,
+        .abi_version = aot_abi_version,
+    };
+}
+
+const StagedColumn = struct {
+    column: *WriteColumn,
+    bytes: []u8,
+
+    fn deinit(self: *StagedColumn, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.* = undefined;
+    }
+
+    /// Copy the staged bytes back over the write table's segments,
+    /// marking only the segments whose contents actually changed as
+    /// dirty (mirroring the interpreted evaluators' store accounting,
+    /// so commit rewrites exactly what the procedure touched).
+    fn copyBack(self: *StagedColumn) void {
+        var offset: usize = 0;
+        for (self.column.segments) |*segment| {
+            const seg_len = segment.bytes.len;
+            if (!std.mem.eql(u8, segment.bytes, self.bytes[offset .. offset + seg_len])) {
+                @memcpy(segment.bytes, self.bytes[offset .. offset + seg_len]);
+                segment.dirty = true;
+            }
+            offset += seg_len;
+        }
+    }
+};
+
+fn aotColumnBuffer(allocator: std.mem.Allocator, staged: *std.array_list.Managed(StagedColumn), write_table: ?*WriteTable, read_table: ?*ReadTable, column_name: []const u8) ExecError![]const u8 {
+    if (write_table) |table| {
+        if (findWriteColumn(table, column_name)) |column| {
+            for (staged.items) |*existing| {
+                if (existing.column == column) return existing.bytes;
+            }
+            var total: usize = 0;
+            for (column.segments) |segment| total += segment.bytes.len;
+            const buffer = allocator.alloc(u8, total) catch return ExecError.OutOfMemory;
+            errdefer allocator.free(buffer);
+            var offset: usize = 0;
+            for (column.segments) |segment| {
+                @memcpy(buffer[offset .. offset + segment.bytes.len], segment.bytes);
+                offset += segment.bytes.len;
+            }
+            staged.append(.{ .column = column, .bytes = buffer }) catch return ExecError.OutOfMemory;
+            return buffer;
+        }
+    }
+    if (read_table) |table| {
+        if (findColumn(table.*, column_name)) |column| return column.bytes;
+    }
+    return ExecError.InvalidFormat;
+}
+
+fn execAotQmod(allocator: std.mem.Allocator, meta: QueryMeta, record: AotRecord, source: []const u8, params_path: ?[]const u8) ExecError!u64 {
+    const shape = try aotShape(meta.grant_entries);
+
+    // The library on disk must still be the exact artifact that was
+    // registered; any drift is an explicit error, never a fallback.
+    const lib_bytes = try readAotLibraryBytes(allocator, record.lib_path);
+    defer allocator.free(lib_bytes);
+    const lib_hash = hashHex(lib_bytes);
+    if (!std.mem.eql(u8, lib_hash[0..], record.lib_sha256)) return ExecError.AotLibraryInvalid;
+
+    var opened = try openAotLibrary(allocator, record.lib_path, record.symbol);
+    defer opened.lib.close();
+
+    const params = try parseAotParams(allocator, source, meta.main);
+    defer allocator.free(params);
+    const slot_count = aotSlotCount(params);
+    if (slot_count > aot_max_slots) return ExecError.AotUnsupportedShape;
+
+    var write_lock: ?table_mod.TableWriteLock = null;
+    defer if (write_lock) |*lock| lock.release();
+    var write_table: ?WriteTable = null;
+    defer if (write_table) |*table| table.deinit(allocator);
+    var read_table: ?ReadTable = null;
+    defer if (read_table) |*table| table.deinit(allocator);
+
+    if (shape.write_table) |table_name| {
+        write_lock = try acquireTableWriteLock(allocator, table_name);
+        write_table = try loadWriteTable(allocator, table_name);
+    }
+    const same_table = shape.read_table != null and shape.write_table != null and std.mem.eql(u8, shape.read_table.?, shape.write_table.?);
+    if (shape.read_table) |table_name| {
+        if (!same_table) read_table = try loadReadTable(allocator, table_name);
+    }
+    if (write_table != null and read_table != null and write_table.?.row_count != read_table.?.row_count) return ExecError.InvalidFormat;
+    const row_count: u64 = if (write_table) |table| table.row_count else if (read_table) |table| table.row_count else 0;
+
+    var staged = std.array_list.Managed(StagedColumn).init(allocator);
+    defer {
+        for (staged.items) |*column| column.deinit(allocator);
+        staged.deinit();
+    }
+
+    var cursor = ParamCursor{ .allocator = allocator, .params_path = params_path };
+    defer cursor.deinit();
+
+    var slots: [aot_max_slots]u64 = undefined;
+    var slot_idx: usize = 0;
+    for (params) |param| {
+        switch (param) {
+            .column => |column_name| {
+                const buffer = try aotColumnBuffer(allocator, &staged, if (write_table) |*table| table else null, if (read_table) |*table| table else null, column_name);
+                slots[slot_idx] = @intFromPtr(buffer.ptr);
+                slots[slot_idx + 1] = @intCast(buffer.len);
+                slot_idx += 2;
+            },
+            .row_count => {
+                slots[slot_idx] = row_count;
+                slot_idx += 1;
+            },
+            .scalar => {
+                slots[slot_idx] = try cursor.readU64();
+                slot_idx += 1;
+            },
+        }
+    }
+    try cursor.finish();
+
+    const result = opened.main_fn(slots[0..slot_count].ptr, @intCast(slot_count));
+
+    if (write_table) |*table| {
+        for (staged.items) |*column| column.copyBack();
+        try commitWriteTable(allocator, table);
+    }
+    return result;
 }
 
 pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_path: ?[]const u8) ExecError!ExecRun {
@@ -2100,6 +2577,22 @@ pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, pa
     };
     defer allocator.free(qmod_source);
     if (!std.mem.eql(u8, &hashBytes(qmod_source), &hash)) return ExecError.QueryPayloadCorrupted;
+    try validateExecPayload(allocator, parsed.value, qmod_source);
+    if (parsed.value.aot) |record| {
+        // An AOT record is an explicit per-module opt-in: the module
+        // runs natively or fails loudly. There is no fallback to the
+        // interpreter from this branch.
+        const aot_result = try execAotQmod(allocator, parsed.value, record, qmod_source, params_path);
+        return .{ .ok = .{
+            .code = 0,
+            .function_name = try allocator.dupe(u8, parsed.value.main),
+            .hash = hash,
+            .result_u64 = aot_result,
+            .fuel_used = meter.used,
+            .fuel_limit = meter.limit,
+            .aot = true,
+        } };
+    }
     const scalar_result = evalScalarQmod(allocator, qmod_source, parsed.value.main, params_path, &meter) catch |err| switch (err) {
         ExecError.UnsupportedOperation => null,
         else => return err,
@@ -4477,4 +4970,608 @@ test "qmod column primitives reject float columns and overscan" {
     const unknown_hash = try hashHexAlloc(std.testing.allocator, unknown_result.hash);
     defer std.testing.allocator.free(unknown_hash);
     try std.testing.expectError(ExecError.InvalidFormat, execQuery(std.testing.allocator, unknown_hash, null));
+}
+
+test "qmod write procedure class is recorded in registry metadata" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("read.query.sa", .{ .truncate = true });
+    defer read_query.close();
+    try read_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\value = load col_id+0 as u64
+        \\return value
+    );
+    var read_result = try registerQuery(std.testing.allocator, "read.query.sa");
+    defer read_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("query", read_result.kind);
+    try std.testing.expect(!read_result.write_capability);
+
+    var write_query = try (sio.Dir{ .inner = tmp.dir }).createFile("write.query.sa", .{ .truncate = true });
+    defer write_query.close();
+    try write_query.writeAll(
+        \\grants [db_write:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\store col_id+0, 1 as u64
+        \\return 0
+    );
+    var write_result = try registerQuery(std.testing.allocator, "write.query.sa");
+    defer write_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("procedure", write_result.kind);
+    try std.testing.expect(write_result.write_capability);
+
+    const write_hash = try hashHexAlloc(std.testing.allocator, write_result.hash);
+    defer std.testing.allocator.free(write_hash);
+    var parsed = try loadMeta(std.testing.allocator, write_hash);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
+    try std.testing.expectEqualStrings("procedure", parsed.value.kind);
+    try std.testing.expect(parsed.value.write_capability);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.write_tables.len);
+    try std.testing.expectEqualStrings("simple", parsed.value.write_tables[0]);
+
+    const inspect = try inspectRegistry(std.testing.allocator, write_hash);
+    defer std.testing.allocator.free(inspect);
+    try std.testing.expect(std.mem.containsAtLeast(u8, inspect, 1, "kind: procedure"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, inspect, 1, "write_capability: true"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, inspect, 1, "write_table: simple"));
+
+    // Re-registering the same procedure from the same source path is
+    // idempotent against its own version 2 record.
+    var again_result = try registerQuery(std.testing.allocator, "write.query.sa");
+    defer again_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("procedure", again_result.kind);
+}
+
+test "qmod exec rejects registry grant entries tampered after register" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\1
+        \\2
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\sum = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_id+offset as u64
+        \\sum = add sum, value
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return sum
+    );
+    var result = try registerQuery(std.testing.allocator, "sum.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    var run = try execQuery(std.testing.allocator, hash_hex, null);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3), run.ok.result_u64.?);
+
+    // Escalate the record's grants on disk: the payload still declares
+    // db_read only, so exec must refuse the mismatched record.
+    const path = try metaPath(std.testing.allocator, hash_hex);
+    defer std.testing.allocator.free(path);
+    const meta_bytes = try readFileAlloc(std.testing.allocator, path, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(meta_bytes);
+    const tampered = try std.mem.replaceOwned(u8, std.testing.allocator, meta_bytes, "db_read:simple", "db_write:simple");
+    defer std.testing.allocator.free(tampered);
+    try writeFile(path, tampered);
+
+    try std.testing.expectError(ExecError.QueryRegistryCorrupted, execQuery(std.testing.allocator, hash_hex, null));
+}
+
+test "qmod exec rejects write procedure record with downgraded grants" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\1
+        \\2
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("write.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_write:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\store col_id+0, 7 as u64
+        \\return 7
+    );
+    var result = try registerQuery(std.testing.allocator, "write.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    var run = try execQuery(std.testing.allocator, hash_hex, null);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), run.ok.result_u64.?);
+
+    // Demote the record's grants on disk: the payload still declares
+    // db_write, so exec must refuse the mismatched record instead of
+    // silently running the procedure under a read-only description.
+    const path = try metaPath(std.testing.allocator, hash_hex);
+    defer std.testing.allocator.free(path);
+    const meta_bytes = try readFileAlloc(std.testing.allocator, path, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(meta_bytes);
+    const tampered = try std.mem.replaceOwned(u8, std.testing.allocator, meta_bytes, "db_write:simple", "db_read:simple");
+    defer std.testing.allocator.free(tampered);
+    try writeFile(path, tampered);
+
+    try std.testing.expectError(ExecError.QueryRegistryCorrupted, execQuery(std.testing.allocator, hash_hex, null));
+}
+
+test "qmod exec rejects forged module class in registry record" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("write.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_write:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\store col_id+0, 1 as u64
+        \\return 0
+    );
+    var result = try registerQuery(std.testing.allocator, "write.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    // Forge the stored class: the record now claims the module is a
+    // read-only query while its grants declare a write procedure.
+    const path = try metaPath(std.testing.allocator, hash_hex);
+    defer std.testing.allocator.free(path);
+    const meta_bytes = try readFileAlloc(std.testing.allocator, path, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(meta_bytes);
+    const tampered = try std.mem.replaceOwned(u8, std.testing.allocator, meta_bytes, "procedure", "query");
+    defer std.testing.allocator.free(tampered);
+    try std.testing.expect(!std.mem.eql(u8, tampered, meta_bytes));
+    try writeFile(path, tampered);
+
+    try std.testing.expectError(ExecError.QueryRegistryCorrupted, execQuery(std.testing.allocator, hash_hex, null));
+}
+
+test "qmod write procedure fuel exhaustion leaves zero partial writes" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\1
+        \\2
+        \\3
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    // Read-write procedure: scale every row by 10, return the row count.
+    var proc = try (sio.Dir{ .inner = tmp.dir }).createFile("scale.proc.sa", .{ .truncate = true });
+    defer proc.close();
+    try proc.writeAll(
+        \\grants [db_read:simple, db_write:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_id+offset as u64
+        \\scaled = mul value, 10
+        \\store col_id+offset, scaled as u64
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return idx
+    );
+    var proc_result = try registerQuery(std.testing.allocator, "scale.proc.sa");
+    defer proc_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("procedure", proc_result.kind);
+    const proc_hash = try hashHexAlloc(std.testing.allocator, proc_result.hash);
+    defer std.testing.allocator.free(proc_hash);
+
+    var sum_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
+    defer sum_query.close();
+    try sum_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\sum = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_id+offset as u64
+        \\sum = add sum, value
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return sum
+    );
+    var sum_result = try registerQuery(std.testing.allocator, "sum.query.sa");
+    defer sum_result.deinit(std.testing.allocator);
+    const sum_hash = try hashHexAlloc(std.testing.allocator, sum_result.hash);
+    defer std.testing.allocator.free(sum_hash);
+
+    var sumsq_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sumsq.query.sa", .{ .truncate = true });
+    defer sumsq_query.close();
+    try sumsq_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\sum = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_id+offset as u64
+        \\sq = mul value, value
+        \\sum = add sum, sq
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return sum
+    );
+    var sumsq_result = try registerQuery(std.testing.allocator, "sumsq.query.sa");
+    defer sumsq_result.deinit(std.testing.allocator);
+    const sumsq_hash = try hashHexAlloc(std.testing.allocator, sumsq_result.hash);
+    defer std.testing.allocator.free(sumsq_hash);
+
+    // A budget of 5 steps cannot finish even the first row, but the
+    // first store may already be staged when the meter runs out. The
+    // staged write set must be discarded wholesale: both independent
+    // aggregates still describe the original rows (1, 2, 3).
+    try std.testing.expectError(ExecError.FuelExhausted, execQueryWithFuel(std.testing.allocator, proc_hash, null, 5));
+
+    var sum_run = try execQuery(std.testing.allocator, sum_hash, null);
+    defer sum_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 6), sum_run.ok.result_u64.?);
+    var sumsq_run = try execQuery(std.testing.allocator, sumsq_hash, null);
+    defer sumsq_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 14), sumsq_run.ok.result_u64.?);
+    _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
+
+    // With the default budget the same procedure commits atomically:
+    // every scaled value becomes visible at once.
+    var proc_run = try execQuery(std.testing.allocator, proc_hash, null);
+    defer proc_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), proc_run.ok.code);
+    try std.testing.expectEqual(@as(u64, 3), proc_run.ok.result_u64.?);
+
+    var scaled_run = try execQuery(std.testing.allocator, sum_hash, null);
+    defer scaled_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 60), scaled_run.ok.result_u64.?);
+    _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
+}
+
+test "qmod write procedure mid error leaves zero partial writes" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\1
+        \\2
+        \\3
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    // The first store succeeds into the staged write set; the second
+    // targets a byte offset far beyond the table and fails. The whole
+    // procedure must roll back: row 0 keeps its original value.
+    var proc = try (sio.Dir{ .inner = tmp.dir }).createFile("bad.proc.sa", .{ .truncate = true });
+    defer proc.close();
+    try proc.writeAll(
+        \\grants [db_write:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\store col_id+0, 99 as u64
+        \\store col_id+8000, 5 as u64
+        \\return 0
+    );
+    var proc_result = try registerQuery(std.testing.allocator, "bad.proc.sa");
+    defer proc_result.deinit(std.testing.allocator);
+    const proc_hash = try hashHexAlloc(std.testing.allocator, proc_result.hash);
+    defer std.testing.allocator.free(proc_hash);
+
+    try std.testing.expectError(ExecError.InvalidFormat, execQuery(std.testing.allocator, proc_hash, null));
+
+    var sum_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum.query.sa", .{ .truncate = true });
+    defer sum_query.close();
+    try sum_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\sum = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_id+offset as u64
+        \\sum = add sum, value
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return sum
+    );
+    var sum_result = try registerQuery(std.testing.allocator, "sum.query.sa");
+    defer sum_result.deinit(std.testing.allocator);
+    const sum_hash = try hashHexAlloc(std.testing.allocator, sum_result.hash);
+    defer std.testing.allocator.free(sum_hash);
+    var sum_run = try execQuery(std.testing.allocator, sum_hash, null);
+    defer sum_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 6), sum_run.ok.result_u64.?);
+    _ = try @import("table.zig").verifyTable(std.testing.allocator, ".", "simple");
+}
+
+test "qmod atomic cursor fuel exhaustion leaves cell unchanged" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\41
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    var proc = try (sio.Dir{ .inner = tmp.dir }).createFile("spin.proc.sa", .{ .truncate = true });
+    defer proc.close();
+    try proc.writeAll(
+        \\grants [db_atomic_cursor:simple]
+        \\@main(&cursor: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\jmp L_LOOP
+        \\L_LOOP:
+        \\old = atomic_rmw_add cursor+0, 1
+        \\jmp L_LOOP
+    );
+    var proc_result = try registerQuery(std.testing.allocator, "spin.proc.sa");
+    defer proc_result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("procedure", proc_result.kind);
+    const proc_hash = try hashHexAlloc(std.testing.allocator, proc_result.hash);
+    defer std.testing.allocator.free(proc_hash);
+
+    try std.testing.expectError(ExecError.FuelExhausted, execQueryWithFuel(std.testing.allocator, proc_hash, null, 20));
+
+    var read_query = try (sio.Dir{ .inner = tmp.dir }).createFile("read.query.sa", .{ .truncate = true });
+    defer read_query.close();
+    try read_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\value = load col_id+0 as u64
+        \\return value
+    );
+    var read_result = try registerQuery(std.testing.allocator, "read.query.sa");
+    defer read_result.deinit(std.testing.allocator);
+    const read_hash = try hashHexAlloc(std.testing.allocator, read_result.hash);
+    defer std.testing.allocator.free(read_hash);
+    var read_run = try execQuery(std.testing.allocator, read_hash, null);
+    defer read_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 41), read_run.ok.result_u64.?);
+}
+
+test "qmod register-aot rejects missing library file" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("read.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\value = load col_id+0 as u64
+        \\return value
+    );
+    var result = try registerQuery(std.testing.allocator, "read.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    try std.testing.expectError(ExecError.AotLibraryInvalid, registerAot(std.testing.allocator, hash_hex, "missing.so", null, false));
+}
+
+test "qmod register-aot rejects non-library file" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("read.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\value = load col_id+0 as u64
+        \\return value
+    );
+    var result = try registerQuery(std.testing.allocator, "read.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    var fake = try (sio.Dir{ .inner = tmp.dir }).createFile("fake.so", .{ .truncate = true });
+    defer fake.close();
+    try fake.writeAll("this is not a shared library\n");
+
+    try std.testing.expectError(ExecError.AotLibraryInvalid, registerAot(std.testing.allocator, hash_hex, "fake.so", null, false));
+}
+
+test "qmod register-aot rejects atomic cursor shape" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var query = try (sio.Dir{ .inner = tmp.dir }).createFile("atomic.query.sa", .{ .truncate = true });
+    defer query.close();
+    try query.writeAll(
+        \\grants [db_atomic_cursor:simple]
+        \\@main(&cursor: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\old = atomic_rmw_add cursor+0, 1
+        \\return old
+    );
+    var result = try registerQuery(std.testing.allocator, "atomic.query.sa");
+    defer result.deinit(std.testing.allocator);
+    const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+    defer std.testing.allocator.free(hash_hex);
+
+    // The shape gate fires before the library is even read: the
+    // atomic-cursor discipline has no AOT tier in step 2.
+    try std.testing.expectError(ExecError.AotUnsupportedShape, registerAot(std.testing.allocator, hash_hex, "missing.so", null, false));
 }
