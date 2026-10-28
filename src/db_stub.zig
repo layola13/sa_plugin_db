@@ -1362,12 +1362,48 @@ fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []
 /// same table's write lock (the read-write evaluator reads its
 /// write table through the staged copy when the names match),
 /// so the fold's lock acquisition cannot self-deadlock.
+/// Drive a read-side fold in bounded slices (docs §12.2):
+/// each slice takes and releases the table write lock on its
+/// own, so this pin never waits behind one monolithic fold —
+/// and neither does any concurrent pin or commit, which can
+/// interleave between slices. Stops at completion, or early
+/// once the manifest reaches the durable frontier: past that
+/// point further slices are checkpoint hygiene, not
+/// visibility work, and read-after-commit is already met.
+/// Every non-final slice publishes at least one unit, so the
+/// loop makes progress and terminates.
+fn foldEpochWalInSlices(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
+    var slices: u32 = 0;
+    while (true) {
+        const step = table_mod.checkpointWalSlice(allocator, ".", table_name, table_mod.FOLD_SLICE_MAX_UNITS) catch |err| return mapTableError(err);
+        if (step.complete) return;
+        slices += 1;
+        if (slices > 64) {
+            // Liveness valve: a writer appending faster than
+            // the slices drain (the checkpoint thresholds bound
+            // this to adversarial cases) must not starve the
+            // pin; finish with one monolithic fold, the
+            // pre-phase-3 behavior, and return.
+            table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+            return;
+        }
+        const gstate = table_mod.groupWalState(".", table_name);
+        if (!gstate.active) continue;
+        const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
+        if (witness) |w| {
+            if (w.epoch >= gstate.frontier_epoch) return;
+        }
+    }
+}
+
 fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
     // Group queue active (docs §11.4): the staging tip runs
     // ahead of the durable frontier by the queued units. If the
     // manifest already sits at the frontier, a fold cannot
     // advance anything — skip it instead of queueing behind
     // the leader's append-section lock while a batch syncs.
+    // The frontier half of this decision resolves through the
+    // lock-free publication of docs §12.1.
     const gstate = table_mod.groupWalState(".", table_name);
     if (gstate.active) {
         const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
@@ -1380,11 +1416,11 @@ fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) 
         if (witness) |w| {
             if (w.epoch == tip_epoch) return;
         }
-        table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+        try foldEpochWalInSlices(allocator, table_name);
         return;
     }
     if (table_mod.walHasPendingEpochUnits(allocator, ".", table_name)) {
-        table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+        try foldEpochWalInSlices(allocator, table_name);
     }
 }
 
@@ -1502,18 +1538,29 @@ fn loadWriteTableGroup(allocator: std.mem.Allocator, table_name: []const u8) Exe
 
 /// Group staging with the fold-first cases handled (docs
 /// §11.2): when the WAL stream is not stageable as a tip (e.g.
-/// row transactions left by ingest), fold it under the write
-/// lock — held for the fold only, never across staging or a
-/// sync wait — and stage again. A second decline is final.
+/// row transactions left by ingest), fold it — in bounded
+/// slices since phase 3 (docs §12.2), the write lock held per
+/// slice only, never across staging or a sync wait — and
+/// stage again. A decline after the fold completes is final.
 fn loadWriteTableGroupWithFold(allocator: std.mem.Allocator, table_name: []const u8) ExecError!?WriteTable {
     if (try loadWriteTableGroup(allocator, table_name)) |write_table| return write_table;
-    var fold_lock = try acquireTableWriteLock(allocator, table_name);
-    table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| {
-        fold_lock.release();
-        return mapTableError(err);
-    };
-    fold_lock.release();
-    return loadWriteTableGroup(allocator, table_name);
+    // Fold in bounded slices (docs §12.2), retrying staging
+    // between slices: each slice holds the write lock alone,
+    // so a group staging never waits behind one monolithic
+    // fold. A stream that is still not stageable once the
+    // fold completes declines for good, as before.
+    var slices: u32 = 0;
+    while (true) {
+        const step = table_mod.checkpointWalSlice(allocator, ".", table_name, table_mod.FOLD_SLICE_MAX_UNITS) catch |err| return mapTableError(err);
+        if (try loadWriteTableGroup(allocator, table_name)) |write_table| return write_table;
+        if (step.complete) return null;
+        slices += 1;
+        if (slices > 64) {
+            // Liveness valve, as in foldEpochWalInSlices.
+            table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+            return loadWriteTableGroup(allocator, table_name);
+        }
+    }
 }
 
 fn loadWriteTableInner(allocator: std.mem.Allocator, table_name: []const u8, mode: enum { locked, group }) ExecError!?WriteTable {
@@ -6778,6 +6825,97 @@ test "qmod fast and locked pin paths resolve the same visible set" {
         try std.testing.expectEqual(@as(u64, 77 * rows), both.fast);
         try std.testing.expectEqual(both.fast, both.locked);
     }
+}
+
+const SliceFolderCtx = struct {
+    table_name: []const u8,
+    first_published: u64 = 0,
+    first_complete: bool = true,
+    parked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    err_name: ?[]const u8 = null,
+
+    fn work(self: *SliceFolderCtx) void {
+        defer self.done.store(true, .release);
+        const step = table_mod.checkpointWalSlice(std.testing.allocator, ".", self.table_name, 1) catch |err| {
+            self.err_name = @errorName(err);
+            self.parked.store(true, .release);
+            return;
+        };
+        self.first_published = step.published_units;
+        self.first_complete = step.complete;
+        self.parked.store(true, .release);
+        while (!self.release_flag.load(.acquire)) {
+            sio.io().sleep(.fromNanoseconds(1_000_000), .awake) catch {};
+        }
+        while (true) {
+            const s = table_mod.checkpointWalSlice(std.testing.allocator, ".", self.table_name, 1) catch |err| {
+                self.err_name = @errorName(err);
+                return;
+            };
+            if (s.complete) break;
+        }
+    }
+};
+
+test "qmod pin completes while a checkpoint fold is parked between slices" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    // The phase-1 solo-commit fixture: each WriteAll appends
+    // exactly one epoch unit, acked synchronously, and never
+    // folds — so the pending-fold state below is exact, not
+    // timing-dependent.
+    const table_name = "walq_park";
+    try walQmodSetupTable(std.testing.allocator, table_name, 600);
+    // Settle the ingest backlog so the base is clean.
+    table_mod.checkpointWalIfDirty(std.testing.allocator, ".", table_name) catch |err| return mapTableError(err);
+    const base = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(@as(u64, 0), walQmodWalSize(table_name));
+
+    try walQmodWriteAll(std.testing.allocator, table_name, 42);
+    try walQmodWriteAll(std.testing.allocator, table_name, 43);
+    try walQmodWriteAll(std.testing.allocator, table_name, 44);
+    {
+        const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+        try std.testing.expectEqual(base.epoch, witness.epoch);
+        try std.testing.expect(walQmodWalSize(table_name) > 0);
+    }
+
+    // A folder publishes exactly one slice, then parks
+    // between slices holding no lock, its fold operation
+    // still in progress.
+    var folder = SliceFolderCtx{ .table_name = table_name };
+    var folder_thread = try std.Thread.spawn(.{}, SliceFolderCtx.work, .{&folder});
+    try groupTestWaitFor(&folder.parked, "folder parked between slices");
+    try std.testing.expectEqual(@as(u64, 1), folder.first_published);
+    try std.testing.expect(!folder.first_complete);
+    {
+        const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+        try std.testing.expectEqual(base.epoch + 1, witness.epoch);
+    }
+
+    // The pin completes now — its read drives the remaining
+    // slices cooperatively — while the folder is still
+    // parked. It resolves the final epoch (value 44), not a
+    // partial fold state.
+    try std.testing.expectEqual(@as(u64, 44), try walQmodReadValueAt(std.testing.allocator, table_name, 0));
+    try std.testing.expectEqual(@as(u64, 44), try walQmodReadValueAt(std.testing.allocator, table_name, 599));
+    try std.testing.expect(!folder.done.load(.acquire));
+
+    folder.release_flag.store(true, .release);
+    folder_thread.join();
+    try std.testing.expect(folder.err_name == null);
+    // The completing slice truncated the WAL; the table
+    // verifies end to end.
+    try std.testing.expectEqual(@as(u64, 0), walQmodWalSize(table_name));
+    const info = try table_mod.verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base.epoch + 3, info.epoch);
 }
 
 test "qmod concurrent writers on one table all land through the commit queue" {

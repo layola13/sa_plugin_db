@@ -9837,16 +9837,57 @@ fn applyEpochUnitLocked(
     try commitTableMetaWithRebuiltIndexesUnlocked(allocator, root_dir, table_name, meta);
 }
 
-pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+/// The outcome of one fold pass (docs §12.2): how many
+/// committed units were published, and whether the whole
+/// currently-foldable prefix was consumed. `complete == false`
+/// means a unit budget stopped the pass; the published units
+/// stay published (each is a whole legacy publish), and the
+/// next pass resumes at the advanced manifest epoch — the
+/// already-published units collect as stale and are skipped,
+/// so the manifest epoch itself is the fold's durable,
+/// crash-recoverable progress state.
+pub const FoldSliceResult = struct {
+    published_units: u64 = 0,
+    complete: bool = true,
+};
+
+/// Per-operation fold budget for slicing callers (docs
+/// §12.4): one unit publish is one legacy commit, so four
+/// bounds a single write-lock hold to a few legacy commits.
+pub const FOLD_SLICE_MAX_UNITS: u64 = 4;
+
+/// Re-anchor the tip entry to the post-fold manifest witness
+/// (the queue-active fold ending of docs §11.4, shared with
+/// partial slices): the fold moved the manifest, and the tip
+/// entry's chain validation compares against the witness.
+fn reanchorTipAfterFold(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    if (readActiveManifestWitness(allocator, root_dir, table_name)) |w| {
+        while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer epoch_tip_cache_mutex.unlock();
+        if (epochTipCacheLookup(root_dir, table_name)) |entry| {
+            entry.base_epoch = w.epoch;
+            entry.base_meta_hash = w.meta_hash;
+        }
+    } else |_| {}
+}
+
+/// The fold itself, optionally bounded to `max_units`
+/// committed units (docs §12.2). Caller holds the table write
+/// lock. With no budget this is exactly the pre-phase-3 fold;
+/// a budget that stops the pass short performs the tip
+/// re-anchor ending instead of the completion endings (no
+/// truncate, no tip drop, no checkpoint-counter reset), so
+/// the WAL keeps its un-folded suffix for the next slice.
+fn checkpointWalLockedBudget(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, max_units: ?u64) TableError!FoldSliceResult {
     const path = try walFilePath(allocator, root_dir, table_name);
     defer allocator.free(path);
 
     const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return .{},
         else => return mapFileError(err),
     };
     defer allocator.free(data);
-    if (data.len == 0) return;
+    if (data.len == 0) return .{};
 
     // Group-commit frontier (docs §11.4): while a commit queue
     // is active for this table, only the durable frontier may
@@ -9857,7 +9898,7 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
         @min(@as(usize, @intCast(gstate.frontier_len)), data.len)
     else
         data.len;
-    if (fold_len == 0) return;
+    if (fold_len == 0) return .{};
     const fold_data = data[0..fold_len];
 
     const parsed = try walParseValidPrefix(allocator, fold_data);
@@ -9875,13 +9916,23 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
     // Fold in stream order: consecutive row transactions fold
     // through one replay + legacy commit; an epoch unit first
     // flushes any pending row group, then materializes and
-    // publishes itself.
+    // publishes itself. A unit budget stops the pass between
+    // units; the accumulated row group is still flushed, so a
+    // slice never leaves a half-published unit behind.
     var row_group = std.array_list.Managed(WalApplicableTx).init(allocator);
     defer {
         for (row_group.items) |*t| t.ops.deinit();
         row_group.deinit();
     }
+    var consumed: u64 = 0;
+    var stopped = false;
     for (units.items) |*unit| {
+        if (max_units) |budget| {
+            if (consumed >= budget) {
+                stopped = true;
+                break;
+            }
+        }
         switch (unit.*) {
             .row_tx => |*tx| {
                 try row_group.append(tx.*);
@@ -9896,11 +9947,21 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
                 try applyEpochUnitLocked(allocator, root_dir, table_name, eu);
             },
         }
+        consumed += 1;
     }
     if (row_group.items.len != 0) {
         try checkpointFlushRowGroup(allocator, root_dir, table_name, row_group.items);
         for (row_group.items) |*t| t.ops.deinit();
         row_group.clearRetainingCapacity();
+    }
+
+    if (stopped) {
+        // Partial slice (docs §12.2): the published prefix is
+        // durable and the rest stays in the WAL for the next
+        // slice. Only the tip re-anchor runs; truncation and
+        // the checkpoint counters belong to completion.
+        reanchorTipAfterFold(allocator, root_dir, table_name);
+        return .{ .published_units = consumed, .complete = false };
     }
 
     if (gstate.active) {
@@ -9910,15 +9971,8 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
         // file as stale (base < disk epoch) and are skipped by
         // later folds. Re-anchor the tip entry to the post-fold
         // manifest witness so its chain validation stays exact.
-        if (readActiveManifestWitness(allocator, root_dir, table_name)) |w| {
-            while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
-            defer epoch_tip_cache_mutex.unlock();
-            if (epochTipCacheLookup(root_dir, table_name)) |entry| {
-                entry.base_epoch = w.epoch;
-                entry.base_meta_hash = w.meta_hash;
-            }
-        } else |_| {}
-        return;
+        reanchorTipAfterFold(allocator, root_dir, table_name);
+        return .{ .published_units = consumed, .complete = true };
     }
 
     // Every unit's new epoch is durable (or nothing needed
@@ -9933,6 +9987,25 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
     }
     epochTipCacheDrop(root_dir, table_name);
     walCheckpointStateOnCheckpoint(allocator, root_dir, table_name);
+    return .{ .published_units = consumed, .complete = true };
+}
+
+pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+    _ = try checkpointWalLockedBudget(allocator, root_dir, table_name, null);
+}
+
+/// Fold at most `max_units` committed units, taking and
+/// releasing the table write lock for this slice alone (docs
+/// §12.2). Slicing callers (reader pins, group staging) drive
+/// the fold with this so no single operation holds the lock
+/// across a whole checkpoint.
+pub fn checkpointWalSlice(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, max_units: u64) TableError!FoldSliceResult {
+    if (isMemoryRoot(root_dir)) return .{};
+    if (skipDurabilitySync()) return .{};
+    if (!walIsDirty(allocator, root_dir, table_name)) return .{};
+    var write_lock = try acquireTableWriteLock(allocator, root_dir, table_name);
+    defer write_lock.release();
+    return checkpointWalLockedBudget(allocator, root_dir, table_name, max_units);
 }
 
 // Like beginWriteTransaction but assumes the caller already holds the table
@@ -29658,6 +29731,83 @@ test "wal epoch unit folds on checkpoint and publishes its meta" {
     // The fold rebuilt the index over the materialized segment.
     const found = try snapshotFindU64(snapshot, 0, 2);
     try std.testing.expect(found.found);
+}
+
+test "wal checkpoint fold honors a unit budget and resumes to completion" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_slice_fold";
+    try walTestInitTable(std.testing.allocator, table_name);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 1, 100);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 2, 200);
+
+    var base_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    const base_epoch = base_meta.epoch;
+    base_meta.deinit(std.testing.allocator);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_epoch, 777);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_epoch + 1, 888);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_epoch + 2, 999);
+
+    // The parse-only view sees the whole chain while the disk
+    // epoch is still at the base: slices move the manifest,
+    // never the log's meaning.
+    {
+        const tip = (try durableEpochTip(std.testing.allocator, ".", table_name)).?;
+        try std.testing.expectEqual(base_epoch + 3, tip.epoch);
+    }
+
+    // Slice 1: exactly one unit published, fold incomplete,
+    // WAL not truncated, manifest advanced by one.
+    {
+        const step = try checkpointWalSlice(std.testing.allocator, ".", table_name, 1);
+        try std.testing.expectEqual(@as(u64, 1), step.published_units);
+        try std.testing.expect(!step.complete);
+        try std.testing.expect(walIsDirty(std.testing.allocator, ".", table_name));
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(base_epoch + 1, disk_meta.epoch);
+    }
+    // Resumption is stateless: a fresh caller (this is also
+    // what a post-crash process would do) continues from the
+    // manifest epoch, skipping the unit slice 1 published.
+    {
+        const step = try checkpointWalSlice(std.testing.allocator, ".", table_name, 1);
+        try std.testing.expectEqual(@as(u64, 1), step.published_units);
+        try std.testing.expect(!step.complete);
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(base_epoch + 2, disk_meta.epoch);
+    }
+    // The completing slice publishes the rest and only now
+    // truncates the WAL.
+    {
+        const step = try checkpointWalSlice(std.testing.allocator, ".", table_name, 16);
+        try std.testing.expectEqual(@as(u64, 1), step.published_units);
+        try std.testing.expect(step.complete);
+        try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(base_epoch + 3, disk_meta.epoch);
+    }
+    // Nothing left: a further slice is a no-op completion.
+    {
+        const step = try checkpointWalSlice(std.testing.allocator, ".", table_name, 1);
+        try std.testing.expectEqual(@as(u64, 0), step.published_units);
+        try std.testing.expect(step.complete);
+    }
+    // The sliced fold lands on the same state a monolithic
+    // fold produces: last unit wins, everything verifies.
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 999), try snapshotGetU64(snapshot, 1, 0));
+    try std.testing.expectEqual(@as(u64, 200), try snapshotGetU64(snapshot, 1, 1));
+    const info = try verifyTable(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base_epoch + 3, info.epoch);
 }
 
 test "wal epoch unit with a chain gap fails the checkpoint loudly" {
