@@ -1111,3 +1111,274 @@ parallel test. The local correctness evidence for phase 2
 is the suite subset runnable on the 2-core VM (§11.7 tests
 plus the WAL/qmod filters), reported with the change.
 
+## 12. Mixed-load hardening (WAL phase 3)
+
+Phase 2's mixed-load items — the frontier clamp, the
+reader fold-skip, the retention statement of §11.4 — were
+reviewed as *defensive*: they keep readers correct under
+write load, but none of them lowers what a reader pays
+while writers are active, and none of them was backed by
+mixed-load pressure evidence. Phase 3 attacks the three
+remaining structural costs, in the order a pin meets them:
+
+1. Every pin consults the group-commit coordinator
+   through a mutex-guarded mirror (`groupWalState`),
+   allocating its lookup key inside the critical section —
+   so reader pins and coordinator publications (every
+   submit, every batch step) serialize on one spin mutex
+   even when the answer is "nothing is happening".
+2. A fold is one monolithic operation under the table
+   write lock: up to a full checkpoint threshold (100
+   units / 4 MiB) of legacy publishes. A pin or a group
+   staging that needs a fold waits for all of it, and any
+   other operation that needs the write lock queues
+   behind all of it.
+3. Superseded segment files are never reclaimed on the
+   commit/fold path: every epoch that rewrites a segment
+   leaves its previous versioned file behind, so retained
+   files grow linearly with epochs under write churn.
+   §3.3 named the floor a reaper must respect
+   (`oldestLiveEpoch`); no reaper existed.
+
+No on-disk format changes; no durability semantic changes.
+The red lines of §10.3/§11.5 are restated where each
+mechanism touches them.
+
+### 12.1 Lock-free common-path pin: atomic frontier publication
+
+The coordinator's WAL-layer view (`GroupWalState`:
+`active`, `projected_extra`, `frontier_len`,
+`frontier_epoch`) gains a lock-free publication channel
+in `table.zig`: a fixed array of 32 seqlock slots, indexed
+by a hash of the state's key (`{root}/{table}`).
+
+- **Publish** (`groupWalPublishState`, `groupWalClear`)
+  still updates the mutex-guarded map first, under the
+  same mutex as before, then mirrors the state into the
+  key's slot: claim the slot if it is free (the slot keeps
+  its own copy of the key forever; entries are never
+  evicted), bump the sequence to odd, store the four
+  fields, bump to even with release ordering. A slot held
+  by a different key is a collision: that table simply
+  never gets a fast slot and always takes the mutex path.
+- **Read** (`groupWalState`) builds its key *outside* any
+  lock, then tries the slot: sequence even and stable
+  across the read, key bytes equal → the snapshot is
+  returned with no mutex taken. Any doubt (odd or changed
+  sequence, empty or foreign slot, fast path disabled by
+  the test seam) falls back to the pre-existing mutex
+  path, byte-for-byte the old code with the key built
+  before the lock instead of inside it.
+
+Freshness argument. Publication order relative to every
+event that matters is unchanged from the mutex design:
+the mirror is updated inside `groupPublishLocked`, which
+runs *before* the tip merge at submit and *before* any
+ack (`cell.complete`) in the leader. A slot snapshot is
+therefore never ahead of the coordinator, and lags it by
+at most the one publish in flight — the same lag the
+mutex mirror exhibited at the same interleaving (a mutex
+reader that acquired before the publish also saw the old
+state). Every consumer's stale direction is the safe one:
+
+- *Reader fold-skip* (`foldEpochWalTipForRead`): a lagging
+  `frontier_epoch` is lower, so the reader folds when it
+  could have skipped, or — clamped by a lagging
+  `frontier_len` — folds a shorter durable prefix. Both
+  publish only durable units. A skip decision requires
+  `witness >= frontier_epoch`; since the frontier is
+  published before the ack, a pin that starts after an
+  ack observes a frontier at least that new.
+- *Fold clamp* (`checkpointWalLocked`): any value that
+  was ever a frontier is a clean unit boundary (§11.4);
+  a lagging value clamps to an earlier boundary.
+- *Staging validation* (`epochWalStaging`,
+  `epochWalStagingOwned`, the `.mixed_stream` declines):
+  a lagging `projected_extra` invalidates the tip entry
+  and degrades to a rebuild or a decline; a lagging
+  `active` reproduces exactly the pre-publication state
+  the mutex design exposed at that interleaving, whose
+  outcomes the phase-2 guards already bound (staging
+  freshness checks, the leader's pre-length check, the
+  poison path — all loud, none silent).
+
+What "common path" means, precisely: with the slot hit,
+a pin's fold/skip decision takes **no coordinator
+mutex**. The pin path's remaining synchronization is an
+inventory of O(1) spin sections that are never held
+across I/O or a sync: the epoch registry's per-table
+mutex (pin share/release), the tip-cache lookup mutex,
+the snapshot attach mutex, and file reads (manifest
+witness). The fallback to locked resolution happens only
+when a fold is genuinely required — witness behind the
+frontier, tip/manifest mismatch, or pending epoch units
+— which is §12.2's path, plus the slot-miss cases above,
+which fall back to the identical decision procedure
+under the mutex. A test toggles the fast path off and on
+across one gated scenario and asserts both paths resolve
+the same visible set at every quiescent point (§12.6).
+
+### 12.2 Bounded incremental fold: slices, not monoliths
+
+`checkpointWalLocked` is refactored into a budgeted core
+(`checkpointWalLockedBudget`): it folds the clamped,
+chain-collected unit stream exactly as before, but stops
+after a per-call **unit budget** (`FOLD_SLICE_MAX_UNITS
+= 4`; a row transaction and an epoch unit each count as
+one). A stopped slice:
+
+- flushes any accumulated row group (the consumed units
+  land whole — a slice never leaves a half-published
+  unit behind, because each unit's publish is the legacy
+  atomic publish);
+- performs the queue-active ending (tip re-anchor) and
+  **not** the completion endings: no WAL truncate, no tip
+  drop, no checkpoint-counter reset;
+- returns `{published_units, complete = false}`.
+
+Resumption needs no new machinery and no new state: the
+units a slice published advanced the manifest epoch, so
+on the next slice they collect as *stale* (base < disk
+epoch) and are skipped by the pre-existing rule, and the
+fold continues at the new chain base. **The fold's
+progress state is the manifest epoch itself** — durable,
+on disk, and already the recovery source of truth — so a
+crash or kill between slices recovers exactly as a crash
+between two phase-1 folds did: the next fold (any caller,
+any process) resumes from the manifest. "Fold state is
+recoverable" is thus a property of the storage format,
+not of a progress file phase 3 would have to defend.
+
+Callers:
+
+- `checkpointWalSlice` (new, public) acquires and
+  releases the table write lock around one slice. The
+  write lock is therefore never held for more than one
+  slice of fold work by any slicing caller.
+- The **pin path** (`foldEpochWalTipForRead`) drives
+  slices until the fold completes or the manifest
+  reaches the durable frontier; between slices the lock
+  is free, so concurrent pins observe the frontier the
+  moment any driver's slice publishes it, and commits
+  interleave instead of queueing behind a full fold.
+  Read-after-commit is unchanged: a pin still resolves
+  only after every durable unit is published.
+- **Group staging's fold-first case**
+  (`loadWriteTableGroupWithFold`) drives slices the same
+  way, retrying staging between slices; a stream that is
+  still not stageable after the fold completes declines
+  as before.
+- The **legacy locked flow** and the native layer's
+  fold points (`checkpointWalIfDirty`: snapshot open,
+  verify, recover, poison recovery) keep their
+  loop-to-completion semantics verbatim, calling the
+  budgeted core with no budget. This is deliberate: the
+  locked flow's atomic lock scope is the progress
+  guarantee §11.1 relies on, and the native points are
+  correctness/recovery paths, not mixed-load paths. The
+  phase-3 claim is scoped accordingly: no *pin* and no
+  *group commit* waits for a monolithic fold.
+
+All fold invariants are inherited, not re-argued: the
+frontier clamp (§11.4), unit-chain accounting with loud
+gaps, torn-tail tolerance with the mid-file corruption
+guard (§10.3), the truncate-only-after-full-publish rule
+(now: only at a slice that consumed the whole foldable
+prefix with the queue idle — the old completion ending),
+and stale-unit skipping (now also the resumption
+mechanism). Checkpoint thresholds are unchanged (100
+units / 4 MiB / 30 s): they still decide *when* a fold is
+due; the budget decides how much of it one operation
+performs under one lock hold.
+
+### 12.3 Retention bound: the superseded-segment reaper
+
+At every *completed* fold (either completion ending of
+§12.2, under the write lock), the checkpointer now reaps
+superseded segment files:
+
+- **Floor.** `table.zig` exposes a hook,
+  `live_pin_floor_hook`, installed by the qmod layer to
+  `epoch_runtime.oldestLiveEpoch` — the floor §3.3
+  designated for exactly this reaper. No hook or no live
+  pins → the floor is the active epoch.
+- **Keep set.** The segment files named by the active
+  meta, plus those named by the versioned metas of every
+  epoch in `[floor, active)`. (If that span exceeds a
+  sanity cap the reap is skipped whole — retention is
+  the safe direction.) Every disk file any in-process
+  consumer can still read is in this set: pin snapshots
+  load by their pinned meta's list (epoch ≥ floor), the
+  legacy per-file load and native snapshots resolve the
+  active meta, and staging reads only files the active
+  meta names (the tip's non-carried entries) — the tip's
+  carried files are memory payloads, not disk files.
+- **Reap set.** Directory entries matching the table's
+  segment-file pattern (`<table>.col<i>.<seg>.dat` with
+  an optional `.e<epoch>` suffix) that are not in the
+  keep set. Deletion is best-effort per file and never
+  fails the fold.
+
+**Declared bound.** After any completed fold, every
+segment file of the table on disk is named by the meta
+of some epoch in `[floor, active]`; with no live pins
+that is exactly the active meta's file set. Between
+folds, accumulation is bounded by the checkpoint
+thresholds' worth of new files, as before.
+
+Scope honesty, matching §11.4's practice of listing
+what is *not* covered: versioned **meta** files are not
+reaped (they are the recovery depth and are small);
+**index** artifacts of superseded epochs keep their
+existing lifecycle; and the floor is an *in-process*
+registry (§3.3's definition): a reader in *another*
+process that resolved an epoch older than this process's
+floor and has not finished loading it can meet a missing
+file — a loud `FileNotFound` at load, the same exposure
+class §11.2 accepted for staging reads, never silent
+wrong data. Cross-process pin floors would need a shared
+registry the epoch protocol deliberately does not have.
+
+### 12.4 Parameters
+
+| Parameter | Default | Rationale |
+|---|---|---|
+| `GROUP_FRONTIER_SLOT_COUNT` | 32 | Bounds the slot array and its immortal key copies; collisions degrade one table to the mutex path, never correctness. Sized well above the table count of a single-process deployment. |
+| `FOLD_SLICE_MAX_UNITS` | 4 units | One unit publish is one legacy commit (the pre-WAL commit cost); four bounds one lock hold to a few legacy commits while amortizing per-slice re-parse. Revisit with box bench data. |
+| Reaper meta-span cap | 4096 epochs | If live pins span more than this, the reap skips whole rather than walking unbounded history per fold. |
+| Checkpoint thresholds | 100 units / 4 MiB / 30 s | Unchanged (§11.6). |
+
+### 12.5 Tests
+
+New tests (seven). Storage layer (`table.zig`): the
+frontier slot serves published state lock-free (hit
+counter advances), falls back cleanly when disabled or
+cleared, and never serves a foreign key's state; a
+budgeted fold publishes exactly the budgeted units per
+slice, does not truncate until the completing slice, and
+resumes to the identical final state as a monolithic
+fold; fold completion reaps superseded segment files —
+all of them with no live pins, and exactly those below
+the floor when a floor is installed. Qmod layer
+(`db_stub.zig`): reader pins resolve through the atomic
+frontier while a batch sync is gated (readers complete,
+frontier fast-hit counter advances during the gate, old
+value read); the fast and locked pin paths resolve the
+same visible set at every quiescent point of a gated
+scenario; a pin completes while a checkpoint fold is
+parked between slices; a mixed churn pressure run
+(concurrent writers and readers, small scale) keeps the
+epoch oracle at zero violations throughout and ends with
+the retained segment-file count at the declared bound
+while the epoch count proves reclamation had work to do.
+
+### 12.6 Pending re-verification (box recovery)
+
+§11.8's list carries forward unchanged and gains: the
+mixed scenario with sync-gate-free timing (reader p50/p99
+under write load, this branch vs phase 2), the fold-slice
+effect on staging latency at the 100-unit threshold, and
+the full suite on the 8-core box. No phase-3 performance
+number is claimed from the 2-core VM.
+
+
