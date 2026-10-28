@@ -337,6 +337,10 @@ fn printReport(scenario: []const u8, threads: u32, ops_done: u64, wall_ns: u64, 
 
 pub fn runBench(args: []const []const u8) !void {
     if (args.len < 2) return error.MissingArgument;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--profile")) db.Profile.setEnabled(true);
+    }
+    defer db.Profile.dump();
     if (std.mem.eql(u8, args[1], "setup")) {
         try setup();
         return;

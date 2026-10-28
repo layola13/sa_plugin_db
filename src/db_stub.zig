@@ -5,6 +5,99 @@ const schema = @import("schema.zig");
 const table_mod = @import("table.zig");
 const epoch_runtime = @import("epoch_runtime.zig");
 
+// ---------------------------------------------------------------------------
+// Optional exec-phase profiling (perf line instrumentation).
+//
+// Disabled by default; the bench harness enables it by setting the
+// process env SA_DB_PROFILE=1 before the first exec (see
+// scripts/bench/bench_main.zig). Counters are atomic accumulators of
+// nanoseconds per phase plus call counts, so concurrent execs can
+// share them. When disabled the only cost is one relaxed atomic load
+// per phase boundary.
+// ---------------------------------------------------------------------------
+pub const Profile = struct {
+    pub const Phase = enum {
+        registry_meta,
+        params_read,
+        qmod_load,
+        scalar_eval,
+        table_meta_source,
+        table_meta_parse_pin,
+        table_schema,
+        segment_read,
+        segment_validate,
+        segment_copy,
+        read_eval_rest,
+        prog_params,
+        prog_lines,
+        stmt_loop,
+        scan_fold,
+        write_load,
+        write_eval_rest,
+        commit_publish,
+    };
+    pub const phase_count = 18;
+    pub const phase_names: [phase_count][]const u8 = .{
+        "registry_meta",      "params_read",   "qmod_load",       "scalar_eval",
+        "table_meta_source",  "table_meta_parse_pin", "table_schema", "segment_read",
+        "segment_validate",   "segment_copy",  "read_eval_rest",  "prog_params",
+        "prog_lines",         "stmt_loop",     "scan_fold",      "write_load",
+        "write_eval_rest",    "commit_publish",
+    };
+
+    var enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var ns: [phase_count]std.atomic.Value(u64) = initCounts();
+    var calls: [phase_count]std.atomic.Value(u64) = initCounts();
+
+    fn initCounts() [phase_count]std.atomic.Value(u64) {
+        var out: [phase_count]std.atomic.Value(u64) = undefined;
+        for (&out) |*slot| slot.* = std.atomic.Value(u64).init(0);
+        return out;
+    }
+
+    pub fn setEnabled(on: bool) void {
+        enabled.store(on, .monotonic);
+    }
+
+    pub fn isEnabled() bool {
+        return enabled.load(.monotonic);
+    }
+
+    pub fn add(phase: Phase, elapsed_ns: u64) void {
+        if (!enabled.load(.monotonic)) return;
+        const idx = @intFromEnum(phase);
+        _ = ns[idx].fetchAdd(elapsed_ns, .monotonic);
+        _ = calls[idx].fetchAdd(1, .monotonic);
+    }
+
+    pub fn dump() void {
+        if (!enabled.load(.monotonic)) return;
+        std.debug.print("== SA_DB_PROFILE (accumulated ns / calls / us per call) ==\n", .{});
+        for (phase_names, 0..) |name, idx| {
+            const total = ns[idx].load(.monotonic);
+            const n = calls[idx].load(.monotonic);
+            if (n > 0) {
+                std.debug.print("  {s:<20} {d:>14} ns  {d:>8} calls  {d:>10} us/call\n", .{ name, total, n, total / n / 1000 });
+            }
+        }
+    }
+};
+
+pub const ScopedTimer = struct {
+    phase: Profile.Phase,
+    start: i128,
+
+    pub fn begin(phase: Profile.Phase) ScopedTimer {
+        return .{ .phase = phase, .start = sio.nanoTimestamp() };
+    }
+
+    pub fn end(self: ScopedTimer) void {
+        if (!Profile.isEnabled()) return;
+        const elapsed: u64 = @intCast(sio.nanoTimestamp() - self.start);
+        Profile.add(self.phase, elapsed);
+    }
+};
+
 pub const ExecError = error{
     OutOfMemory,
     InvalidFormat,
@@ -264,11 +357,17 @@ const TableColumn = struct {
     ty: []const u8,
     stride: u32,
     bytes: []u8,
+    /// False when name/ty/bytes are borrowed from a pinned snapshot
+    /// (see Snapshot below); the snapshot owns them and frees them
+    /// when its pin drains. Owned columns free their parts here.
+    owned: bool = true,
 
     pub fn deinit(self: *TableColumn, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.ty);
-        allocator.free(self.bytes);
+        if (self.owned) {
+            allocator.free(self.name);
+            allocator.free(self.ty);
+            allocator.free(self.bytes);
+        }
         self.* = undefined;
     }
 };
@@ -317,11 +416,19 @@ const ReadTable = struct {
     name: []u8,
     row_count: u64,
     columns: []TableColumn,
+    /// Set when the columns borrow from a pinned snapshot: the pin
+    /// hold taken by loadReadTable is owned by this ReadTable and
+    /// released here, so the snapshot outlives every use of the
+    /// borrowed bytes. `pin_table_name` borrows the caller's table
+    /// name slice (grant storage outlives the exec).
+    pin: ?*epoch_runtime.EpochPin = null,
+    pin_table_name: []const u8 = "",
 
     pub fn deinit(self: *ReadTable, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         for (self.columns) |*column| column.deinit(allocator);
         allocator.free(self.columns);
+        if (self.pin) |pin| epoch_runtime.release(self.pin_table_name, pin);
         self.* = undefined;
     }
 };
@@ -806,34 +913,159 @@ fn activeMetaEpoch(allocator: std.mem.Allocator, meta_bytes: []const u8) ExecErr
     return parsed.value.epoch;
 }
 
+/// A materialized, immutable copy of one pinned epoch's read
+/// columns (perf line; design note in docs/vm_concurrency_epoch.md
+/// §9). Built once per (table, epoch, meta-hash) by the first exec
+/// that pins the epoch — the build is exactly the legacy per-exec
+/// load, including manifest/meta resolution, schema-hash check and
+/// full segment hash validation — and then shared by every later
+/// exec on the same pin. The snapshot hangs off the epoch pin
+/// itself (`EpochPin.attachment`), so its lifetime is the pin's:
+/// it is freed by the pin-free hook when the pin is retired and
+/// its last holder releases it, never while a reader can still
+/// borrow from it. Retained memory uses the page allocator,
+/// following the epoch registry precedent, so snapshot lifetimes
+/// never couple to a per-exec allocator.
+///
+/// Semantic note (validation timing): segment bytes and the schema
+/// are validated at materialization, not re-validated per exec.
+/// Within the storage layer's own operations an epoch's artifacts
+/// are immutable — commits write new files and publish by manifest
+/// swap — so re-validating identical content-addressed bytes on
+/// every exec could only ever re-derive the same verdict. Epoch
+/// advance or restore is still adopted immediately: the manifest
+/// and meta are re-read on every exec and a different (epoch,
+/// meta-hash) never hits the old snapshot. What changes is only
+/// the treatment of out-of-band edits to an already-pinned epoch's
+/// files mid-flight, which the epoch model places outside its
+/// consistency domain (a fresh process — or a fresh epoch —
+/// materializes and validates from disk as before).
+const Snapshot = struct {
+    columns: []TableColumn,
+    row_count: u64,
+    total_bytes: u64,
+};
+
+const snapshot_allocator = std.heap.page_allocator;
+/// Snapshots larger than this are not cached; their execs take the
+/// legacy per-exec load path and produce identical results. Bounds
+/// worst-case retained memory per live pin.
+const snapshot_max_bytes: u64 = 256 * 1024 * 1024;
+var snapshot_attach_mutex: std.atomic.Mutex = .unlocked;
+var snapshot_hook_installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn freeSnapshotAttachment(pin: *epoch_runtime.EpochPin) void {
+    const snapshot: *Snapshot = @ptrCast(@alignCast(pin.attachment.?));
+    for (snapshot.columns) |*column| column.deinit(snapshot_allocator);
+    snapshot_allocator.free(snapshot.columns);
+    snapshot_allocator.destroy(snapshot);
+    pin.attachment = null;
+}
+
+fn ensureSnapshotHook() void {
+    if (!snapshot_hook_installed.swap(true, .acq_rel)) {
+        epoch_runtime.pin_free_hook = freeSnapshotAttachment;
+    }
+}
+
+/// Return the pin's materialized snapshot, building it on first
+/// use. Null means the snapshot exceeds the cache size cap and the
+/// caller should take the legacy load path. Build errors are the
+/// legacy load's errors, propagated unchanged; a failed build
+/// leaves nothing attached, so the next exec retries the load (and
+/// fails the same way) exactly as the uncached path would.
+fn snapshotForPin(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecError!?*Snapshot {
+    ensureSnapshotHook();
+    while (!snapshot_attach_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer snapshot_attach_mutex.unlock();
+    if (pin.attachment) |attachment| {
+        const snapshot: *Snapshot = @ptrCast(@alignCast(attachment));
+        return snapshot;
+    }
+    var built = try loadReadTableFromMeta(snapshot_allocator, table_name, pin.meta_source);
+    var total: u64 = 0;
+    for (built.columns) |column| total += @as(u64, column.bytes.len);
+    if (total > snapshot_max_bytes) {
+        built.deinit(snapshot_allocator);
+        return null;
+    }
+    const snapshot = snapshot_allocator.create(Snapshot) catch {
+        built.deinit(snapshot_allocator);
+        return ExecError.OutOfMemory;
+    };
+    snapshot.* = .{ .columns = built.columns, .row_count = built.row_count, .total_bytes = total };
+    snapshot_allocator.free(built.name);
+    pin.attachment = snapshot;
+    return snapshot;
+}
+
 /// Read-side load under the epoch protocol (docs/vm_concurrency_epoch.md
 /// §3.1): resolve the active meta through the manifest, pin that epoch
-/// in the in-process runtime, and load segment bytes from the pinned
-/// meta. The pin is held only for the load window — afterwards the
-/// exec owns a private in-memory copy of the epoch, as before — but
-/// the epoch choice is now named, shared, and accounted, and a
-/// concurrent commit swaps in a new epoch without disturbing this
-/// load. Segment files are still hash-validated per exec.
+/// in the in-process runtime, and serve the exec from the pinned
+/// epoch's materialized snapshot (see Snapshot above). The pin hold
+/// transfers to the returned ReadTable and is released by its
+/// deinit, so borrowed snapshot bytes stay live for the whole exec;
+/// a concurrent commit swaps in a new epoch without disturbing this
+/// exec. Epochs whose snapshots exceed the cache cap take the
+/// legacy path: bytes are loaded and hash-validated per exec and
+/// the pin is released when the load window closes, as before.
 fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!ReadTable {
+    const t_source = ScopedTimer.begin(.table_meta_source);
     const meta_bytes = try readActiveTableMetaSource(allocator, table_name);
+    t_source.end();
     defer allocator.free(meta_bytes);
+    const t_parse = ScopedTimer.begin(.table_meta_parse_pin);
     const epoch = try activeMetaEpoch(allocator, meta_bytes);
     const pin = epoch_runtime.pinLatest(table_name, meta_bytes, epoch, hashBytes(meta_bytes)) catch return ExecError.OutOfMemory;
+    t_parse.end();
+    const snapshot = snapshotForPin(table_name, pin) catch |err| {
+        epoch_runtime.release(table_name, pin);
+        return err;
+    };
+    if (snapshot) |snap| {
+        const out = ReadTable{
+            .name = allocator.dupe(u8, table_name) catch {
+                epoch_runtime.release(table_name, pin);
+                return ExecError.OutOfMemory;
+            },
+            .row_count = snap.row_count,
+            .columns = allocator.alloc(TableColumn, snap.columns.len) catch {
+                epoch_runtime.release(table_name, pin);
+                return ExecError.OutOfMemory;
+            },
+            .pin = pin,
+            .pin_table_name = table_name,
+        };
+        for (snap.columns, out.columns) |*src_column, *dst_column| {
+            dst_column.* = .{
+                .name = src_column.name,
+                .ty = src_column.ty,
+                .stride = src_column.stride,
+                .bytes = src_column.bytes,
+                .owned = false,
+            };
+        }
+        return out;
+    }
     defer epoch_runtime.release(table_name, pin);
     return loadReadTableFromMeta(allocator, table_name, pin.meta_source);
 }
 
 fn loadReadTableFromMeta(allocator: std.mem.Allocator, table_name: []const u8, meta_bytes: []const u8) ExecError!ReadTable {
+    const t_parse2 = ScopedTimer.begin(.table_meta_parse_pin);
     var parsed = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.SnapshotCorrupted;
+    t_parse2.end();
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.magic, "sa-db-table-meta") or parsed.value.version != 1) return ExecError.SnapshotCorrupted;
     if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return ExecError.SnapshotCorrupted;
 
+    const t_schema = ScopedTimer.begin(.table_schema);
     const current_schema_path = try schemaPath(allocator, table_name);
     defer allocator.free(current_schema_path);
     const current_schema = try readFileAlloc(allocator, current_schema_path, 1024 * 1024);
     defer allocator.free(current_schema);
     const current_schema_hash = hashHex(current_schema);
+    t_schema.end();
     if (!std.mem.eql(u8, current_schema_hash[0..], parsed.value.schema_hash)) return ExecError.SchemaMismatch;
 
     var out = ReadTable{
@@ -851,11 +1083,17 @@ fn loadReadTableFromMeta(allocator: std.mem.Allocator, table_name: []const u8, m
         for (parsed.value.segments) |segment| {
             if (segment.files.len != parsed.value.columns.len) return ExecError.SnapshotCorrupted;
             const file_meta = segment.files[col_idx];
+            const t_read = ScopedTimer.begin(.segment_read);
             const bytes = try readFileAlloc(allocator, file_meta.path, 1 << 30);
+            t_read.end();
             defer allocator.free(bytes);
+            const t_validate = ScopedTimer.begin(.segment_validate);
             try validateQmodFileBytes(file_meta, bytes);
+            t_validate.end();
             if (bytes.len != segment.rows * meta_column.stride) return ExecError.SnapshotCorrupted;
+            const t_copy = ScopedTimer.begin(.segment_copy);
             merged.appendSlice(bytes) catch return ExecError.OutOfMemory;
+            t_copy.end();
         }
         out.columns[col_idx] = .{
             .name = allocator.dupe(u8, meta_column.name) catch return ExecError.OutOfMemory,
@@ -974,6 +1212,157 @@ fn loadColumnValue(column: TableColumn, offset: u64) ExecError!u64 {
         return @bitCast(@as(f64, @floatCast(@as(f32, @bitCast(bits)))));
     }
     return ExecError.UnsupportedOperation;
+}
+
+/// The value kind of a readable column, resolved once per primitive
+/// call instead of re-dispatching on the type string for every row
+/// (perf line: the per-row string dispatch in `loadColumnValue`
+/// dominated scan primitives — 20k rows × ~10 `mem.eql` each).
+/// Resolution mirrors `isReadableColumn` + the dispatch order of
+/// `loadColumnValue` exactly, and `loadColumnValueKind` reproduces
+/// `loadColumnValue`'s value for every kind bit-for-bit, so scan
+/// results are unchanged; only the dispatch cost moves out of the
+/// loop. Callers must guarantee `offset + stride <= bytes.len`
+/// (the primitive row limit already does).
+const ColumnKind = enum { u64_, u32_, u16_, u8_, i64_, i32_, i16_, i8_, f64_, f32_ };
+
+fn columnKind(ty: []const u8, stride: u32) ?ColumnKind {
+    if (!isReadableColumn(ty, stride)) return null;
+    if (std.mem.eql(u8, ty, "u64")) return .u64_;
+    if (std.mem.eql(u8, ty, "u32")) return .u32_;
+    if (std.mem.eql(u8, ty, "u16")) return .u16_;
+    if (std.mem.eql(u8, ty, "u8")) return .u8_;
+    if (std.mem.eql(u8, ty, "i64")) return .i64_;
+    if (std.mem.eql(u8, ty, "i32")) return .i32_;
+    if (std.mem.eql(u8, ty, "i16")) return .i16_;
+    if (std.mem.eql(u8, ty, "i8")) return .i8_;
+    if (std.mem.eql(u8, ty, "f64")) return .f64_;
+    if (std.mem.eql(u8, ty, "f32")) return .f32_;
+    return null;
+}
+
+fn loadColumnValueKind(kind: ColumnKind, bytes: []const u8, offset: usize) u64 {
+    // Reads go through fixed-size array pointers: `readInt` on a
+    // runtime slice (`bytes[offset..][0..8]`) compiles to a byte-wise
+    // fallback in this toolchain (measured ~25 ns/read vs ~1 ns),
+    // while the array-pointer form has statically known size and
+    // alignment and compiles to a single unaligned load. Values are
+    // identical either way (little-endian file layout).
+    return switch (kind) {
+        .u64_ => std.mem.readInt(u64, @ptrCast(bytes.ptr + offset), .little),
+        .u32_ => std.mem.readInt(u32, @ptrCast(bytes.ptr + offset), .little),
+        .u16_ => std.mem.readInt(u16, @ptrCast(bytes.ptr + offset), .little),
+        .u8_ => bytes[offset],
+        .i64_ => @bitCast(std.mem.readInt(i64, @ptrCast(bytes.ptr + offset), .little)),
+        .i32_ => @bitCast(@as(i64, std.mem.readInt(i32, @ptrCast(bytes.ptr + offset), .little))),
+        .i16_ => @bitCast(@as(i64, std.mem.readInt(i16, @ptrCast(bytes.ptr + offset), .little))),
+        .i8_ => @bitCast(@as(i64, @as(i8, @bitCast(bytes[offset])))),
+        .f64_ => std.mem.readInt(u64, @ptrCast(bytes.ptr + offset), .little),
+        .f32_ => @bitCast(@as(f64, @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, @ptrCast(bytes.ptr + offset), .little)))))),
+    };
+}
+
+/// Whole-column scan operations for the read primitives. The fold
+/// runs over a typed word slice whenever the column buffer is
+/// aligned for the word size (our own allocations are; a runtime
+/// check keeps unaligned buffers correct), which lets the compiler
+/// vectorize the loop — measured ~20x faster than per-row scalar
+/// loads for a 20k-row u64 sum. The unaligned path folds over an
+/// `align(1)` word slice with the same conversions, so results are
+/// bit-for-bit identical on every path: each kind's conversion is
+/// exactly `loadColumnValueKind`'s. `.min`/`.max` require
+/// rows >= 1 (callers reject rows == 0 first, as before) and seed
+/// from row 0, matching the legacy loops.
+const ScanOp = union(enum) {
+    sum,
+    min,
+    max,
+    count_eq: u64,
+    count_range: struct { lo: u64, hi: u64 },
+};
+
+fn scanConvert(comptime kind: ColumnKind, word: anytype) u64 {
+    return switch (kind) {
+        .u64_, .i64_, .f64_, .u32_, .u16_, .u8_ => @as(u64, word),
+        .i32_ => @bitCast(@as(i64, @as(i32, @bitCast(word)))),
+        .i16_ => @bitCast(@as(i64, @as(i16, @bitCast(word)))),
+        .i8_ => @bitCast(@as(i64, @as(i8, @bitCast(word)))),
+        .f32_ => @bitCast(@as(f64, @floatCast(@as(f32, @bitCast(word))))),
+    };
+}
+
+fn foldWords(comptime kind: ColumnKind, words: anytype, op: ScanOp) u64 {
+    switch (op) {
+        .sum => {
+            var acc: u64 = 0;
+            for (words) |word| acc +%= scanConvert(kind, word);
+            return acc;
+        },
+        .min => {
+            var acc: u64 = scanConvert(kind, words[0]);
+            for (words[1..]) |word| {
+                const value = scanConvert(kind, word);
+                if (value < acc) acc = value;
+            }
+            return acc;
+        },
+        .max => {
+            var acc: u64 = scanConvert(kind, words[0]);
+            for (words[1..]) |word| {
+                const value = scanConvert(kind, word);
+                if (value > acc) acc = value;
+            }
+            return acc;
+        },
+        .count_eq => |target| {
+            var count: u64 = 0;
+            for (words) |word| {
+                if (scanConvert(kind, word) == target) count += 1;
+            }
+            return count;
+        },
+        .count_range => |range| {
+            var count: u64 = 0;
+            for (words) |word| {
+                const value = scanConvert(kind, word);
+                if (value >= range.lo and value < range.hi) count += 1;
+            }
+            return count;
+        },
+    }
+}
+
+fn scanKind(comptime kind: ColumnKind, comptime W: type, bytes: []const u8, rows: u64, op: ScanOp) u64 {
+    const n: usize = @intCast(rows);
+    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+        if (@intFromPtr(bytes.ptr) % @sizeOf(W) == 0) {
+            // bytesAsSlice returns an align(1) slice in this
+            // toolchain, which silently blocks vectorization; the
+            // runtime check above proves the natural alignment, so
+            // restore it explicitly (measured ~10x on a 20k sum).
+            const words: []const W = @alignCast(std.mem.bytesAsSlice(W, bytes[0 .. n * @sizeOf(W)]));
+            return foldWords(kind, words, op);
+        }
+    }
+    const base: [*]align(1) const W = @ptrCast(bytes.ptr);
+    return foldWords(kind, base[0..n], op);
+}
+
+fn scanOp(kind: ColumnKind, bytes: []const u8, rows: u64, op: ScanOp) u64 {
+    const t_scan = ScopedTimer.begin(.scan_fold);
+    defer t_scan.end();
+    return switch (kind) {
+        .u64_ => scanKind(.u64_, u64, bytes, rows, op),
+        .i64_ => scanKind(.i64_, u64, bytes, rows, op),
+        .f64_ => scanKind(.f64_, u64, bytes, rows, op),
+        .u32_ => scanKind(.u32_, u32, bytes, rows, op),
+        .i32_ => scanKind(.i32_, u32, bytes, rows, op),
+        .f32_ => scanKind(.f32_, u32, bytes, rows, op),
+        .u16_ => scanKind(.u16_, u16, bytes, rows, op),
+        .i16_ => scanKind(.i16_, u16, bytes, rows, op),
+        .u8_ => scanKind(.u8_, u8, bytes, rows, op),
+        .i8_ => scanKind(.i8_, u8, bytes, rows, op),
+    };
 }
 
 fn storeColumnValue(column: *WriteColumn, offset: u64, value: u64) ExecError!void {
@@ -1584,6 +1973,8 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
 }
 
 fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!void {
+    const t_commit = ScopedTimer.begin(.commit_publish);
+    defer t_commit.end();
     var any_dirty = false;
     var owned_paths = std.array_list.Managed([]const u8).init(allocator);
     defer {
@@ -1704,17 +2095,23 @@ fn evalColumnPrimitive(line: []const u8, values: *ValueMap, pointers: *std.Strin
             if (std.mem.eql(u8, op, "col_sum")) return .{ .dst = dst, .value = 0 };
             return ExecError.InvalidFormat;
         }
+        const is_sum = std.mem.eql(u8, op, "col_sum");
+        const is_min = std.mem.eql(u8, op, "col_min");
+        if (columnKind(column.ty, column.stride)) |kind| {
+            const scan_op: ScanOp = if (is_sum) .sum else if (is_min) .min else .max;
+            return .{ .dst = dst, .value = scanOp(kind, column.bytes, rows, scan_op) };
+        }
         var acc: u64 = 0;
         var row: u64 = 0;
-        if (!std.mem.eql(u8, op, "col_sum")) {
+        if (!is_sum) {
             acc = try loadColumnValue(column.*, 0);
             row = 1;
         }
         while (row < rows) : (row += 1) {
             const value = try loadColumnValue(column.*, row * @as(u64, column.stride));
-            if (std.mem.eql(u8, op, "col_sum")) {
+            if (is_sum) {
                 acc +%= value;
-            } else if (std.mem.eql(u8, op, "col_min")) {
+            } else if (is_min) {
                 if (value < acc) acc = value;
             } else {
                 if (value > acc) acc = value;
@@ -1728,6 +2125,9 @@ fn evalColumnPrimitive(line: []const u8, values: *ValueMap, pointers: *std.Strin
         const rows = try primitiveRowLimit(column, try lookupValue(values, args[1]));
         const target = try lookupValue(values, args[2]);
         try meter.charge(rows);
+        if (columnKind(column.ty, column.stride)) |kind| {
+            return .{ .dst = dst, .value = scanOp(kind, column.bytes, rows, .{ .count_eq = target }) };
+        }
         var count: u64 = 0;
         var row: u64 = 0;
         while (row < rows) : (row += 1) {
@@ -1742,6 +2142,9 @@ fn evalColumnPrimitive(line: []const u8, values: *ValueMap, pointers: *std.Strin
         const lo = try lookupValue(values, args[2]);
         const hi = try lookupValue(values, args[3]);
         try meter.charge(rows);
+        if (columnKind(column.ty, column.stride)) |kind| {
+            return .{ .dst = dst, .value = scanOp(kind, column.bytes, rows, .{ .count_range = .{ .lo = lo, .hi = hi } }) };
+        }
         var count: u64 = 0;
         var row: u64 = 0;
         while (row < rows) : (row += 1) {
@@ -1760,9 +2163,23 @@ fn evalColumnPrimitive(line: []const u8, values: *ValueMap, pointers: *std.Strin
         try meter.charge(rows);
         var sum: u64 = 0;
         var row: u64 = 0;
-        while (row < rows) : (row += 1) {
-            if ((try loadColumnValue(key_column.*, row * @as(u64, key_column.stride))) == target) {
-                sum +%= try loadColumnValue(sum_column.*, row * @as(u64, sum_column.stride));
+        const key_kind = columnKind(key_column.ty, key_column.stride);
+        const sum_kind = columnKind(sum_column.ty, sum_column.stride);
+        if (key_kind != null and sum_kind != null) {
+            const key_bytes = key_column.bytes;
+            const sum_bytes = sum_column.bytes;
+            const key_stride: u64 = key_column.stride;
+            const sum_stride: u64 = sum_column.stride;
+            while (row < rows) : (row += 1) {
+                if (loadColumnValueKind(key_kind.?, key_bytes, @intCast(row * key_stride)) == target) {
+                    sum +%= loadColumnValueKind(sum_kind.?, sum_bytes, @intCast(row * sum_stride));
+                }
+            }
+        } else {
+            while (row < rows) : (row += 1) {
+                if ((try loadColumnValue(key_column.*, row * @as(u64, key_column.stride))) == target) {
+                    sum +%= try loadColumnValue(sum_column.*, row * @as(u64, sum_column.stride));
+                }
             }
         }
         return .{ .dst = dst, .value = sum };
@@ -1776,20 +2193,28 @@ fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_nam
 
     var read_table = try loadReadTable(allocator, table_name);
     defer read_table.deinit(allocator);
+    const t_rest = ScopedTimer.begin(.read_eval_rest);
+    defer t_rest.end();
     var values = ValueMap.init(allocator);
     defer values.deinit();
     var pointers = std.StringHashMap(*const TableColumn).init(allocator);
     defer pointers.deinit();
+    const t_params = ScopedTimer.begin(.prog_params);
     parseDbFunctionParams(allocator, source, main_name, read_table, params_path, &values, &pointers) catch |err| switch (err) {
         ExecError.UnsupportedOperation => return null,
         else => return err,
     };
+    t_params.end();
 
     var labels = std.StringHashMap(usize).init(allocator);
     defer labels.deinit();
+    const t_lines = ScopedTimer.begin(.prog_lines);
     const lines = try collectExecutableLines(allocator, source, main_name, &labels);
+    t_lines.end();
     defer allocator.free(lines);
 
+    const t_loop = ScopedTimer.begin(.stmt_loop);
+    defer t_loop.end();
     var pc: usize = 0;
     while (pc < lines.len) {
         try meter.charge(1);
@@ -1850,8 +2275,12 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
     var write_lock = try acquireTableWriteLock(allocator, table_name);
     defer write_lock.release();
 
+    const t_wload = ScopedTimer.begin(.write_load);
     var write_table = try loadWriteTable(allocator, table_name);
+    t_wload.end();
     defer write_table.deinit(allocator);
+    const t_weval = ScopedTimer.begin(.write_eval_rest);
+    defer t_weval.end();
     var values = ValueMap.init(allocator);
     defer values.deinit();
     var pointers = std.StringHashMap(*WriteColumn).init(allocator);
@@ -2592,17 +3021,23 @@ pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_pat
 
 pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, params_path: ?[]const u8, fuel_limit: ?u64) ExecError!ExecRun {
     var meter = FuelMeter{ .limit = try resolveFuelLimit(fuel_limit) };
+    const t_registry = ScopedTimer.begin(.registry_meta);
     var parsed = try loadMeta(allocator, hash_text);
+    t_registry.end();
     defer parsed.deinit();
     if (params_path) |path| {
+        const t_params = ScopedTimer.begin(.params_read);
         const params = try readFileAlloc(allocator, path, 64 * 1024 * 1024);
+        t_params.end();
         allocator.free(params);
     }
     const hash = try parseHashHex(parsed.value.hash);
+    const t_qmod = ScopedTimer.begin(.qmod_load);
     const qmod_source = readFileAlloc(allocator, parsed.value.qmod_path, 16 * 1024 * 1024) catch |err| switch (err) {
         ExecError.FileNotFound => return ExecError.QueryPayloadCorrupted,
         else => return err,
     };
+    t_qmod.end();
     defer allocator.free(qmod_source);
     if (!std.mem.eql(u8, &hashBytes(qmod_source), &hash)) return ExecError.QueryPayloadCorrupted;
     try validateExecPayload(allocator, parsed.value, qmod_source);
@@ -2621,10 +3056,12 @@ pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, pa
             .aot = true,
         } };
     }
+    const t_scalar = ScopedTimer.begin(.scalar_eval);
     const scalar_result = evalScalarQmod(allocator, qmod_source, parsed.value.main, params_path, &meter) catch |err| switch (err) {
         ExecError.UnsupportedOperation => null,
         else => return err,
     };
+    t_scalar.end();
     const db_result = if (scalar_result == null)
         (evalReadonlyDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,

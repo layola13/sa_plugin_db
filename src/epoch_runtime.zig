@@ -44,7 +44,20 @@ pub const EpochPin = struct {
     /// Guarded by the owning TableState.mutex. Set when the pin is
     /// superseded; the pin is freed when refs drain to zero.
     retired: bool = false,
+    /// Opaque attachment owned by the qmod layer (the materialized
+    /// snapshot cache in db_stub.zig). epoch_runtime never inspects
+    /// it; it only hands it to `pin_free_hook` when the pin is
+    /// freed. Set by a pin holder while it holds a reference, so
+    /// the pin cannot be freed concurrently with the attach.
+    attachment: ?*anyopaque = null,
 };
+
+/// Optional hook invoked from `freePin` just before the pin's own
+/// memory is released, so the qmod layer can free whatever it
+/// attached (see `EpochPin.attachment`). Set once by db_stub before
+/// its first pin; null in this module's own tests, where nothing is
+/// ever attached.
+pub var pin_free_hook: ?*const fn (pin: *EpochPin) void = null;
 
 const TableState = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -85,6 +98,9 @@ fn retireCurrentLocked(state: *TableState, pin: *EpochPin) void {
 }
 
 fn freePin(pin: *EpochPin) void {
+    if (pin.attachment != null) {
+        if (pin_free_hook) |hook| hook(pin);
+    }
     registry_allocator.free(pin.meta_source);
     registry_allocator.destroy(pin);
 }
