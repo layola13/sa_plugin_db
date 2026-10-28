@@ -558,7 +558,60 @@ loop it replaces remains covered by the unit suite.
 
 ### 9.4 Results
 
-(Filled in with the final clean-window, 3-round-median numbers
-at the end of the line: per-scenario ratios vs both references,
-per-optimization contributions, and profiling attribution for
-any row still under the 99% line.)
+Final round: box `2d60bdf6bf1a`, one window, medians of 3
+rounds, same harness (`scripts/bench`), reference systems
+untuned (SQLite defaults journal=delete/synchronous=FULL; PG
+defaults). The window carried neighbour load (sci integration
+and slaredis lines); both reference systems show the same
+inflation (PG point p50 64 µs vs 75–77 µs in quieter rounds,
+PG write 109/s vs 175.8/s in the section-8 era), so ratios are
+the meaningful figure. Pre-line baseline is section 8.
+
+| scenario | before | after | SQLite | PG | vs SQLite | vs PG |
+|---|---:|---:|---:|---:|---:|---:|
+| readsum 1t | 142.0/s | 6048/s | 1236/s | 823/s | 489% | 735% |
+| readsum 8t | 535.6/s | 15386/s | 4375/s | 2639/s | 352% | 583% |
+| readsum 32t | — | 3380/s | 2912/s | 3413/s | 116% | 99% |
+| point 1t | 222.7/s | 12099/s (p50 68 µs) | 167727/s (5 µs) | 13152/s (64 µs) | 7% | 92% |
+| point 4t | — | 24863/s | 32945/s | 22334/s | 75% | 111% |
+| point 8t | 980.4/s | 21134/s | 10968/s | 22447/s | 193% | 94% |
+| write 1t | 26.1/s | 81/s (p50 12.1 ms) | 173/s (5.8 ms) | 109/s (7.9 ms) | 47% | 74% |
+| mixed 4t readers | 398.5/s | 12070/s | — | — | — | — |
+| mixed 4t writer | 2.5/s | 51.3/s | — | — | — | — |
+
+Suite on the box: 222/222 (the 221 of section 7 plus the
+col_fill equivalence test). Concurrency oracle: unchanged,
+0 violations.
+
+Per-optimization measured contributions (box profiles):
+pinned snapshot + vectorized folds: readsum 1t 142 → ~3000/s
+era (profile: ~510 µs of segment hashing + ~500 µs of scalar
+conversion removed from the hot path); col_fill: write
+evaluation 44.2 ms → ~0.16 ms per call in the profile;
+manifest-witness read path + dir-fsync merge + SHA freshness:
+point 1t p50 283 → 114 µs era, commit fsyncs 5 → 4;
+content-addressed exec caches: point p50 114 → 85 µs;
+manifest witness fast scan: point p50 85 → 75 µs;
+write-side snapshot COW: removes per-commit segment reads on
+the hot table (visible in mixed, where readers keep the pin
+warm); signature-spec cache: point p50 75 → 68 µs.
+
+Remaining gaps, with profiling-grade attribution:
+
+- point 1t vs SQLite (7%): not a tuning gap. SQLite's 5 µs is
+  an in-process function call on an already-open connection.
+  The plugin's exec contract mandates, per operation, fresh
+  registry-meta and manifest reads (the freshness semantics of
+  section 8), currently ~30 µs of the 68 µs p50 all-in. Against
+  the client-server reference (PG, same op shape) the line is
+  at 92–111%.
+- write (47% / 74%): commit latency is sync-bound. Per commit
+  the epoch protocol pays 3 fdatasync + 1 dir fsync (measured
+  2.4–6.3 ms each in-window; raw fdatasync-after-write p50
+  1.25 ms on this disk), versus ~2 for SQLite and ~1 for PG
+  (WAL). CPU per commit is ~1.5–1.9 ms of the 12.1 ms p50.
+  Reaching 99% here requires collapsing the commit to a
+  single synced append (a WAL-shaped commit path), a storage
+  change beyond this line's protocol-preserving scope; the
+  table layer's existing WAL path for transactions is the
+  natural base for a follow-up line.
