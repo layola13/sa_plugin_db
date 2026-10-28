@@ -5598,15 +5598,26 @@ fn appendRowFromJson(columns: []const ColumnMeta, row: std.json.Value, buffers: 
     }
 }
 
-fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!WrittenMeta {
+/// Serialize a meta exactly as writeVersionedMeta persists it
+/// (schema-field normalization + the canonical JSON shape) without
+/// writing anything. The WAL-shaped epoch commit
+/// (docs/vm_concurrency_epoch.md §10) stores these bytes in its
+/// EPOCH_META record; the fold parses them back and publishes
+/// through writeMeta, where the same normalization runs again —
+/// it is idempotent because it re-derives the same schema
+/// path/hash from the on-disk schema.
+pub fn serializeVersionedMetaJson(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError![]u8 {
     var persisted = meta;
     var owned_schema_path: ?[]u8 = null;
     var owned_schema_hash: ?[]u8 = null;
     defer if (owned_schema_path) |path| allocator.free(path);
     defer if (owned_schema_hash) |hash| allocator.free(hash);
     try normalizePersistedMetaSchemaFields(allocator, root_dir, table_name, &persisted, &owned_schema_path, &owned_schema_hash);
+    return std.json.Stringify.valueAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
+}
 
-    const json = std.json.Stringify.valueAlloc(allocator, persisted, .{}) catch |err| return mapJsonError(err);
+fn writeVersionedMeta(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, meta: TableMeta) TableError!WrittenMeta {
+    const json = try serializeVersionedMetaJson(allocator, root_dir, table_name, meta);
     errdefer allocator.free(json);
 
     const versioned_name = try tableVersionedMetaName(allocator, table_name, meta.epoch);
@@ -5819,6 +5830,32 @@ pub fn rewriteColumnFileForEpoch(
     errdefer if (!hashes_consumed) freeFileHashes(allocator, written.hashes);
     const meta = try makeFileMetaFromWrite(allocator, next_path, written);
     hashes_consumed = true;
+    return meta;
+}
+
+/// The write-free half of rewriteColumnFileForEpoch: the versioned
+/// path and FileMeta (byte length + SHA-256 + block hashes) that
+/// writing `bytes` at `epoch` would produce, computed from the
+/// bytes alone. The WAL-shaped epoch commit
+/// (docs/vm_concurrency_epoch.md §10) stores the (path, bytes)
+/// pair in the table WAL instead of writing the file; the fold
+/// materializes the file later and verifies the payload against
+/// exactly this meta before publishing it.
+pub fn fileMetaForEpochBytes(
+    allocator: std.mem.Allocator,
+    previous_path: []const u8,
+    epoch: u64,
+    bytes: []const u8,
+) TableError!FileMeta {
+    const next_path = try allocPrintPath(allocator, "{s}.e{d}", .{ stripEpochSuffixes(previous_path), epoch });
+    defer allocator.free(next_path);
+    const hashes = try makeFileHashesSinglePass(allocator, bytes, FILE_BLOCK_BYTES);
+    errdefer freeFileHashes(allocator, hashes);
+    var meta = try makeFileMetaFromWrite(allocator, next_path, .{ .bytes = @intCast(bytes.len), .hashes = hashes });
+    // Match writeBytesToFileAndHashes (the legacy write's hash
+    // shape): an empty file carries block_size 0, not the block
+    // size it would have used had it held any bytes.
+    if (bytes.len == 0) meta.block_size = 0;
     return meta;
 }
 
@@ -7386,7 +7423,10 @@ pub fn beginWriteTransaction(
     var wal_overlay_replay = false;
     if (!isMemoryRoot(root_dir) and !skipDurabilitySync()) {
         if (walIsDirty(allocator, root_dir, table_name)) {
-            if (walShouldCheckpoint(allocator, root_dir, table_name)) {
+            // Epoch units (docs §10) also force the disk
+            // checkpoint: the row overlay cannot absorb a
+            // wholesale segment replacement.
+            if (walShouldCheckpoint(allocator, root_dir, table_name) or walContainsEpochRecords(allocator, root_dir, table_name)) {
                 try checkpointWalLocked(allocator, root_dir, table_name);
             } else {
                 wal_overlay_replay = true;
@@ -8046,6 +8086,22 @@ const WAL_RECORD_ROW: u8 = 2;
 const WAL_RECORD_DICT_PUT: u8 = 3;
 const WAL_RECORD_BLOB_PUT: u8 = 4;
 const WAL_RECORD_TX_COMMIT: u8 = 5;
+// Epoch-unit records (docs/vm_concurrency_epoch.md §10): the WAL
+// image of one qmod epoch commit. An epoch unit is
+// EPOCH_BEGIN, one EPOCH_FILE per dirty segment file, one
+// EPOCH_META carrying the new epoch's serialized meta JSON, and
+// EPOCH_COMMIT. It chains on the same epoch sequence as row
+// transactions: its base_epoch must equal the running epoch at
+// its position in the stream.
+const WAL_RECORD_EPOCH_BEGIN: u8 = 6;
+const WAL_RECORD_EPOCH_FILE: u8 = 7;
+const WAL_RECORD_EPOCH_META: u8 = 8;
+const WAL_RECORD_EPOCH_COMMIT: u8 = 9;
+
+fn walIsEpochRecordTag(tag: u8) bool {
+    return tag == WAL_RECORD_EPOCH_BEGIN or tag == WAL_RECORD_EPOCH_FILE or
+        tag == WAL_RECORD_EPOCH_META or tag == WAL_RECORD_EPOCH_COMMIT;
+}
 
 const WAL_ROW_OP_INSERT: u8 = 1;
 const WAL_ROW_OP_REPLACE: u8 = 2;
@@ -8053,7 +8109,7 @@ const WAL_ROW_OP_DELETE: u8 = 3;
 
 // Sanity cap for a single record length: a corrupt length beyond this is
 // treated as a torn tail instead of triggering a huge allocation.
-const WAL_MAX_RECORD_BYTES: u32 = 512 * 1024 * 1024;
+pub const WAL_MAX_RECORD_BYTES: u32 = 512 * 1024 * 1024;
 
 var wal_txid_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
 
@@ -8205,6 +8261,7 @@ fn walDeleteIfExists(allocator: std.mem.Allocator, root_dir: []const u8, table_n
     const path = walFilePath(allocator, root_dir, table_name) catch return;
     defer allocator.free(path);
     walForgetDirSynced(path);
+    epochTipCacheDrop(root_dir, table_name);
     sio.cwd().deleteFile(path) catch {};
 }
 
@@ -8239,16 +8296,23 @@ fn walForgetDirSynced(path: []const u8) void {
 
 // --- record staging (transaction-local) ------------------------------------
 
-fn walStageRecord(tx: *WriteTransaction, payload: []const u8) TableError!void {
-    if (!tx.wal_capture) return;
+/// Append one framed record (u32 payload_len | payload | crc64-xz)
+/// to `out`. The single framing implementation for every WAL
+/// record family.
+fn walAppendFrameTo(out: *std.array_list.Managed(u8), payload: []const u8) TableError!void {
     if (payload.len > WAL_MAX_RECORD_BYTES) return TableError.CursorOverflow;
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
-    try tx.wal_ops.appendSlice(&header);
-    try tx.wal_ops.appendSlice(payload);
+    try out.appendSlice(&header);
+    try out.appendSlice(payload);
     var crc_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(payload), .little);
-    try tx.wal_ops.appendSlice(&crc_buf);
+    try out.appendSlice(&crc_buf);
+}
+
+fn walStageRecord(tx: *WriteTransaction, payload: []const u8) TableError!void {
+    if (!tx.wal_capture) return;
+    try walAppendFrameTo(&tx.wal_ops, payload);
 }
 
 fn walStageRowOp(tx: *WriteTransaction, op: u8, row_index: u64, row_bytes: []const u8) TableError!void {
@@ -8344,13 +8408,7 @@ fn walFrameTxBegin(out: *std.array_list.Managed(u8), txid: u64, base_epoch: u64)
     payload[0] = WAL_RECORD_TX_BEGIN;
     std.mem.writeInt(u64, payload[1..9], txid, .little);
     std.mem.writeInt(u64, payload[9..17], base_epoch, .little);
-    var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
-    try out.appendSlice(&header);
-    try out.appendSlice(&payload);
-    var crc_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(&payload), .little);
-    try out.appendSlice(&crc_buf);
+    try walAppendFrameTo(out, &payload);
 }
 
 fn walFrameTxCommit(out: *std.array_list.Managed(u8), txid: u64, new_epoch: u64) TableError!void {
@@ -8358,13 +8416,43 @@ fn walFrameTxCommit(out: *std.array_list.Managed(u8), txid: u64, new_epoch: u64)
     payload[0] = WAL_RECORD_TX_COMMIT;
     std.mem.writeInt(u64, payload[1..9], txid, .little);
     std.mem.writeInt(u64, payload[9..17], new_epoch, .little);
-    var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, &header, @as(u32, @intCast(payload.len)), .little);
-    try out.appendSlice(&header);
-    try out.appendSlice(&payload);
-    var crc_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &crc_buf, std.hash.crc.@"CRC-64/XZ".hash(&payload), .little);
-    try out.appendSlice(&crc_buf);
+    try walAppendFrameTo(out, &payload);
+}
+
+fn walFrameEpochBegin(out: *std.array_list.Managed(u8), txid: u64, base_epoch: u64) TableError!void {
+    var payload: [1 + 8 + 8]u8 = undefined;
+    payload[0] = WAL_RECORD_EPOCH_BEGIN;
+    std.mem.writeInt(u64, payload[1..9], txid, .little);
+    std.mem.writeInt(u64, payload[9..17], base_epoch, .little);
+    try walAppendFrameTo(out, &payload);
+}
+
+fn walFrameEpochCommit(out: *std.array_list.Managed(u8), txid: u64, new_epoch: u64) TableError!void {
+    var payload: [1 + 8 + 8]u8 = undefined;
+    payload[0] = WAL_RECORD_EPOCH_COMMIT;
+    std.mem.writeInt(u64, payload[1..9], txid, .little);
+    std.mem.writeInt(u64, payload[9..17], new_epoch, .little);
+    try walAppendFrameTo(out, &payload);
+}
+
+fn walFrameEpochFile(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) TableError!void {
+    var payload = std.array_list.Managed(u8).init(allocator);
+    defer payload.deinit();
+    try payload.append(WAL_RECORD_EPOCH_FILE);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @as(u32, @intCast(path.len)), .little);
+    try payload.appendSlice(&len_buf);
+    try payload.appendSlice(path);
+    try payload.appendSlice(bytes);
+    try walAppendFrameTo(out, payload.items);
+}
+
+fn walFrameEpochMeta(out: *std.array_list.Managed(u8), allocator: std.mem.Allocator, meta_json: []const u8) TableError!void {
+    var payload = std.array_list.Managed(u8).init(allocator);
+    defer payload.deinit();
+    try payload.append(WAL_RECORD_EPOCH_META);
+    try payload.appendSlice(meta_json);
+    try walAppendFrameTo(out, payload.items);
 }
 
 // --- durable append --------------------------------------------------------
@@ -8418,6 +8506,481 @@ fn walIsDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []
     return walFileSize(allocator, root_dir, table_name) > 0;
 }
 
+var wal_presence_mutex: std.atomic.Mutex = .unlocked;
+var wal_presence: std.StringHashMap(WalPresenceEntry) = undefined;
+var wal_presence_init: bool = false;
+const WalPresenceEntry = struct { wal_len: u64, has_epoch: bool };
+
+/// True if the table's WAL currently carries epoch-family
+/// records. Backs cross-process discovery for readers (docs
+/// §10.2): a process that did not make the commits (a restarted
+/// process, a read-only peer) has no tip-cache entry, so it
+/// detects pending epoch units from the WAL itself. The answer
+/// is cached per (table, WAL length) — appends change the
+/// length and folds truncate to zero, so a length match means
+/// the parsed stream is the current one; a stale answer in the
+/// worst case degrades to the pre-§10 behavior for one read
+/// (serve the manifest epoch; the native fold points still
+/// apply), never to reading a partial epoch.
+pub fn walHasPendingEpochUnits(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
+    if (skipDurabilitySync() or isMemoryRoot(root_dir)) return false;
+    const len = walFileSize(allocator, root_dir, table_name);
+    if (len == 0) return false;
+    {
+        while (!wal_presence_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer wal_presence_mutex.unlock();
+        if (wal_presence_init) {
+            const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch
+                return walContainsEpochRecords(allocator, root_dir, table_name);
+            defer unsafe_init_cache_allocator.free(key);
+            if (wal_presence.get(key)) |entry| {
+                if (entry.wal_len == len) return entry.has_epoch;
+            }
+        }
+    }
+    const has = walContainsEpochRecords(allocator, root_dir, table_name);
+    {
+        while (!wal_presence_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer wal_presence_mutex.unlock();
+        if (!wal_presence_init) {
+            wal_presence = std.StringHashMap(WalPresenceEntry).init(unsafe_init_cache_allocator);
+            wal_presence_init = true;
+        }
+        const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return has;
+        const gop = wal_presence.getOrPut(key) catch {
+            unsafe_init_cache_allocator.free(key);
+            return has;
+        };
+        if (gop.found_existing) unsafe_init_cache_allocator.free(key);
+        gop.value_ptr.* = .{ .wal_len = len, .has_epoch = has };
+    }
+    return has;
+}
+
+/// True if the WAL's valid prefix contains any epoch-family
+/// record. Used by beginWriteTransaction: the row overlay cannot
+/// absorb a wholesale segment replacement, so a WAL carrying
+/// epoch units folds through a disk checkpoint instead. Any read
+/// or parse failure answers true — the checkpointer then surfaces
+/// the real error.
+fn walContainsEpochRecords(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
+    const path = walFilePath(allocator, root_dir, table_name) catch return true;
+    defer allocator.free(path);
+    const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch return true;
+    defer allocator.free(data);
+    if (data.len == 0) return false;
+    const parsed = walParseValidPrefix(allocator, data) catch return true;
+    defer allocator.free(parsed.records);
+    for (parsed.records) |rec| {
+        if (walIsEpochRecordTag(rec.tag)) return true;
+    }
+    return false;
+}
+
+// --- epoch tip (docs/vm_concurrency_epoch.md §10.2) --------------------------
+// Process-local cache of a table's un-folded epoch tip: the tip
+// meta of the pending epoch-unit chain plus the newest payload per
+// carried segment path. The WAL on disk is authoritative; this is
+// a cache only. Entries are validated against the manifest
+// witness (epoch + meta SHA-256 of the chain base) and the WAL
+// length before use, and dropped on any fold, delete, or
+// mismatch. Memory per entry is bounded by the WAL checkpoint
+// thresholds: folds happen at 100 units / 4 MiB / 30 s, so an
+// entry never holds more than about one WAL's worth of payloads.
+
+/// One carried segment file of an epoch commit: the versioned
+/// relative path and its full staged content.
+pub const EpochCommitFile = struct {
+    path: []const u8,
+    bytes: []const u8,
+};
+
+/// A borrowed view of the cached epoch tip. `files` maps
+/// versioned segment paths to their WAL-carried bytes (newest
+/// unit wins); the map's keys/values and `meta_json` borrow the
+/// cache entry, so the view is valid until the next commit,
+/// fold, or delete for the table in this process. Writers
+/// consume it under the table write lock — the same lock every
+/// mutation of the entry requires — so it cannot be invalidated
+/// mid-staging. Free only the view's map structure (EpochTip
+/// .deinit), never the borrowed strings.
+pub const EpochTip = struct {
+    epoch: u64,
+    meta_json: []const u8,
+    meta_hash: [32]u8,
+    files: std.StringHashMapUnmanaged([]const u8),
+
+    pub fn deinit(self: *EpochTip, allocator: std.mem.Allocator) void {
+        self.files.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const EpochWalStaging = union(enum) {
+    /// No un-folded epoch units affect staging.
+    none,
+    /// Stage from this tip instead of the manifest.
+    tip: EpochTip,
+    /// The WAL stream mixes row transactions with epoch units
+    /// (or is otherwise not stageable as a tip): fold it first,
+    /// then stage from the manifest.
+    mixed_stream,
+};
+
+const EpochTipCacheEntry = struct {
+    base_epoch: u64,
+    base_meta_hash: [32]u8,
+    wal_len: u64,
+    tip_epoch: u64,
+    tip_meta_json: []u8,
+    tip_meta_hash: [32]u8,
+    files: std.StringHashMapUnmanaged([]const u8) = .{},
+
+    fn deinit(self: *EpochTipCacheEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.tip_meta_json);
+        var it = self.files.iterator();
+        while (it.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        self.files.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+var epoch_tip_cache_mutex: std.atomic.Mutex = .unlocked;
+var epoch_tip_cache: std.StringHashMap(*EpochTipCacheEntry) = undefined;
+var epoch_tip_cache_init: bool = false;
+
+/// Lookup with epoch_tip_cache_mutex held.
+fn epochTipCacheLookup(root_dir: []const u8, table_name: []const u8) ?*EpochTipCacheEntry {
+    if (!epoch_tip_cache_init) return null;
+    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return null;
+    defer unsafe_init_cache_allocator.free(key);
+    return epoch_tip_cache.get(key);
+}
+
+/// Drop with epoch_tip_cache_mutex held.
+fn epochTipCacheDropLocked(root_dir: []const u8, table_name: []const u8) void {
+    if (!epoch_tip_cache_init) return;
+    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return;
+    defer unsafe_init_cache_allocator.free(key);
+    if (epoch_tip_cache.fetchRemove(key)) |kv| {
+        unsafe_init_cache_allocator.free(kv.key);
+        kv.value.deinit(unsafe_init_cache_allocator);
+        unsafe_init_cache_allocator.destroy(kv.value);
+    }
+}
+
+fn epochTipCacheDrop(root_dir: []const u8, table_name: []const u8) void {
+    while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer epoch_tip_cache_mutex.unlock();
+    epochTipCacheDropLocked(root_dir, table_name);
+}
+
+fn epochTipView(allocator: std.mem.Allocator, entry: *const EpochTipCacheEntry) TableError!EpochTip {
+    var files = std.StringHashMapUnmanaged([]const u8){};
+    errdefer files.deinit(allocator);
+    var it = entry.files.iterator();
+    while (it.next()) |kv| {
+        try files.put(allocator, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    return .{ .epoch = entry.tip_epoch, .meta_json = entry.tip_meta_json, .meta_hash = entry.tip_meta_hash, .files = files };
+}
+
+/// The epoch of this process's un-folded epoch tip for a table,
+/// or null. Cache-only (no I/O): backs the read-side fold check.
+pub fn epochTipEpoch(root_dir: []const u8, table_name: []const u8) ?u64 {
+    while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer epoch_tip_cache_mutex.unlock();
+    const entry = epochTipCacheLookup(root_dir, table_name) orelse return null;
+    return entry.tip_epoch;
+}
+
+/// The SHA-256 of this process's un-folded epoch tip meta, or
+/// null. Cache-only (no I/O): backs the commit-time freshness
+/// check while a tip is live.
+pub fn epochTipMetaHash(root_dir: []const u8, table_name: []const u8) ?[32]u8 {
+    while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer epoch_tip_cache_mutex.unlock();
+    const entry = epochTipCacheLookup(root_dir, table_name) orelse return null;
+    return entry.tip_meta_hash;
+}
+
+/// How a writer should stage this table (docs §10.2): from the
+/// manifest (`none`), from the un-folded epoch tip (`tip`), or
+/// after folding a stream that is not stageable as a tip
+/// (`mixed_stream`). A cache entry is used only after validation
+/// against the manifest witness and the WAL length; on any
+/// mismatch the tip is rebuilt by parsing the WAL (bounded by
+/// the checkpoint thresholds).
+pub fn epochWalStaging(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!EpochWalStaging {
+    if (skipDurabilitySync() or isMemoryRoot(root_dir)) return .none;
+    const witness = readActiveManifestWitness(allocator, root_dir, table_name) catch |err| switch (err) {
+        error.NotFound => return .none,
+        else => return err,
+    };
+    const wal_len = walFileSize(allocator, root_dir, table_name);
+    if (wal_len == 0) {
+        epochTipCacheDrop(root_dir, table_name);
+        return .none;
+    }
+    {
+        while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer epoch_tip_cache_mutex.unlock();
+        if (epochTipCacheLookup(root_dir, table_name)) |entry| {
+            if (entry.base_epoch == witness.epoch and std.mem.eql(u8, &entry.base_meta_hash, &witness.meta_hash) and entry.wal_len == wal_len) {
+                return .{ .tip = try epochTipView(allocator, entry) };
+            }
+        }
+    }
+    return epochWalStagingFromDisk(allocator, root_dir, table_name, witness);
+}
+
+fn epochWalStagingFromDisk(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    witness: ActiveManifestWitness,
+) TableError!EpochWalStaging {
+    const path = try walFilePath(allocator, root_dir, table_name);
+    defer allocator.free(path);
+    const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
+        error.FileNotFound => return .none,
+        else => return mapFileError(err),
+    };
+    defer allocator.free(data);
+    if (data.len == 0) return .none;
+    const parsed = try walParseValidPrefix(allocator, data);
+    defer allocator.free(parsed.records);
+    try walGuardAgainstMidFileCorruption(parsed.records, data, parsed.valid_bytes);
+    var units = try walCollectUnits(allocator, parsed.records, witness.epoch);
+    defer freeWalUnits(&units);
+    var saw_epoch = false;
+    for (units.items) |*unit| {
+        switch (unit.*) {
+            .row_tx => return .mixed_stream,
+            .epoch => saw_epoch = true,
+        }
+    }
+    if (!saw_epoch) {
+        epochTipCacheDrop(root_dir, table_name);
+        return .none;
+    }
+    const entry = try epochTipCacheEntryFromUnits(witness, @intCast(data.len), units.items);
+    while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer epoch_tip_cache_mutex.unlock();
+    epochTipCacheDropLocked(root_dir, table_name);
+    if (!epoch_tip_cache_init) {
+        epoch_tip_cache = std.StringHashMap(*EpochTipCacheEntry).init(unsafe_init_cache_allocator);
+        epoch_tip_cache_init = true;
+    }
+    const key = try walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name);
+    errdefer unsafe_init_cache_allocator.free(key);
+    epoch_tip_cache.put(key, entry) catch |err| {
+        entry.deinit(unsafe_init_cache_allocator);
+        unsafe_init_cache_allocator.destroy(entry);
+        return err;
+    };
+    // Build the view while still holding the cache mutex: outside
+    // it, another thread's fold or append could retire the entry
+    // the view borrows from.
+    return .{ .tip = try epochTipView(allocator, entry) };
+}
+
+fn epochTipCacheEntryFromUnits(
+    witness: ActiveManifestWitness,
+    wal_len: u64,
+    units: []const WalUnit,
+) TableError!*EpochTipCacheEntry {
+    const alloc = unsafe_init_cache_allocator;
+    const entry = try alloc.create(EpochTipCacheEntry);
+    errdefer alloc.destroy(entry);
+    entry.* = .{
+        .base_epoch = witness.epoch,
+        .base_meta_hash = witness.meta_hash,
+        .wal_len = wal_len,
+        .tip_epoch = witness.epoch,
+        .tip_meta_json = &.{},
+        .tip_meta_hash = std.mem.zeroes([32]u8),
+        .files = .{},
+    };
+    errdefer entry.deinit(alloc);
+    for (units) |*unit| {
+        const eu = switch (unit.*) {
+            .epoch => |*e| e,
+            .row_tx => unreachable,
+        };
+        try epochTipEntryMergeUnit(entry, eu);
+    }
+    return entry;
+}
+
+/// Merge one epoch unit's payloads into a tip entry (newest wins)
+/// and advance the entry's tip to the unit's epoch. Page
+/// allocator throughout: entries are process-global cache state.
+fn epochTipEntryMergeUnit(entry: *EpochTipCacheEntry, unit: *const WalEpochUnit) TableError!void {
+    const alloc = unsafe_init_cache_allocator;
+    for (unit.files.items) |file| {
+        const owned_bytes = try alloc.dupe(u8, file.bytes);
+        errdefer alloc.free(owned_bytes);
+        if (entry.files.getPtr(file.path)) |slot| {
+            alloc.free(slot.*);
+            slot.* = owned_bytes;
+        } else {
+            const owned_path = try alloc.dupe(u8, file.path);
+            errdefer alloc.free(owned_path);
+            try entry.files.put(alloc, owned_path, owned_bytes);
+        }
+    }
+    const meta_json = unit.meta_json orelse return TableError.VerifyFailed;
+    const owned_meta = try alloc.dupe(u8, meta_json);
+    alloc.free(entry.tip_meta_json);
+    entry.tip_meta_json = owned_meta;
+    std.crypto.hash.sha2.Sha256.hash(entry.tip_meta_json, &entry.tip_meta_hash, .{});
+    entry.tip_epoch = unit.base_epoch + 1;
+}
+
+/// Best-effort tip-cache maintenance after a successful epoch
+/// append. Extends the entry when it provably describes the full
+/// current chain (same tip epoch, same pre-append WAL length);
+/// opens a fresh entry when the append started a chain on an
+/// empty WAL; drops the entry on any other mismatch — the next
+/// staging rebuilds it from disk. Cache maintenance must never
+/// fail a commit, so every error here just drops or skips.
+fn epochTipCacheNoteAppend(
+    root_dir: []const u8,
+    table_name: []const u8,
+    base_epoch: u64,
+    base_meta_hash: [32]u8,
+    pre_len: u64,
+    new_len: u64,
+    files: []const EpochCommitFile,
+    meta_json: []const u8,
+) void {
+    const alloc = unsafe_init_cache_allocator;
+    while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer epoch_tip_cache_mutex.unlock();
+    if (epochTipCacheLookup(root_dir, table_name)) |entry| {
+        if (entry.tip_epoch == base_epoch and entry.wal_len == pre_len) {
+            var merged_files = std.array_list.Managed(WalEpochFile).init(alloc);
+            defer merged_files.deinit();
+            for (files) |file| {
+                merged_files.append(.{ .path = file.path, .bytes = file.bytes }) catch {
+                    epochTipCacheDropLocked(root_dir, table_name);
+                    return;
+                };
+            }
+            const unit: WalEpochUnit = .{
+                .base_epoch = base_epoch,
+                .files = merged_files,
+                .meta_json = meta_json,
+            };
+            epochTipEntryMergeUnit(entry, &unit) catch {
+                epochTipCacheDropLocked(root_dir, table_name);
+                return;
+            };
+            // The merge consumed copies; the scratch list's own
+            // deinit (deferred) frees only the list structure.
+            entry.wal_len = new_len;
+            return;
+        }
+        epochTipCacheDropLocked(root_dir, table_name);
+        return;
+    }
+    if (pre_len != 0) return; // chain opened elsewhere; staging parse builds the tip
+    if (!epoch_tip_cache_init) {
+        epoch_tip_cache = std.StringHashMap(*EpochTipCacheEntry).init(alloc);
+        epoch_tip_cache_init = true;
+    }
+    const entry = alloc.create(EpochTipCacheEntry) catch return;
+    entry.* = .{
+        .base_epoch = base_epoch,
+        .base_meta_hash = base_meta_hash,
+        .wal_len = new_len,
+        .tip_epoch = base_epoch,
+        .tip_meta_json = &.{},
+        .tip_meta_hash = std.mem.zeroes([32]u8),
+        .files = .{},
+    };
+    var merged_files = std.array_list.Managed(WalEpochFile).init(alloc);
+    defer merged_files.deinit();
+    for (files) |file| {
+        merged_files.append(.{ .path = file.path, .bytes = file.bytes }) catch {
+            entry.deinit(alloc);
+            alloc.destroy(entry);
+            return;
+        };
+    }
+    const unit: WalEpochUnit = .{
+        .base_epoch = base_epoch,
+        .files = merged_files,
+        .meta_json = meta_json,
+    };
+    epochTipEntryMergeUnit(entry, &unit) catch {
+        entry.deinit(alloc);
+        alloc.destroy(entry);
+        return;
+    };
+    const key = walCheckpointStateKey(alloc, root_dir, table_name) catch {
+        entry.deinit(alloc);
+        alloc.destroy(entry);
+        return;
+    };
+    epoch_tip_cache.put(key, entry) catch {
+        alloc.free(key);
+        entry.deinit(alloc);
+        alloc.destroy(entry);
+        return;
+    };
+}
+
+/// Whether the WAL-shaped epoch commit may run at all: durable
+/// mode on a real (non-memory) root. Mirrors the dispatch rule
+/// in commitWriteTransaction.
+pub fn walCommitPathAvailable(root_dir: []const u8) bool {
+    return !skipDurabilitySync() and !isMemoryRoot(root_dir);
+}
+
+/// True when the WAL has reached a synchronous-checkpoint
+/// threshold (the walShouldCheckpoint policy, shared with row
+/// transactions).
+pub fn walCheckpointDue(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
+    return walShouldCheckpoint(allocator, root_dir, table_name);
+}
+
+/// Commit one epoch unit to the table WAL: frame BEGIN + FILE×n +
+/// META + COMMIT and append with a single fdatasync
+/// (walAppendSync) — the entire durability barrier of a
+/// WAL-shaped epoch commit (docs/vm_concurrency_epoch.md §10).
+/// `base_meta_hash` is the SHA-256 of the on-disk meta at
+/// `base_epoch` (the chain base); it anchors the tip cache entry
+/// when this append opens a chain.
+pub fn appendEpochCommitWal(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    base_epoch: u64,
+    base_meta_hash: [32]u8,
+    files: []const EpochCommitFile,
+    meta_json: []const u8,
+) TableError!void {
+    const txid = walNextTxId();
+    var frame = std.array_list.Managed(u8).init(allocator);
+    defer frame.deinit();
+    try walFrameEpochBegin(&frame, txid, base_epoch);
+    for (files) |file| {
+        try walFrameEpochFile(&frame, allocator, file.path, file.bytes);
+    }
+    try walFrameEpochMeta(&frame, allocator, meta_json);
+    try walFrameEpochCommit(&frame, txid, base_epoch + 1);
+
+    const pre_len = walFileSize(allocator, root_dir, table_name);
+    try walAppendSync(allocator, root_dir, table_name, frame.items);
+    walCheckpointStateOnCommit(allocator, root_dir, table_name);
+    epochTipCacheNoteAppend(root_dir, table_name, base_epoch, base_meta_hash, pre_len, pre_len + frame.items.len, files, meta_json);
+}
+
 // --- parsing ---------------------------------------------------------------
 
 const WalParsedRecord = struct {
@@ -8450,14 +9013,17 @@ fn walParseValidPrefix(allocator: std.mem.Allocator, data: []const u8) TableErro
 }
 
 // --- checkpoint --------------------------------------------------------------
-// Folds all committed WAL transactions (base_epoch == on-disk epoch, in file
-// order) into the durable state by replaying their ops through a fresh write
-// transaction and running the legacy full-commit path. Stale transactions
-// (base_epoch < disk epoch, i.e. already checkpointed before a crash) are
-// skipped. The WAL is truncated + fdatasync'd only after the new epoch is
-// published.
+// Folds all committed WAL units (base_epoch == on-disk epoch, in file
+// order) into the durable state. Row transactions fold by replaying
+// their ops through a fresh write transaction and running the legacy
+// full-commit path; epoch units (docs/vm_concurrency_epoch.md §10)
+// fold by materializing their carried segment files and publishing
+// their meta through the same legacy commit. Stale units
+// (base_epoch < disk epoch, i.e. already checkpointed before a crash)
+// are skipped. The WAL is truncated + fdatasync'd only after every
+// unit's new epoch is published.
 
-fn checkpointWalIfDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+pub fn checkpointWalIfDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
     if (isMemoryRoot(root_dir)) return;
     if (skipDurabilitySync()) return;
     if (!walIsDirty(allocator, root_dir, table_name)) return;
@@ -8566,7 +9132,277 @@ fn walReplayApplicableTxsIntoTx(
     return disk_epoch + applicable.len;
 }
 
-fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
+// --- unified unit stream (row transactions + epoch units) -------------------
+// The checkpointer and the writer's tip view consume the WAL as one
+// ordered stream of committed units sharing a single epoch chain.
+// `files`/`meta_json` payloads reference the WAL `data` buffer passed
+// to `walCollectUnits`; the caller must keep it alive while using
+// these.
+
+const WalEpochFile = struct {
+    path: []const u8,
+    bytes: []const u8,
+};
+
+const WalEpochUnit = struct {
+    base_epoch: u64,
+    files: std.array_list.Managed(WalEpochFile),
+    meta_json: ?[]const u8 = null,
+};
+
+const WalUnit = union(enum) {
+    row_tx: WalApplicableTx,
+    epoch: WalEpochUnit,
+};
+
+fn freeWalUnits(units: *std.array_list.Managed(WalUnit)) void {
+    for (units.items) |*unit| {
+        switch (unit.*) {
+            .row_tx => |*tx| tx.ops.deinit(),
+            .epoch => |*eu| eu.files.deinit(),
+        }
+    }
+    units.deinit();
+}
+
+/// Group parsed WAL records into committed units (row transactions
+/// and epoch units interleaved in file order), keeping the units
+/// that form a contiguous epoch chain from the on-disk epoch.
+/// Structural damage inside the valid prefix — nested or unclosed
+/// units, records outside a unit, a chain gap — is VerifyFailed
+/// (loud); only a trailing *incomplete* unit is dropped, which is
+/// the torn tail a crash can produce. Stale units (already folded
+/// before a crash interrupted the truncate) are skipped.
+fn walCollectUnits(
+    allocator: std.mem.Allocator,
+    records: []const WalParsedRecord,
+    disk_epoch: u64,
+) TableError!std.array_list.Managed(WalUnit) {
+    var pending_row: ?WalApplicableTx = null;
+    defer if (pending_row) |*p| p.ops.deinit();
+    var pending_epoch: ?WalEpochUnit = null;
+    defer if (pending_epoch) |*p| p.files.deinit();
+    var pending_epoch_txid: u64 = 0;
+    var units = std.array_list.Managed(WalUnit).init(allocator);
+    errdefer freeWalUnits(&units);
+    var expected_epoch = disk_epoch;
+
+    for (records) |rec| {
+        switch (rec.tag) {
+            WAL_RECORD_TX_BEGIN => {
+                if (rec.payload.len != 17) return TableError.VerifyFailed;
+                if (pending_row != null or pending_epoch != null) return TableError.VerifyFailed;
+                pending_row = .{
+                    .txid = std.mem.readInt(u64, rec.payload[1..9], .little),
+                    .base_epoch = std.mem.readInt(u64, rec.payload[9..17], .little),
+                    .ops = std.array_list.Managed(WalParsedRecord).init(allocator),
+                };
+            },
+            WAL_RECORD_ROW, WAL_RECORD_DICT_PUT, WAL_RECORD_BLOB_PUT => {
+                const p = &(pending_row orelse return TableError.VerifyFailed);
+                try p.ops.append(rec);
+            },
+            WAL_RECORD_TX_COMMIT => {
+                if (rec.payload.len != 17) return TableError.VerifyFailed;
+                var p = pending_row orelse return TableError.VerifyFailed;
+                pending_row = null;
+                const commit_txid = std.mem.readInt(u64, rec.payload[1..9], .little);
+                if (commit_txid != p.txid) {
+                    p.ops.deinit();
+                    return TableError.VerifyFailed;
+                }
+                if (p.base_epoch == expected_epoch) {
+                    try units.append(.{ .row_tx = p });
+                    expected_epoch += 1;
+                } else if (p.base_epoch < expected_epoch) {
+                    p.ops.deinit();
+                } else {
+                    p.ops.deinit();
+                    return TableError.VerifyFailed;
+                }
+            },
+            WAL_RECORD_EPOCH_BEGIN => {
+                if (rec.payload.len != 17) return TableError.VerifyFailed;
+                if (pending_row != null or pending_epoch != null) return TableError.VerifyFailed;
+                pending_epoch_txid = std.mem.readInt(u64, rec.payload[1..9], .little);
+                pending_epoch = .{
+                    .base_epoch = std.mem.readInt(u64, rec.payload[9..17], .little),
+                    .files = std.array_list.Managed(WalEpochFile).init(allocator),
+                };
+            },
+            WAL_RECORD_EPOCH_FILE => {
+                const p = &(pending_epoch orelse return TableError.VerifyFailed);
+                if (rec.payload.len < 5) return TableError.VerifyFailed;
+                const path_len = std.mem.readInt(u32, rec.payload[1..5], .little);
+                if (rec.payload.len < 5 + @as(usize, path_len)) return TableError.VerifyFailed;
+                try p.files.append(.{
+                    .path = rec.payload[5 .. 5 + path_len],
+                    .bytes = rec.payload[5 + path_len ..],
+                });
+            },
+            WAL_RECORD_EPOCH_META => {
+                const p = &(pending_epoch orelse return TableError.VerifyFailed);
+                if (p.meta_json != null) return TableError.VerifyFailed;
+                p.meta_json = rec.payload[1..];
+            },
+            WAL_RECORD_EPOCH_COMMIT => {
+                if (rec.payload.len != 17) return TableError.VerifyFailed;
+                var p = pending_epoch orelse return TableError.VerifyFailed;
+                pending_epoch = null;
+                const commit_txid = std.mem.readInt(u64, rec.payload[1..9], .little);
+                const new_epoch = std.mem.readInt(u64, rec.payload[9..17], .little);
+                if (commit_txid != pending_epoch_txid or new_epoch != p.base_epoch + 1 or p.meta_json == null) {
+                    p.files.deinit();
+                    return TableError.VerifyFailed;
+                }
+                if (p.base_epoch == expected_epoch) {
+                    try units.append(.{ .epoch = p });
+                    expected_epoch += 1;
+                } else if (p.base_epoch < expected_epoch) {
+                    p.files.deinit();
+                } else {
+                    p.files.deinit();
+                    return TableError.VerifyFailed;
+                }
+            },
+            else => return TableError.VerifyFailed,
+        }
+    }
+    if (pending_row) |*p| {
+        p.ops.deinit(); // trailing incomplete transaction: dropped
+        pending_row = null;
+    }
+    if (pending_epoch) |*p| {
+        p.files.deinit(); // trailing incomplete epoch unit: dropped
+        pending_epoch = null;
+    }
+    return units;
+}
+
+/// True if a complete, CRC-valid frame exists at or after byte
+/// offset `from` in `data` (epoch frames only, when `epoch_only`).
+/// Distinguishes a torn tail from mid-file corruption: a crash
+/// mid-append can only truncate the file's tail, so nothing valid
+/// can follow the tear point; valid frames beyond it mean the
+/// damage is in the middle of the log.
+fn walValidFrameExistsAfter(data: []const u8, from: usize, epoch_only: bool) bool {
+    if (from >= data.len) return false;
+    var offset = from;
+    while (offset + 4 + 1 + 8 <= data.len) : (offset += 1) {
+        const payload_len = std.mem.readInt(u32, data[offset..][0..4], .little);
+        if (payload_len == 0 or payload_len > WAL_MAX_RECORD_BYTES) continue;
+        const total = 4 + @as(usize, payload_len) + 8;
+        if (offset + total > data.len) continue;
+        const payload = data[offset + 4 .. offset + 4 + payload_len];
+        const tag_ok = if (epoch_only)
+            walIsEpochRecordTag(payload[0])
+        else switch (payload[0]) {
+            WAL_RECORD_TX_BEGIN, WAL_RECORD_ROW, WAL_RECORD_DICT_PUT, WAL_RECORD_BLOB_PUT, WAL_RECORD_TX_COMMIT, WAL_RECORD_EPOCH_BEGIN, WAL_RECORD_EPOCH_FILE, WAL_RECORD_EPOCH_META, WAL_RECORD_EPOCH_COMMIT => true,
+            else => false,
+        };
+        if (!tag_ok) continue;
+        const stored_crc = std.mem.readInt(u64, data[offset + 4 + payload_len ..][0..8], .little);
+        if (std.hash.crc.@"CRC-64/XZ".hash(payload) == stored_crc) return true;
+    }
+    return false;
+}
+
+/// The framed-prefix parser stops at the first incomplete or
+/// CRC-invalid record. For streams involving epoch records
+/// (docs/vm_concurrency_epoch.md §10.3) that stop point is a torn
+/// tail only if no valid frame follows it; a valid frame beyond
+/// the stop point proves mid-file corruption and fails loudly.
+/// Row-only streams keep the Phase-1 tail tolerance bit-for-bit:
+/// they take the loud path only when the surviving tail itself
+/// carries epoch frames (i.e. an epoch chain was damaged).
+fn walGuardAgainstMidFileCorruption(records: []const WalParsedRecord, data: []const u8, valid_bytes: usize) TableError!void {
+    if (valid_bytes >= data.len) return;
+    var prefix_has_epoch = false;
+    for (records) |rec| {
+        if (walIsEpochRecordTag(rec.tag)) {
+            prefix_has_epoch = true;
+            break;
+        }
+    }
+    if (!prefix_has_epoch) {
+        if (!walValidFrameExistsAfter(data, valid_bytes, true)) return;
+    }
+    if (walValidFrameExistsAfter(data, valid_bytes, false)) return TableError.VerifyFailed;
+}
+
+/// Fold one group of consecutive row transactions into the durable
+/// state through a single legacy commit (the Phase-1 mechanism,
+/// unchanged): replay every op into a fresh write transaction and
+/// publish once, landing on the group's tip epoch.
+fn checkpointFlushRowGroup(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    group: []const WalApplicableTx,
+) TableError!void {
+    var base_meta = try loadActiveMeta(allocator, root_dir, table_name);
+    defer base_meta.deinit(allocator);
+    const disk_epoch = base_meta.epoch;
+    var replay_tx = try beginWriteTransactionLocked(allocator, root_dir, table_name, &base_meta);
+    errdefer {
+        replay_tx.deinit(allocator);
+        allocator.destroy(replay_tx);
+    }
+    const target_epoch = try walReplayApplicableTxsIntoTx(allocator, replay_tx, group, disk_epoch);
+    // The replay folds N committed transactions; the legacy commit
+    // below bumps the epoch by exactly one, so pre-set it to
+    // target-1 to land on the correct final epoch (keeps the disk
+    // epoch chain consistent with the in-memory epochs already
+    // reported to committers).
+    replay_tx.meta.epoch = target_epoch - 1;
+    _ = try commitWriteTransactionLegacy(allocator, replay_tx);
+    replay_tx.deinit(allocator);
+    allocator.destroy(replay_tx);
+}
+
+fn findSegmentFileMeta(meta: TableMeta, path: []const u8) ?FileMeta {
+    for (meta.segments) |segment| {
+        for (segment.files) |file| {
+            if (std.mem.eql(u8, file.path, path)) return file;
+        }
+    }
+    return null;
+}
+
+/// Fold one epoch unit into the durable state: verify every carried
+/// segment payload against the unit meta's FileMeta (length +
+/// SHA-256 + block hashes — the checks a segment load performs)
+/// before writing anything, materialize the files with the legacy
+/// write discipline (content fdatasync inside each write; the
+/// publish's closing directory fsync covers the renames), then
+/// publish through the legacy meta commit, which rebuilds indexes
+/// from the materialized segments. Caller holds the table write
+/// lock (the checkpointer's context).
+fn applyEpochUnitLocked(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    unit: *const WalEpochUnit,
+) TableError!void {
+    const meta_json = unit.meta_json orelse return TableError.VerifyFailed;
+    var parsed_meta = try parseTableMeta(allocator, meta_json);
+    defer parsed_meta.deinit();
+    const meta = parsed_meta.value;
+    if (!std.mem.eql(u8, meta.table_name, table_name)) return TableError.VerifyFailed;
+    if (meta.epoch != unit.base_epoch + 1) return TableError.VerifyFailed;
+    for (unit.files.items) |file| {
+        const file_meta = findSegmentFileMeta(meta, file.path) orelse return TableError.VerifyFailed;
+        try validateFileMetaBytes(file_meta, file.bytes);
+    }
+    for (unit.files.items) |file| {
+        const active_path = try activePath(allocator, root_dir, file.path);
+        defer allocator.free(active_path);
+        try writeArtifactFile(allocator, active_path, file.bytes);
+    }
+    try commitTableMetaWithRebuiltIndexesUnlocked(allocator, root_dir, table_name, meta);
+}
+
+pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!void {
     const path = try walFilePath(allocator, root_dir, table_name);
     defer allocator.free(path);
 
@@ -8579,38 +9415,50 @@ fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table
 
     const parsed = try walParseValidPrefix(allocator, data);
     defer allocator.free(parsed.records);
+    try walGuardAgainstMidFileCorruption(parsed.records, data, parsed.valid_bytes);
 
     var base_meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer base_meta.deinit(allocator);
     if (base_meta.locked) return TableError.Locked;
     const disk_epoch = base_meta.epoch;
 
-    var applicable = try walCollectApplicableTxs(allocator, parsed.records, disk_epoch);
+    var units = try walCollectUnits(allocator, parsed.records, disk_epoch);
+    defer freeWalUnits(&units);
+
+    // Fold in stream order: consecutive row transactions fold
+    // through one replay + legacy commit; an epoch unit first
+    // flushes any pending row group, then materializes and
+    // publishes itself.
+    var row_group = std.array_list.Managed(WalApplicableTx).init(allocator);
     defer {
-        for (applicable.items) |*t| t.ops.deinit();
-        applicable.deinit();
+        for (row_group.items) |*t| t.ops.deinit();
+        row_group.deinit();
     }
-
-    if (applicable.items.len != 0) {
-        var replay_tx = try beginWriteTransactionLocked(allocator, root_dir, table_name, &base_meta);
-        errdefer {
-            replay_tx.deinit(allocator);
-            allocator.destroy(replay_tx);
+    for (units.items) |*unit| {
+        switch (unit.*) {
+            .row_tx => |*tx| {
+                try row_group.append(tx.*);
+                tx.ops = std.array_list.Managed(WalParsedRecord).init(allocator);
+            },
+            .epoch => |*eu| {
+                if (row_group.items.len != 0) {
+                    try checkpointFlushRowGroup(allocator, root_dir, table_name, row_group.items);
+                    for (row_group.items) |*t| t.ops.deinit();
+                    row_group.clearRetainingCapacity();
+                }
+                try applyEpochUnitLocked(allocator, root_dir, table_name, eu);
+            },
         }
-        const target_epoch = try walReplayApplicableTxsIntoTx(allocator, replay_tx, applicable.items, disk_epoch);
-        // The replay folds N committed transactions; the legacy commit below
-        // bumps the epoch by exactly one, so pre-set it to target-1 to land
-        // on the correct final epoch (keeps the disk epoch chain consistent
-        // with the in-memory epochs already reported to committers).
-        replay_tx.meta.epoch = target_epoch - 1;
-        _ = try commitWriteTransactionLegacy(allocator, replay_tx);
-        replay_tx.deinit(allocator);
-        allocator.destroy(replay_tx);
+    }
+    if (row_group.items.len != 0) {
+        try checkpointFlushRowGroup(allocator, root_dir, table_name, row_group.items);
+        for (row_group.items) |*t| t.ops.deinit();
+        row_group.clearRetainingCapacity();
     }
 
-    // New epoch is durable (or nothing needed replaying): truncate the WAL.
-    // A torn tail is discarded here as well — only valid committed records
-    // were replayed above.
+    // Every unit's new epoch is durable (or nothing needed
+    // folding): truncate the WAL. A torn tail is discarded here as
+    // well — only valid committed units were folded above.
     var wal_file = sio.cwd().createFile(path, .{ .truncate = true }) catch |err| return mapFileError(err);
     defer wal_file.close();
     if (builtin.os.tag == .linux) {
@@ -8618,6 +9466,7 @@ fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, table
     } else {
         wal_file.sync() catch |err| return mapFileError(err);
     }
+    epochTipCacheDrop(root_dir, table_name);
     walCheckpointStateOnCheckpoint(allocator, root_dir, table_name);
 }
 
@@ -28206,4 +29055,227 @@ test "wal frame roundtrip preserves records and crc" {
     try std.testing.expectEqual(WAL_RECORD_TX_COMMIT, parsed.records[2].tag);
     try std.testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, parsed.records[2].payload[9..17], .little));
     try std.testing.expectEqual(frame.items.len, parsed.valid_bytes);
+}
+
+/// Build and append one epoch unit that republishes the table's
+/// current val column (column 1, segment 0) with its first cell
+/// set to `new_val`, chaining from `base_epoch`. Mirrors what a
+/// qmod WAL commit appends, using only storage-layer pieces.
+fn walTestAppendEpochUnit(allocator: std.mem.Allocator, table_name: []const u8, base_epoch: u64, new_val: u64) TableError!void {
+    var meta = try loadActiveMeta(allocator, ".", table_name);
+    defer meta.deinit(allocator);
+    const base_source = try readActiveMetaSource(allocator, ".", table_name);
+    defer allocator.free(base_source);
+    const base_hash = hashBytes(base_source);
+
+    const old_file = meta.segments[0].files[1];
+    const old_path = try activePath(allocator, ".", old_file.path);
+    defer allocator.free(old_path);
+    const bytes = try readFileAlloc(allocator, old_path, 1 << 30);
+    defer allocator.free(bytes);
+    const new_bytes = try allocator.dupe(u8, bytes);
+    defer allocator.free(new_bytes);
+    writeU64LE(new_bytes, 0, new_val);
+
+    var next = try duplicateTableMeta(allocator, meta);
+    defer next.deinit(allocator);
+    next.epoch = base_epoch + 1;
+    const new_meta = try fileMetaForEpochBytes(allocator, old_file.path, next.epoch, new_bytes);
+    freeFileMeta(allocator, next.segments[0].files[1]);
+    next.segments[0].files[1] = new_meta;
+
+    const meta_json = try serializeVersionedMetaJson(allocator, ".", table_name, next);
+    defer allocator.free(meta_json);
+    const files = [_]EpochCommitFile{.{ .path = new_meta.path, .bytes = new_bytes }};
+    try appendEpochCommitWal(allocator, ".", table_name, base_epoch, base_hash, &files, meta_json);
+}
+
+fn walTestInsertLegacy(allocator: std.mem.Allocator, table_name: []const u8, id: u64, val: u64) TableError!void {
+    const tx = try beginWriteTransaction(allocator, ".", table_name);
+    const row = walTestRow(id, val);
+    _ = try writeTransactionInsertRawRow(tx, &row);
+    _ = try commitWriteTransaction(allocator, tx);
+    destroyWriteTransaction(allocator, tx);
+}
+
+test "wal epoch unit folds on checkpoint and publishes its meta" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_epoch_fold";
+    try walTestInitTable(std.testing.allocator, table_name);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 1, 100);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 2, 200);
+
+    var base_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer base_meta.deinit(std.testing.allocator);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_meta.epoch, 777);
+
+    // The unit is durable in the WAL; the published state is untouched.
+    try std.testing.expect(walIsDirty(std.testing.allocator, ".", table_name));
+    {
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(base_meta.epoch, disk_meta.epoch);
+    }
+
+    try checkpointWalIfDirty(std.testing.allocator, ".", table_name);
+    try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+    {
+        var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+        defer disk_meta.deinit(std.testing.allocator);
+        try std.testing.expectEqual(base_meta.epoch + 1, disk_meta.epoch);
+    }
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 777), try snapshotGetU64(snapshot, 1, 0));
+    try std.testing.expectEqual(@as(u64, 200), try snapshotGetU64(snapshot, 1, 1));
+    // The fold rebuilt the index over the materialized segment.
+    const found = try snapshotFindU64(snapshot, 0, 2);
+    try std.testing.expect(found.found);
+}
+
+test "wal epoch unit with a chain gap fails the checkpoint loudly" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_epoch_gap";
+    try walTestInitTable(std.testing.allocator, table_name);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 1, 100);
+
+    var base_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer base_meta.deinit(std.testing.allocator);
+    // Chain the unit from three epochs past the disk epoch: a gap
+    // the fold must refuse, not skip.
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_meta.epoch + 3, 777);
+
+    try std.testing.expectError(TableError.VerifyFailed, checkpointWalIfDirty(std.testing.allocator, ".", table_name));
+    // Nothing was published and the WAL was not truncated.
+    try std.testing.expect(walIsDirty(std.testing.allocator, ".", table_name));
+    var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer disk_meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(base_meta.epoch, disk_meta.epoch);
+}
+
+test "wal epoch unit forces a checkpoint at begin instead of the overlay" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_epoch_begin";
+    try walTestInitTable(std.testing.allocator, table_name);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 1, 100);
+
+    var base_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    const base_epoch = base_meta.epoch;
+    base_meta.deinit(std.testing.allocator);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_epoch, 777);
+    try std.testing.expect(walIsDirty(std.testing.allocator, ".", table_name));
+
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        defer destroyWriteTransaction(std.testing.allocator, tx);
+        // Begin folded the unit instead of overlaying it.
+        try std.testing.expect(!walIsDirty(std.testing.allocator, ".", table_name));
+        try std.testing.expectEqual(base_epoch + 1, tx.meta.epoch);
+    }
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 777), try snapshotGetU64(snapshot, 1, 0));
+}
+
+test "wal epoch unit then row transaction fold in stream order" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_epoch_mix";
+    try walTestInitTable(std.testing.allocator, table_name);
+    try walTestInsertLegacy(std.testing.allocator, table_name, 1, 100);
+
+    var base_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    const base_epoch = base_meta.epoch;
+    base_meta.deinit(std.testing.allocator);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_epoch, 777);
+
+    // The next native transaction folds the epoch unit at begin
+    // and chains its own WAL commit onto the folded epoch.
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        const row2 = walTestRow(2, 200);
+        _ = try writeTransactionInsertRawRow(tx, &row2);
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    try checkpointWalIfDirty(std.testing.allocator, ".", table_name);
+
+    const snapshot = try openReadSnapshot(std.testing.allocator, ".", table_name);
+    defer snapshot.destroy();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.row_count);
+    try std.testing.expectEqual(@as(u64, 777), try snapshotGetU64(snapshot, 1, 0));
+    try std.testing.expectEqual(@as(u64, 200), try snapshotGetU64(snapshot, 1, 1));
+    var disk_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer disk_meta.deinit(std.testing.allocator);
+    try std.testing.expectEqual(base_epoch + 2, disk_meta.epoch);
+}
+
+test "wal collector chains row transactions and epoch units in order" {
+    const allocator = std.testing.allocator;
+    var frame = std.array_list.Managed(u8).init(allocator);
+    defer frame.deinit();
+    try walFrameTxBegin(&frame, 11, 5);
+    const row1 = walTestRow(5, 50);
+    var row_payload = std.array_list.Managed(u8).init(allocator);
+    defer row_payload.deinit();
+    try row_payload.append(WAL_RECORD_ROW);
+    try row_payload.append(WAL_ROW_OP_INSERT);
+    var idx_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &idx_buf, 0, .little);
+    try row_payload.appendSlice(&idx_buf);
+    try row_payload.appendSlice(&row1);
+    const framed = try walTestFrameRecord(allocator, row_payload.items);
+    defer allocator.free(framed);
+    try frame.appendSlice(framed);
+    try walFrameTxCommit(&frame, 11, 6);
+    try walFrameEpochBegin(&frame, 12, 6);
+    try walFrameEpochFile(&frame, allocator, "t.dat.e7", "abcd");
+    try walFrameEpochMeta(&frame, allocator, "{}");
+    try walFrameEpochCommit(&frame, 12, 7);
+
+    const parsed = try walParseValidPrefix(allocator, frame.items);
+    defer allocator.free(parsed.records);
+    var units = try walCollectUnits(allocator, parsed.records, 5);
+    defer freeWalUnits(&units);
+    try std.testing.expectEqual(@as(usize, 2), units.items.len);
+    switch (units.items[0]) {
+        .row_tx => |tx| try std.testing.expectEqual(@as(u64, 5), tx.base_epoch),
+        .epoch => return TableError.InvalidFormat,
+    }
+    switch (units.items[1]) {
+        .epoch => |eu| {
+            try std.testing.expectEqual(@as(u64, 6), eu.base_epoch);
+            try std.testing.expectEqual(@as(usize, 1), eu.files.items.len);
+            try std.testing.expectEqualStrings("t.dat.e7", eu.files.items[0].path);
+            try std.testing.expectEqualStrings("abcd", eu.files.items[0].bytes);
+            try std.testing.expectEqualStrings("{}", eu.meta_json.?);
+        },
+        .row_tx => return TableError.InvalidFormat,
+    }
+    // A disk epoch behind the chain head is a gap, not a skip.
+    try std.testing.expectError(TableError.VerifyFailed, walCollectUnits(allocator, parsed.records, 4));
 }

@@ -1337,7 +1337,38 @@ fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []
 /// witness match proves the snapshot is the manifest's epoch. Any
 /// mismatch (or a missing manifest on compat/memory roots) takes
 /// the full resolution below, which also adopts newer epochs.
+/// Read-side fold (docs/vm_concurrency_epoch.md §10.2): if
+/// epoch units are still living only in the WAL — committed by
+/// this process (tip cache ahead of the manifest) or by another
+/// (a restarted or read-only process has no tip entry, so
+/// pending epoch units are detected from the WAL itself) —
+/// publish them before resolving, so the exec observes every
+/// committed epoch: the read-after-commit contract the manifest
+/// publish used to provide directly. A tip another process
+/// already folded is recognized by epoch equality with the
+/// manifest witness and left alone. Row-only WALs are not
+/// folded here: folding those remains the native layer's
+/// discipline (§3.5), exactly as before.
+/// loadReadTable is never invoked while this thread holds the
+/// same table's write lock (the read-write evaluator reads its
+/// write table through the staged copy when the names match),
+/// so the fold's lock acquisition cannot self-deadlock.
+fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
+    if (table_mod.epochTipEpoch(".", table_name)) |tip_epoch| {
+        const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
+        if (witness) |w| {
+            if (w.epoch == tip_epoch) return;
+        }
+        table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+        return;
+    }
+    if (table_mod.walHasPendingEpochUnits(allocator, ".", table_name)) {
+        table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+    }
+}
+
 fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!ReadTable {
+    try foldEpochWalTipForRead(allocator, table_name);
     {
         const t_witness = ScopedTimer.begin(.table_meta_source);
         const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
@@ -1437,7 +1468,38 @@ fn validateCurrentSchemaHash(allocator: std.mem.Allocator, table_name: []const u
 fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!WriteTable {
     const meta_path = try tableMetaPath(allocator, table_name);
     errdefer allocator.free(meta_path);
-    const meta_bytes = try readActiveTableMetaSource(allocator, table_name);
+    // Epoch-WAL staging (docs/vm_concurrency_epoch.md §10.2):
+    // with un-folded epoch units pending, the manifest describes
+    // a superseded epoch, so stage from the WAL tip instead —
+    // unless the checkpoint thresholds are reached or the WAL
+    // stream is not stageable as a tip, in which case fold first
+    // (this exec holds the table write lock, so the locked
+    // checkpoint variant is the right one) and stage from the
+    // manifest as before. Tip segment payloads are borrowed
+    // under the segments' copy-on-write discipline; the tip entry
+    // cannot be retired mid-staging because every retirement
+    // path needs the write lock this exec holds.
+    var wal_tip: ?table_mod.EpochTip = null;
+    defer if (wal_tip) |*tip| tip.deinit(allocator);
+    switch (table_mod.epochWalStaging(allocator, ".", table_name) catch |err| return mapTableError(err)) {
+        .none => {},
+        .mixed_stream => {
+            table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| return mapTableError(err);
+        },
+        .tip => |tip| {
+            if (table_mod.walCheckpointDue(allocator, ".", table_name)) {
+                var t = tip;
+                t.deinit(allocator);
+                table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| return mapTableError(err);
+            } else {
+                wal_tip = tip;
+            }
+        },
+    }
+    const meta_bytes = if (wal_tip) |tip|
+        allocator.dupe(u8, tip.meta_json) catch return ExecError.OutOfMemory
+    else
+        try readActiveTableMetaSource(allocator, table_name);
     defer allocator.free(meta_bytes);
     var parsed = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.SnapshotCorrupted;
     errdefer parsed.deinit();
@@ -1466,8 +1528,15 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
     // over-cap snapshot, hash mismatch) takes the per-file load
     // unchanged.
     var snapshot: ?*Snapshot = null;
-    const write_pin = epoch_runtime.pinCurrentIf(table_name, parsed.value.epoch, out.meta_hash) orelse
-        (epoch_runtime.pinLatest(table_name, meta_bytes, parsed.value.epoch, out.meta_hash) catch null);
+    // No pin/snapshot borrowing when staging from the WAL tip:
+    // the tip epoch is not published yet, so no pin can exist for
+    // it, and materializing a snapshot would read segment files
+    // that are still only in the WAL.
+    const write_pin = if (wal_tip == null)
+        epoch_runtime.pinCurrentIf(table_name, parsed.value.epoch, out.meta_hash) orelse
+            (epoch_runtime.pinLatest(table_name, meta_bytes, parsed.value.epoch, out.meta_hash) catch null)
+    else
+        null;
     if (write_pin) |pin| {
         const snap = snapshotForPin(table_name, pin) catch |err| {
             epoch_runtime.release(table_name, pin);
@@ -1490,6 +1559,23 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
         for (out.parsed.value.segments, 0..) |segment_meta, seg_idx| {
             if (segment_meta.files.len != out.parsed.value.columns.len) return ExecError.SnapshotCorrupted;
             const file_meta = segment_meta.files[col_idx];
+            if (wal_tip) |tip| {
+                if (tip.files.get(file_meta.path)) |payload| {
+                    // Carried by the WAL: validate exactly as a
+                    // file load would, then borrow under COW.
+                    try validateQmodFileBytes(file_meta, payload);
+                    if (payload.len != segment_meta.rows * meta_column.stride) return ExecError.SnapshotCorrupted;
+                    segments[seg_idx] = .{ .path = file_meta.path, .rows = segment_meta.rows, .bytes = @constCast(payload), .borrowed = true };
+                    continue;
+                }
+                // Not carried by the WAL: already durable on disk.
+                const disk_bytes = try readFileAlloc(allocator, file_meta.path, 1 << 30);
+                errdefer allocator.free(disk_bytes);
+                try validateQmodFileBytes(file_meta, disk_bytes);
+                if (disk_bytes.len != segment_meta.rows * meta_column.stride) return ExecError.SnapshotCorrupted;
+                segments[seg_idx] = .{ .path = file_meta.path, .rows = segment_meta.rows, .bytes = disk_bytes };
+                continue;
+            }
             if (snapshot) |snap| {
                 var offset: usize = 0;
                 for (out.parsed.value.segments[0..seg_idx]) |prior| {
@@ -2322,10 +2408,91 @@ fn tableMetaStillCurrent(allocator: std.mem.Allocator, write_table: *WriteTable)
     // concurrency guard, and unreachable through the plugin's own
     // deterministic serializer, where one logical meta has exactly
     // one byte form.
+    //
+    // While an epoch tip is live (docs §10.2), the "active meta"
+    // is the tip, not the manifest: the exec staged from the tip
+    // and the next commit must chain onto it. The tip can only
+    // have been produced or retired under the table write lock
+    // this exec holds, so the cache-only lookup is authoritative
+    // here; load and check always name the same active meta.
+    if (table_mod.epochTipMetaHash(".", write_table.parsed.value.table_name)) |tip_hash| {
+        return std.mem.eql(u8, &tip_hash, &write_table.meta_hash);
+    }
     const meta_bytes = try readActiveTableMetaSource(allocator, write_table.parsed.value.table_name);
     defer allocator.free(meta_bytes);
     const current_hash = hashBytes(meta_bytes);
     return std.mem.eql(u8, &current_hash, &write_table.meta_hash);
+}
+
+/// Minimum total staged dirty bytes for the WAL-shaped epoch
+/// commit (docs/vm_concurrency_epoch.md §10). Mirrors the row
+/// WAL's policy in commitWriteTransaction: small commits keep
+/// the legacy synchronous publish, whose on-disk side effects
+/// (materialized segments, published manifest) small-transaction
+/// callers and tests observe directly; the WAL still guarantees
+/// the same durability for the commits it takes.
+const EPOCH_WAL_MIN_DIRTY_BYTES: usize = 4096;
+
+/// The WAL-shaped commit (docs/vm_concurrency_epoch.md §10):
+/// compute the new epoch's file metas from the staged bytes (no
+/// writes), serialize the new meta, and append one epoch unit to
+/// the table WAL with a single fdatasync. Returns false when the
+/// commit is not WAL-eligible, in which case nothing was mutated
+/// and the caller runs the legacy publish. On an error return
+/// the staged table is abandoned exactly as a failed legacy
+/// commit abandons it (the manifest never moved; a partially
+/// appended unit is a torn tail the fold drops whole).
+fn commitWriteTableWal(
+    allocator: std.mem.Allocator,
+    write_table: *WriteTable,
+    next_epoch: u64,
+    owned_paths: *std.array_list.Managed([]const u8),
+    owned_hashes: *std.array_list.Managed([]const u8),
+    owned_block_hashes: *std.array_list.Managed([][]const u8),
+) ExecError!bool {
+    if (!table_mod.walCommitPathAvailable(".")) return false;
+    var total_dirty: usize = 0;
+    for (write_table.columns) |*column| {
+        for (column.segments) |*segment| {
+            if (!segment.dirty) continue;
+            // One WAL record must hold path + bytes (with the
+            // frame's own overhead staying under the cap).
+            if (segment.bytes.len + segment.path.len + 5 > table_mod.WAL_MAX_RECORD_BYTES) return false;
+            total_dirty += segment.bytes.len;
+        }
+    }
+    if (total_dirty < EPOCH_WAL_MIN_DIRTY_BYTES) return false;
+
+    var files = std.array_list.Managed(table_mod.EpochCommitFile).init(allocator);
+    defer files.deinit();
+    for (write_table.columns, 0..) |*column, col_idx| {
+        for (column.segments, 0..) |*segment, seg_idx| {
+            if (!segment.dirty) continue;
+            var file_meta = table_mod.fileMetaForEpochBytes(allocator, segment.path, next_epoch, segment.bytes) catch |err| return mapTableError(err);
+            errdefer {
+                allocator.free(file_meta.path);
+                allocator.free(file_meta.sha256);
+                for (file_meta.block_sha256) |hash| allocator.free(hash);
+                allocator.free(file_meta.block_sha256);
+            }
+            owned_paths.append(file_meta.path) catch return ExecError.OutOfMemory;
+            errdefer _ = owned_paths.pop();
+            owned_hashes.append(file_meta.sha256) catch return ExecError.OutOfMemory;
+            errdefer _ = owned_hashes.pop();
+            owned_block_hashes.append(file_meta.block_sha256) catch return ExecError.OutOfMemory;
+            errdefer _ = owned_block_hashes.pop();
+            files.append(.{ .path = file_meta.path, .bytes = segment.bytes }) catch return ExecError.OutOfMemory;
+            const target = &write_table.parsed.value.segments[seg_idx].files[col_idx];
+            target.* = file_meta;
+            segment.path = target.path;
+            file_meta = undefined;
+        }
+    }
+    write_table.parsed.value.epoch = next_epoch;
+    const meta_json = table_mod.serializeVersionedMetaJson(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
+    defer allocator.free(meta_json);
+    table_mod.appendEpochCommitWal(allocator, ".", write_table.parsed.value.table_name, next_epoch - 1, write_table.meta_hash, files.items, meta_json) catch |err| return mapTableError(err);
+    return true;
 }
 
 fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) ExecError!void {
@@ -2361,8 +2528,18 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     t_check.end();
     if (!still_current) return ExecError.StaleMetadata;
 
-    const t_rewrite = ScopedTimer.begin(.commit_rewrite);
     const next_epoch = write_table.parsed.value.epoch + 1;
+    // WAL-shaped commit (docs/vm_concurrency_epoch.md §10): one
+    // synced WAL append replaces the legacy publish when the
+    // policy below admits it; publication is deferred to the
+    // fold. On success the in-process publication tail is the
+    // same as the legacy path's.
+    if (try commitWriteTableWal(allocator, write_table, next_epoch, &owned_paths, &owned_hashes, &owned_block_hashes)) {
+        epoch_runtime.noteCommitted(write_table.parsed.value.table_name, next_epoch);
+        return;
+    }
+
+    const t_rewrite = ScopedTimer.begin(.commit_rewrite);
     for (write_table.columns, 0..) |*column, col_idx| {
         for (column.segments, 0..) |*segment, seg_idx| {
             if (!segment.dirty) continue;
@@ -5128,6 +5305,254 @@ test "qmod write commit rejects stale block checksum metadata" {
     try table_mod.commitTableMetaUnlocked(std.testing.allocator, ".", "simple", meta);
 
     try std.testing.expectError(ExecError.StaleMetadata, commitWriteTable(std.testing.allocator, &write_table));
+}
+
+fn walQmodSetupTable(allocator: std.mem.Allocator, table_name: []const u8, rows: u64) ExecError!void {
+    var schema_name_buf: [128]u8 = undefined;
+    const schema_name = std.fmt.bufPrint(&schema_name_buf, "{s}.sadb-schema", .{table_name}) catch return ExecError.OutOfMemory;
+    var schema_file = sio.cwd().createFile(schema_name, .{ .truncate = true }) catch return ExecError.InvalidPath;
+    defer schema_file.close();
+    schema_file.writeAll(
+        \\#def MAX_ROWS = 4096
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    ) catch return ExecError.InvalidPath;
+    var csv = std.array_list.Managed(u8).init(allocator);
+    defer csv.deinit();
+    csv.appendSlice("id\n") catch return ExecError.OutOfMemory;
+    var i: u64 = 0;
+    while (i < rows) : (i += 1) {
+        var line_buf: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "{d}\n", .{i}) catch return ExecError.OutOfMemory;
+        csv.appendSlice(line) catch return ExecError.OutOfMemory;
+    }
+    var csv_file = sio.cwd().createFile("rows.csv", .{ .truncate = true }) catch return ExecError.InvalidPath;
+    defer csv_file.close();
+    csv_file.writeAll(csv.items) catch return ExecError.InvalidPath;
+    _ = table_mod.ingestTable(allocator, ".", table_name, "rows.csv") catch |err| return mapTableError(err);
+}
+
+/// One write exec that sets every row's id cell to `value` and
+/// commits (the set-all shape of the bench write scenario).
+fn walQmodWriteAll(allocator: std.mem.Allocator, table_name: []const u8, value: u64) ExecError!void {
+    var write_table = try loadWriteTable(allocator, table_name);
+    defer write_table.deinit(allocator);
+    const column = findWriteColumn(&write_table, "id") orelse return ExecError.InvalidFormat;
+    var row: u64 = 0;
+    while (row < write_table.row_count) : (row += 1) {
+        try storeColumnValue(allocator, column, row * 8, value);
+    }
+    try commitWriteTable(allocator, &write_table);
+}
+
+fn walQmodReadValueAt(allocator: std.mem.Allocator, table_name: []const u8, row: u64) ExecError!u64 {
+    var read_table = try loadReadTable(allocator, table_name);
+    defer read_table.deinit(allocator);
+    const column = findColumn(read_table, "id") orelse return ExecError.InvalidFormat;
+    return loadColumnValue(column.*, row * 8);
+}
+
+fn walQmodWalSize(table_name: []const u8) u64 {
+    var name_buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{s}.wal", .{table_name}) catch return 0;
+    const stat = sio.cwd().statFile(name) catch return 0;
+    return stat.size;
+}
+
+fn walQmodAppendWalBytes(table_name: []const u8, bytes: []const u8) !void {
+    var name_buf: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}.wal", .{table_name});
+    var file = try sio.cwd().createFile(name, .{ .truncate = false });
+    defer file.close();
+    try file.seekTo(try file.getEndPos());
+    try file.writeAll(bytes);
+}
+
+fn walQmodTruncateWal(table_name: []const u8, keep: u64) !void {
+    var name_buf: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}.wal", .{table_name});
+    const data = try sio.cwd().readFileAlloc(std.testing.allocator, name, 1 << 30);
+    defer std.testing.allocator.free(data);
+    var file = try sio.cwd().createFile(name, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(data[0..@intCast(keep)]);
+}
+
+test "qmod wal epoch commit appends one unit and folds on read" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "walq_fold";
+    try walQmodSetupTable(std.testing.allocator, table_name, 600);
+    const base = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+
+    try walQmodWriteAll(std.testing.allocator, table_name, 42);
+    // The commit is a single WAL unit: the WAL is non-empty and
+    // the manifest has NOT advanced yet.
+    try std.testing.expect(walQmodWalSize(table_name) > 0);
+    {
+        const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+        try std.testing.expectEqual(base.epoch, witness.epoch);
+    }
+    try std.testing.expectEqual(@as(?u64, base.epoch + 1), table_mod.epochTipEpoch(".", table_name));
+
+    // The first read folds the unit and observes the commit.
+    try std.testing.expectEqual(@as(u64, 42), try walQmodReadValueAt(std.testing.allocator, table_name, 0));
+    try std.testing.expectEqual(@as(u64, 42), try walQmodReadValueAt(std.testing.allocator, table_name, 599));
+    const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base.epoch + 1, witness.epoch);
+    try std.testing.expectEqual(@as(u64, 0), walQmodWalSize(table_name));
+    try std.testing.expectEqual(@as(?u64, null), table_mod.epochTipEpoch(".", table_name));
+}
+
+test "qmod small commit below the wal threshold stays on the legacy publish" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "walq_small";
+    try walQmodSetupTable(std.testing.allocator, table_name, 10);
+    const base = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+
+    try walQmodWriteAll(std.testing.allocator, table_name, 7);
+    // 80 staged bytes < the 4096 threshold: legacy publish — the
+    // manifest advanced inside the commit and no WAL exists.
+    const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base.epoch + 1, witness.epoch);
+    try std.testing.expectEqual(@as(u64, 0), walQmodWalSize(table_name));
+    try std.testing.expectEqual(@as(?u64, null), table_mod.epochTipEpoch(".", table_name));
+    try std.testing.expectEqual(@as(u64, 7), try walQmodReadValueAt(std.testing.allocator, table_name, 9));
+}
+
+test "qmod wal epoch commit survives kill -9 and folds on reopen" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "walq_crash";
+    try walQmodSetupTable(std.testing.allocator, table_name, 600);
+    const base = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+
+    const fork_rc = std.os.linux.fork();
+    if (fork_rc != 0 and fork_rc > @as(usize, @intCast(std.math.maxInt(i32)))) return error.ForkFailed;
+    const child_pid: std.os.linux.pid_t = @intCast(fork_rc);
+    if (child_pid == 0) {
+        // Child: commit through the WAL path, prove the commit is
+        // WAL-only (manifest untouched, WAL non-empty), leave a
+        // marker recording that the commit was acked, then die by
+        // SIGKILL — no cleanup, no fold, no cache flush.
+        const alloc = std.heap.page_allocator;
+        walQmodWriteAll(alloc, table_name, 42) catch std.process.abort();
+        const witness = table_mod.readActiveManifestWitness(alloc, ".", table_name) catch std.process.abort();
+        if (witness.epoch != base.epoch) std.process.abort();
+        if (walQmodWalSize(table_name) == 0) std.process.abort();
+        var marker = sio.cwd().createFile("wal_child_marker", .{ .truncate = true }) catch std.process.abort();
+        marker.writeAll("committed") catch std.process.abort();
+        marker.close();
+        _ = std.os.linux.kill(std.os.linux.getpid(), std.os.linux.SIG.KILL);
+        unreachable;
+    }
+    var wait_status: i32 = 0;
+    _ = std.os.linux.waitpid(child_pid, &wait_status, 0);
+    // Death by SIGKILL (9), not a clean exit or another signal.
+    try std.testing.expectEqual(@as(i32, 9), wait_status & 0x7f);
+    // The commit was acked before the kill (marker written after
+    // the write exec returned).
+    _ = try sio.cwd().statFile("wal_child_marker");
+
+    // Reopen in the parent, which shares no in-process state
+    // with the child: the read discovers the pending epoch unit
+    // in the WAL, folds it, and observes the committed values.
+    try std.testing.expectEqual(@as(u64, 42), try walQmodReadValueAt(std.testing.allocator, table_name, 0));
+    try std.testing.expectEqual(@as(u64, 42), try walQmodReadValueAt(std.testing.allocator, table_name, 599));
+    const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base.epoch + 1, witness.epoch);
+    try std.testing.expectEqual(@as(u64, 0), walQmodWalSize(table_name));
+}
+
+test "qmod wal epoch commit torn tail falls back to the last complete commit" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "walq_torn";
+    try walQmodSetupTable(std.testing.allocator, table_name, 600);
+    const base = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+
+    try walQmodWriteAll(std.testing.allocator, table_name, 42);
+    // A later append torn mid-frame: partial record bytes after
+    // the complete unit.
+    try walQmodAppendWalBytes(table_name, &[_]u8{ 0x39, 0x00, 0x00, 0x00, 0x08, 0xAA, 0xBB });
+    // The read folds the complete unit and discards the tear.
+    try std.testing.expectEqual(@as(u64, 42), try walQmodReadValueAt(std.testing.allocator, table_name, 0));
+    {
+        const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+        try std.testing.expectEqual(base.epoch + 1, witness.epoch);
+    }
+
+    // Now the tear eats a unit itself: keep only half of a fresh
+    // commit's WAL image.
+    try walQmodWriteAll(std.testing.allocator, table_name, 43);
+    try walQmodTruncateWal(table_name, walQmodWalSize(table_name) / 2);
+    // The half unit is dropped whole — no half epoch is read —
+    // and the state is still the last complete commit.
+    try std.testing.expectEqual(@as(u64, 42), try walQmodReadValueAt(std.testing.allocator, table_name, 0));
+    {
+        const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+        try std.testing.expectEqual(base.epoch + 1, witness.epoch);
+    }
+    // The table remains writable afterwards.
+    try walQmodWriteAll(std.testing.allocator, table_name, 44);
+    try std.testing.expectEqual(@as(u64, 44), try walQmodReadValueAt(std.testing.allocator, table_name, 599));
+    const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base.epoch + 2, witness.epoch);
+}
+
+test "qmod wal epoch commit mid-file corruption fails loudly" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "walq_corrupt";
+    try walQmodSetupTable(std.testing.allocator, table_name, 600);
+    const base = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+
+    try walQmodWriteAll(std.testing.allocator, table_name, 42);
+    try walQmodWriteAll(std.testing.allocator, table_name, 43);
+    // Corrupt one byte inside the first unit's FILE payload. The
+    // first frame (EPOCH_BEGIN) is 4 + 17 + 8 = 29 bytes; the
+    // FILE frame's payload starts at 29 + 4 = 33. Valid frames
+    // (the rest of unit 1, all of unit 2) survive after the
+    // damaged point, so this is mid-file corruption, not a tear.
+    {
+        var name_buf: [128]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{s}.wal", .{table_name});
+        var file = try sio.cwd().openFile(name, .{ .mode = .write_only });
+        defer file.close();
+        try file.seekTo(33 + 64);
+        try file.writeAll(&[_]u8{0xFF});
+    }
+    try std.testing.expectError(ExecError.SnapshotCorrupted, loadReadTable(std.testing.allocator, table_name));
+    // Nothing was published and no partial epoch became visible.
+    const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
+    try std.testing.expectEqual(base.epoch, witness.epoch);
 }
 
 test "qmod exec filters u64 DB column values" {
