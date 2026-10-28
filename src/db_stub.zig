@@ -32,17 +32,21 @@ pub const Profile = struct {
         prog_lines,
         stmt_loop,
         scan_fold,
+        commit_check,
+        commit_rewrite,
+        commit_meta,
         write_load,
         write_eval_rest,
         commit_publish,
     };
-    pub const phase_count = 18;
+    pub const phase_count = 21;
     pub const phase_names: [phase_count][]const u8 = .{
         "registry_meta",      "params_read",   "qmod_load",       "scalar_eval",
         "table_meta_source",  "table_meta_parse_pin", "table_schema", "segment_read",
         "segment_validate",   "segment_copy",  "read_eval_rest",  "prog_params",
-        "prog_lines",         "stmt_loop",     "scan_fold",      "write_load",
-        "write_eval_rest",    "commit_publish",
+        "prog_lines",         "stmt_loop",     "scan_fold",      "commit_check",
+        "commit_rewrite",     "commit_meta",   "write_load",     "write_eval_rest",
+        "commit_publish",
     };
 
     var enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -1383,6 +1387,67 @@ fn storeColumnValue(column: *WriteColumn, offset: u64, value: u64) ExecError!voi
     return ExecError.InvalidFormat;
 }
 
+/// Native bulk fill, the write-side counterpart of the read scan
+/// primitives: `dst = col_fill col_ptr, len, value` writes `value`
+/// into the first `len` rows of the column and yields the number of
+/// rows filled. Row 0 goes through `storeColumnValue`, so the
+/// per-type cast/range rules are exactly the interpreted store
+/// loop's; the remaining rows reuse the encoded byte pattern
+/// verbatim. Fuel is charged per row, like the read primitives.
+fn fillColumnValue(column: *WriteColumn, rows: u64, value: u64) ExecError!u64 {
+    if (!isReadableColumn(column.ty, column.stride)) return ExecError.UnsupportedOperation;
+    var total_rows: u64 = 0;
+    for (column.segments) |segment| total_rows += segment.rows;
+    if (rows > total_rows) return ExecError.InvalidFormat;
+    if (rows == 0) return 0;
+    try storeColumnValue(column, 0, value);
+    const stride: usize = column.stride;
+    var pattern: [8]u8 = @splat(0);
+    for (column.segments) |segment| {
+        if (segment.rows > 0) {
+            @memcpy(pattern[0..stride], segment.bytes[0..stride]);
+            break;
+        }
+    }
+    var row_cursor: u64 = 1;
+    var seg_base: u64 = 0;
+    for (column.segments) |*segment| {
+        const seg_end = seg_base + segment.rows;
+        if (row_cursor < rows and seg_end > row_cursor) {
+            const local_start: u64 = if (row_cursor > seg_base) row_cursor - seg_base else 0;
+            const local_end: u64 = @min(segment.rows, rows - seg_base);
+            var i: usize = @intCast(local_start * stride);
+            const end: usize = @intCast(local_end * stride);
+            while (i < end) : (i += stride) {
+                @memcpy(segment.bytes[i..][0..stride], pattern[0..stride]);
+            }
+            segment.dirty = true;
+            row_cursor = seg_base + local_end;
+        }
+        seg_base = seg_end;
+    }
+    return rows;
+}
+
+fn evalColumnFill(line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*WriteColumn), meter: *FuelMeter) ExecError!?struct { dst: []const u8, value: u64 } {
+    const eq = std.mem.indexOf(u8, line, " = ") orelse return null;
+    const expr = std.mem.trim(u8, line[eq + 3 ..], " \t\r\n");
+    var parts = std.mem.tokenizeAny(u8, expr, " ,\t");
+    const op = parts.next() orelse return null;
+    if (!std.mem.eql(u8, op, "col_fill")) return null;
+    const dst = std.mem.trim(u8, line[0..eq], " \t\r\n");
+    const col_name = parts.next() orelse return ExecError.InvalidFormat;
+    const len_name = parts.next() orelse return ExecError.InvalidFormat;
+    const value_name = parts.next() orelse return ExecError.InvalidFormat;
+    if (parts.next() != null) return ExecError.InvalidFormat;
+    const column = pointers.get(col_name) orelse return ExecError.UnsupportedOperation;
+    const rows = try lookupValue(values, len_name);
+    const value = try lookupValue(values, value_name);
+    try meter.charge(rows);
+    const filled = try fillColumnValue(column, rows, value);
+    return .{ .dst = dst, .value = filled };
+}
+
 fn countLinesWithPrefix(source: []const u8, prefix: []const u8) u64 {
     var count: u64 = 0;
     var it = std.mem.splitScalar(u8, source, '\n');
@@ -2000,8 +2065,12 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
         }
     }
     if (!any_dirty) return;
-    if (!(try tableMetaStillCurrent(allocator, write_table))) return ExecError.StaleMetadata;
+    const t_check = ScopedTimer.begin(.commit_check);
+    const still_current = try tableMetaStillCurrent(allocator, write_table);
+    t_check.end();
+    if (!still_current) return ExecError.StaleMetadata;
 
+    const t_rewrite = ScopedTimer.begin(.commit_rewrite);
     const next_epoch = write_table.parsed.value.epoch + 1;
     for (write_table.columns, 0..) |*column, col_idx| {
         for (column.segments, 0..) |*segment, seg_idx| {
@@ -2025,8 +2094,11 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
             file_meta = undefined;
         }
     }
+    t_rewrite.end();
     write_table.parsed.value.epoch = next_epoch;
+    const t_meta = ScopedTimer.begin(.commit_meta);
     table_mod.commitTableMetaWithRebuiltIndexesUnlocked(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
+    t_meta.end();
     // In-process publication (docs/vm_concurrency_epoch.md §3.2): the
     // manifest publish above is the durable commit point; this swap
     // retires the previous epoch pin so in-process readers that pin
@@ -2323,6 +2395,11 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
             pc = labels.get(if ((try lookupValue(&values, cond_name)) != 0) true_label else false_label) orelse return ExecError.InvalidFormat;
             continue;
         }
+        if (try evalColumnFill(line, &values, &pointers, meter)) |filled| {
+            values.put(filled.dst, filled.value) catch return ExecError.OutOfMemory;
+            pc += 1;
+            continue;
+        }
         if (try evalStore(line, &values, &pointers)) {
             pc += 1;
             continue;
@@ -2418,6 +2495,11 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
                 pc += 1;
                 continue;
             }
+        }
+        if (try evalColumnFill(line, &values, &write_pointers, meter)) |filled| {
+            values.put(filled.dst, filled.value) catch return ExecError.OutOfMemory;
+            pc += 1;
+            continue;
         }
         if (try evalStore(line, &values, &write_pointers)) {
             pc += 1;
@@ -5376,6 +5458,94 @@ test "qmod vm column primitives match loop aggregation" {
         try std.testing.expect(run.ok.fuel_used > 0);
         try std.testing.expect(run.ok.fuel_used <= run.ok.fuel_limit);
     }
+}
+
+test "qmod col_fill matches the interpreted store loop" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("filltab.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VAL_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 16
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id,val
+        \\1,10
+        \\2,20
+        \\3,30
+        \\4,40
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "filltab", "rows.csv");
+
+    // Partial fill: first 3 rows become 7, row 4 keeps 40.
+    var fill_query = try (sio.Dir{ .inner = tmp.dir }).createFile("fill.query.sa", .{ .truncate = true });
+    defer fill_query.close();
+    try fill_query.writeAll(
+        \\grants [db_write:filltab]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\filled = col_fill col_val, 3, 7
+        \\return filled
+    );
+    var fill_result = try registerQuery(std.testing.allocator, "fill.query.sa");
+    defer fill_result.deinit(std.testing.allocator);
+    const fill_hash = try hashHexAlloc(std.testing.allocator, fill_result.hash);
+    defer std.testing.allocator.free(fill_hash);
+    var fill_run = try execQuery(std.testing.allocator, fill_hash, null);
+    defer fill_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), fill_run.ok.code);
+    try std.testing.expectEqual(@as(u64, 3), fill_run.ok.result_u64.?);
+    try std.testing.expect(fill_run.ok.fuel_used >= 3);
+
+    // Read back through a scan: 7+7+7+40 = 61.
+    var sum_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sumback.query.sa", .{ .truncate = true });
+    defer sum_query.close();
+    try sum_query.writeAll(
+        \\grants [db_read:filltab]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\total = col_sum col_val, len
+        \\return total
+    );
+    var sum_result = try registerQuery(std.testing.allocator, "sumback.query.sa");
+    defer sum_result.deinit(std.testing.allocator);
+    const sum_hash = try hashHexAlloc(std.testing.allocator, sum_result.hash);
+    defer std.testing.allocator.free(sum_hash);
+    var sum_run = try execQuery(std.testing.allocator, sum_hash, null);
+    defer sum_run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 61), sum_run.ok.result_u64.?);
+
+    // Over-range fill is rejected, exactly like the read primitives.
+    var over_query = try (sio.Dir{ .inner = tmp.dir }).createFile("overfill.query.sa", .{ .truncate = true });
+    defer over_query.close();
+    try over_query.writeAll(
+        \\grants [db_write:filltab]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\filled = col_fill col_val, 99, 1
+        \\return filled
+    );
+    var over_result = try registerQuery(std.testing.allocator, "overfill.query.sa");
+    defer over_result.deinit(std.testing.allocator);
+    const over_hash = try hashHexAlloc(std.testing.allocator, over_result.hash);
+    defer std.testing.allocator.free(over_hash);
+    try std.testing.expectError(ExecError.InvalidFormat, execQuery(std.testing.allocator, over_hash, null));
+
+    // The rejected fill left no partial writes behind (staged
+    // write-set atomicity): the sum is still 61.
+    var sum_run2 = try execQuery(std.testing.allocator, sum_hash, null);
+    defer sum_run2.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 61), sum_run2.ok.result_u64.?);
 }
 
 test "qmod fuel meter terminates unbounded and over-budget modules" {
