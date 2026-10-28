@@ -5696,6 +5696,32 @@ pub fn commitTableMetaWithRebuiltIndexes(allocator: std.mem.Allocator, root_dir:
     try commitTableMetaWithRebuiltIndexesUnlocked(allocator, root_dir, table_name, meta);
 }
 
+/// The canonical base of a versioned column file: strip every
+/// trailing ".e<digits>" epoch suffix. Versioned artifacts are
+/// named `<base>.e<epoch>` from the base name (the same discipline
+/// deleteTableArtifacts enumerates); appending the suffix to the
+/// previous epoch's path instead chains suffixes without bound
+/// (…dat.e2.e3.…e56), grows the file name on every commit, breaks
+/// the cleanup enumeration, and eventually makes the table
+/// unwritable once the name crosses the filesystem limit.
+fn stripEpochSuffixes(path: []const u8) []const u8 {
+    var end = path.len;
+    while (true) {
+        const dot = std.mem.lastIndexOfScalar(u8, path[0..end], '.') orelse break;
+        if (dot + 2 >= end or path[dot + 1] != 'e') break;
+        var all_digits = true;
+        for (path[dot + 2 .. end]) |ch| {
+            if (ch < '0' or ch > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (!all_digits) break;
+        end = dot;
+    }
+    return path[0..end];
+}
+
 pub fn rewriteColumnFileForEpoch(
     allocator: std.mem.Allocator,
     root_dir: []const u8,
@@ -5703,7 +5729,7 @@ pub fn rewriteColumnFileForEpoch(
     epoch: u64,
     bytes: []const u8,
 ) TableError!FileMeta {
-    const next_path = try allocPrintPath(allocator, "{s}.e{d}", .{ previous_path, epoch });
+    const next_path = try allocPrintPath(allocator, "{s}.e{d}", .{ stripEpochSuffixes(previous_path), epoch });
     defer allocator.free(next_path);
     const active_next_path = try activePath(allocator, root_dir, next_path);
     defer allocator.free(active_next_path);

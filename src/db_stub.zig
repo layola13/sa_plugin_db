@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const sio = @import("sio");
 const schema = @import("schema.zig");
 const table_mod = @import("table.zig");
+const epoch_runtime = @import("epoch_runtime.zig");
 
 pub const ExecError = error{
     OutOfMemory,
@@ -798,9 +799,31 @@ fn verifyAtomicGrantCursors(allocator: std.mem.Allocator, source: []const u8, gr
     }
 }
 
+fn activeMetaEpoch(allocator: std.mem.Allocator, meta_bytes: []const u8) ExecError!u64 {
+    var parsed = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.SnapshotCorrupted;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-table-meta") or parsed.value.version != 1) return ExecError.SnapshotCorrupted;
+    return parsed.value.epoch;
+}
+
+/// Read-side load under the epoch protocol (docs/vm_concurrency_epoch.md
+/// §3.1): resolve the active meta through the manifest, pin that epoch
+/// in the in-process runtime, and load segment bytes from the pinned
+/// meta. The pin is held only for the load window — afterwards the
+/// exec owns a private in-memory copy of the epoch, as before — but
+/// the epoch choice is now named, shared, and accounted, and a
+/// concurrent commit swaps in a new epoch without disturbing this
+/// load. Segment files are still hash-validated per exec.
 fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!ReadTable {
     const meta_bytes = try readActiveTableMetaSource(allocator, table_name);
     defer allocator.free(meta_bytes);
+    const epoch = try activeMetaEpoch(allocator, meta_bytes);
+    const pin = epoch_runtime.pinLatest(table_name, meta_bytes, epoch, hashBytes(meta_bytes)) catch return ExecError.OutOfMemory;
+    defer epoch_runtime.release(table_name, pin);
+    return loadReadTableFromMeta(allocator, table_name, pin.meta_source);
+}
+
+fn loadReadTableFromMeta(allocator: std.mem.Allocator, table_name: []const u8, meta_bytes: []const u8) ExecError!ReadTable {
     var parsed = std.json.parseFromSlice(QmodTableMeta, allocator, meta_bytes, .{ .allocate = .alloc_always }) catch return ExecError.SnapshotCorrupted;
     defer parsed.deinit();
     if (!std.mem.eql(u8, parsed.value.magic, "sa-db-table-meta") or parsed.value.version != 1) return ExecError.SnapshotCorrupted;
@@ -1613,6 +1636,11 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     }
     write_table.parsed.value.epoch = next_epoch;
     table_mod.commitTableMetaWithRebuiltIndexesUnlocked(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
+    // In-process publication (docs/vm_concurrency_epoch.md §3.2): the
+    // manifest publish above is the durable commit point; this swap
+    // retires the previous epoch pin so in-process readers that pin
+    // from now on adopt the new epoch and the old pin drains.
+    epoch_runtime.noteCommitted(write_table.parsed.value.table_name, next_epoch);
 }
 
 /// Native column primitives for read-only qmod modules (VM query layer,
@@ -2634,6 +2662,101 @@ pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, pa
         .fuel_used = meter.used,
         .fuel_limit = meter.limit,
     } };
+}
+
+/// One independent exec request for `execQueriesParallel`.
+pub const ExecRequest = struct {
+    hash_text: []const u8,
+    params_path: ?[]const u8 = null,
+    fuel_limit: ?u64 = null,
+};
+
+/// Per-request outcome of `execQueriesParallel`, in request order.
+/// Exactly one of `run` / `err` is set.
+pub const ExecOutcome = struct {
+    run: ?ExecRun = null,
+    err: ?ExecError = null,
+
+    pub fn deinit(self: *ExecOutcome, allocator: std.mem.Allocator) void {
+        if (self.run) |*run| run.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ParallelExecCtx = struct {
+    allocator: std.mem.Allocator,
+    requests: []const ExecRequest,
+    outcomes: []ExecOutcome,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn runOne(self: *ParallelExecCtx, idx: usize) void {
+        const request = self.requests[idx];
+        if (execQueryWithFuel(self.allocator, request.hash_text, request.params_path, request.fuel_limit)) |run| {
+            self.outcomes[idx].run = run;
+        } else |err| {
+            self.outcomes[idx].err = err;
+        }
+    }
+
+    fn worker(self: *ParallelExecCtx) void {
+        while (true) {
+            const idx = self.next.fetchAdd(1, .monotonic);
+            if (idx >= self.requests.len) return;
+            self.runOne(idx);
+        }
+    }
+};
+
+/// Run independent exec requests concurrently — the in-process
+/// parallel surface of the epoch concurrency model
+/// (docs/vm_concurrency_epoch.md §4). Read requests execute truly
+/// in parallel against pinned epoch snapshots; write requests
+/// serialize per table on the existing table write lock. Each
+/// request gets its own fuel meter, exactly as a solo
+/// `execQueryWithFuel` call would.
+///
+/// `execQuery` / `execQueryWithFuel` are safe to call concurrently
+/// from multiple threads under the same condition this helper
+/// requires of its caller: `allocator` must be thread-safe (for
+/// example `std.heap.smp_allocator`, or a per-process debug
+/// allocator in tests). All evaluator state is per-call; this file
+/// keeps no mutable globals — the only shared state is the epoch
+/// runtime's mutex-guarded pin registry and the table layer's
+/// already-guarded caches.
+///
+/// `max_threads` bounds the worker pool (and is clamped to the
+/// request count); 0 or 1 runs everything on the calling thread.
+/// If a worker thread cannot be spawned, the remaining requests
+/// still run on the calling thread — requests are never dropped.
+pub fn execQueriesParallel(allocator: std.mem.Allocator, requests: []const ExecRequest, max_threads: usize) error{OutOfMemory}![]ExecOutcome {
+    const outcomes = try allocator.alloc(ExecOutcome, requests.len);
+    for (outcomes) |*outcome| outcome.* = .{};
+    if (requests.len == 0) return outcomes;
+
+    const worker_count = @min(@max(max_threads, 1), requests.len);
+    if (worker_count == 1) {
+        for (requests, 0..) |_, idx| {
+            var ctx = ParallelExecCtx{ .allocator = allocator, .requests = requests, .outcomes = outcomes };
+            ctx.runOne(idx);
+        }
+        return outcomes;
+    }
+
+    var ctx = ParallelExecCtx{ .allocator = allocator, .requests = requests, .outcomes = outcomes };
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+    var spawned: usize = 0;
+    defer {
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (threads) |*thread| {
+        thread.* = std.Thread.spawn(.{}, ParallelExecCtx.worker, .{&ctx}) catch break;
+        spawned += 1;
+    }
+    // If spawning fell short (including zero), drain the rest here;
+    // the atomic cursor makes this race-safe with live workers.
+    if (spawned < worker_count) ctx.worker();
+    return outcomes;
 }
 
 test "qmod register inspect and exec metadata round trip" {
@@ -5574,4 +5697,648 @@ test "qmod register-aot rejects atomic cursor shape" {
     // The shape gate fires before the library is even read: the
     // atomic-cursor discipline has no AOT tier in step 2.
     try std.testing.expectError(ExecError.AotUnsupportedShape, registerAot(std.testing.allocator, hash_hex, "missing.so", null, false));
+}
+
+// ------------------------------------------------------------------
+// Concurrency tests (VM concurrency line, Model A epoch protocol;
+// docs/vm_concurrency_epoch.md). Fixtures mirror the serial tests
+// above: tmp cwd, schema file, CSV ingest, register, exec.
+// ------------------------------------------------------------------
+
+fn concWriteFile(tmp: std.testing.TmpDir, name: []const u8, bytes: []const u8) !void {
+    var file = try (sio.Dir{ .inner = tmp.dir }).createFile(name, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+}
+
+fn concRegister(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, file_name: []const u8, source: []const u8) ![]u8 {
+    try concWriteFile(tmp, file_name, source);
+    var result = try registerQuery(allocator, file_name);
+    defer result.deinit(allocator);
+    return hashHexAlloc(allocator, result.hash);
+}
+
+/// Builds the two-column `conc` table (id, val) with `rows` rows and
+/// val = `val_fill` everywhere, plus a one-column `counter` table.
+/// Returns the registered module hashes used by the concurrency
+/// tests.
+const ConcFixture = struct {
+    sum_hash: []u8,
+    setall_hash: []u8,
+    atomic_hash: []u8,
+    counter_sum_hash: []u8,
+};
+
+fn concSetup(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, rows: u32, val_fill: u64) !ConcFixture {
+    try concWriteFile(tmp, "conc.sadb-schema",
+        \\#def MAX_ROWS = 65536
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VAL_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 16
+    );
+    var csv_text = std.array_list.Managed(u8).init(allocator);
+    defer csv_text.deinit();
+    try csv_text.appendSlice("ID,VAL\n");
+    var line_buf: [64]u8 = undefined;
+    for (0..rows) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "{d},{d}\n", .{ i, val_fill });
+        try csv_text.appendSlice(line);
+    }
+    try concWriteFile(tmp, "conc.csv", csv_text.items);
+    _ = try table_mod.ingestTable(allocator, ".", "conc", "conc.csv");
+
+    try concWriteFile(tmp, "counter.sadb-schema",
+        \\#def MAX_ROWS = 16
+        \\#def COL_N_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    try concWriteFile(tmp, "counter.csv", "n\n0\n");
+    _ = try table_mod.ingestTable(allocator, ".", "counter", "counter.csv");
+
+    const sum_hash = try concRegister(allocator, tmp, "conc_sum.query.sa",
+        \\grants [db_read:conc]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\total = col_sum col_val, len
+        \\return total
+    );
+    errdefer allocator.free(sum_hash);
+    const setall_hash = try concRegister(allocator, tmp, "conc_setall.query.sa",
+        \\grants [db_write:conc]
+        \\@main(&col_val: ptr, len: u64, value: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\store col_val+offset, value as u64
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return value
+    );
+    errdefer allocator.free(setall_hash);
+    const atomic_hash = try concRegister(allocator, tmp, "conc_atomic.query.sa",
+        \\grants [db_atomic_cursor:counter]
+        \\@main(&cursor: ptr) -> u64:
+        \\L_ENTRY:
+        \\old = atomic_rmw_add cursor+0, 1
+        \\return old
+    );
+    errdefer allocator.free(atomic_hash);
+    const counter_sum_hash = try concRegister(allocator, tmp, "counter_sum.query.sa",
+        \\grants [db_read:counter]
+        \\@main(&col_n: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\total = col_sum col_n, len
+        \\return total
+    );
+    return .{
+        .sum_hash = sum_hash,
+        .setall_hash = setall_hash,
+        .atomic_hash = atomic_hash,
+        .counter_sum_hash = counter_sum_hash,
+    };
+}
+
+fn concFreeFixture(allocator: std.mem.Allocator, fixture: ConcFixture) void {
+    allocator.free(fixture.sum_hash);
+    allocator.free(fixture.setall_hash);
+    allocator.free(fixture.atomic_hash);
+    allocator.free(fixture.counter_sum_hash);
+}
+
+test "qmod concurrent readers and single writer keep the epoch oracle" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 200;
+    const commits: u64 = 10;
+    const fixture = try concSetup(std.testing.allocator, tmp, @intCast(rows), 0);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    // Per-commit params files, written up front so worker threads
+    // never write files.
+    var param_names: [10][24]u8 = undefined;
+    for (0..commits) |i| {
+        const name = try std.fmt.bufPrint(&param_names[i], "cparams{d}.bin", .{i + 1});
+        param_names[i][name.len] = 0;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, i + 1, .little);
+        try concWriteFile(tmp, name, &bytes);
+    }
+
+    // One warm exec adopts the setup epoch into the runtime.
+    {
+        var warm = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer warm.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), warm.ok.result_u64.?);
+    }
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    const WriterCtx = struct {
+        hash: []const u8,
+        names: *const [10][24]u8,
+        commits: u64,
+        done: u64 = 0,
+        bad: u64 = 0,
+    };
+    const writer_fn = struct {
+        fn work(ctx: *WriterCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var v: u64 = 1;
+            while (v <= ctx.commits) : (v += 1) {
+                const name = std.mem.sliceTo(&ctx.names[v - 1], 0);
+                var run = execQuery(alloc, ctx.hash, name) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0 or run.ok.result_u64.? != v) ctx.bad += 1;
+                ctx.done += 1;
+            }
+        }
+    }.work;
+
+    const ReaderCtx = struct {
+        hash: []const u8,
+        rows: u64,
+        max_v: u64,
+        execs: u64,
+        done: u64 = 0,
+        bad: u64 = 0,
+    };
+    const reader_fn = struct {
+        fn work(ctx: *ReaderCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var last_v: u64 = 0;
+            var i: u64 = 0;
+            while (i < ctx.execs) : (i += 1) {
+                var run = execQuery(alloc, ctx.hash, null) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                const sum = run.ok.result_u64.?;
+                // The oracle: every committed epoch has val == v in
+                // all rows, so a consistent read is exactly v*rows
+                // for some committed v, and v never goes backwards
+                // for a single reader. Anything else is a torn read.
+                if (sum % ctx.rows != 0) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                const v = sum / ctx.rows;
+                if (v > ctx.max_v or v < last_v) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                last_v = v;
+                ctx.done += 1;
+            }
+        }
+    }.work;
+
+    var writer_ctx = WriterCtx{ .hash = fixture.setall_hash, .names = &param_names, .commits = commits };
+    var reader_ctxs: [4]ReaderCtx = undefined;
+    for (&reader_ctxs) |*ctx| ctx.* = .{ .hash = fixture.sum_hash, .rows = rows, .max_v = commits, .execs = 30 };
+
+    var writer_thread = try std.Thread.spawn(.{}, writer_fn, .{&writer_ctx});
+    var reader_threads: [4]std.Thread = undefined;
+    for (&reader_threads, &reader_ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, reader_fn, .{ctx});
+    }
+    writer_thread.join();
+    for (&reader_threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(@as(u64, 0), writer_ctx.bad);
+    try std.testing.expectEqual(commits, writer_ctx.done);
+    for (&reader_ctxs) |*ctx| {
+        try std.testing.expectEqual(@as(u64, 0), ctx.bad);
+        try std.testing.expectEqual(@as(u64, 30), ctx.done);
+    }
+
+    // Final state equals the serial oracle: the last commit wins.
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(commits * rows, run.ok.result_u64.?);
+    }
+    _ = try table_mod.verifyTable(std.testing.allocator, ".", "conc");
+    // Every pin drained; the runtime's current epoch is the last commit.
+    try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
+    try std.testing.expectEqual(@as(?u64, null), epoch_runtime.oldestLiveEpoch("conc"));
+    try std.testing.expectEqual(@as(?u64, base_epoch + commits), epoch_runtime.currentEpoch("conc"));
+}
+
+test "qmod concurrent atomic cursor increments are exact" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const fixture = try concSetup(std.testing.allocator, tmp, 4, 0);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    const threads_n: u64 = 4;
+    const per_thread: u64 = 12;
+    const total: u64 = threads_n * per_thread;
+
+    const Ctx = struct {
+        hash: []const u8,
+        execs: u64,
+        seen: *[64]bool,
+        seen_mutex: *std.atomic.Mutex,
+        bad: u64 = 0,
+    };
+    const worker = struct {
+        fn work(ctx: *Ctx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var i: u64 = 0;
+            while (i < ctx.execs) : (i += 1) {
+                var run = execQuery(alloc, ctx.hash, null) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                const old = run.ok.result_u64.?;
+                if (old >= 64) {
+                    ctx.bad += 1;
+                    continue;
+                }
+                while (!ctx.seen_mutex.tryLock()) std.atomic.spinLoopHint();
+                if (ctx.seen[old]) ctx.bad += 1;
+                ctx.seen[old] = true;
+                ctx.seen_mutex.unlock();
+            }
+        }
+    }.work;
+
+    var seen: [64]bool = std.mem.zeroes([64]bool);
+    var seen_mutex: std.atomic.Mutex = .unlocked;
+    var ctxs: [4]Ctx = undefined;
+    for (&ctxs) |*ctx| ctx.* = .{ .hash = fixture.atomic_hash, .execs = per_thread, .seen = &seen, .seen_mutex = &seen_mutex };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, &ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, worker, .{ctx});
+    }
+    for (&threads) |*thread| thread.join();
+
+    for (&ctxs) |*ctx| try std.testing.expectEqual(@as(u64, 0), ctx.bad);
+    // Every old value 0..total-1 was handed out exactly once: no
+    // lost update and no double increment across concurrent execs.
+    for (0..total) |i| try std.testing.expect(seen[i]);
+    for (total..64) |i| try std.testing.expect(!seen[i]);
+
+    var run = try execQuery(std.testing.allocator, fixture.counter_sum_hash, null);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(total, run.ok.result_u64.?);
+}
+
+test "qmod fuel exhaustion under concurrency stays per-exec" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const fixture = try concSetup(std.testing.allocator, tmp, 50, 1);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    const runaway_hash = try concRegister(std.testing.allocator, tmp, "conc_runaway.query.sa",
+        \\grants [db_read:conc]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\zero = add 0, 0
+        \\jmp L_TOP
+        \\L_TOP:
+        \\v = load col_val+zero as u64
+        \\jmp L_TOP
+    );
+    defer std.testing.allocator.free(runaway_hash);
+
+    // Params for a set-all of value 9 that will be starved of fuel.
+    var nine: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nine, 9, .little);
+    try concWriteFile(tmp, "fparams.bin", &nine);
+
+    const FlagCtx = struct {
+        hash: []const u8,
+        params: ?[]const u8,
+        fuel: ?u64,
+        got_fuel_exhausted: bool = false,
+        bad: u64 = 0,
+    };
+    const flag_fn = struct {
+        fn work(ctx: *FlagCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            if (execQueryWithFuel(alloc, ctx.hash, ctx.params, ctx.fuel)) |run| {
+                var owned = run;
+                owned.deinit(alloc);
+                ctx.bad += 1; // must not succeed
+            } else |err| {
+                if (err == ExecError.FuelExhausted) {
+                    ctx.got_fuel_exhausted = true;
+                } else {
+                    ctx.bad += 1;
+                }
+            }
+        }
+    }.work;
+
+    const ReaderCtx = struct {
+        hash: []const u8,
+        expected: u64,
+        execs: u64,
+        bad: u64 = 0,
+    };
+    const reader_fn = struct {
+        fn work(ctx: *ReaderCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var i: u64 = 0;
+            while (i < ctx.execs) : (i += 1) {
+                var run = execQuery(alloc, ctx.hash, null) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0 or run.ok.result_u64.? != ctx.expected) ctx.bad += 1;
+            }
+        }
+    }.work;
+
+    var runaway_ctx = FlagCtx{ .hash = runaway_hash, .params = null, .fuel = null };
+    var starved_ctx = FlagCtx{ .hash = fixture.setall_hash, .params = "fparams.bin", .fuel = 10 };
+    var reader_ctxs: [2]ReaderCtx = undefined;
+    for (&reader_ctxs) |*ctx| ctx.* = .{ .hash = fixture.sum_hash, .expected = 50, .execs = 20 };
+
+    var t1 = try std.Thread.spawn(.{}, flag_fn, .{&runaway_ctx});
+    var t2 = try std.Thread.spawn(.{}, flag_fn, .{&starved_ctx});
+    var reader_threads: [2]std.Thread = undefined;
+    for (&reader_threads, &reader_ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, reader_fn, .{ctx});
+    }
+    t1.join();
+    t2.join();
+    for (&reader_threads) |*thread| thread.join();
+
+    // Both runaway executions died on their own meters...
+    try std.testing.expect(runaway_ctx.got_fuel_exhausted);
+    try std.testing.expect(starved_ctx.got_fuel_exhausted);
+    try std.testing.expectEqual(@as(u64, 0), runaway_ctx.bad);
+    try std.testing.expectEqual(@as(u64, 0), starved_ctx.bad);
+    // ...readers were never disturbed...
+    for (&reader_ctxs) |*ctx| try std.testing.expectEqual(@as(u64, 0), ctx.bad);
+    // ...and the starved writer left zero partial writes.
+    var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 50), run.ok.result_u64.?);
+}
+
+test "qmod grant rejections hold under concurrent read load" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const fixture = try concSetup(std.testing.allocator, tmp, 50, 1);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    const ReaderCtx = struct {
+        hash: []const u8,
+        expected: u64,
+        execs: u64,
+        bad: u64 = 0,
+    };
+    const reader_fn = struct {
+        fn work(ctx: *ReaderCtx) void {
+            var gpa = std.heap.DebugAllocator(.{}){};
+            defer _ = gpa.deinit();
+            const alloc = gpa.allocator();
+            var i: u64 = 0;
+            while (i < ctx.execs) : (i += 1) {
+                var run = execQuery(alloc, ctx.hash, null) catch {
+                    ctx.bad += 1;
+                    continue;
+                };
+                defer run.deinit(alloc);
+                if (run.ok.code != 0 or run.ok.result_u64.? != ctx.expected) ctx.bad += 1;
+            }
+        }
+    }.work;
+
+    var reader_ctxs: [3]ReaderCtx = undefined;
+    for (&reader_ctxs) |*ctx| ctx.* = .{ .hash = fixture.sum_hash, .expected = 50, .execs = 40 };
+    var reader_threads: [3]std.Thread = undefined;
+    for (&reader_threads, &reader_ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, reader_fn, .{ctx});
+    }
+
+    // While readers hammer the table, the register-time static
+    // checks must reject exactly as they do without load: a store
+    // under a read grant, a load through an undeclared pointer, and
+    // an atomic op under a read grant are all capability escalations.
+    try concWriteFile(tmp, "bad_store.query.sa",
+        \\grants [db_read:conc]
+        \\@main(&col_val: ptr) -> u64:
+        \\L_ENTRY:
+        \\store col_val+0, 1 as u64
+        \\return 0
+    );
+    try std.testing.expectError(ExecError.DbCapabilityEscalation, registerQuery(std.testing.allocator, "bad_store.query.sa"));
+
+    try concWriteFile(tmp, "bad_pointer.query.sa",
+        \\grants [db_read:conc]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\offset = mul 0, 8
+        \\value = load other+offset as u64
+        \\return value
+    );
+    try std.testing.expectError(ExecError.DbCapabilityEscalation, registerQuery(std.testing.allocator, "bad_pointer.query.sa"));
+
+    try concWriteFile(tmp, "bad_atomic.query.sa",
+        \\grants [db_read:conc]
+        \\@main(&cursor: ptr) -> u64:
+        \\L_ENTRY:
+        \\old = atomic_rmw_add cursor+0, 1
+        \\return old
+    );
+    try std.testing.expectError(ExecError.DbCapabilityEscalation, registerQuery(std.testing.allocator, "bad_atomic.query.sa"));
+
+    for (&reader_threads) |*thread| thread.join();
+    for (&reader_ctxs) |*ctx| try std.testing.expectEqual(@as(u64, 0), ctx.bad);
+}
+
+test "qmod parallel exec surface is ordered and scales readers" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    // A CPU-bound read workload: interpreter loop sum over 20k rows
+    // (no native primitive), so serial-vs-parallel wall time shows
+    // whether readers truly run concurrently.
+    try concWriteFile(tmp, "bench.sadb-schema",
+        \\#def MAX_ROWS = 65536
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_VAL_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 16
+    );
+    var csv_text = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer csv_text.deinit();
+    try csv_text.appendSlice("ID,VAL\n");
+    var line_buf: [64]u8 = undefined;
+    for (0..20_000) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "{d},1\n", .{i});
+        try csv_text.appendSlice(line);
+    }
+    try concWriteFile(tmp, "bench.csv", csv_text.items);
+    _ = try table_mod.ingestTable(std.testing.allocator, ".", "bench", "bench.csv");
+
+    const loop_hash = try concRegister(std.testing.allocator, tmp, "bench_sum.query.sa",
+        \\grants [db_read:bench]
+        \\@main(&col_val: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\sum = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_val+offset as u64
+        \\sum = add sum, value
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return sum
+    );
+    defer std.testing.allocator.free(loop_hash);
+
+    var requests: [8]ExecRequest = undefined;
+    for (&requests) |*request| request.* = .{ .hash_text = loop_hash };
+
+    const serial_start = sio.nanoTimestamp();
+    const serial = try execQueriesParallel(std.testing.allocator, &requests, 1);
+    const serial_ns: u64 = @intCast(sio.nanoTimestamp() - serial_start);
+    for (serial) |*outcome| {
+        try std.testing.expect(outcome.err == null);
+        try std.testing.expectEqual(@as(u64, 20_000), outcome.run.?.ok.result_u64.?);
+        outcome.deinit(std.testing.allocator);
+    }
+    std.testing.allocator.free(serial);
+
+    const parallel_start = sio.nanoTimestamp();
+    const parallel = try execQueriesParallel(std.testing.allocator, &requests, 4);
+    const parallel_ns: u64 = @intCast(sio.nanoTimestamp() - parallel_start);
+    for (parallel) |*outcome| {
+        try std.testing.expect(outcome.err == null);
+        try std.testing.expectEqual(@as(u64, 20_000), outcome.run.?.ok.result_u64.?);
+        outcome.deinit(std.testing.allocator);
+    }
+    std.testing.allocator.free(parallel);
+
+    std.debug.print("qmod parallel scaling: serial={d}ms parallel4={d}ms\n", .{ serial_ns / std.time.ns_per_ms, parallel_ns / std.time.ns_per_ms });
+    // Readers are not serialized by a global lock: four workers
+    // finish the same CPU-bound batch well under the serial time.
+    try std.testing.expect(parallel_ns * 4 <= serial_ns * 3);
+
+    // Mixed batch: outcomes stay in request order even though the
+    // write races the reads; each read sees a whole epoch.
+    const fixture = try concSetup(std.testing.allocator, tmp, 10, 3);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    var seven: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seven, 7, .little);
+    try concWriteFile(tmp, "mparams.bin", &seven);
+    const mixed = [_]ExecRequest{
+        .{ .hash_text = fixture.sum_hash },
+        .{ .hash_text = fixture.setall_hash, .params_path = "mparams.bin" },
+        .{ .hash_text = fixture.sum_hash },
+    };
+    const outcomes = try execQueriesParallel(std.testing.allocator, &mixed, 3);
+    defer std.testing.allocator.free(outcomes);
+    defer for (outcomes) |*outcome| outcome.deinit(std.testing.allocator);
+    for (outcomes) |*outcome| try std.testing.expect(outcome.err == null);
+    const first_sum = outcomes[0].run.?.ok.result_u64.?;
+    const last_sum = outcomes[2].run.?.ok.result_u64.?;
+    try std.testing.expect(first_sum == 30 or first_sum == 70);
+    try std.testing.expect(last_sum == 30 or last_sum == 70);
+    try std.testing.expectEqual(@as(u64, 7), outcomes[1].run.?.ok.result_u64.?);
+
+    var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 70), run.ok.result_u64.?);
+}
+
+test "qmod many sequential commits keep canonical epoch file names" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const fixture = try concSetup(std.testing.allocator, tmp, 4, 1);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    // Regression for the chained epoch-suffix defect: the segment
+    // rewrite used to append ".e<epoch>" to the previous epoch's
+    // file name, so names grew on every commit and writes started
+    // failing with SnapshotCorrupted once the name crossed the
+    // filesystem limit (observed at epoch 57 on the bench table),
+    // leaving the table permanently unwritable. 90 commits stay
+    // far below that limit only when names are canonical.
+    var i: u64 = 0;
+    while (i < 90) : (i += 1) {
+        const value: u64 = if (i % 2 == 0) 5 else 6;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, value, .little);
+        try concWriteFile(tmp, "mparams.bin", &bytes);
+        var run = try execQuery(std.testing.allocator, fixture.setall_hash, "mparams.bin");
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), run.ok.code);
+        try std.testing.expectEqual(value, run.ok.result_u64.?);
+    }
+
+    var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 24), run.ok.result_u64.?);
+    const info = try table_mod.verifyTable(std.testing.allocator, ".", "conc");
+    try std.testing.expectEqual(@as(u64, 91), info.epoch);
+    try std.testing.expectEqual(@as(u64, 4), info.row_count);
+    try std.testing.expect(!info.locked);
 }
