@@ -9023,12 +9023,126 @@ fn groupWalLock() void {
     while (!group_wal_mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
+// --- lock-free frontier publication (docs §12.1) -----------------------------
+// The mutex-guarded map above stays the authoritative state;
+// alongside it, every publish mirrors the state into a fixed
+// array of seqlock slots so the common reader (a pin deciding
+// whether a fold can advance anything) resolves the frontier
+// with atomic loads only — no coordinator mutex. A slot is
+// claimed by the first key that hashes to it and keeps that
+// key forever (the copy below is never freed; the array is
+// the bound). A table whose slot is held by a foreign key
+// simply always takes the mutex path. Publication order is
+// unchanged from the mutex-only design (the mirror is written
+// inside the publish call, before any ack the publish feeds),
+// so a slot snapshot is never ahead of the coordinator and
+// lags it by at most the one publish in flight; §12.1
+// enumerates why every consumer's stale direction is safe.
+
+pub const GROUP_FRONTIER_SLOT_COUNT: usize = 32;
+
+const GroupFrontierSlot = struct {
+    seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    key: std.atomic.Value(?[*:0]const u8) = std.atomic.Value(?[*:0]const u8).init(null),
+    active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    projected_extra: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    frontier_len: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    frontier_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+var group_frontier_slots: [GROUP_FRONTIER_SLOT_COUNT]GroupFrontierSlot = blk: {
+    var arr: [GROUP_FRONTIER_SLOT_COUNT]GroupFrontierSlot = undefined;
+    for (&arr) |*slot| slot.* = .{};
+    break :blk arr;
+};
+
+/// Observability for tests and diagnostics: how many
+/// `groupWalState` reads the lock-free path has served.
+pub var group_frontier_fast_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Test seam (mirrors `test_sync_gate`): when set,
+/// `groupWalState` never takes the lock-free path, so tests
+/// can prove the locked and lock-free resolutions agree.
+/// Never set outside tests.
+pub var test_group_frontier_fast_disable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn groupFrontierIndex(key: []const u8) usize {
+    var h = std.hash.Wyhash.init(0x67726f75702d666e);
+    h.update(key);
+    return @intCast(h.final() % GROUP_FRONTIER_SLOT_COUNT);
+}
+
+/// The slot for `key`, claiming a free one when `claim` is
+/// set. Slots are probed linearly from the key's hash and
+/// never evicted or unclaimed, so a claimed key is always
+/// found before the first empty slot of its probe chain.
+/// Caller holds group_wal_mutex (publishers are serialized),
+/// so claiming needs no CAS.
+fn groupFrontierSlot(key: []const u8, claim: bool) ?*GroupFrontierSlot {
+    const base = groupFrontierIndex(key);
+    var i: usize = 0;
+    while (i < GROUP_FRONTIER_SLOT_COUNT) : (i += 1) {
+        const slot = &group_frontier_slots[(base + i) % GROUP_FRONTIER_SLOT_COUNT];
+        if (slot.key.load(.acquire)) |existing| {
+            if (std.mem.eql(u8, std.mem.span(existing), key)) return slot;
+            continue;
+        }
+        if (!claim) return null;
+        const buf = unsafe_init_cache_allocator.alloc(u8, key.len + 1) catch return null;
+        @memcpy(buf[0..key.len], key);
+        buf[key.len] = 0;
+        const owned: [*:0]const u8 = @ptrCast(buf.ptr);
+        slot.key.store(owned, .release);
+        return slot;
+    }
+    return null;
+}
+
+/// Mirror one published state into the key's slot.
+/// Caller holds group_wal_mutex.
+fn groupFrontierPublish(key: []const u8, state: GroupWalState, claim: bool) void {
+    const slot = groupFrontierSlot(key, claim) orelse return;
+    _ = slot.seq.fetchAdd(1, .acq_rel); // odd: update in flight
+    slot.active.store(state.active, .monotonic);
+    slot.projected_extra.store(state.projected_extra, .monotonic);
+    slot.frontier_len.store(state.frontier_len, .monotonic);
+    slot.frontier_epoch.store(state.frontier_epoch, .monotonic);
+    _ = slot.seq.fetchAdd(1, .release); // even: snapshot stable
+}
+
+/// A lock-free snapshot of the key's state, or null when the
+/// fast path cannot prove one (fast path disabled, the key's
+/// probe chain ends unclaimed, or an update raced the read).
+fn groupFrontierRead(key: []const u8) ?GroupWalState {
+    if (test_group_frontier_fast_disable.load(.acquire)) return null;
+    const base = groupFrontierIndex(key);
+    var i: usize = 0;
+    while (i < GROUP_FRONTIER_SLOT_COUNT) : (i += 1) {
+        const slot = &group_frontier_slots[(base + i) % GROUP_FRONTIER_SLOT_COUNT];
+        const key_ptr = slot.key.load(.acquire) orelse return null;
+        if (!std.mem.eql(u8, std.mem.span(key_ptr), key)) continue;
+        const seq1 = slot.seq.load(.acquire);
+        if (seq1 % 2 != 0) return null;
+        const state = GroupWalState{
+            .active = slot.active.load(.monotonic),
+            .projected_extra = slot.projected_extra.load(.monotonic),
+            .frontier_len = slot.frontier_len.load(.monotonic),
+            .frontier_epoch = slot.frontier_epoch.load(.monotonic),
+        };
+        if (slot.seq.load(.acquire) != seq1) return null;
+        _ = group_frontier_fast_hits.fetchAdd(1, .monotonic);
+        return state;
+    }
+    return null;
+}
+
 pub fn groupWalState(root_dir: []const u8, table_name: []const u8) GroupWalState {
+    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return .{};
+    defer unsafe_init_cache_allocator.free(key);
+    if (groupFrontierRead(key)) |state| return state;
     groupWalLock();
     defer group_wal_mutex.unlock();
     if (!group_wal_states_init) return .{};
-    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return .{};
-    defer unsafe_init_cache_allocator.free(key);
     return group_wal_states.get(key) orelse .{};
 }
 
@@ -9044,8 +9158,9 @@ pub fn groupWalPublishState(root_dir: []const u8, table_name: []const u8, state:
         unsafe_init_cache_allocator.free(key);
         return;
     };
-    if (gop.found_existing) unsafe_init_cache_allocator.free(key);
     gop.value_ptr.* = state;
+    groupFrontierPublish(key, state, true);
+    if (gop.found_existing) unsafe_init_cache_allocator.free(key);
 }
 
 pub fn groupWalClear(root_dir: []const u8, table_name: []const u8) void {
@@ -9055,6 +9170,9 @@ pub fn groupWalClear(root_dir: []const u8, table_name: []const u8) void {
     const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return;
     defer unsafe_init_cache_allocator.free(key);
     if (group_wal_states.fetchRemove(key)) |kv| unsafe_init_cache_allocator.free(kv.key);
+    // The mirror follows the map: a cleared table publishes
+    // the default state, but never claims a fresh slot.
+    groupFrontierPublish(key, .{}, false);
 }
 
 /// An owned deep copy of the epoch tip (docs §11.2): group
@@ -29443,6 +29561,61 @@ fn walTestInsertLegacy(allocator: std.mem.Allocator, table_name: []const u8, id:
     _ = try writeTransactionInsertRawRow(tx, &row);
     _ = try commitWriteTransaction(allocator, tx);
     destroyWriteTransaction(allocator, tx);
+}
+
+test "wal group frontier fast path serves published state and falls back cleanly" {
+    const table_name = "frontier_fast";
+    const hits0 = group_frontier_fast_hits.load(.acquire);
+
+    // Nothing published: the default state, from either path.
+    var state = groupWalState(".", table_name);
+    try std.testing.expect(!state.active);
+    try std.testing.expectEqual(@as(u64, 0), state.frontier_epoch);
+
+    groupWalPublishState(".", table_name, .{
+        .active = true,
+        .projected_extra = 7,
+        .frontier_len = 123,
+        .frontier_epoch = 9,
+    });
+    state = groupWalState(".", table_name);
+    try std.testing.expect(state.active);
+    try std.testing.expectEqual(@as(u64, 7), state.projected_extra);
+    try std.testing.expectEqual(@as(u64, 123), state.frontier_len);
+    try std.testing.expectEqual(@as(u64, 9), state.frontier_epoch);
+    // The lock-free path served at least the post-publish read.
+    try std.testing.expect(group_frontier_fast_hits.load(.acquire) > hits0);
+
+    // With the fast path disabled, the locked path serves the
+    // identical snapshot and the fast-hit counter does not move.
+    const hits1 = group_frontier_fast_hits.load(.acquire);
+    test_group_frontier_fast_disable.store(true, .release);
+    state = groupWalState(".", table_name);
+    test_group_frontier_fast_disable.store(false, .release);
+    try std.testing.expect(state.active);
+    try std.testing.expectEqual(@as(u64, 9), state.frontier_epoch);
+    try std.testing.expectEqual(hits1, group_frontier_fast_hits.load(.acquire));
+
+    // A state republished through the slot tracks the newest
+    // values, and a clear returns both paths to the default.
+    groupWalPublishState(".", table_name, .{
+        .active = true,
+        .projected_extra = 0,
+        .frontier_len = 200,
+        .frontier_epoch = 10,
+    });
+    state = groupWalState(".", table_name);
+    try std.testing.expectEqual(@as(u64, 200), state.frontier_len);
+    try std.testing.expectEqual(@as(u64, 10), state.frontier_epoch);
+    groupWalClear(".", table_name);
+    state = groupWalState(".", table_name);
+    try std.testing.expect(!state.active);
+    try std.testing.expectEqual(@as(u64, 0), state.frontier_epoch);
+
+    // A different table never observes this table's state.
+    state = groupWalState(".", "frontier_fast_other");
+    try std.testing.expect(!state.active);
+    try std.testing.expectEqual(@as(u64, 0), state.frontier_len);
 }
 
 test "wal epoch unit folds on checkpoint and publishes its meta" {

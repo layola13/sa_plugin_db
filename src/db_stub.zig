@@ -6656,6 +6656,130 @@ test "qmod group commit readers are not starved by a syncing batch" {
     try std.testing.expectEqual(@as(u64, 9 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
 }
 
+test "qmod pins resolve through the atomic frontier while a batch sync is gated" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+
+    var gate = table_mod.TestSyncGate{};
+    table_mod.test_sync_gate = &gate;
+    defer {
+        gate.releaseAll();
+        table_mod.test_sync_gate = null;
+    }
+
+    try groupTestWriteParams(tmp, "gfront.bin", 9);
+    var wctx = GroupWriterCtx{ .hash = fixture.setall_hash, .params = "gfront.bin", .expect = 9 };
+    var wthread = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{&wctx});
+    try groupTestWaitFor(&gate.entered, "leader sync entry");
+    // The submit-side publications have landed, so the frontier
+    // slot for this table is claimed. From here, every reader
+    // decision must come from atomic loads: the leader is
+    // parked inside the sync holding the table write lock, so
+    // any reader that needed the coordinator mutex or a fold
+    // would either serialize against the publications or block
+    // behind the lock past the gate.
+    const hits0 = table_mod.group_frontier_fast_hits.load(.acquire);
+
+    var rctxs: [2]GroupReaderCtx = undefined;
+    var rthreads: [2]std.Thread = undefined;
+    for (&rctxs) |*rctx| rctx.* = .{ .hash = fixture.sum_hash, .expect_sum = 5 * rows, .execs = 10 };
+    for (&rthreads, &rctxs) |*thread, *rctx| {
+        thread.* = try std.Thread.spawn(.{}, GroupReaderCtx.work, .{rctx});
+    }
+    for (&rthreads) |*thread| thread.join();
+    for (&rctxs) |*rctx| {
+        try std.testing.expectEqual(@as(u64, 0), rctx.bad);
+        try std.testing.expectEqual(@as(u64, 10), rctx.completed);
+    }
+    try std.testing.expect(table_mod.group_frontier_fast_hits.load(.acquire) > hits0);
+    try std.testing.expect(!wctx.done.load(.acquire));
+    gate.releaseAll();
+    wthread.join();
+    try std.testing.expect(wctx.ok);
+    try std.testing.expectEqual(@as(u64, 9 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+}
+
+test "qmod fast and locked pin paths resolve the same visible set" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    // Warm read adopts the setup epoch into the runtime; only
+    // then is the epoch baseline meaningful.
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    const read_both = struct {
+        fn go(hash: []const u8) !struct { fast: u64, locked: u64 } {
+            table_mod.test_group_frontier_fast_disable.store(false, .release);
+            const fast = try groupTestSum(std.testing.allocator, hash);
+            table_mod.test_group_frontier_fast_disable.store(true, .release);
+            const locked = try groupTestSum(std.testing.allocator, hash);
+            table_mod.test_group_frontier_fast_disable.store(false, .release);
+            return .{ .fast = fast, .locked = locked };
+        }
+    }.go;
+
+    // Quiescent point: nothing pending anywhere.
+    {
+        const both = try read_both(fixture.sum_hash);
+        try std.testing.expectEqual(@as(u64, 5 * rows), both.fast);
+        try std.testing.expectEqual(both.fast, both.locked);
+    }
+
+    var gate = table_mod.TestSyncGate{};
+    table_mod.test_sync_gate = &gate;
+    defer {
+        gate.releaseAll();
+        table_mod.test_sync_gate = null;
+    }
+    try groupTestWriteParams(tmp, "gvis2.bin", 77);
+    var ctx = GroupWriterCtx{ .hash = fixture.setall_hash, .params = "gvis2.bin", .expect = 77 };
+    var thread = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{&ctx});
+    try groupTestWaitFor(&gate.entered, "leader sync entry");
+    // Mid-flight point: the batch is framed and syncing but
+    // unacked; both paths must keep resolving the old epoch.
+    {
+        const both = try read_both(fixture.sum_hash);
+        try std.testing.expectEqual(@as(u64, 5 * rows), both.fast);
+        try std.testing.expectEqual(both.fast, both.locked);
+        try std.testing.expectEqual(base_epoch, epoch_runtime.currentEpoch("conc").?);
+    }
+    gate.releaseAll();
+    thread.join();
+    try std.testing.expect(ctx.ok);
+    // Acked-but-unfolded point: whichever path reads first
+    // drives the fold; both must land on the new epoch's sum.
+    {
+        const both = try read_both(fixture.sum_hash);
+        try std.testing.expectEqual(@as(u64, 77 * rows), both.fast);
+        try std.testing.expectEqual(both.fast, both.locked);
+        try std.testing.expectEqual(base_epoch + 1, epoch_runtime.currentEpoch("conc").?);
+    }
+    // Settled point: WAL folded and truncated.
+    table_mod.checkpointWalIfDirty(std.testing.allocator, ".", "conc") catch |err| return mapTableError(err);
+    {
+        const both = try read_both(fixture.sum_hash);
+        try std.testing.expectEqual(@as(u64, 77 * rows), both.fast);
+        try std.testing.expectEqual(both.fast, both.locked);
+    }
+}
+
 test "qmod concurrent writers on one table all land through the commit queue" {
     var original_cwd = try sio.cwd().openDir(".", .{});
     defer original_cwd.close();
