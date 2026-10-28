@@ -1,0 +1,5 @@
+grants [db_read:vm_orders]
+@main(&col_amount: ptr, &col_qty: ptr, len: u64) -> u64:
+L_ENTRY:
+total = col_sum_where_eq col_amount, len, col_qty, 5
+return total

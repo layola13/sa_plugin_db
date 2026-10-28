@@ -150,4 +150,158 @@ test -f .sa/db/qmods/$query_hash.meta.json
 test -f .sa/db/qmods/$odd_hash.qmod
 test -f .sa/db/qmods/$odd_hash.meta.json
 
+# --- VM query layer step 1: fuel metering + native column primitives ---
+cat > vm_orders.sadb-schema <<'SCHEMA'
+#def MAX_ROWS = 16
+#def COL_ID_STRIDE = 8 // u64
+#def COL_QTY_STRIDE = 8 // u64
+#def COL_AMOUNT_STRIDE = 8 // u64
+SCHEMA
+
+cat > vm_orders.csv <<'CSV'
+ID,QTY,AMOUNT
+1,2,100
+2,5,250
+3,1,40
+4,5,300
+5,3,150
+CSV
+
+SA_PLUGIN_DEV=1 "$sa_bin" db init vm_orders.sadb-schema >/dev/null
+SA_PLUGIN_DEV=1 "$sa_bin" db ingest vm_orders vm_orders.csv | grep -F 'row_count: 5' >/dev/null
+
+# Interpreter loop: sum of AMOUNT where QTY == 5 (250 + 300 = 550).
+cat > vm_loop_sum.query.sa <<'QUERY'
+grants [db_read:vm_orders]
+@main(&col_qty: ptr, &col_amount: ptr, len: u64) -> u64:
+L_ENTRY:
+idx = add 0, 0
+sum = add 0, 0
+jmp L_COND
+L_COND:
+cond = ult idx, len
+br cond -> L_BODY, L_EXIT
+L_BODY:
+qoff = mul idx, 8
+qty = load col_qty+qoff as u64
+hit = eq qty, 5
+br hit -> L_MATCH, L_NEXT
+L_MATCH:
+aoff = mul idx, 8
+amt = load col_amount+aoff as u64
+sum = add sum, amt
+jmp L_NEXT
+L_NEXT:
+idx = add idx, 1
+jmp L_COND
+L_EXIT:
+return sum
+QUERY
+
+vm_loop_output="$(SA_PLUGIN_DEV=1 "$sa_bin" db register vm_loop_sum.query.sa)"
+vm_loop_hash="$(printf '%s\n' "$vm_loop_output" | awk '/^Hash:/ {print $2}')"
+test "${#vm_loop_hash}" -eq 64
+SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_loop_hash" | grep -F 'result_u64: 550' >/dev/null
+
+# Native primitive: the same predicate + aggregate in one call.
+cat > vm_prim_sum.query.sa <<'QUERY'
+grants [db_read:vm_orders]
+@main(&col_amount: ptr, &col_qty: ptr, len: u64) -> u64:
+L_ENTRY:
+total = col_sum_where_eq col_amount, len, col_qty, 5
+return total
+QUERY
+
+vm_prim_output="$(SA_PLUGIN_DEV=1 "$sa_bin" db register vm_prim_sum.query.sa)"
+vm_prim_hash="$(printf '%s\n' "$vm_prim_output" | awk '/^Hash:/ {print $2}')"
+vm_prim_exec="$(SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_prim_hash")"
+printf '%s\n' "$vm_prim_exec" | grep -F 'result_u64: 550' >/dev/null
+printf '%s\n' "$vm_prim_exec" | grep -F 'fuel_used:' >/dev/null
+printf '%s\n' "$vm_prim_exec" | grep -F 'fuel_limit: 1000000' >/dev/null
+
+# Native primitive: whole-column total (100 + 250 + 40 + 300 + 150 = 840).
+cat > vm_prim_total.query.sa <<'QUERY'
+grants [db_read:vm_orders]
+@main(&col_amount: ptr, len: u64) -> u64:
+L_ENTRY:
+total = col_sum col_amount, len
+return total
+QUERY
+
+vm_total_output="$(SA_PLUGIN_DEV=1 "$sa_bin" db register vm_prim_total.query.sa)"
+vm_total_hash="$(printf '%s\n' "$vm_total_output" | awk '/^Hash:/ {print $2}')"
+SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_total_hash" | grep -F 'result_u64: 840' >/dev/null
+
+# Fuel: an explicit tiny budget terminates the loop module with a clean error.
+if SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_loop_hash" --fuel 10 >fuel_small.out 2>fuel_small.err; then
+    echo 'over-budget exec unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'DB query fuel exhausted' fuel_small.err >/dev/null
+
+# Fuel: the SA_DB_QMOD_FUEL environment variable sets the same budget.
+if SA_DB_QMOD_FUEL=10 SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_loop_hash" >fuel_env.out 2>fuel_env.err; then
+    echo 'env-budget exec unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'DB query fuel exhausted' fuel_env.err >/dev/null
+
+# Fuel: an invalid budget is a clean configuration error, not a silent default.
+if SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_loop_hash" --fuel 0 >fuel_bad.out 2>fuel_bad.err; then
+    echo 'zero-fuel exec unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'invalid DB fuel limit' fuel_bad.err >/dev/null
+
+# Fuel: a runaway module is terminated by the default limit; the host stays up.
+cat > vm_runaway.query.sa <<'QUERY'
+grants [db_read:vm_orders]
+@main(&col_id: ptr, len: u64) -> u64:
+L_ENTRY:
+zero = add 0, 0
+jmp L_TOP
+L_TOP:
+v = load col_id+zero as u64
+jmp L_TOP
+QUERY
+
+vm_runaway_output="$(SA_PLUGIN_DEV=1 "$sa_bin" db register vm_runaway.query.sa)"
+vm_runaway_hash="$(printf '%s\n' "$vm_runaway_output" | awk '/^Hash:/ {print $2}')"
+if timeout 60 env SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_runaway_hash" >fuel_run.out 2>fuel_run.err; then
+    echo 'runaway exec unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'DB query fuel exhausted' fuel_run.err >/dev/null
+SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_loop_hash" | grep -F 'result_u64: 550' >/dev/null
+
+# Hash addressing: an unregistered hash fails cleanly.
+if SA_PLUGIN_DEV=1 "$sa_bin" db exec 0000000000000000000000000000000000000000000000000000000000000000 >unknown.out 2>unknown.err; then
+    echo 'unknown hash exec unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'DB query hash is unknown' unknown.err >/dev/null
+
+# Hash addressing: a tampered payload no longer matches its hash and is rejected.
+printf 'x' >> ".sa/db/qmods/$vm_loop_hash.qmod"
+if SA_PLUGIN_DEV=1 "$sa_bin" db exec "$vm_loop_hash" >tamper.out 2>tamper.err; then
+    echo 'tampered payload exec unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'DB query payload is corrupted' tamper.err >/dev/null
+
+# Read-only enforcement: a store under a read-only grant is rejected at register.
+cat > vm_store.query.sa <<'QUERY'
+grants [db_read:vm_orders]
+@main(&col_id: ptr, len: u64) -> u64:
+L_ENTRY:
+store col_id+0, 1 as u64
+return len
+QUERY
+
+if SA_PLUGIN_DEV=1 "$sa_bin" db register vm_store.query.sa >store.out 2>store.err; then
+    echo 'store under read-only grant unexpectedly registered' >&2
+    exit 1
+fi
+grep -F 'capability escalation' store.err >/dev/null
+
 echo 'installed db plugin smoke passed'

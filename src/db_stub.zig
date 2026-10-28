@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const sio = @import("sio");
 const schema = @import("schema.zig");
 const table_mod = @import("table.zig");
@@ -22,6 +23,8 @@ pub const ExecError = error{
     StaleMetadata,
     UnsupportedOperation,
     ConstraintViolation,
+    FuelExhausted,
+    InvalidFuelLimit,
 };
 
 pub const ExecResult = struct {
@@ -45,6 +48,8 @@ pub const ExecRunResult = struct {
     function_name: []u8,
     hash: [32]u8,
     result_u64: ?u64 = null,
+    fuel_used: u64 = 0,
+    fuel_limit: u64 = 0,
 
     pub fn deinit(self: *ExecRunResult, allocator: std.mem.Allocator) void {
         allocator.free(self.function_name);
@@ -62,6 +67,65 @@ pub const ExecRun = union(enum) {
         self.* = undefined;
     }
 };
+
+/// Default per-exec fuel budget, in abstract steps. One step is charged per
+/// executed qmod instruction; native column primitives additionally charge
+/// one step per scanned row. The default matches the historical hard-coded
+/// 1,000,000 instruction cap the evaluators used before fuel metering
+/// existed, so previously accepted modules keep running unchanged.
+pub const default_fuel_limit: u64 = 1_000_000;
+
+/// Environment variable that overrides the default fuel limit for
+/// `sa db exec` when no explicit fuel limit is given. Following the same
+/// pattern as table.zig's SA_DB_UNSAFE_NO_SYNC detection, the value is read
+/// from /proc/self/environ on Linux: libdb.so is linked without libc, so
+/// getenv is unavailable (and std.posix.getenv was removed in Zig 0.17);
+/// the variable is only honored as inherited at process start.
+pub const fuel_limit_env_var = "SA_DB_QMOD_FUEL";
+
+/// Step budget for one qmod execution. A single meter is created per exec
+/// and shared by every evaluator shape the exec attempts, so shape probing
+/// cannot multiply the total work one exec performs. Exhaustion is a hard
+/// error (FuelExhausted), never the UnsupportedOperation shape signal.
+pub const FuelMeter = struct {
+    limit: u64,
+    used: u64 = 0,
+
+    pub fn charge(self: *FuelMeter, steps: u64) ExecError!void {
+        if (steps > self.limit - @min(self.used, self.limit)) return ExecError.FuelExhausted;
+        self.used += steps;
+    }
+};
+
+fn fuelLimitFromProcEnv() ExecError!?u64 {
+    if (builtin.os.tag != .linux) return null;
+    var file = sio.openFileAbsolute("/proc/self/environ", .{}) catch return null;
+    defer file.close();
+    var buffer: [128 * 1024]u8 = undefined;
+    const bytes_read = file.read(&buffer) catch return null;
+    var entries = std.mem.splitScalar(u8, buffer[0..bytes_read], 0);
+    while (entries.next()) |entry| {
+        if (entry.len <= fuel_limit_env_var.len) continue;
+        if (entry[fuel_limit_env_var.len] != '=') continue;
+        if (!std.mem.eql(u8, entry[0..fuel_limit_env_var.len], fuel_limit_env_var)) continue;
+        const text = entry[fuel_limit_env_var.len + 1 ..];
+        const value = std.fmt.parseInt(u64, text, 10) catch return ExecError.InvalidFuelLimit;
+        if (value == 0) return ExecError.InvalidFuelLimit;
+        return value;
+    }
+    return null;
+}
+
+/// Resolve the effective fuel limit for one exec: an explicit limit wins,
+/// then the SA_DB_QMOD_FUEL environment variable, then the default.
+pub fn resolveFuelLimit(explicit: ?u64) ExecError!u64 {
+    if (explicit) |limit| {
+        if (limit == 0) return ExecError.InvalidFuelLimit;
+        return limit;
+    }
+    if (try fuelLimitFromProcEnv()) |limit| return limit;
+    return default_fuel_limit;
+}
 
 const QueryMeta = struct {
     magic: []const u8,
@@ -1018,7 +1082,7 @@ fn evalBinaryValue(op: []const u8, lhs: u64, rhs: u64) ExecError!u64 {
     return evalBinaryU64(op, lhs, rhs);
 }
 
-fn evalScalarQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, params_path: ?[]const u8) ExecError!?u64 {
+fn evalScalarQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     if (std.mem.indexOf(u8, source, " load ") != null or
         std.mem.indexOf(u8, source, "store ") != null or
         std.mem.indexOf(u8, source, "atomic_rmw_") != null or
@@ -1052,6 +1116,7 @@ fn evalScalarQmod(allocator: std.mem.Allocator, source: []const u8, main_name: [
             continue;
         }
         if (!in_body or std.mem.endsWith(u8, line, ":")) continue;
+        try meter.charge(1);
         if (std.mem.startsWith(u8, line, "return ")) {
             return try lookupValue(&values, std.mem.trim(u8, line["return ".len..], " \t\r\n"));
         }
@@ -1475,7 +1540,134 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     table_mod.commitTableMetaWithRebuiltIndexesUnlocked(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
 }
 
-fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
+/// Native column primitives for read-only qmod modules (VM query layer,
+/// step 1). A primitive call is written like an assignment whose operator
+/// is the primitive name:
+///
+///     total = col_sum col_amount, len
+///     hits  = col_count_eq col_qty, len, 5
+///     total = col_sum_where_eq col_amount, len, col_qty, 5
+///
+/// Primitives run natively over the read snapshot's merged column bytes;
+/// the module only orchestrates (which columns, which predicate, how
+/// results combine). Each call charges the fuel meter one step per scanned
+/// row, on top of the per-instruction step the eval loop charges for the
+/// call line itself. Only integer-typed columns are supported (u8..u64 and
+/// i8..i64 as loaded by loadColumnValue); float columns are rejected with
+/// ColumnTypeMismatch because aggregating their loaded bit patterns would
+/// be meaningless. All comparisons use the loaded u64 cell representation,
+/// so signed columns compare as their two's-complement bit patterns.
+fn isIntegerColumnType(ty: []const u8) bool {
+    return std.mem.eql(u8, ty, "u64") or std.mem.eql(u8, ty, "u32") or
+        std.mem.eql(u8, ty, "u16") or std.mem.eql(u8, ty, "u8") or
+        std.mem.eql(u8, ty, "i64") or std.mem.eql(u8, ty, "i32") or
+        std.mem.eql(u8, ty, "i16") or std.mem.eql(u8, ty, "i8");
+}
+
+fn primitiveColumn(pointers: *std.StringHashMap(*const TableColumn), name: []const u8) ExecError!*const TableColumn {
+    const column = pointers.get(name) orelse return ExecError.UnsupportedOperation;
+    if (!isIntegerColumnType(column.ty)) return ExecError.ColumnTypeMismatch;
+    return column;
+}
+
+fn primitiveRowLimit(column: *const TableColumn, len: u64) ExecError!u64 {
+    const available: u64 = @intCast(column.bytes.len / column.stride);
+    if (len > available) return ExecError.InvalidFormat;
+    return len;
+}
+
+fn evalColumnPrimitive(line: []const u8, values: *ValueMap, pointers: *std.StringHashMap(*const TableColumn), meter: *FuelMeter) ExecError!?struct { dst: []const u8, value: u64 } {
+    const eq = std.mem.indexOf(u8, line, " = ") orelse return null;
+    const expr = std.mem.trim(u8, line[eq + 3 ..], " \t\r\n");
+    var parts = std.mem.tokenizeAny(u8, expr, " ,\t");
+    const op = parts.next() orelse return null;
+    if (!std.mem.startsWith(u8, op, "col_")) return null;
+    const dst = std.mem.trim(u8, line[0..eq], " \t\r\n");
+    var arg_buf: [4][]const u8 = undefined;
+    var arg_count: usize = 0;
+    while (parts.next()) |arg| {
+        if (arg_count >= arg_buf.len) return ExecError.InvalidFormat;
+        arg_buf[arg_count] = arg;
+        arg_count += 1;
+    }
+    const args = arg_buf[0..arg_count];
+
+    if (std.mem.eql(u8, op, "col_sum") or std.mem.eql(u8, op, "col_min") or std.mem.eql(u8, op, "col_max")) {
+        if (args.len != 2) return ExecError.InvalidFormat;
+        const column = try primitiveColumn(pointers, args[0]);
+        const rows = try primitiveRowLimit(column, try lookupValue(values, args[1]));
+        try meter.charge(rows);
+        if (rows == 0) {
+            if (std.mem.eql(u8, op, "col_sum")) return .{ .dst = dst, .value = 0 };
+            return ExecError.InvalidFormat;
+        }
+        var acc: u64 = 0;
+        var row: u64 = 0;
+        if (!std.mem.eql(u8, op, "col_sum")) {
+            acc = try loadColumnValue(column.*, 0);
+            row = 1;
+        }
+        while (row < rows) : (row += 1) {
+            const value = try loadColumnValue(column.*, row * @as(u64, column.stride));
+            if (std.mem.eql(u8, op, "col_sum")) {
+                acc +%= value;
+            } else if (std.mem.eql(u8, op, "col_min")) {
+                if (value < acc) acc = value;
+            } else {
+                if (value > acc) acc = value;
+            }
+        }
+        return .{ .dst = dst, .value = acc };
+    }
+    if (std.mem.eql(u8, op, "col_count_eq")) {
+        if (args.len != 3) return ExecError.InvalidFormat;
+        const column = try primitiveColumn(pointers, args[0]);
+        const rows = try primitiveRowLimit(column, try lookupValue(values, args[1]));
+        const target = try lookupValue(values, args[2]);
+        try meter.charge(rows);
+        var count: u64 = 0;
+        var row: u64 = 0;
+        while (row < rows) : (row += 1) {
+            if ((try loadColumnValue(column.*, row * @as(u64, column.stride))) == target) count += 1;
+        }
+        return .{ .dst = dst, .value = count };
+    }
+    if (std.mem.eql(u8, op, "col_count_range")) {
+        if (args.len != 4) return ExecError.InvalidFormat;
+        const column = try primitiveColumn(pointers, args[0]);
+        const rows = try primitiveRowLimit(column, try lookupValue(values, args[1]));
+        const lo = try lookupValue(values, args[2]);
+        const hi = try lookupValue(values, args[3]);
+        try meter.charge(rows);
+        var count: u64 = 0;
+        var row: u64 = 0;
+        while (row < rows) : (row += 1) {
+            const value = try loadColumnValue(column.*, row * @as(u64, column.stride));
+            if (value >= lo and value < hi) count += 1;
+        }
+        return .{ .dst = dst, .value = count };
+    }
+    if (std.mem.eql(u8, op, "col_sum_where_eq")) {
+        if (args.len != 4) return ExecError.InvalidFormat;
+        const sum_column = try primitiveColumn(pointers, args[0]);
+        const rows = try primitiveRowLimit(sum_column, try lookupValue(values, args[1]));
+        const key_column = try primitiveColumn(pointers, args[2]);
+        _ = try primitiveRowLimit(key_column, rows);
+        const target = try lookupValue(values, args[3]);
+        try meter.charge(rows);
+        var sum: u64 = 0;
+        var row: u64 = 0;
+        while (row < rows) : (row += 1) {
+            if ((try loadColumnValue(key_column.*, row * @as(u64, key_column.stride))) == target) {
+                sum +%= try loadColumnValue(sum_column.*, row * @as(u64, sum_column.stride));
+            }
+        }
+        return .{ .dst = dst, .value = sum };
+    }
+    return ExecError.InvalidFormat;
+}
+
+fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     const table_name = try singleReadGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, "store ") != null or std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
 
@@ -1496,10 +1688,8 @@ fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_nam
     defer allocator.free(lines);
 
     var pc: usize = 0;
-    var steps: usize = 0;
     while (pc < lines.len) {
-        steps += 1;
-        if (steps > 1_000_000) return ExecError.UnsupportedOperation;
+        try meter.charge(1);
         const line = lines[pc];
         if (std.mem.startsWith(u8, line, "!")) {
             pc += 1;
@@ -1528,6 +1718,11 @@ fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_nam
             pc += 1;
             continue;
         }
+        if (try evalColumnPrimitive(line, &values, &pointers, meter)) |primitive| {
+            values.put(primitive.dst, primitive.value) catch return ExecError.OutOfMemory;
+            pc += 1;
+            continue;
+        }
         const eq = std.mem.indexOf(u8, line, " = ") orelse return ExecError.UnsupportedOperation;
         const dst = std.mem.trim(u8, line[0..eq], " \t\r\n");
         const expr = std.mem.trim(u8, line[eq + 3 ..], " \t\r\n");
@@ -1545,7 +1740,7 @@ fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_nam
     return ExecError.InvalidFormat;
 }
 
-fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
+fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     const table_name = try singleWriteGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, " load ") != null or std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
 
@@ -1569,10 +1764,8 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
     defer allocator.free(lines);
 
     var pc: usize = 0;
-    var steps: usize = 0;
     while (pc < lines.len) {
-        steps += 1;
-        if (steps > 1_000_000) return ExecError.UnsupportedOperation;
+        try meter.charge(1);
         const line = lines[pc];
         if (std.mem.startsWith(u8, line, "!")) {
             pc += 1;
@@ -1619,7 +1812,7 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
     return ExecError.InvalidFormat;
 }
 
-fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
+fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     const grants = try singleReadWriteGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
 
@@ -1654,10 +1847,8 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
     defer allocator.free(lines);
 
     var pc: usize = 0;
-    var steps: usize = 0;
     while (pc < lines.len) {
-        steps += 1;
-        if (steps > 1_000_000) return ExecError.UnsupportedOperation;
+        try meter.charge(1);
         const line = lines[pc];
         if (std.mem.startsWith(u8, line, "!")) {
             pc += 1;
@@ -1717,7 +1908,7 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
     return ExecError.InvalidFormat;
 }
 
-fn evalAtomicDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8) ExecError!?u64 {
+fn evalAtomicDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grant_entries: []const []const u8, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     const table_name = try singleAtomicGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, " load ") != null or std.mem.indexOf(u8, source, "store ") != null) return null;
 
@@ -1741,10 +1932,8 @@ fn evalAtomicDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name:
     defer allocator.free(lines);
 
     var pc: usize = 0;
-    var steps: usize = 0;
     while (pc < lines.len) {
-        steps += 1;
-        if (steps > 1_000_000) return ExecError.UnsupportedOperation;
+        try meter.charge(1);
         const line = lines[pc];
         if (std.mem.startsWith(u8, line, "!")) {
             pc += 1;
@@ -1893,6 +2082,11 @@ pub fn inspectRegistry(allocator: std.mem.Allocator, hash_text: []const u8) Exec
 }
 
 pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_path: ?[]const u8) ExecError!ExecRun {
+    return execQueryWithFuel(allocator, hash_text, params_path, null);
+}
+
+pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, params_path: ?[]const u8, fuel_limit: ?u64) ExecError!ExecRun {
+    var meter = FuelMeter{ .limit = try resolveFuelLimit(fuel_limit) };
     var parsed = try loadMeta(allocator, hash_text);
     defer parsed.deinit();
     if (params_path) |path| {
@@ -1906,33 +2100,33 @@ pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_pat
     };
     defer allocator.free(qmod_source);
     if (!std.mem.eql(u8, &hashBytes(qmod_source), &hash)) return ExecError.QueryPayloadCorrupted;
-    const scalar_result = evalScalarQmod(allocator, qmod_source, parsed.value.main, params_path) catch |err| switch (err) {
+    const scalar_result = evalScalarQmod(allocator, qmod_source, parsed.value.main, params_path, &meter) catch |err| switch (err) {
         ExecError.UnsupportedOperation => null,
         else => return err,
     };
     const db_result = if (scalar_result == null)
-        (evalReadonlyDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path) catch |err| switch (err) {
+        (evalReadonlyDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
     else
         null;
     const write_result = if (scalar_result == null and db_result == null)
-        (evalWriteDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path) catch |err| switch (err) {
+        (evalWriteDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
     else
         null;
     const read_write_result = if (scalar_result == null and db_result == null and write_result == null)
-        (evalReadWriteDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path) catch |err| switch (err) {
+        (evalReadWriteDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
     else
         null;
     const atomic_result = if (scalar_result == null and db_result == null and write_result == null and read_write_result == null)
-        (evalAtomicDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path) catch |err| switch (err) {
+        (evalAtomicDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
@@ -1944,6 +2138,8 @@ pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_pat
         .function_name = try allocator.dupe(u8, parsed.value.main),
         .hash = hash,
         .result_u64 = final_result,
+        .fuel_used = meter.used,
+        .fuel_limit = meter.limit,
     } };
 }
 
@@ -3982,4 +4178,303 @@ test "qmod exec filters f32 DB column values" {
     defer run.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), run.ok.code);
     try std.testing.expectEqual(@as(u64, 2), run.ok.result_u64.?);
+}
+
+test "qmod vm column primitives match loop aggregation" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("orders.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_QTY_STRIDE = 8 // u64
+        \\#def COL_AMOUNT_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 24
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id,qty,amount
+        \\1,2,100
+        \\2,5,250
+        \\3,1,40
+        \\4,5,300
+        \\5,3,150
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "orders", "rows.csv");
+
+    const Case = struct { name: []const u8, source: []const u8, expected: u64 };
+    const cases = [_]Case{
+        .{
+            .name = "loop_sum_where.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_qty: ptr, &col_amount: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\idx = add 0, 0
+            \\sum = add 0, 0
+            \\jmp L_COND
+            \\L_COND:
+            \\cond = ult idx, len
+            \\br cond -> L_BODY, L_EXIT
+            \\L_BODY:
+            \\qoff = mul idx, 8
+            \\qty = load col_qty+qoff as u64
+            \\hit = eq qty, 5
+            \\br hit -> L_MATCH, L_NEXT
+            \\L_MATCH:
+            \\aoff = mul idx, 8
+            \\amt = load col_amount+aoff as u64
+            \\sum = add sum, amt
+            \\jmp L_NEXT
+            \\L_NEXT:
+            \\idx = add idx, 1
+            \\jmp L_COND
+            \\L_EXIT:
+            \\return sum
+            ,
+            .expected = 550,
+        },
+        .{
+            .name = "prim_sum_where.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_amount: ptr, &col_qty: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\total = col_sum_where_eq col_amount, len, col_qty, 5
+            \\return total
+            ,
+            .expected = 550,
+        },
+        .{
+            .name = "prim_sum.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_amount: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\total = col_sum col_amount, len
+            \\return total
+            ,
+            .expected = 840,
+        },
+        .{
+            .name = "prim_count_range.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_qty: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\hits = col_count_range col_qty, len, 3, 6
+            \\return hits
+            ,
+            .expected = 3,
+        },
+        .{
+            .name = "prim_count_eq.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_qty: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\hits = col_count_eq col_qty, len, 5
+            \\return hits
+            ,
+            .expected = 2,
+        },
+        .{
+            .name = "prim_min.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_amount: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\smallest = col_min col_amount, len
+            \\return smallest
+            ,
+            .expected = 40,
+        },
+        .{
+            .name = "prim_max.query.sa",
+            .source =
+            \\grants [db_read:orders]
+            \\@main(&col_amount: ptr, len: u64) -> u64:
+            \\L_ENTRY:
+            \\largest = col_max col_amount, len
+            \\return largest
+            ,
+            .expected = 300,
+        },
+    };
+    for (cases) |case| {
+        var query = try (sio.Dir{ .inner = tmp.dir }).createFile(case.name, .{ .truncate = true });
+        try query.writeAll(case.source);
+        query.close();
+        var result = try registerQuery(std.testing.allocator, case.name);
+        defer result.deinit(std.testing.allocator);
+        const hash_hex = try hashHexAlloc(std.testing.allocator, result.hash);
+        defer std.testing.allocator.free(hash_hex);
+        var run = try execQuery(std.testing.allocator, hash_hex, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), run.ok.code);
+        try std.testing.expectEqual(case.expected, run.ok.result_u64.?);
+        try std.testing.expect(run.ok.fuel_used > 0);
+        try std.testing.expect(run.ok.fuel_used <= run.ok.fuel_limit);
+    }
+}
+
+test "qmod fuel meter terminates unbounded and over-budget modules" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("simple.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 10
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def TABLE_ROW_BYTES = 8
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id
+        \\1
+        \\2
+        \\3
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "simple", "rows.csv");
+
+    var loop_query = try (sio.Dir{ .inner = tmp.dir }).createFile("runaway.query.sa", .{ .truncate = true });
+    defer loop_query.close();
+    try loop_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\zero = add 0, 0
+        \\jmp L_TOP
+        \\L_TOP:
+        \\v = load col_id+zero as u64
+        \\jmp L_TOP
+    );
+    var loop_result = try registerQuery(std.testing.allocator, "runaway.query.sa");
+    defer loop_result.deinit(std.testing.allocator);
+    const loop_hash = try hashHexAlloc(std.testing.allocator, loop_result.hash);
+    defer std.testing.allocator.free(loop_hash);
+    try std.testing.expectError(ExecError.FuelExhausted, execQueryWithFuel(std.testing.allocator, loop_hash, null, 1_000));
+    try std.testing.expectError(ExecError.FuelExhausted, execQueryWithFuel(std.testing.allocator, loop_hash, null, null));
+
+    var sum_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum_ids.query.sa", .{ .truncate = true });
+    defer sum_query.close();
+    try sum_query.writeAll(
+        \\grants [db_read:simple]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\idx = add 0, 0
+        \\sum = add 0, 0
+        \\jmp L_COND
+        \\L_COND:
+        \\cond = ult idx, len
+        \\br cond -> L_BODY, L_EXIT
+        \\L_BODY:
+        \\offset = mul idx, 8
+        \\value = load col_id+offset as u64
+        \\sum = add sum, value
+        \\idx = add idx, 1
+        \\jmp L_COND
+        \\L_EXIT:
+        \\return sum
+    );
+    var sum_result = try registerQuery(std.testing.allocator, "sum_ids.query.sa");
+    defer sum_result.deinit(std.testing.allocator);
+    const sum_hash = try hashHexAlloc(std.testing.allocator, sum_result.hash);
+    defer std.testing.allocator.free(sum_hash);
+    try std.testing.expectError(ExecError.FuelExhausted, execQueryWithFuel(std.testing.allocator, sum_hash, null, 10));
+    var run = try execQueryWithFuel(std.testing.allocator, sum_hash, null, 100_000);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), run.ok.code);
+    try std.testing.expectEqual(@as(u64, 6), run.ok.result_u64.?);
+    try std.testing.expectEqual(@as(u64, 100_000), run.ok.fuel_limit);
+    try std.testing.expect(run.ok.fuel_used > 10);
+    try std.testing.expect(run.ok.fuel_used <= 100_000);
+
+    try std.testing.expectError(ExecError.InvalidFuelLimit, resolveFuelLimit(0));
+    try std.testing.expectEqual(@as(u64, 42), try resolveFuelLimit(42));
+}
+
+test "qmod column primitives reject float columns and overscan" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var schema_file = try (sio.Dir{ .inner = tmp.dir }).createFile("flash.sadb-schema", .{ .truncate = true });
+    defer schema_file.close();
+    try schema_file.writeAll(
+        \\#def MAX_ROWS = 8
+        \\#def COL_ID_STRIDE = 8 // u64
+        \\#def COL_PRICE_STRIDE = 4 // f32
+        \\#def TABLE_ROW_BYTES = 12
+    );
+    var csv = try (sio.Dir{ .inner = tmp.dir }).createFile("rows.csv", .{ .truncate = true });
+    defer csv.close();
+    try csv.writeAll(
+        \\id,price
+        \\1,9.5
+        \\2,10.25
+    );
+    _ = try @import("table.zig").ingestTable(std.testing.allocator, ".", "flash", "rows.csv");
+
+    var float_query = try (sio.Dir{ .inner = tmp.dir }).createFile("sum_price.query.sa", .{ .truncate = true });
+    defer float_query.close();
+    try float_query.writeAll(
+        \\grants [db_read:flash]
+        \\@main(&col_price: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\total = col_sum col_price, len
+        \\return total
+    );
+    var float_result = try registerQuery(std.testing.allocator, "sum_price.query.sa");
+    defer float_result.deinit(std.testing.allocator);
+    const float_hash = try hashHexAlloc(std.testing.allocator, float_result.hash);
+    defer std.testing.allocator.free(float_hash);
+    try std.testing.expectError(ExecError.ColumnTypeMismatch, execQuery(std.testing.allocator, float_hash, null));
+
+    var over_query = try (sio.Dir{ .inner = tmp.dir }).createFile("overscan.query.sa", .{ .truncate = true });
+    defer over_query.close();
+    try over_query.writeAll(
+        \\grants [db_read:flash]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\wide = add len, 10
+        \\total = col_sum col_id, wide
+        \\return total
+    );
+    var over_result = try registerQuery(std.testing.allocator, "overscan.query.sa");
+    defer over_result.deinit(std.testing.allocator);
+    const over_hash = try hashHexAlloc(std.testing.allocator, over_result.hash);
+    defer std.testing.allocator.free(over_hash);
+    try std.testing.expectError(ExecError.InvalidFormat, execQuery(std.testing.allocator, over_hash, null));
+
+    var unknown_query = try (sio.Dir{ .inner = tmp.dir }).createFile("unknown_prim.query.sa", .{ .truncate = true });
+    defer unknown_query.close();
+    try unknown_query.writeAll(
+        \\grants [db_read:flash]
+        \\@main(&col_id: ptr, len: u64) -> u64:
+        \\L_ENTRY:
+        \\total = col_frobnicate col_id, len
+        \\return total
+    );
+    var unknown_result = try registerQuery(std.testing.allocator, "unknown_prim.query.sa");
+    defer unknown_result.deinit(std.testing.allocator);
+    const unknown_hash = try hashHexAlloc(std.testing.allocator, unknown_result.hash);
+    defer std.testing.allocator.free(unknown_hash);
+    try std.testing.expectError(ExecError.InvalidFormat, execQuery(std.testing.allocator, unknown_hash, null));
 }

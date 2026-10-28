@@ -1,0 +1,4 @@
+#def MAX_ROWS = 16
+#def COL_ID_STRIDE = 8 // u64
+#def COL_QTY_STRIDE = 8 // u64
+#def COL_AMOUNT_STRIDE = 8 // u64

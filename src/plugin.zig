@@ -338,7 +338,7 @@ const skills = [_]plugin.SkillSection{
         .items = &.{
             "db init <schema.sadb-schema>",
             "db register <query.sa>",
-            "db exec <hash> [--params <file>]",
+            "db exec <hash> [--params <file>] [--fuel <steps>]",
             "db ingest <table> <csv|jsonl>",
             "db index-u64 <table> <column-index> [unique]",
             "db inspect <table|hash>",
@@ -380,6 +380,8 @@ fn isDbCliError(err: anyerror) bool {
         error.UnsupportedOperation,
         error.StaleMetadata,
         error.ConstraintViolation,
+        error.FuelExhausted,
+        error.InvalidFuelLimit,
         error.OutOfMemory,
         => true,
         else => false,
@@ -396,7 +398,7 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
         else if (std.mem.eql(u8, sub, "register"))
             "usage: sa db register <query.sa>"
         else if (std.mem.eql(u8, sub, "exec"))
-            "usage: sa db exec <hash> [--params <file>]"
+            "usage: sa db exec <hash> [--params <file>] [--fuel <steps>]"
         else if (std.mem.eql(u8, sub, "ingest"))
             "usage: sa db ingest <table> <csv|jsonl>"
         else if (std.mem.eql(u8, sub, "index-u64"))
@@ -428,6 +430,8 @@ fn dbCliHint(argv: []const []const u8, err: anyerror) []const u8 {
         error.DbCapabilityEscalation => "add explicit db_read/db_write/db_atomic_cursor grants for the query instructions",
         error.StaleMetadata => "retry the DB operation after refreshing table metadata",
         error.ConstraintViolation => "use unique values for columns with unique DB indexes",
+        error.FuelExhausted => "raise the limit with --fuel <steps> or SA_DB_QMOD_FUEL, or simplify the query module",
+        error.InvalidFuelLimit => "use a positive integer step budget for --fuel or SA_DB_QMOD_FUEL",
         error.UnsupportedOperation => "this DB operation is not implemented yet",
         error.OutOfMemory => "free memory and retry",
         else => "check DB command arguments",
@@ -459,6 +463,8 @@ fn writeDbCliError(writer: anytype, argv: []const []const u8, err: anyerror) !vo
         error.DbCapabilityEscalation => "DB query capability escalation",
         error.StaleMetadata => "DB table metadata changed during exec",
         error.ConstraintViolation => "DB constraint violation",
+        error.FuelExhausted => "DB query fuel exhausted",
+        error.InvalidFuelLimit => "invalid DB fuel limit",
         error.UnsupportedOperation => "DB operation is not implemented",
         error.OutOfMemory => "out of memory while processing DB command",
         else => @errorName(err),
@@ -540,6 +546,8 @@ fn mapQmodError(err: qmod.ExecError) anyerror {
         error.StaleMetadata => error.StaleMetadata,
         error.UnsupportedOperation => error.UnsupportedOperation,
         error.ConstraintViolation => error.ConstraintViolation,
+        error.FuelExhausted => error.FuelExhausted,
+        error.InvalidFuelLimit => error.InvalidFuelLimit,
     };
 }
 
@@ -587,17 +595,30 @@ fn runDbRegister(allocator: std.mem.Allocator, argv: []const []const u8, stdout:
 fn runDbExec(allocator: std.mem.Allocator, argv: []const []const u8, stdout: *std.Io.Writer) anyerror!?u8 {
     if (argv.len < 4) return error.MissingSourcePath;
     var params_path: ?[]const u8 = null;
-    if (argv.len == 6) {
-        if (!std.mem.eql(u8, argv[4], "--params")) return error.UnexpectedArgument;
-        params_path = argv[5];
-    } else if (argv.len != 4) return error.UnexpectedArgument;
-    var result = qmod.execQuery(allocator, argv[3], params_path) catch |err| return mapQmodError(err);
+    var fuel_limit: ?u64 = null;
+    var idx: usize = 4;
+    while (idx < argv.len) {
+        if (std.mem.eql(u8, argv[idx], "--params")) {
+            if (idx + 1 >= argv.len) return error.UnexpectedArgument;
+            params_path = argv[idx + 1];
+            idx += 2;
+        } else if (std.mem.eql(u8, argv[idx], "--fuel")) {
+            if (idx + 1 >= argv.len) return error.UnexpectedArgument;
+            const parsed = std.fmt.parseInt(u64, argv[idx + 1], 10) catch return error.InvalidFuelLimit;
+            if (parsed == 0) return error.InvalidFuelLimit;
+            fuel_limit = parsed;
+            idx += 2;
+        } else return error.UnexpectedArgument;
+    }
+    var result = qmod.execQueryWithFuel(allocator, argv[3], params_path, fuel_limit) catch |err| return mapQmodError(err);
     defer result.deinit(allocator);
     switch (result) {
         .ok => |ok| {
             if (ok.code == 0) {
                 try stdout.print("Executed: {s}\n", .{ok.function_name});
                 if (ok.result_u64) |value| try stdout.print("result_u64: {d}\n", .{value});
+                try stdout.print("fuel_used: {d}\n", .{ok.fuel_used});
+                try stdout.print("fuel_limit: {d}\n", .{ok.fuel_limit});
             }
             return ok.code;
         },
@@ -878,6 +899,33 @@ test "db plugin wrapper renders invalid exec params diagnostic" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: invalid DB params format"));
     try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "check params.bin layout and byte length"));
+}
+
+test "db plugin wrapper renders fuel exhausted diagnostic" {
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer stderr_buffer.deinit();
+
+    const argv = [_][]const u8{ "sa", "db", "exec", "<hash>" };
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.FuelExhausted);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: DB query fuel exhausted"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "raise the limit with --fuel <steps> or SA_DB_QMOD_FUEL, or simplify the query module"));
+}
+
+test "db plugin wrapper renders invalid fuel limit diagnostic" {
+    var stderr_buffer = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer stderr_buffer.deinit();
+
+    const argv = [_][]const u8{ "sa", "db", "exec", "<hash>", "--fuel", "0" };
+    try writeDbCliError(sio.managedWriter(&stderr_buffer), &argv, error.InvalidFuelLimit);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "error[SA-DB-CLI]: invalid DB fuel limit"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, stderr_buffer.items, 1, "use a positive integer step budget for --fuel or SA_DB_QMOD_FUEL"));
+}
+
+test "db plugin wrapper classifies fuel errors as CLI diagnostics" {
+    try std.testing.expect(isDbCliError(error.FuelExhausted));
+    try std.testing.expect(isDbCliError(error.InvalidFuelLimit));
 }
 
 test "db plugin wrapper renders invalid query hash diagnostic" {

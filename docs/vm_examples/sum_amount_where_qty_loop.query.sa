@@ -1,0 +1,24 @@
+grants [db_read:vm_orders]
+@main(&col_qty: ptr, &col_amount: ptr, len: u64) -> u64:
+L_ENTRY:
+idx = add 0, 0
+sum = add 0, 0
+jmp L_COND
+L_COND:
+cond = ult idx, len
+br cond -> L_BODY, L_EXIT
+L_BODY:
+qoff = mul idx, 8
+qty = load col_qty+qoff as u64
+hit = eq qty, 5
+br hit -> L_MATCH, L_NEXT
+L_MATCH:
+aoff = mul idx, 8
+amt = load col_amount+aoff as u64
+sum = add sum, amt
+jmp L_NEXT
+L_NEXT:
+idx = add idx, 1
+jmp L_COND
+L_EXIT:
+return sum

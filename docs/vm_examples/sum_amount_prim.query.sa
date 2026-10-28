@@ -1,0 +1,5 @@
+grants [db_read:vm_orders]
+@main(&col_amount: ptr, len: u64) -> u64:
+L_ENTRY:
+total = col_sum col_amount, len
+return total

@@ -102,3 +102,33 @@ return count
 ```
 
 `tests/smoke_installed.sh` verifies this shape against the installed plugin.
+
+## VM Query Layer: Fuel + Native Column Primitives
+
+Every `db exec` runs under a fuel budget. One step is charged per
+executed instruction; the limit comes from `--fuel <steps>`, then the
+`SA_DB_QMOD_FUEL` environment variable, then the default of
+1,000,000 steps. Exhaustion fails cleanly with
+`error[SA-DB-CLI]: DB query fuel exhausted` — a runaway module can no
+longer fall through to another evaluator shape or hang the host.
+Successful exec output ends with `fuel_used:` / `fuel_limit:` lines.
+
+Read-only modules can also call native column primitives instead of
+interpreting per-row loads. The primitive runs over the snapshot
+column natively; the module only orchestrates. The same
+predicate + aggregate as the loop examples above, over a
+`vm_orders(ID, QTY, AMOUNT)` table (files in `docs/vm_examples/`):
+
+```sa
+grants [db_read:vm_orders]
+@main(&col_amount: ptr, &col_qty: ptr, len: u64) -> u64:
+L_ENTRY:
+total = col_sum_where_eq col_amount, len, col_qty, 5
+return total
+```
+
+Available primitives: `col_sum`, `col_min`, `col_max`,
+`col_count_eq`, `col_count_range`, `col_sum_where_eq`. Each charges
+one fuel step per scanned row. Integer columns only; see
+`docs/vm_query_layer.md` for the full semantics and the step-1
+design record.
