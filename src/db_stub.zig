@@ -543,32 +543,33 @@ fn verifyExistingRegistration(
     grants: GrantSet,
     main_name: []const u8,
 ) ExecError!void {
-    const existing_meta = loadMeta(allocator, hash_hex) catch |err| switch (err) {
+    const existing_entry = acquireMeta(allocator, hash_hex) catch |err| switch (err) {
         ExecError.QueryHashUnknown => return,
         else => return err,
     };
-    defer existing_meta.deinit();
+    defer releaseMeta(existing_entry);
+    const existing_meta = existing_entry.value();
 
-    if (!std.mem.eql(u8, existing_meta.value.source_path, source_path) or
-        !std.mem.eql(u8, existing_meta.value.qmod_path, qmod_path) or
-        existing_meta.value.imports != imports or
-        existing_meta.value.grants != grants.entries.len or
-        !grantEntriesEqual(existing_meta.value.grant_entries, grants.entries) or
-        !std.mem.eql(u8, existing_meta.value.main, main_name) or
-        !std.mem.eql(u8, existing_meta.value.hash, hash_hex))
+    if (!std.mem.eql(u8, existing_meta.source_path, source_path) or
+        !std.mem.eql(u8, existing_meta.qmod_path, qmod_path) or
+        existing_meta.imports != imports or
+        existing_meta.grants != grants.entries.len or
+        !grantEntriesEqual(existing_meta.grant_entries, grants.entries) or
+        !std.mem.eql(u8, existing_meta.main, main_name) or
+        !std.mem.eql(u8, existing_meta.hash, hash_hex))
     {
         return ExecError.DuplicateRegister;
     }
 
-    if (existing_meta.value.version >= 2) {
+    if (existing_meta.version >= 2) {
         // A version 2 record's stored class fields must agree with the
         // class derived from its own grant entries; a record that lies
         // about its write capability is corrupted, not a duplicate.
-        const existing_class = try deriveModuleClass(allocator, existing_meta.value.grant_entries);
+        const existing_class = try deriveModuleClass(allocator, existing_meta.grant_entries);
         defer allocator.free(existing_class.write_tables);
-        if (!std.mem.eql(u8, existing_meta.value.kind, existing_class.kind) or
-            existing_meta.value.write_capability != existing_class.write_capability or
-            !grantEntriesEqual(existing_meta.value.write_tables, existing_class.write_tables))
+        if (!std.mem.eql(u8, existing_meta.kind, existing_class.kind) or
+            existing_meta.write_capability != existing_class.write_capability or
+            !grantEntriesEqual(existing_meta.write_tables, existing_class.write_tables))
         {
             return ExecError.QueryRegistryCorrupted;
         }
@@ -1029,6 +1030,220 @@ fn readTableFromSnapshot(allocator: std.mem.Allocator, table_name: []const u8, p
         };
     }
     return out;
+}
+
+/// Content-addressed caches for the exec hot path (perf line).
+/// Every entry is keyed by the SHA-256 of the exact bytes it was
+/// built from, and the source bytes are still read and hashed on
+/// every exec where the uncached path reads them, so a cache hit
+/// is proof of byte identity with what the uncached path would
+/// have parsed — the parse is the only thing skipped, never a
+/// check. The qmod payload cache is keyed by the registry-verified
+/// query hash itself: entries are stored only after the payload's
+/// hash matched its registry entry, which is the same verification
+/// the uncached path repeats per exec. Memory is owned by the
+/// page allocator and bounded by the number of registered queries.
+/// Meta entries are reference-counted: an entry replaced by a
+/// re-registration is retired and freed only when its last reader
+/// releases it, so no reader can observe freed memory.
+const cache_allocator = std.heap.page_allocator;
+var exec_cache_mutex: std.atomic.Mutex = .unlocked;
+
+fn lockExecCache() void {
+    while (!exec_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+const MetaCacheEntry = struct {
+    content_hash: [32]u8,
+    parsed: std.json.Parsed(QueryMeta),
+    refs: u32 = 1, // guarded by exec_cache_mutex; includes the map's own hold while installed
+    retired: bool = false,
+
+    fn value(self: *MetaCacheEntry) *const QueryMeta {
+        return &self.parsed.value;
+    }
+};
+
+var meta_cache: std.StringHashMapUnmanaged(*MetaCacheEntry) = .{};
+
+fn destroyMetaEntry(entry: *MetaCacheEntry) void {
+    entry.parsed.deinit();
+    cache_allocator.destroy(entry);
+}
+
+/// Acquire the registry meta for `hash_text`, parsing only when
+/// the on-disk bytes changed since the cached parse. The meta file
+/// is read and hashed on every call (freshness); a byte-identical
+/// file serves the cached parse. Release with releaseMeta.
+fn acquireMeta(allocator: std.mem.Allocator, hash_text: []const u8) ExecError!*MetaCacheEntry {
+    const hash = try parseHashHex(hash_text);
+    const hash_hex = try hashHexAlloc(allocator, hash);
+    defer allocator.free(hash_hex);
+    const path = try metaPath(allocator, hash_hex);
+    defer allocator.free(path);
+    const bytes = readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
+        ExecError.FileNotFound => return ExecError.QueryHashUnknown,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    const content_hash = hashBytes(bytes);
+
+    lockExecCache();
+    if (meta_cache.get(hash_hex)) |entry| {
+        if (std.mem.eql(u8, &entry.content_hash, &content_hash)) {
+            entry.refs += 1;
+            exec_cache_mutex.unlock();
+            return entry;
+        }
+    }
+    exec_cache_mutex.unlock();
+
+    var parsed = try parseMetaValidated(allocator, bytes, hash_hex);
+    const entry = cache_allocator.create(MetaCacheEntry) catch {
+        parsed.deinit();
+        return ExecError.OutOfMemory;
+    };
+    entry.* = .{ .content_hash = content_hash, .parsed = parsed };
+    parsed = undefined;
+
+    lockExecCache();
+    defer exec_cache_mutex.unlock();
+    if (meta_cache.get(hash_hex)) |old| {
+        if (std.mem.eql(u8, &old.content_hash, &content_hash)) {
+            // Lost a parse race: serve the installed entry.
+            destroyMetaEntry(entry);
+            old.refs += 1;
+            return old;
+        }
+        old.retired = true;
+        old.refs -= 1; // the map's hold moves to the new entry
+        if (old.refs == 0) destroyMetaEntry(old);
+        _ = meta_cache.remove(hash_hex);
+    }
+    const key = cache_allocator.dupe(u8, hash_hex) catch {
+        destroyMetaEntry(entry);
+        return ExecError.OutOfMemory;
+    };
+    meta_cache.put(cache_allocator, key, entry) catch {
+        cache_allocator.free(key);
+        destroyMetaEntry(entry);
+        return ExecError.OutOfMemory;
+    };
+    entry.refs += 1; // the caller's hold
+    return entry;
+}
+
+/// Parse + validate a registry meta exactly as loadMeta did; the
+/// result is owned by the caller (cache allocator).
+fn parseMetaValidated(allocator: std.mem.Allocator, bytes: []const u8, hash_hex: []const u8) ExecError!std.json.Parsed(QueryMeta) {
+    var parsed = std.json.parseFromSlice(QueryMeta, cache_allocator, bytes, .{ .allocate = .alloc_always }) catch return ExecError.InvalidFormat;
+    errdefer parsed.deinit();
+    const expected_qmod_path = try qmodPath(allocator, hash_hex);
+    defer allocator.free(expected_qmod_path);
+    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-qmod-meta") or (parsed.value.version != 1 and parsed.value.version != 2)) {
+        return ExecError.InvalidFormat;
+    }
+    if (!std.mem.eql(u8, parsed.value.hash, hash_hex) or
+        !std.mem.eql(u8, parsed.value.qmod_path, expected_qmod_path) or
+        parsed.value.grants != parsed.value.grant_entries.len or
+        parsed.value.main.len == 0)
+    {
+        return ExecError.QueryRegistryCorrupted;
+    }
+    return parsed;
+}
+
+fn releaseMeta(entry: *MetaCacheEntry) void {
+    lockExecCache();
+    defer exec_cache_mutex.unlock();
+    entry.refs -= 1;
+    if (entry.refs == 0) {
+        std.debug.assert(entry.retired);
+        destroyMetaEntry(entry);
+    }
+}
+
+/// Qmod payload bytes by registry-verified hash. Stored only
+/// after the payload hashed to the key; later execs serve the
+/// stored bytes, whose identity the key itself vouches for.
+/// Entries are never replaced (the key IS the content hash).
+var qmod_source_cache: std.StringHashMapUnmanaged([]const u8) = .{};
+
+fn cachedQmodSource(allocator: std.mem.Allocator, hash: [32]u8, hash_hex: []const u8, qmod_path: []const u8) ExecError![]const u8 {
+    lockExecCache();
+    if (qmod_source_cache.get(hash_hex)) |source| {
+        exec_cache_mutex.unlock();
+        return source;
+    }
+    exec_cache_mutex.unlock();
+    const bytes = readFileAlloc(allocator, qmod_path, 16 * 1024 * 1024) catch |err| switch (err) {
+        ExecError.FileNotFound => return ExecError.QueryPayloadCorrupted,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    if (!std.mem.eql(u8, &hashBytes(bytes), &hash)) return ExecError.QueryPayloadCorrupted;
+    const copy = cache_allocator.dupe(u8, bytes) catch return ExecError.OutOfMemory;
+    lockExecCache();
+    defer exec_cache_mutex.unlock();
+    if (qmod_source_cache.get(hash_hex)) |existing| {
+        cache_allocator.free(copy);
+        return existing;
+    }
+    const key = cache_allocator.dupe(u8, hash_hex) catch {
+        cache_allocator.free(copy);
+        return ExecError.OutOfMemory;
+    };
+    qmod_source_cache.put(cache_allocator, key, copy) catch {
+        cache_allocator.free(copy);
+        cache_allocator.free(key);
+        return ExecError.OutOfMemory;
+    };
+    return copy;
+}
+
+/// A qmod procedure's executable lines + label table, parsed once
+/// per (source hash, proc name). Lines and label keys point into
+/// the entry's own copy of the source, so entries are self-owned
+/// and immutable once published; evaluators only read them.
+const CachedProgram = struct {
+    lines: []const []const u8,
+    labels: std.StringHashMap(usize),
+};
+
+var program_cache: std.StringHashMapUnmanaged(*CachedProgram) = .{};
+
+fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8) ExecError!*const CachedProgram {
+    const source_hash = hashBytes(source);
+    const hex = std.fmt.bytesToHex(source_hash, .lower);
+    const key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ hex, main_name });
+    defer allocator.free(key);
+    lockExecCache();
+    if (program_cache.get(key)) |program| {
+        exec_cache_mutex.unlock();
+        return program;
+    }
+    exec_cache_mutex.unlock();
+
+    const source_copy = cache_allocator.dupe(u8, source) catch return ExecError.OutOfMemory;
+    errdefer cache_allocator.free(source_copy);
+    var labels = std.StringHashMap(usize).init(cache_allocator);
+    errdefer labels.deinit();
+    const lines = try collectExecutableLines(cache_allocator, source_copy, main_name, &labels);
+    const program = cache_allocator.create(CachedProgram) catch return ExecError.OutOfMemory;
+    program.* = .{ .lines = lines, .labels = labels };
+    lockExecCache();
+    defer exec_cache_mutex.unlock();
+    if (program_cache.get(key)) |existing| {
+        // Lost a build race: drop our copy, serve the winner.
+        program.labels.deinit();
+        cache_allocator.free(program.lines);
+        cache_allocator.free(source_copy);
+        cache_allocator.destroy(program);
+        return existing;
+    }
+    const owned_key = cache_allocator.dupe(u8, key) catch return ExecError.OutOfMemory;
+    program_cache.put(cache_allocator, owned_key, program) catch return ExecError.OutOfMemory;
+    return program;
 }
 
 /// Read-side load under the epoch protocol (docs/vm_concurrency_epoch.md
@@ -2253,12 +2468,11 @@ fn evalReadonlyDbQmod(allocator: std.mem.Allocator, source: []const u8, main_nam
     };
     t_params.end();
 
-    var labels = std.StringHashMap(usize).init(allocator);
-    defer labels.deinit();
     const t_lines = ScopedTimer.begin(.prog_lines);
-    const lines = try collectExecutableLines(allocator, source, main_name, &labels);
+    const program = try cachedProgram(allocator, source, main_name);
     t_lines.end();
-    defer allocator.free(lines);
+    const lines = program.lines;
+    const labels = &program.labels;
 
     const t_loop = ScopedTimer.begin(.stmt_loop);
     defer t_loop.end();
@@ -2337,10 +2551,9 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
         else => return err,
     };
 
-    var labels = std.StringHashMap(usize).init(allocator);
-    defer labels.deinit();
-    const lines = try collectExecutableLines(allocator, source, main_name, &labels);
-    defer allocator.free(lines);
+    const program = try cachedProgram(allocator, source, main_name);
+    const lines = program.lines;
+    const labels = &program.labels;
 
     var pc: usize = 0;
     while (pc < lines.len) {
@@ -2425,10 +2638,9 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
         };
     }
 
-    var labels = std.StringHashMap(usize).init(allocator);
-    defer labels.deinit();
-    const lines = try collectExecutableLines(allocator, source, main_name, &labels);
-    defer allocator.free(lines);
+    const program = try cachedProgram(allocator, source, main_name);
+    const lines = program.lines;
+    const labels = &program.labels;
 
     var pc: usize = 0;
     while (pc < lines.len) {
@@ -2515,10 +2727,9 @@ fn evalAtomicDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name:
         else => return err,
     };
 
-    var labels = std.StringHashMap(usize).init(allocator);
-    defer labels.deinit();
-    const lines = try collectExecutableLines(allocator, source, main_name, &labels);
-    defer allocator.free(lines);
+    const program = try cachedProgram(allocator, source, main_name);
+    const lines = program.lines;
+    const labels = &program.labels;
 
     var pc: usize = 0;
     while (pc < lines.len) {
@@ -2632,57 +2843,29 @@ pub fn registerQuery(allocator: std.mem.Allocator, source_path: []const u8) Exec
     };
 }
 
-fn loadMeta(allocator: std.mem.Allocator, hash_text: []const u8) ExecError!std.json.Parsed(QueryMeta) {
-    const hash = try parseHashHex(hash_text);
-    const hash_hex = try hashHexAlloc(allocator, hash);
-    defer allocator.free(hash_hex);
-    const path = try metaPath(allocator, hash_hex);
-    defer allocator.free(path);
-    const expected_qmod_path = try qmodPath(allocator, hash_hex);
-    defer allocator.free(expected_qmod_path);
-    const bytes = readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
-        ExecError.FileNotFound => return ExecError.QueryHashUnknown,
-        else => return err,
-    };
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(QueryMeta, allocator, bytes, .{ .allocate = .alloc_always }) catch return ExecError.InvalidFormat;
-    if (!std.mem.eql(u8, parsed.value.magic, "sa-db-qmod-meta") or (parsed.value.version != 1 and parsed.value.version != 2)) {
-        parsed.deinit();
-        return ExecError.InvalidFormat;
-    }
-    if (!std.mem.eql(u8, parsed.value.hash, hash_hex) or
-        !std.mem.eql(u8, parsed.value.qmod_path, expected_qmod_path) or
-        parsed.value.grants != parsed.value.grant_entries.len or
-        parsed.value.main.len == 0)
-    {
-        parsed.deinit();
-        return ExecError.QueryRegistryCorrupted;
-    }
-    return parsed;
-}
-
 pub fn inspectRegistry(allocator: std.mem.Allocator, hash_text: []const u8) ExecError![]u8 {
-    var parsed = try loadMeta(allocator, hash_text);
-    defer parsed.deinit();
+    const entry = try acquireMeta(allocator, hash_text);
+    defer releaseMeta(entry);
+    const parsed = entry.value();
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
-    out.print("hash: {s}\n", .{parsed.value.hash}) catch return ExecError.OutOfMemory;
-    out.print("source: {s}\n", .{parsed.value.source_path}) catch return ExecError.OutOfMemory;
-    out.print("qmod: {s}\n", .{parsed.value.qmod_path}) catch return ExecError.OutOfMemory;
-    out.print("imports: {d}\n", .{parsed.value.imports}) catch return ExecError.OutOfMemory;
-    out.print("grants: {d}\n", .{parsed.value.grants}) catch return ExecError.OutOfMemory;
-    for (parsed.value.grant_entries) |entry| {
-        out.print("grant: {s}\n", .{entry}) catch return ExecError.OutOfMemory;
+    out.print("hash: {s}\n", .{parsed.hash}) catch return ExecError.OutOfMemory;
+    out.print("source: {s}\n", .{parsed.source_path}) catch return ExecError.OutOfMemory;
+    out.print("qmod: {s}\n", .{parsed.qmod_path}) catch return ExecError.OutOfMemory;
+    out.print("imports: {d}\n", .{parsed.imports}) catch return ExecError.OutOfMemory;
+    out.print("grants: {d}\n", .{parsed.grants}) catch return ExecError.OutOfMemory;
+    for (parsed.grant_entries) |grant_entry| {
+        out.print("grant: {s}\n", .{grant_entry}) catch return ExecError.OutOfMemory;
     }
-    out.print("main: {s}\n", .{parsed.value.main}) catch return ExecError.OutOfMemory;
-    const module_class = try deriveModuleClass(allocator, parsed.value.grant_entries);
+    out.print("main: {s}\n", .{parsed.main}) catch return ExecError.OutOfMemory;
+    const module_class = try deriveModuleClass(allocator, parsed.grant_entries);
     defer allocator.free(module_class.write_tables);
     out.print("kind: {s}\n", .{module_class.kind}) catch return ExecError.OutOfMemory;
     out.print("write_capability: {s}\n", .{if (module_class.write_capability) "true" else "false"}) catch return ExecError.OutOfMemory;
     for (module_class.write_tables) |table_name| {
         out.print("write_table: {s}\n", .{table_name}) catch return ExecError.OutOfMemory;
     }
-    if (parsed.value.aot) |record| {
+    if (parsed.aot) |record| {
         out.print("aot_lib: {s}\n", .{record.lib_path}) catch return ExecError.OutOfMemory;
         out.print("aot_lib_sha256: {s}\n", .{record.lib_sha256}) catch return ExecError.OutOfMemory;
         out.print("aot_symbol: {s}\n", .{record.symbol}) catch return ExecError.OutOfMemory;
@@ -2874,9 +3057,9 @@ fn readAotLibraryBytes(allocator: std.mem.Allocator, lib_path: []const u8) ExecE
 /// and with one it always runs native — substitution requires the
 /// explicit replace flag, never a silent overwrite of native code.
 pub fn registerAot(allocator: std.mem.Allocator, hash_text: []const u8, lib_path: []const u8, symbol: ?[]const u8, replace: bool) ExecError!AotResult {
-    var parsed = try loadMeta(allocator, hash_text);
-    defer parsed.deinit();
-    const meta = parsed.value;
+    const meta_entry = try acquireMeta(allocator, hash_text);
+    defer releaseMeta(meta_entry);
+    const meta = meta_entry.value().*;
     const entry_symbol = symbol orelse aot_default_entry_symbol;
     const hash = try parseHashHex(meta.hash);
 
@@ -3079,33 +3262,29 @@ pub fn execQuery(allocator: std.mem.Allocator, hash_text: []const u8, params_pat
 pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, params_path: ?[]const u8, fuel_limit: ?u64) ExecError!ExecRun {
     var meter = FuelMeter{ .limit = try resolveFuelLimit(fuel_limit) };
     const t_registry = ScopedTimer.begin(.registry_meta);
-    var parsed = try loadMeta(allocator, hash_text);
+    const meta_entry = try acquireMeta(allocator, hash_text);
     t_registry.end();
-    defer parsed.deinit();
+    defer releaseMeta(meta_entry);
+    const parsed = meta_entry.value();
     if (params_path) |path| {
         const t_params = ScopedTimer.begin(.params_read);
         const params = try readFileAlloc(allocator, path, 64 * 1024 * 1024);
         t_params.end();
         allocator.free(params);
     }
-    const hash = try parseHashHex(parsed.value.hash);
+    const hash = try parseHashHex(parsed.hash);
     const t_qmod = ScopedTimer.begin(.qmod_load);
-    const qmod_source = readFileAlloc(allocator, parsed.value.qmod_path, 16 * 1024 * 1024) catch |err| switch (err) {
-        ExecError.FileNotFound => return ExecError.QueryPayloadCorrupted,
-        else => return err,
-    };
+    const qmod_source = try cachedQmodSource(allocator, hash, parsed.hash, parsed.qmod_path);
     t_qmod.end();
-    defer allocator.free(qmod_source);
-    if (!std.mem.eql(u8, &hashBytes(qmod_source), &hash)) return ExecError.QueryPayloadCorrupted;
-    try validateExecPayload(allocator, parsed.value, qmod_source);
-    if (parsed.value.aot) |record| {
+    try validateExecPayload(allocator, parsed.*, qmod_source);
+    if (parsed.aot) |record| {
         // An AOT record is an explicit per-module opt-in: the module
         // runs natively or fails loudly. There is no fallback to the
         // interpreter from this branch.
-        const aot_result = try execAotQmod(allocator, parsed.value, record, qmod_source, params_path);
+        const aot_result = try execAotQmod(allocator, parsed.*, record, qmod_source, params_path);
         return .{ .ok = .{
             .code = 0,
-            .function_name = try allocator.dupe(u8, parsed.value.main),
+            .function_name = try allocator.dupe(u8, parsed.main),
             .hash = hash,
             .result_u64 = aot_result,
             .fuel_used = meter.used,
@@ -3114,34 +3293,34 @@ pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, pa
         } };
     }
     const t_scalar = ScopedTimer.begin(.scalar_eval);
-    const scalar_result = evalScalarQmod(allocator, qmod_source, parsed.value.main, params_path, &meter) catch |err| switch (err) {
+    const scalar_result = evalScalarQmod(allocator, qmod_source, parsed.main, params_path, &meter) catch |err| switch (err) {
         ExecError.UnsupportedOperation => null,
         else => return err,
     };
     t_scalar.end();
     const db_result = if (scalar_result == null)
-        (evalReadonlyDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
+        (evalReadonlyDbQmod(allocator, qmod_source, parsed.main, parsed.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
     else
         null;
     const write_result = if (scalar_result == null and db_result == null)
-        (evalWriteDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
+        (evalWriteDbQmod(allocator, qmod_source, parsed.main, parsed.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
     else
         null;
     const read_write_result = if (scalar_result == null and db_result == null and write_result == null)
-        (evalReadWriteDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
+        (evalReadWriteDbQmod(allocator, qmod_source, parsed.main, parsed.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
     else
         null;
     const atomic_result = if (scalar_result == null and db_result == null and write_result == null and read_write_result == null)
-        (evalAtomicDbQmod(allocator, qmod_source, parsed.value.main, parsed.value.grant_entries, params_path, &meter) catch |err| switch (err) {
+        (evalAtomicDbQmod(allocator, qmod_source, parsed.main, parsed.grant_entries, params_path, &meter) catch |err| switch (err) {
             ExecError.UnsupportedOperation => null,
             else => return err,
         })
@@ -3150,7 +3329,7 @@ pub fn execQueryWithFuel(allocator: std.mem.Allocator, hash_text: []const u8, pa
     const final_result = scalar_result orelse db_result orelse write_result orelse read_write_result orelse atomic_result;
     return .{ .ok = .{
         .code = if (final_result == null) 12 else 0,
-        .function_name = try allocator.dupe(u8, parsed.value.main),
+        .function_name = try allocator.dupe(u8, parsed.main),
         .hash = hash,
         .result_u64 = final_result,
         .fuel_used = meter.used,
@@ -5723,13 +5902,14 @@ test "qmod write procedure class is recorded in registry metadata" {
 
     const write_hash = try hashHexAlloc(std.testing.allocator, write_result.hash);
     defer std.testing.allocator.free(write_hash);
-    var parsed = try loadMeta(std.testing.allocator, write_hash);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
-    try std.testing.expectEqualStrings("procedure", parsed.value.kind);
-    try std.testing.expect(parsed.value.write_capability);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.write_tables.len);
-    try std.testing.expectEqualStrings("simple", parsed.value.write_tables[0]);
+    const meta_entry = try acquireMeta(std.testing.allocator, write_hash);
+    defer releaseMeta(meta_entry);
+    const parsed = meta_entry.value();
+    try std.testing.expectEqual(@as(u32, 2), parsed.version);
+    try std.testing.expectEqualStrings("procedure", parsed.kind);
+    try std.testing.expect(parsed.write_capability);
+    try std.testing.expectEqual(@as(usize, 1), parsed.write_tables.len);
+    try std.testing.expectEqualStrings("simple", parsed.write_tables[0]);
 
     const inspect = try inspectRegistry(std.testing.allocator, write_hash);
     defer std.testing.allocator.free(inspect);
