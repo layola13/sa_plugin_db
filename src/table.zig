@@ -8460,6 +8460,32 @@ fn walFrameEpochMeta(out: *std.array_list.Managed(u8), allocator: std.mem.Alloca
 // fdatasync before returning. On file creation the parent directory is
 // fsync'd once (tracked per process) so the new file survives a crash.
 
+/// Test seam (docs/vm_concurrency_epoch.md §11.7): when a test
+/// installs a gate here, `walAppendSync` reports entry and
+/// waits for release before writing, holding a real sync in
+/// flight deterministically. Never installed outside tests;
+/// the fold/recovery logic has no test-only branches — the
+/// gate only stretches a sync in time.
+pub const TestSyncGate = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    open: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn wait(self: *TestSyncGate) void {
+        _ = self.hits.fetchAdd(1, .acq_rel);
+        self.entered.store(true, .release);
+        while (!self.open.load(.acquire)) {
+            sio.io().sleep(.fromNanoseconds(1_000_000), .awake) catch {};
+        }
+    }
+
+    pub fn releaseAll(self: *TestSyncGate) void {
+        self.open.store(true, .release);
+    }
+};
+
+pub var test_sync_gate: ?*TestSyncGate = null;
+
 fn walAppendSync(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8, bytes: []const u8) TableError!void {
     if (bytes.len == 0) return;
     const path = try walFilePath(allocator, root_dir, table_name);
@@ -8481,6 +8507,7 @@ fn walAppendSync(allocator: std.mem.Allocator, root_dir: []const u8, table_name:
     var file = sio.cwd().createFile(path, .{ .truncate = false }) catch |err| return mapFileError(err);
     defer file.close();
     { const st = file.stat() catch |err| return mapFileError(err); file.seekTo(st.size) catch |err| return mapFileError(err); }
+    if (test_sync_gate) |gate| gate.wait();
     file.writeAll(bytes) catch |err| return mapFileError(err);
     if (!skipDurabilitySync()) {
         if (builtin.os.tag == .linux) {
@@ -8678,6 +8705,12 @@ fn epochTipCacheDrop(root_dir: []const u8, table_name: []const u8) void {
     epochTipCacheDropLocked(root_dir, table_name);
 }
 
+/// Drop the cached epoch tip (group-commit poison recovery,
+/// docs §11.5): the next staging rebuilds it from disk.
+pub fn epochTipDrop(root_dir: []const u8, table_name: []const u8) void {
+    epochTipCacheDrop(root_dir, table_name);
+}
+
 fn epochTipView(allocator: std.mem.Allocator, entry: *const EpochTipCacheEntry) TableError!EpochTip {
     var files = std.StringHashMapUnmanaged([]const u8){};
     errdefer files.deinit(allocator);
@@ -8720,6 +8753,11 @@ pub fn epochWalStaging(allocator: std.mem.Allocator, root_dir: []const u8, table
         error.NotFound => return .none,
         else => return err,
     };
+    // Group queue active (docs §11.2): the borrowed tip is not
+    // a staging source — its payloads may be retired by a
+    // queued merge at any time. Decline to the fold-then-load
+    // behavior; group writers use `epochWalStagingOwned`.
+    if (groupWalState(root_dir, table_name).active) return .mixed_stream;
     const wal_len = walFileSize(allocator, root_dir, table_name);
     if (wal_len == 0) {
         epochTipCacheDrop(root_dir, table_name);
@@ -8743,6 +8781,10 @@ fn epochWalStagingFromDisk(
     table_name: []const u8,
     witness: ActiveManifestWitness,
 ) TableError!EpochWalStaging {
+    // Never rebuild the tip from disk under an active group
+    // queue: queued units are not in the file yet, so a rebuild
+    // would silently stage from behind the chain tip.
+    if (groupWalState(root_dir, table_name).active) return .mixed_stream;
     const path = try walFilePath(allocator, root_dir, table_name);
     defer allocator.free(path);
     const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
@@ -8935,6 +8977,194 @@ fn epochTipCacheNoteAppend(
     };
 }
 
+/// Merge one queued epoch unit into the staging tip (docs
+/// §11.3): the phase-1 note-append, called at group-submit time
+/// with projected WAL lengths (file length + queued bytes).
+/// The entry's chain checks are identical; only the meaning of
+/// the lengths differs, and the coordinator keeps them exact.
+pub fn epochTipNoteQueuedAppend(
+    root_dir: []const u8,
+    table_name: []const u8,
+    base_epoch: u64,
+    base_meta_hash: [32]u8,
+    pre_len: u64,
+    new_len: u64,
+    files: []const EpochCommitFile,
+    meta_json: []const u8,
+) void {
+    epochTipCacheNoteAppend(root_dir, table_name, base_epoch, base_meta_hash, pre_len, new_len, files, meta_json);
+}
+
+// --- group-commit WAL state (docs/vm_concurrency_epoch.md §11) -------------
+// The qmod group-commit coordinator lives in db_stub; the
+// pieces the WAL layer itself must respect are registered
+// here: whether a commit queue is active for the table, how
+// many framed bytes are queued-but-unappended (the staging
+// tip's recorded WAL length runs ahead of the file by exactly
+// this), and the durable frontier — the WAL length up to
+// which units are synced and may be folded or pinned.
+
+pub const GroupWalState = struct {
+    active: bool = false,
+    projected_extra: u64 = 0,
+    frontier_len: u64 = 0,
+    /// Epoch at the durable frontier: the newest epoch a fold
+    /// in this process may publish. Readers compare it against
+    /// the manifest witness to skip folds that cannot advance
+    /// anything (docs §11.4).
+    frontier_epoch: u64 = 0,
+};
+
+var group_wal_mutex: std.atomic.Mutex = .unlocked;
+var group_wal_states: std.StringHashMap(GroupWalState) = undefined;
+var group_wal_states_init: bool = false;
+
+fn groupWalLock() void {
+    while (!group_wal_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+pub fn groupWalState(root_dir: []const u8, table_name: []const u8) GroupWalState {
+    groupWalLock();
+    defer group_wal_mutex.unlock();
+    if (!group_wal_states_init) return .{};
+    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return .{};
+    defer unsafe_init_cache_allocator.free(key);
+    return group_wal_states.get(key) orelse .{};
+}
+
+pub fn groupWalPublishState(root_dir: []const u8, table_name: []const u8, state: GroupWalState) void {
+    groupWalLock();
+    defer group_wal_mutex.unlock();
+    if (!group_wal_states_init) {
+        group_wal_states = std.StringHashMap(GroupWalState).init(unsafe_init_cache_allocator);
+        group_wal_states_init = true;
+    }
+    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return;
+    const gop = group_wal_states.getOrPut(key) catch {
+        unsafe_init_cache_allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) unsafe_init_cache_allocator.free(key);
+    gop.value_ptr.* = state;
+}
+
+pub fn groupWalClear(root_dir: []const u8, table_name: []const u8) void {
+    groupWalLock();
+    defer group_wal_mutex.unlock();
+    if (!group_wal_states_init) return;
+    const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return;
+    defer unsafe_init_cache_allocator.free(key);
+    if (group_wal_states.fetchRemove(key)) |kv| unsafe_init_cache_allocator.free(kv.key);
+}
+
+/// An owned deep copy of the epoch tip (docs §11.2): group
+/// staging holds no borrows into the shared tip cache, so tip
+/// merges and folds may retire cache payloads while a writer
+/// is still evaluating against its copy.
+pub const OwnedEpochTip = struct {
+    epoch: u64,
+    meta_json: []u8,
+    meta_hash: [32]u8,
+    files: std.StringHashMapUnmanaged([]const u8) = .{},
+
+    pub fn deinit(self: *OwnedEpochTip, allocator: std.mem.Allocator) void {
+        allocator.free(self.meta_json);
+        var it = self.files.iterator();
+        while (it.next()) |kv| {
+            allocator.free(kv.key_ptr.*);
+            allocator.free(kv.value_ptr.*);
+        }
+        self.files.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// A borrowed view aliasing this copy; valid while the
+    /// copy lives. Do not deinit the view.
+    pub fn view(self: *const OwnedEpochTip) EpochTip {
+        return .{ .epoch = self.epoch, .meta_json = self.meta_json, .meta_hash = self.meta_hash, .files = self.files };
+    }
+};
+
+pub const EpochOwnedStaging = union(enum) {
+    none,
+    tip: OwnedEpochTip,
+    mixed_stream,
+};
+
+/// Deep-copy the cache entry's tip. Caller holds
+/// epoch_tip_cache_mutex.
+fn epochTipEntryDeepCopy(allocator: std.mem.Allocator, entry: *const EpochTipCacheEntry) TableError!OwnedEpochTip {
+    var out = OwnedEpochTip{
+        .epoch = entry.tip_epoch,
+        .meta_json = try allocator.dupe(u8, entry.tip_meta_json),
+        .meta_hash = entry.tip_meta_hash,
+        .files = .{},
+    };
+    errdefer out.deinit(allocator);
+    var it = entry.files.iterator();
+    while (it.next()) |kv| {
+        const owned_path = try allocator.dupe(u8, kv.key_ptr.*);
+        errdefer allocator.free(owned_path);
+        const owned_bytes = try allocator.dupe(u8, kv.value_ptr.*);
+        errdefer allocator.free(owned_bytes);
+        try out.files.put(allocator, owned_path, owned_bytes);
+    }
+    return out;
+}
+
+/// The group-commit staging source (docs §11.2): like
+/// `epochWalStaging`, but a tip result is an owned deep copy
+/// the caller may evaluate against without holding any lock.
+/// While a commit queue is active the tip comes only from the
+/// in-memory chain state (validated against the projected WAL
+/// length); if that state is unavailable the answer is
+/// `mixed_stream` — the caller declines the group path and
+/// drains the queue instead of rebuilding under it.
+pub fn epochWalStagingOwned(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!EpochOwnedStaging {
+    if (skipDurabilitySync() or isMemoryRoot(root_dir)) return .none;
+    const witness = readActiveManifestWitness(allocator, root_dir, table_name) catch |err| switch (err) {
+        error.NotFound => return .none,
+        else => return err,
+    };
+    const wal_len = walFileSize(allocator, root_dir, table_name);
+    const gstate = groupWalState(root_dir, table_name);
+    // While a queue is active the tip may exist only in memory
+    // (the first batch has not landed, so the file is still
+    // empty): the wal_len == 0 shortcut below must not drop it.
+    if (wal_len == 0 and !gstate.active) {
+        epochTipCacheDrop(root_dir, table_name);
+        return .none;
+    }
+    {
+        while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer epoch_tip_cache_mutex.unlock();
+        if (epochTipCacheLookup(root_dir, table_name)) |entry| {
+            const valid = if (gstate.active)
+                entry.wal_len == wal_len + gstate.projected_extra
+            else
+                entry.base_epoch == witness.epoch and std.mem.eql(u8, &entry.base_meta_hash, &witness.meta_hash) and entry.wal_len == wal_len;
+            if (valid) return .{ .tip = try epochTipEntryDeepCopy(allocator, entry) };
+        }
+    }
+    if (gstate.active) return .mixed_stream;
+    switch (try epochWalStaging(allocator, root_dir, table_name)) {
+        .none => return .none,
+        .mixed_stream => return .mixed_stream,
+        .tip => |view| {
+            // The view borrows the cache entry; copy from the
+            // entry under its mutex rather than from the view,
+            // so a concurrent merge or fold cannot free the
+            // payloads mid-copy.
+            var view_mut = view;
+            view_mut.deinit(allocator);
+            while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer epoch_tip_cache_mutex.unlock();
+            const entry = epochTipCacheLookup(root_dir, table_name) orelse return .mixed_stream;
+            return .{ .tip = try epochTipEntryDeepCopy(allocator, entry) };
+        },
+    }
+}
+
 /// Whether the WAL-shaped epoch commit may run at all: durable
 /// mode on a real (non-memory) root. Mirrors the dispatch rule
 /// in commitWriteTransaction.
@@ -8956,15 +9186,15 @@ pub fn walCheckpointDue(allocator: std.mem.Allocator, root_dir: []const u8, tabl
 /// `base_meta_hash` is the SHA-256 of the on-disk meta at
 /// `base_epoch` (the chain base); it anchors the tip cache entry
 /// when this append opens a chain.
-pub fn appendEpochCommitWal(
+/// Serialize one epoch unit (BEGIN + FILE×n + META + COMMIT)
+/// without appending it. Group commit (docs §11) frames units
+/// at submit time and appends a batch of them with one sync.
+pub fn serializeEpochCommitUnit(
     allocator: std.mem.Allocator,
-    root_dir: []const u8,
-    table_name: []const u8,
     base_epoch: u64,
-    base_meta_hash: [32]u8,
     files: []const EpochCommitFile,
     meta_json: []const u8,
-) TableError!void {
+) TableError![]u8 {
     const txid = walNextTxId();
     var frame = std.array_list.Managed(u8).init(allocator);
     defer frame.deinit();
@@ -8974,11 +9204,49 @@ pub fn appendEpochCommitWal(
     }
     try walFrameEpochMeta(&frame, allocator, meta_json);
     try walFrameEpochCommit(&frame, txid, base_epoch + 1);
+    return frame.toOwnedSlice();
+}
+
+/// Append already-framed WAL bytes with the durable-append
+/// discipline (exactly one fdatasync). Ordering and chain
+/// bookkeeping belong to the caller.
+pub fn appendWalBytesSynced(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    bytes: []const u8,
+) TableError!void {
+    try walAppendSync(allocator, root_dir, table_name, bytes);
+}
+
+/// Record one committed unit in the checkpoint-threshold
+/// counters (the bookkeeping `appendEpochCommitWal` performs
+/// per unit; group commit performs it per unit at ack time).
+pub fn noteWalUnitCommitted(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    walCheckpointStateOnCommit(allocator, root_dir, table_name);
+}
+
+/// The table WAL's current byte length (0 when absent).
+pub fn walByteLen(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) u64 {
+    return walFileSize(allocator, root_dir, table_name);
+}
+
+pub fn appendEpochCommitWal(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    base_epoch: u64,
+    base_meta_hash: [32]u8,
+    files: []const EpochCommitFile,
+    meta_json: []const u8,
+) TableError!void {
+    const frame = try serializeEpochCommitUnit(allocator, base_epoch, files, meta_json);
+    defer allocator.free(frame);
 
     const pre_len = walFileSize(allocator, root_dir, table_name);
-    try walAppendSync(allocator, root_dir, table_name, frame.items);
+    try walAppendSync(allocator, root_dir, table_name, frame);
     walCheckpointStateOnCommit(allocator, root_dir, table_name);
-    epochTipCacheNoteAppend(root_dir, table_name, base_epoch, base_meta_hash, pre_len, pre_len + frame.items.len, files, meta_json);
+    epochTipCacheNoteAppend(root_dir, table_name, base_epoch, base_meta_hash, pre_len, pre_len + frame.len, files, meta_json);
 }
 
 // --- parsing ---------------------------------------------------------------
@@ -9279,6 +9547,55 @@ fn walCollectUnits(
     return units;
 }
 
+pub const DurableEpochTip = struct {
+    epoch: u64,
+    meta_hash: [32]u8,
+    /// Offset just past the last complete frame; equals the
+    /// file length unless a torn tail trails the prefix.
+    end_len: u64,
+};
+
+/// The durable epoch tip proven from disk alone: the active
+/// manifest witness advanced through every complete epoch
+/// unit in the WAL's framed prefix. Parse-only — the
+/// read-only twin of the fold's chain accounting (§10/§11),
+/// sharing the fold's parser and unit collector, so the two
+/// can never disagree about what the log says. Returns null
+/// when no manifest exists, or when the stream contains row
+/// transactions (a row fold lands through a legacy commit
+/// whose meta hash cannot be derived from the log alone).
+pub fn durableEpochTip(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError!?DurableEpochTip {
+    const witness = readActiveManifestWitness(allocator, root_dir, table_name) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const path = try walFilePath(allocator, root_dir, table_name);
+    defer allocator.free(path);
+    const data = sio.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
+        error.FileNotFound => return .{ .epoch = witness.epoch, .meta_hash = witness.meta_hash, .end_len = 0 },
+        else => return mapFileError(err),
+    };
+    defer allocator.free(data);
+    if (data.len == 0) return .{ .epoch = witness.epoch, .meta_hash = witness.meta_hash, .end_len = 0 };
+    const parsed = try walParseValidPrefix(allocator, data);
+    defer allocator.free(parsed.records);
+    var units = try walCollectUnits(allocator, parsed.records, witness.epoch);
+    defer freeWalUnits(&units);
+    var epoch = witness.epoch;
+    var hash = witness.meta_hash;
+    for (units.items) |*unit| {
+        switch (unit.*) {
+            .row_tx => return null,
+            .epoch => |*e| {
+                epoch += 1;
+                const meta_json = e.meta_json orelse return TableError.VerifyFailed;
+                std.crypto.hash.sha2.Sha256.hash(meta_json, &hash, .{});
+            },
+        }
+    }
+    return .{ .epoch = epoch, .meta_hash = hash, .end_len = @intCast(parsed.valid_bytes) };
+}
+
 /// True if a complete, CRC-valid frame exists at or after byte
 /// offset `from` in `data` (epoch frames only, when `epoch_only`).
 /// Distinguishes a torn tail from mid-file corruption: a crash
@@ -9413,9 +9730,21 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
     defer allocator.free(data);
     if (data.len == 0) return;
 
-    const parsed = try walParseValidPrefix(allocator, data);
+    // Group-commit frontier (docs §11.4): while a commit queue
+    // is active for this table, only the durable frontier may
+    // fold — bytes past it are queued or still syncing, and a
+    // prefix cut at the frontier is a clean unit boundary.
+    const gstate = groupWalState(root_dir, table_name);
+    const fold_len = if (gstate.active)
+        @min(@as(usize, @intCast(gstate.frontier_len)), data.len)
+    else
+        data.len;
+    if (fold_len == 0) return;
+    const fold_data = data[0..fold_len];
+
+    const parsed = try walParseValidPrefix(allocator, fold_data);
     defer allocator.free(parsed.records);
-    try walGuardAgainstMidFileCorruption(parsed.records, data, parsed.valid_bytes);
+    try walGuardAgainstMidFileCorruption(parsed.records, fold_data, parsed.valid_bytes);
 
     var base_meta = try loadActiveMeta(allocator, root_dir, table_name);
     defer base_meta.deinit(allocator);
@@ -9454,6 +9783,24 @@ pub fn checkpointWalLocked(allocator: std.mem.Allocator, root_dir: []const u8, t
         try checkpointFlushRowGroup(allocator, root_dir, table_name, row_group.items);
         for (row_group.items) |*t| t.ops.deinit();
         row_group.clearRetainingCapacity();
+    }
+
+    if (gstate.active) {
+        // Queue active (docs §11.4): no truncate, no tip drop —
+        // queued units' append offsets and the staging tip must
+        // survive this fold. The units folded above stay in the
+        // file as stale (base < disk epoch) and are skipped by
+        // later folds. Re-anchor the tip entry to the post-fold
+        // manifest witness so its chain validation stays exact.
+        if (readActiveManifestWitness(allocator, root_dir, table_name)) |w| {
+            while (!epoch_tip_cache_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer epoch_tip_cache_mutex.unlock();
+            if (epochTipCacheLookup(root_dir, table_name)) |entry| {
+                entry.base_epoch = w.epoch;
+                entry.base_meta_hash = w.meta_hash;
+            }
+        } else |_| {}
+        return;
     }
 
     // Every unit's new epoch is durable (or nothing needed

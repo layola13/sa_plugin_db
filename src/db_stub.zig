@@ -430,6 +430,11 @@ const WriteTable = struct {
     /// slice (grant storage outlives the exec).
     pin: ?*epoch_runtime.EpochPin = null,
     pin_table_name: []const u8 = "",
+    /// Group-commit staging (docs §11.2): the owned epoch tip
+    /// this table was staged from. Clean segments borrow its
+    /// payload copies (COW), so it must outlive the exec; freed
+    /// here. Null on every locked staging path.
+    owned_tip: ?*table_mod.OwnedEpochTip = null,
 
     pub fn deinit(self: *WriteTable, allocator: std.mem.Allocator) void {
         allocator.free(self.meta_path);
@@ -437,6 +442,10 @@ const WriteTable = struct {
         allocator.free(self.columns);
         self.parsed.deinit();
         if (self.pin) |pin| epoch_runtime.release(self.pin_table_name, pin);
+        if (self.owned_tip) |owned| {
+            owned.deinit(allocator);
+            allocator.destroy(owned);
+        }
         self.* = undefined;
     }
 };
@@ -1354,6 +1363,18 @@ fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []
 /// write table through the staged copy when the names match),
 /// so the fold's lock acquisition cannot self-deadlock.
 fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
+    // Group queue active (docs §11.4): the staging tip runs
+    // ahead of the durable frontier by the queued units. If the
+    // manifest already sits at the frontier, a fold cannot
+    // advance anything — skip it instead of queueing behind
+    // the leader's append-section lock while a batch syncs.
+    const gstate = table_mod.groupWalState(".", table_name);
+    if (gstate.active) {
+        const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
+        if (witness) |w| {
+            if (w.epoch >= gstate.frontier_epoch) return;
+        }
+    }
     if (table_mod.epochTipEpoch(".", table_name)) |tip_epoch| {
         const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
         if (witness) |w| {
@@ -1466,6 +1487,36 @@ fn validateCurrentSchemaHash(allocator: std.mem.Allocator, table_name: []const u
 }
 
 fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!WriteTable {
+    return (try loadWriteTableInner(allocator, table_name, .locked)).?;
+}
+
+/// Group-commit staging (docs/vm_concurrency_epoch.md §11.2):
+/// like `loadWriteTable`, but the staged table owns a deep copy
+/// of the epoch tip and the caller holds no lock. Returns null
+/// when the group path declines (mixed WAL stream, checkpoint
+/// due at staging, tip not buildable under an active queue);
+/// the caller then drains the queue and runs the locked flow.
+fn loadWriteTableGroup(allocator: std.mem.Allocator, table_name: []const u8) ExecError!?WriteTable {
+    return loadWriteTableInner(allocator, table_name, .group);
+}
+
+/// Group staging with the fold-first cases handled (docs
+/// §11.2): when the WAL stream is not stageable as a tip (e.g.
+/// row transactions left by ingest), fold it under the write
+/// lock — held for the fold only, never across staging or a
+/// sync wait — and stage again. A second decline is final.
+fn loadWriteTableGroupWithFold(allocator: std.mem.Allocator, table_name: []const u8) ExecError!?WriteTable {
+    if (try loadWriteTableGroup(allocator, table_name)) |write_table| return write_table;
+    var fold_lock = try acquireTableWriteLock(allocator, table_name);
+    table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| {
+        fold_lock.release();
+        return mapTableError(err);
+    };
+    fold_lock.release();
+    return loadWriteTableGroup(allocator, table_name);
+}
+
+fn loadWriteTableInner(allocator: std.mem.Allocator, table_name: []const u8, mode: enum { locked, group }) ExecError!?WriteTable {
     const meta_path = try tableMetaPath(allocator, table_name);
     errdefer allocator.free(meta_path);
     // Epoch-WAL staging (docs/vm_concurrency_epoch.md §10.2):
@@ -1473,28 +1524,61 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
     // a superseded epoch, so stage from the WAL tip instead —
     // unless the checkpoint thresholds are reached or the WAL
     // stream is not stageable as a tip, in which case fold first
-    // (this exec holds the table write lock, so the locked
+    // (the locked mode holds the table write lock, so the locked
     // checkpoint variant is the right one) and stage from the
-    // manifest as before. Tip segment payloads are borrowed
-    // under the segments' copy-on-write discipline; the tip entry
-    // cannot be retired mid-staging because every retirement
-    // path needs the write lock this exec holds.
+    // manifest as before. In locked mode the tip segment
+    // payloads are borrowed under the segments' copy-on-write
+    // discipline; the tip entry cannot be retired mid-staging
+    // because every retirement path needs the write lock this
+    // exec holds. Group mode (§11.2) deep-copies the tip into
+    // the WriteTable instead and declines the fold-first cases.
     var wal_tip: ?table_mod.EpochTip = null;
-    defer if (wal_tip) |*tip| tip.deinit(allocator);
-    switch (table_mod.epochWalStaging(allocator, ".", table_name) catch |err| return mapTableError(err)) {
-        .none => {},
-        .mixed_stream => {
-            table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| return mapTableError(err);
-        },
-        .tip => |tip| {
-            if (table_mod.walCheckpointDue(allocator, ".", table_name)) {
-                var t = tip;
-                t.deinit(allocator);
+    var tip_aliased = false;
+    defer if (wal_tip) |*tip| {
+        if (!tip_aliased) tip.deinit(allocator);
+    };
+    var owned_tip: ?*table_mod.OwnedEpochTip = null;
+    errdefer if (owned_tip) |owned| {
+        owned.deinit(allocator);
+        allocator.destroy(owned);
+    };
+    if (mode == .group) {
+        switch (table_mod.epochWalStagingOwned(allocator, ".", table_name) catch |err| return mapTableError(err)) {
+            .none => {},
+            .mixed_stream => {
+                allocator.free(meta_path);
+                return null;
+            },
+            .tip => |owned| {
+                if (table_mod.walCheckpointDue(allocator, ".", table_name)) {
+                    var o = owned;
+                    o.deinit(allocator);
+                    allocator.free(meta_path);
+                    return null;
+                }
+                const boxed = allocator.create(table_mod.OwnedEpochTip) catch return ExecError.OutOfMemory;
+                boxed.* = owned;
+                owned_tip = boxed;
+                wal_tip = boxed.view();
+                tip_aliased = true;
+            },
+        }
+    } else {
+        switch (table_mod.epochWalStaging(allocator, ".", table_name) catch |err| return mapTableError(err)) {
+            .none => {},
+            .mixed_stream => {
                 table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| return mapTableError(err);
-            } else {
-                wal_tip = tip;
-            }
-        },
+            },
+            .tip => |tip| {
+                if (table_mod.walCheckpointDue(allocator, ".", table_name)) {
+                    var t = tip;
+                    t.deinit(allocator);
+                    table_mod.checkpointWalLocked(allocator, ".", table_name) catch |err| return mapTableError(err);
+                } else {
+                    wal_tip = tip;
+                }
+            },
+        }
     }
     const meta_bytes = if (wal_tip) |tip|
         allocator.dupe(u8, tip.meta_json) catch return ExecError.OutOfMemory
@@ -1598,6 +1682,8 @@ fn loadWriteTable(allocator: std.mem.Allocator, table_name: []const u8) ExecErro
             .segments = segments,
         };
     }
+    out.owned_tip = owned_tip;
+    owned_tip = null;
     return out;
 }
 
@@ -2442,29 +2528,50 @@ const EPOCH_WAL_MIN_DIRTY_BYTES: usize = 4096;
 /// the staged table is abandoned exactly as a failed legacy
 /// commit abandons it (the manifest never moved; a partially
 /// appended unit is a torn tail the fold drops whole).
-fn commitWriteTableWal(
+/// A computed epoch unit, ready to append: the carried files
+/// (views into the staged table) and the serialized new meta.
+/// Shared by the phase-1 WAL commit and group commit (§11).
+const PreparedEpochUnit = struct {
+    files: std.array_list.Managed(table_mod.EpochCommitFile),
+    meta_json: []u8,
+    base_epoch: u64,
+
+    fn deinit(self: *PreparedEpochUnit, allocator: std.mem.Allocator) void {
+        self.files.deinit();
+        allocator.free(self.meta_json);
+        self.* = undefined;
+    }
+};
+
+/// The write-free half of the WAL-shaped commit: compute the
+/// new epoch's file metas from the staged bytes and serialize
+/// the new meta. Returns null when the commit is not
+/// WAL-eligible (path unavailable, an oversized segment, or —
+/// unless `waive_min_dirty` — under the small-commit threshold).
+fn prepareEpochUnit(
     allocator: std.mem.Allocator,
     write_table: *WriteTable,
     next_epoch: u64,
     owned_paths: *std.array_list.Managed([]const u8),
     owned_hashes: *std.array_list.Managed([]const u8),
     owned_block_hashes: *std.array_list.Managed([][]const u8),
-) ExecError!bool {
-    if (!table_mod.walCommitPathAvailable(".")) return false;
+    waive_min_dirty: bool,
+) ExecError!?PreparedEpochUnit {
+    if (!table_mod.walCommitPathAvailable(".")) return null;
     var total_dirty: usize = 0;
     for (write_table.columns) |*column| {
         for (column.segments) |*segment| {
             if (!segment.dirty) continue;
             // One WAL record must hold path + bytes (with the
             // frame's own overhead staying under the cap).
-            if (segment.bytes.len + segment.path.len + 5 > table_mod.WAL_MAX_RECORD_BYTES) return false;
+            if (segment.bytes.len + segment.path.len + 5 > table_mod.WAL_MAX_RECORD_BYTES) return null;
             total_dirty += segment.bytes.len;
         }
     }
-    if (total_dirty < EPOCH_WAL_MIN_DIRTY_BYTES) return false;
+    if (!waive_min_dirty and total_dirty < EPOCH_WAL_MIN_DIRTY_BYTES) return null;
 
     var files = std.array_list.Managed(table_mod.EpochCommitFile).init(allocator);
-    defer files.deinit();
+    errdefer files.deinit();
     for (write_table.columns, 0..) |*column, col_idx| {
         for (column.segments, 0..) |*segment, seg_idx| {
             if (!segment.dirty) continue;
@@ -2490,8 +2597,20 @@ fn commitWriteTableWal(
     }
     write_table.parsed.value.epoch = next_epoch;
     const meta_json = table_mod.serializeVersionedMetaJson(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
-    defer allocator.free(meta_json);
-    table_mod.appendEpochCommitWal(allocator, ".", write_table.parsed.value.table_name, next_epoch - 1, write_table.meta_hash, files.items, meta_json) catch |err| return mapTableError(err);
+    return .{ .files = files, .meta_json = meta_json, .base_epoch = next_epoch - 1 };
+}
+
+fn commitWriteTableWal(
+    allocator: std.mem.Allocator,
+    write_table: *WriteTable,
+    next_epoch: u64,
+    owned_paths: *std.array_list.Managed([]const u8),
+    owned_hashes: *std.array_list.Managed([]const u8),
+    owned_block_hashes: *std.array_list.Managed([][]const u8),
+) ExecError!bool {
+    var prepared = (try prepareEpochUnit(allocator, write_table, next_epoch, owned_paths, owned_hashes, owned_block_hashes, false)) orelse return false;
+    defer prepared.deinit(allocator);
+    table_mod.appendEpochCommitWal(allocator, ".", write_table.parsed.value.table_name, prepared.base_epoch, write_table.meta_hash, prepared.files.items, prepared.meta_json) catch |err| return mapTableError(err);
     return true;
 }
 
@@ -2572,6 +2691,476 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     // retires the previous epoch pin so in-process readers that pin
     // from now on adopt the new epoch and the old pin drains.
     epoch_runtime.noteCommitted(write_table.parsed.value.table_name, next_epoch);
+}
+
+// --- group commit (docs/vm_concurrency_epoch.md §11) -----------------------
+// Per-table commit queue: writers stage and evaluate without
+// the table write lock, then queue their framed epoch units;
+// a leader (a writer thread, never a dedicated thread) appends
+// a batch of units with one fdatasync and only then acks the
+// batch's writers. The queue extends the epoch chain in
+// submission order, one unit per epoch — the same serial order
+// the locked flow produces — so no commit semantics change.
+
+const GROUP_COMMIT_MAX_BATCH: usize = 32;
+const GROUP_COMMIT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const GROUP_COMMIT_LINGER_US: u64 = 0;
+const GROUP_STALE_RETRIES: u32 = 2;
+
+const GroupError = ExecError || error{ StaleBase, GroupDeclined };
+
+const GroupCell = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0), // 0 pending, 1 ok, 2 failed
+    err: ?ExecError = null,
+
+    fn complete(self: *GroupCell, result: ?ExecError) void {
+        self.err = result;
+        self.state.store(if (result == null) @as(u8, 1) else @as(u8, 2), .release);
+    }
+
+    fn wait(self: *GroupCell) ?ExecError {
+        var spins: u32 = 0;
+        while (true) {
+            switch (self.state.load(.acquire)) {
+                1 => return null,
+                2 => return self.err orelse ExecError.InvalidFormat,
+                else => {
+                    spins += 1;
+                    if (spins < 256) {
+                        std.atomic.spinLoopHint();
+                    } else {
+                        sio.io().sleep(.fromNanoseconds(20_000), .awake) catch {};
+                    }
+                },
+            }
+        }
+    }
+};
+
+const GroupRequest = struct {
+    cell: *GroupCell,
+    unit_bytes: []const u8, // borrowed from the waiting writer; freed by it after the wait
+    files: []const table_mod.EpochCommitFile, // borrowed from the waiting writer's staged table
+    meta_json: []const u8, // borrowed from the waiting writer's prepared unit
+    base_epoch: u64,
+    base_hash: [32]u8,
+    new_epoch: u64,
+    expected_pre_len: u64,
+};
+
+const GroupTableState = struct {
+    queue: std.array_list.Managed(*GroupRequest),
+    chain_epoch: u64 = 0,
+    chain_hash: [32]u8 = std.mem.zeroes([32]u8),
+    chain_valid: bool = false,
+    leader_active: bool = false,
+    poisoned: bool = false,
+    recovering: bool = false,
+    /// A locked-flow fallback commit is in progress (docs
+    /// §11.1): submissions decline while it is held, so the
+    /// fallback's solo append can never interleave with a
+    /// queued batch (the leader's pre-length check would
+    /// poison the batch and fail its writers spuriously).
+    exclusive: bool = false,
+    staging_in_flight: u32 = 0,
+    staging_wal_len: u64 = 0, // projected WAL length: file bytes + unappended framed bytes
+    frontier_len: u64 = 0, // WAL length known durable in this process
+    frontier_epoch: u64 = 0, // epoch at the durable frontier
+    unappended_bytes: u64 = 0, // framed bytes queued or in flight, not yet appended
+};
+
+var group_mutex: std.atomic.Mutex = .unlocked;
+var group_states: std.StringHashMap(*GroupTableState) = undefined;
+var group_states_init: bool = false;
+
+fn groupLock() void {
+    while (!group_mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn groupStateFor(table_name: []const u8) *GroupTableState {
+    groupLock();
+    defer group_mutex.unlock();
+    if (!group_states_init) {
+        group_states = std.StringHashMap(*GroupTableState).init(std.heap.page_allocator);
+        group_states_init = true;
+    }
+    if (group_states.get(table_name)) |state| return state;
+    const state = std.heap.page_allocator.create(GroupTableState) catch @panic("group commit state OOM");
+    state.* = .{ .queue = std.array_list.Managed(*GroupRequest).init(std.heap.page_allocator) };
+    const key = std.heap.page_allocator.dupe(u8, table_name) catch @panic("group commit state OOM");
+    group_states.put(key, state) catch @panic("group commit state OOM");
+    return state;
+}
+
+/// Publish the coordinator's WAL-layer view (docs §11.4) with
+/// group_mutex held: folds clamp to `frontier_len` and staging
+/// validates against file length + `unappended_bytes` while
+/// the queue is active.
+fn groupPublishLocked(state: *const GroupTableState, table_name: []const u8) void {
+    const active = state.queue.items.len != 0 or state.leader_active or state.poisoned;
+    table_mod.groupWalPublishState(".", table_name, .{
+        .active = active,
+        .projected_extra = state.unappended_bytes,
+        .frontier_len = state.frontier_len,
+        .frontier_epoch = state.frontier_epoch,
+    });
+}
+
+fn groupQueueActive(table_name: []const u8) bool {
+    groupLock();
+    defer group_mutex.unlock();
+    if (!group_states_init) return false;
+    const state = group_states.get(table_name) orelse return false;
+    return state.queue.items.len != 0 or state.leader_active or state.poisoned;
+}
+
+/// Poison recovery (docs §11.5): fold whatever the WAL holds
+/// under the write lock — complete units are adopted, a torn
+/// tail is discarded — resolving the outcome-unknown state a
+/// failed batch leaves behind. Runs outside the group mutex;
+/// concurrent submitters wait for the recovering flag.
+fn groupRecoverIfPoisoned(allocator: std.mem.Allocator, table_name: []const u8, state: *GroupTableState) ExecError!void {
+    while (true) {
+        groupLock();
+        if (!state.poisoned) {
+            group_mutex.unlock();
+            return;
+        }
+        if (state.recovering) {
+            group_mutex.unlock();
+            sio.io().sleep(.fromNanoseconds(1_000_000), .awake) catch {};
+            continue;
+        }
+        state.recovering = true;
+        group_mutex.unlock();
+        break;
+    }
+    defer {
+        groupLock();
+        state.poisoned = false;
+        state.recovering = false;
+        state.chain_valid = false;
+        state.frontier_len = 0;
+        state.frontier_epoch = 0;
+        state.staging_wal_len = 0;
+        state.unappended_bytes = 0;
+        group_mutex.unlock();
+    }
+    table_mod.groupWalClear(".", table_name);
+    table_mod.epochTipDrop(".", table_name);
+    table_mod.checkpointWalIfDirty(allocator, ".", table_name) catch |err| return mapTableError(err);
+}
+
+/// Take the coordinator's exclusive token for a locked-flow
+/// fallback commit: waits until the queue is empty, no leader
+/// is active, and no other fallback holds the token,
+/// recovering from poison on the way. While the token is held,
+/// group submissions decline (and their callers queue up here
+/// in turn), so the fallback's solo append is the only commit
+/// motion for the table (docs §11.1).
+fn groupEnterExclusive(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
+    const state = groupStateFor(table_name);
+    while (true) {
+        try groupRecoverIfPoisoned(allocator, table_name, state);
+        groupLock();
+        if (state.queue.items.len == 0 and !state.leader_active and !state.exclusive) {
+            state.exclusive = true;
+            group_mutex.unlock();
+            return;
+        }
+        group_mutex.unlock();
+        sio.io().sleep(.fromNanoseconds(200_000), .awake) catch {};
+    }
+}
+
+fn groupExitExclusive(table_name: []const u8) void {
+    const state = groupStateFor(table_name);
+    groupLock();
+    state.exclusive = false;
+    group_mutex.unlock();
+}
+
+/// Fail a batch (already removed from the queue) plus every
+/// unit still queued behind it, and poison the coordinator:
+/// the queued units chain onto a base that never landed, so
+/// none of them can be acked or appended.
+fn groupPoisonAndFail(allocator: std.mem.Allocator, table_name: []const u8, state: *GroupTableState, batch: []const *GroupRequest, err: ExecError) void {
+    _ = allocator;
+    groupLock();
+    state.poisoned = true;
+    state.chain_valid = false;
+    state.unappended_bytes = 0;
+    // Complete the stranded cells while still holding the
+    // mutex (completion is two atomic stores), then drop the
+    // queue's structure: no allocation on the failure path.
+    for (state.queue.items) |req| req.cell.complete(err);
+    state.queue.clearRetainingCapacity();
+    groupPublishLocked(state, table_name);
+    group_mutex.unlock();
+    table_mod.epochTipDrop(".", table_name);
+    for (batch) |req| req.cell.complete(err);
+}
+
+/// The leader loop (docs §11.3): drain the queue in batches,
+/// one synced append per batch, ack strictly after the sync.
+/// Runs on a writer thread; resigns when the queue empties.
+fn groupLead(allocator: std.mem.Allocator, table_name: []const u8, state: *GroupTableState) void {
+    while (true) {
+        var batch: std.array_list.Managed(*GroupRequest) = std.array_list.Managed(*GroupRequest).init(allocator);
+        defer batch.deinit();
+        var batch_bytes: u64 = 0;
+        groupLock();
+        if (state.queue.items.len == 0) {
+            state.leader_active = false;
+            groupPublishLocked(state, table_name);
+            group_mutex.unlock();
+            return;
+        }
+        while (state.queue.items.len != 0 and batch.items.len < GROUP_COMMIT_MAX_BATCH) {
+            const req = state.queue.items[0];
+            if (batch.items.len != 0 and batch_bytes + req.unit_bytes.len > GROUP_COMMIT_MAX_BATCH_BYTES) break;
+            _ = state.queue.orderedRemove(0);
+            batch.append(req) catch {
+                // Restore the request and fail the whole batch:
+                // leadership must never strand a queued writer.
+                state.queue.insert(0, req) catch {};
+                break;
+            };
+            batch_bytes += req.unit_bytes.len;
+        }
+        if (GROUP_COMMIT_LINGER_US > 0 and batch.items.len == 1 and state.staging_in_flight != 0) {
+            group_mutex.unlock();
+            sio.io().sleep(.fromNanoseconds(GROUP_COMMIT_LINGER_US * 1000), .awake) catch {};
+            groupLock();
+            while (state.queue.items.len != 0 and batch.items.len < GROUP_COMMIT_MAX_BATCH) {
+                const req = state.queue.items[0];
+                if (batch_bytes + req.unit_bytes.len > GROUP_COMMIT_MAX_BATCH_BYTES) break;
+                _ = state.queue.orderedRemove(0);
+                batch.append(req) catch break;
+                batch_bytes += req.unit_bytes.len;
+            }
+        }
+        group_mutex.unlock();
+        if (batch.items.len == 0) continue;
+
+        var batch_pre_len = batch.items[0].expected_pre_len;
+        var write_lock = acquireTableWriteLock(allocator, table_name) catch |err| {
+            groupPoisonAndFail(allocator, table_name, state, batch.items, err);
+            continue;
+        };
+        const actual_len = table_mod.walByteLen(allocator, ".", table_name);
+        if (actual_len != batch_pre_len) {
+            // The byte offset is bookkeeping; the invariant
+            // that matters is that the durable tip still
+            // equals the batch head's base. A local fold can
+            // legitimately move the offset (it publishes the
+            // very units the batch chains onto, then
+            // truncates), so re-prove the tip from disk
+            // before condemning the batch: resync when the
+            // durable tip is exactly the head's base and the
+            // file ends at the last complete frame. Anything
+            // else — a foreign append, a torn tail, a
+            // different tip — poisons as before (docs §11.5).
+            var resynced = false;
+            if (table_mod.durableEpochTip(allocator, ".", table_name) catch null) |tip| {
+                if (tip.epoch == batch.items[0].base_epoch and
+                    std.mem.eql(u8, &tip.meta_hash, &batch.items[0].base_hash) and
+                    tip.end_len == actual_len)
+                {
+                    batch_pre_len = actual_len;
+                    resynced = true;
+                }
+            }
+            if (!resynced) {
+                write_lock.release();
+                groupPoisonAndFail(allocator, table_name, state, batch.items, ExecError.StaleMetadata);
+                continue;
+            }
+        }
+        var joined = std.array_list.Managed(u8).init(allocator);
+        defer joined.deinit();
+        var append_err: ?ExecError = null;
+        for (batch.items) |req| {
+            joined.appendSlice(req.unit_bytes) catch {
+                append_err = ExecError.OutOfMemory;
+                break;
+            };
+        }
+        if (append_err == null) {
+            table_mod.appendWalBytesSynced(allocator, ".", table_name, joined.items) catch |err| {
+                append_err = mapTableError(err);
+            };
+        }
+        write_lock.release();
+        if (append_err) |err| {
+            groupPoisonAndFail(allocator, table_name, state, batch.items, err);
+            continue;
+        }
+        // The batch is durable. Advance the frontier, do the
+        // per-unit bookkeeping, retire the snapshot pin once
+        // for the batch's final epoch — and only then ack.
+        groupLock();
+        state.frontier_len = batch_pre_len + batch_bytes;
+        state.frontier_epoch = batch.items[batch.items.len - 1].new_epoch;
+        state.unappended_bytes -= batch_bytes;
+        // Keep the projected staging length exact even when
+        // this append resynced the batch offset (fold
+        // interference): staging length is always the durable
+        // frontier plus the bytes still queued behind it.
+        state.staging_wal_len = state.frontier_len + state.unappended_bytes;
+        groupPublishLocked(state, table_name);
+        group_mutex.unlock();
+        for (batch.items) |_| table_mod.noteWalUnitCommitted(allocator, ".", table_name);
+        epoch_runtime.noteCommitted(table_name, batch.items[batch.items.len - 1].new_epoch);
+        for (batch.items) |req| req.cell.complete(null);
+    }
+}
+
+/// Queue one prepared epoch unit and wait for its batch's ack
+/// (docs §11.3). `unit_bytes` and the prepared unit are the
+/// caller's; both outlive the wait. Fails with
+/// `error.StaleBase` when the unit's base is no longer the
+/// chain tip — the caller re-stages the whole exec.
+fn groupSubmit(
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    base_epoch: u64,
+    base_hash: [32]u8,
+    prepared: *const PreparedEpochUnit,
+    unit_bytes: []const u8,
+) GroupError!void {
+    const state = groupStateFor(table_name);
+    try groupRecoverIfPoisoned(allocator, table_name, state);
+    // With an empty queue, make sure a staging tip entry exists
+    // when the WAL holds a pure epoch stream, so the submit-time
+    // tip merge extends it instead of no-oping (docs §11.3).
+    if (!groupQueueActive(table_name) and table_mod.epochTipEpoch(".", table_name) == null and table_mod.walByteLen(allocator, ".", table_name) != 0) {
+        switch (table_mod.epochWalStaging(allocator, ".", table_name) catch |err| return mapTableError(err)) {
+            .none => {},
+            .mixed_stream => return error.GroupDeclined,
+            .tip => |view| {
+                var v = view;
+                v.deinit(allocator);
+            },
+        }
+    }
+
+    var cell = GroupCell{};
+    const req = std.heap.page_allocator.create(GroupRequest) catch return ExecError.OutOfMemory;
+    defer std.heap.page_allocator.destroy(req);
+    req.* = .{
+        .cell = &cell,
+        .unit_bytes = unit_bytes,
+        .files = prepared.files.items,
+        .meta_json = prepared.meta_json,
+        .base_epoch = base_epoch,
+        .base_hash = base_hash,
+        .new_epoch = base_epoch + 1,
+        .expected_pre_len = 0,
+    };
+
+    var become_leader = false;
+    groupLock();
+    if (state.exclusive) {
+        // A locked-flow fallback commit is in progress; its
+        // solo append must not interleave with a batch.
+        group_mutex.unlock();
+        return error.GroupDeclined;
+    }
+    // Re-derive the chain whenever the queue is idle: with no
+    // units in flight there is no in-memory base to protect,
+    // and re-deriving keeps the coordinator exact across solo
+    // (locked-path) commits and long idle gaps.
+    if (!state.chain_valid or (state.queue.items.len == 0 and !state.leader_active)) {
+        if (table_mod.epochTipEpoch(".", table_name)) |tip_epoch| {
+            state.chain_epoch = tip_epoch;
+            state.chain_hash = table_mod.epochTipMetaHash(".", table_name) orelse std.mem.zeroes([32]u8);
+        } else {
+            const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch |err| {
+                group_mutex.unlock();
+                return mapTableError(err);
+            };
+            state.chain_epoch = witness.epoch;
+            state.chain_hash = witness.meta_hash;
+        }
+        state.staging_wal_len = table_mod.walByteLen(allocator, ".", table_name);
+        state.frontier_len = state.staging_wal_len;
+        // Everything already in the file reached it through a
+        // synced append (phase-1 commits sync synchronously),
+        // so the chain tip at derive time is durable.
+        state.frontier_epoch = state.chain_epoch;
+    }
+    if (state.chain_epoch != base_epoch or !std.mem.eql(u8, &state.chain_hash, &base_hash)) {
+        group_mutex.unlock();
+        return error.StaleBase;
+    }
+    req.expected_pre_len = state.staging_wal_len;
+    state.staging_wal_len += unit_bytes.len;
+    state.unappended_bytes += unit_bytes.len;
+    state.chain_epoch = req.new_epoch;
+    state.chain_hash = hashBytes(prepared.meta_json);
+    state.chain_valid = true;
+    state.queue.append(req) catch {
+        group_mutex.unlock();
+        return ExecError.OutOfMemory;
+    };
+    if (!state.leader_active) {
+        state.leader_active = true;
+        become_leader = true;
+    }
+    groupPublishLocked(state, table_name);
+    // Extend the staging tip inside the same critical section,
+    // so a concurrent stager never observes the projected
+    // length ahead of the tip entry it validates against.
+    table_mod.epochTipNoteQueuedAppend(".", table_name, base_epoch, base_hash, req.expected_pre_len, req.expected_pre_len + unit_bytes.len, prepared.files.items, prepared.meta_json);
+    group_mutex.unlock();
+
+    if (become_leader) groupLead(allocator, table_name, state);
+    if (cell.wait()) |err| return err;
+}
+
+/// The group-shaped commit (docs §11): queue the staged epoch
+/// unit and wait for the batch ack. Declines (GroupDeclined)
+/// when the commit cannot ride the queue — oversized segment,
+/// or sub-threshold with an idle queue (the phase-1 threshold
+/// policy is preserved) — in which case nothing was queued
+/// and the caller drains the queue and runs the locked flow.
+fn commitWriteTableGroup(allocator: std.mem.Allocator, write_table: *WriteTable) GroupError!void {
+    var any_dirty = false;
+    for (write_table.columns) |*column| {
+        for (column.segments) |*segment| {
+            if (segment.dirty) any_dirty = true;
+        }
+    }
+    if (!any_dirty) return;
+    const table_name = write_table.parsed.value.table_name;
+    const next_epoch = write_table.parsed.value.epoch + 1;
+
+    var owned_paths = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (owned_paths.items) |path| allocator.free(path);
+        owned_paths.deinit();
+    }
+    var owned_hashes = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (owned_hashes.items) |hash| allocator.free(hash);
+        owned_hashes.deinit();
+    }
+    var owned_block_hashes = std.array_list.Managed([][]const u8).init(allocator);
+    defer {
+        for (owned_block_hashes.items) |hashes| {
+            for (hashes) |hash| allocator.free(hash);
+            allocator.free(hashes);
+        }
+        owned_block_hashes.deinit();
+    }
+
+    const waive = groupQueueActive(table_name);
+    var prepared = (try prepareEpochUnit(allocator, write_table, next_epoch, &owned_paths, &owned_hashes, &owned_block_hashes, waive)) orelse return error.GroupDeclined;
+    defer prepared.deinit(allocator);
+    const unit_bytes = table_mod.serializeEpochCommitUnit(allocator, prepared.base_epoch, prepared.files.items, prepared.meta_json) catch |err| return mapTableError(err);
+    defer allocator.free(unit_bytes);
+    try groupSubmit(allocator, table_name, prepared.base_epoch, write_table.meta_hash, &prepared, unit_bytes);
 }
 
 /// Native column primitives for read-only qmod modules (VM query layer,
@@ -2811,6 +3400,115 @@ fn evalWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_name: 
     const table_name = try singleWriteGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, " load ") != null or std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
 
+    // Group commit (docs §11), same discipline as the
+    // read-write evaluator: lock-free staging, queued commit,
+    // stale bases re-run, declines drain and fall back.
+    if (table_mod.walCommitPathAvailable(".")) {
+        var attempt: u32 = 0;
+        while (attempt <= GROUP_STALE_RETRIES) : (attempt += 1) {
+            const outcome = evalWriteDbQmodGroupOnce(allocator, source, main_name, table_name, params_path, meter) catch |err| switch (err) {
+                error.StaleBase => continue,
+                error.GroupDeclined => break,
+                else => |e| return e,
+            };
+            return outcome;
+        }
+        // Take the exclusive token before the locked flow on
+        // every exit path (see the read-write wrapper).
+        try groupEnterExclusive(allocator, table_name);
+        const result = evalWriteDbQmodLocked(allocator, source, main_name, table_name, params_path, meter);
+        groupExitExclusive(table_name);
+        return result;
+    }
+    return evalWriteDbQmodLocked(allocator, source, main_name, table_name, params_path, meter);
+}
+
+/// One group-commit attempt of the write-only evaluator:
+/// mirrors `evalWriteDbQmodLocked` statement for statement;
+/// only the staging source and the commit differ.
+fn evalWriteDbQmodGroupOnce(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, table_name: []const u8, params_path: ?[]const u8, meter: *FuelMeter) GroupError!?u64 {
+    const gstate = groupStateFor(table_name);
+    {
+        groupLock();
+        gstate.staging_in_flight += 1;
+        group_mutex.unlock();
+    }
+    defer {
+        groupLock();
+        gstate.staging_in_flight -= 1;
+        group_mutex.unlock();
+    }
+
+    var write_table = (try loadWriteTableGroupWithFold(allocator, table_name)) orelse return error.GroupDeclined;
+    defer write_table.deinit(allocator);
+    var values = ValueMap.init(allocator);
+    defer values.deinit();
+    var pointers = std.StringHashMap(*WriteColumn).init(allocator);
+    defer pointers.deinit();
+    parseWriteDbFunctionParams(allocator, source, main_name, &write_table, params_path, &values, &pointers) catch |err| switch (err) {
+        ExecError.UnsupportedOperation => return null,
+        else => return err,
+    };
+
+    const program = try cachedProgram(allocator, source, main_name);
+    const lines = program.lines;
+    const labels = &program.labels;
+
+    var pc: usize = 0;
+    while (pc < lines.len) {
+        try meter.charge(1);
+        const line = lines[pc];
+        if (std.mem.startsWith(u8, line, "!")) {
+            pc += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "return ")) {
+            const result = try lookupValue(&values, std.mem.trim(u8, line["return ".len..], " \t\r\n"));
+            try commitWriteTableGroup(allocator, &write_table);
+            return result;
+        }
+        if (std.mem.startsWith(u8, line, "jmp ")) {
+            const label = std.mem.trim(u8, line["jmp ".len..], " \t\r\n");
+            pc = labels.get(label) orelse return ExecError.InvalidFormat;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "br ")) {
+            const arrow = std.mem.indexOf(u8, line, " -> ") orelse return ExecError.InvalidFormat;
+            const cond_name = std.mem.trim(u8, line["br ".len..arrow], " \t");
+            var targets = std.mem.splitScalar(u8, line[arrow + " -> ".len ..], ',');
+            const true_label = std.mem.trim(u8, targets.next() orelse return ExecError.InvalidFormat, " \t\r\n");
+            const false_label = std.mem.trim(u8, targets.next() orelse return ExecError.InvalidFormat, " \t\r\n");
+            if (targets.next() != null) return ExecError.InvalidFormat;
+            pc = labels.get(if ((try lookupValue(&values, cond_name)) != 0) true_label else false_label) orelse return ExecError.InvalidFormat;
+            continue;
+        }
+        if (try evalColumnFill(allocator, line, &values, &pointers, meter)) |filled| {
+            values.put(filled.dst, filled.value) catch return ExecError.OutOfMemory;
+            pc += 1;
+            continue;
+        }
+        if (try evalStore(allocator, line, &values, &pointers)) {
+            pc += 1;
+            continue;
+        }
+        const eq = std.mem.indexOf(u8, line, " = ") orelse return ExecError.UnsupportedOperation;
+        const dst = std.mem.trim(u8, line[0..eq], " \t\r\n");
+        const expr = std.mem.trim(u8, line[eq + 3 ..], " \t\r\n");
+        var parts = std.mem.tokenizeAny(u8, expr, " ,\t");
+        const op = parts.next() orelse return ExecError.InvalidFormat;
+        const lhs_text = parts.next() orelse return ExecError.InvalidFormat;
+        const rhs_text = parts.next() orelse return ExecError.InvalidFormat;
+        if (parts.next() != null) return ExecError.UnsupportedOperation;
+        const lhs = try lookupValue(&values, lhs_text);
+        const rhs = try lookupValue(&values, rhs_text);
+        const value = try evalBinaryValue(op, lhs, rhs);
+        values.put(dst, value) catch return ExecError.OutOfMemory;
+        pc += 1;
+    }
+    return ExecError.InvalidFormat;
+}
+
+fn evalWriteDbQmodLocked(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, table_name: []const u8, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     var write_lock = try acquireTableWriteLock(allocator, table_name);
     defer write_lock.release();
 
@@ -2891,6 +3589,147 @@ fn evalReadWriteDbQmod(allocator: std.mem.Allocator, source: []const u8, main_na
     const grants = try singleReadWriteGrant(grant_entries) orelse return null;
     if (std.mem.indexOf(u8, source, "atomic_rmw_") != null) return null;
 
+    // Group commit (docs §11): stage and evaluate without the
+    // table write lock and ack through the commit queue. A
+    // stale staging base re-runs the whole exec (its effects
+    // never left the staged table); a decline drains the queue
+    // and falls back to the locked flow below.
+    if (table_mod.walCommitPathAvailable(".")) {
+        var attempt: u32 = 0;
+        while (attempt <= GROUP_STALE_RETRIES) : (attempt += 1) {
+            const outcome = evalReadWriteDbQmodGroupOnce(allocator, source, main_name, grants, params_path, meter) catch |err| switch (err) {
+                error.StaleBase => continue,
+                error.GroupDeclined => break,
+                else => |e| return e,
+            };
+            return outcome;
+        }
+        // Every non-returning exit (decline or exhausted
+        // retries) takes the coordinator's exclusive token
+        // before the locked flow (docs §11.1): the locked
+        // flow stages from the manifest, and with units still
+        // queued its freshness check would fail the exec
+        // spuriously; with a batch in flight its solo append
+        // would interleave with the batch.
+        try groupEnterExclusive(allocator, grants.write_table);
+        const result = evalReadWriteDbQmodLocked(allocator, source, main_name, grants, params_path, meter);
+        groupExitExclusive(grants.write_table);
+        return result;
+    }
+    return evalReadWriteDbQmodLocked(allocator, source, main_name, grants, params_path, meter);
+}
+
+/// One group-commit attempt: the evalReadWriteDbQmod body with
+/// lock-free staging and a queued commit. Mirrors the locked
+/// body statement for statement; only the staging source and
+/// the commit differ.
+fn evalReadWriteDbQmodGroupOnce(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grants: ReadWriteGrant, params_path: ?[]const u8, meter: *FuelMeter) GroupError!?u64 {
+    const gstate = groupStateFor(grants.write_table);
+    {
+        groupLock();
+        gstate.staging_in_flight += 1;
+        group_mutex.unlock();
+    }
+    defer {
+        groupLock();
+        gstate.staging_in_flight -= 1;
+        group_mutex.unlock();
+    }
+
+    var write_table = (try loadWriteTableGroupWithFold(allocator, grants.write_table)) orelse return error.GroupDeclined;
+    defer write_table.deinit(allocator);
+    var read_table: ?ReadTable = if (std.mem.eql(u8, grants.read_table, grants.write_table)) null else try loadReadTable(allocator, grants.read_table);
+    defer if (read_table) |*table| table.deinit(allocator);
+    var values = ValueMap.init(allocator);
+    defer values.deinit();
+    var read_pointers = std.StringHashMap(*const TableColumn).init(allocator);
+    defer read_pointers.deinit();
+    var write_pointers = std.StringHashMap(*WriteColumn).init(allocator);
+    defer write_pointers.deinit();
+    if (read_table) |table| {
+        parseCrossReadWriteDbFunctionParams(allocator, source, main_name, table, &write_table, params_path, &values, &read_pointers, &write_pointers) catch |err| switch (err) {
+            ExecError.UnsupportedOperation => return null,
+            else => return err,
+        };
+    } else {
+        parseWriteDbFunctionParams(allocator, source, main_name, &write_table, params_path, &values, &write_pointers) catch |err| switch (err) {
+            ExecError.UnsupportedOperation => return null,
+            else => return err,
+        };
+    }
+
+    const program = try cachedProgram(allocator, source, main_name);
+    const lines = program.lines;
+    const labels = &program.labels;
+
+    var pc: usize = 0;
+    while (pc < lines.len) {
+        try meter.charge(1);
+        const line = lines[pc];
+        if (std.mem.startsWith(u8, line, "!")) {
+            pc += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "return ")) {
+            const result = try lookupValue(&values, std.mem.trim(u8, line["return ".len..], " \t\r\n"));
+            try commitWriteTableGroup(allocator, &write_table);
+            return result;
+        }
+        if (std.mem.startsWith(u8, line, "jmp ")) {
+            const label = std.mem.trim(u8, line["jmp ".len..], " \t\r\n");
+            pc = labels.get(label) orelse return ExecError.InvalidFormat;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "br ")) {
+            const arrow = std.mem.indexOf(u8, line, " -> ") orelse return ExecError.InvalidFormat;
+            const cond_name = std.mem.trim(u8, line["br ".len..arrow], " \t");
+            var targets = std.mem.splitScalar(u8, line[arrow + " -> ".len ..], ',');
+            const true_label = std.mem.trim(u8, targets.next() orelse return ExecError.InvalidFormat, " \t\r\n");
+            const false_label = std.mem.trim(u8, targets.next() orelse return ExecError.InvalidFormat, " \t\r\n");
+            if (targets.next() != null) return ExecError.InvalidFormat;
+            pc = labels.get(if ((try lookupValue(&values, cond_name)) != 0) true_label else false_label) orelse return ExecError.InvalidFormat;
+            continue;
+        }
+        if (read_table != null) {
+            if (try evalLoad(line, &values, &read_pointers)) |loaded| {
+                values.put(loaded.dst, loaded.value) catch return ExecError.OutOfMemory;
+                pc += 1;
+                continue;
+            }
+        } else {
+            if (try evalWriteLoad(line, &values, &write_pointers)) |loaded| {
+                values.put(loaded.dst, loaded.value) catch return ExecError.OutOfMemory;
+                pc += 1;
+                continue;
+            }
+        }
+        if (try evalColumnFill(allocator, line, &values, &write_pointers, meter)) |filled| {
+            values.put(filled.dst, filled.value) catch return ExecError.OutOfMemory;
+            pc += 1;
+            continue;
+        }
+        if (try evalStore(allocator, line, &values, &write_pointers)) {
+            pc += 1;
+            continue;
+        }
+        const eq = std.mem.indexOf(u8, line, " = ") orelse return ExecError.UnsupportedOperation;
+        const dst = std.mem.trim(u8, line[0..eq], " \t\r\n");
+        const expr = std.mem.trim(u8, line[eq + 3 ..], " \t\r\n");
+        var parts = std.mem.tokenizeAny(u8, expr, " ,\t");
+        const op = parts.next() orelse return ExecError.InvalidFormat;
+        const lhs_text = parts.next() orelse return ExecError.InvalidFormat;
+        const rhs_text = parts.next() orelse return ExecError.InvalidFormat;
+        if (parts.next() != null) return ExecError.UnsupportedOperation;
+        const lhs = try lookupValue(&values, lhs_text);
+        const rhs = try lookupValue(&values, rhs_text);
+        const value = try evalBinaryValue(op, lhs, rhs);
+        values.put(dst, value) catch return ExecError.OutOfMemory;
+        pc += 1;
+    }
+    return ExecError.InvalidFormat;
+}
+
+fn evalReadWriteDbQmodLocked(allocator: std.mem.Allocator, source: []const u8, main_name: []const u8, grants: ReadWriteGrant, params_path: ?[]const u8, meter: *FuelMeter) ExecError!?u64 {
     var write_lock = try acquireTableWriteLock(allocator, grants.write_table);
     defer write_lock.release();
 
@@ -5553,6 +6392,390 @@ test "qmod wal epoch commit mid-file corruption fails loudly" {
     // Nothing was published and no partial epoch became visible.
     const witness = try table_mod.readActiveManifestWitness(std.testing.allocator, ".", table_name);
     try std.testing.expectEqual(base.epoch, witness.epoch);
+}
+
+// --- group commit (docs/vm_concurrency_epoch.md §11) -----------------------
+// These tests drive the real exec entry (registerQuery +
+// execQuery) from several threads against the `conc` fixture:
+// 600 rows, so one setall commit dirties 4800 bytes of the val
+// segment and is WAL-eligible.
+
+const GroupWriterCtx = struct {
+    hash: []const u8,
+    params: []const u8,
+    expect: u64,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ok: bool = false,
+    err_name: ?[]const u8 = null,
+
+    fn work(self: *GroupWriterCtx) void {
+        defer self.done.store(true, .release);
+        var run = execQuery(std.testing.allocator, self.hash, self.params) catch |err| {
+            self.err_name = @errorName(err);
+            return;
+        };
+        defer run.deinit(std.testing.allocator);
+        self.ok = run.ok.code == 0 and (run.ok.result_u64 orelse 0) == self.expect;
+    }
+};
+
+const GroupReaderCtx = struct {
+    hash: []const u8,
+    expect_sum: u64,
+    execs: u32,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    bad: u64 = 0,
+    completed: u64 = 0,
+
+    fn work(self: *GroupReaderCtx) void {
+        defer self.done.store(true, .release);
+        var i: u32 = 0;
+        while (i < self.execs) : (i += 1) {
+            var run = execQuery(std.testing.allocator, self.hash, null) catch {
+                self.bad += 1;
+                continue;
+            };
+            defer run.deinit(std.testing.allocator);
+            if (run.ok.code != 0 or (run.ok.result_u64 orelse std.math.maxInt(u64)) != self.expect_sum) {
+                self.bad += 1;
+            } else {
+                self.completed += 1;
+            }
+        }
+    }
+};
+
+fn groupTestWaitFor(flag: *std.atomic.Value(bool), what: []const u8) !void {
+    var waited_ms: u32 = 0;
+    while (!flag.load(.acquire)) {
+        if (waited_ms > 10_000) {
+            std.debug.print("group test timeout waiting for {s}\n", .{what});
+            return error.GroupTestTimeout;
+        }
+        sio.io().sleep(.fromNanoseconds(1_000_000), .awake) catch {};
+        waited_ms += 1;
+    }
+}
+
+fn groupTestWriteParams(tmp: std.testing.TmpDir, name: []const u8, value: u64) !void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    try concWriteFile(tmp, name, &bytes);
+}
+
+fn groupTestSum(allocator: std.mem.Allocator, hash: []const u8) !u64 {
+    var run = try execQuery(allocator, hash, null);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), run.ok.code);
+    return run.ok.result_u64.?;
+}
+
+test "qmod group commit acks concurrent writers only after the sync lands" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    var gate = table_mod.TestSyncGate{};
+    table_mod.test_sync_gate = &gate;
+    defer {
+        gate.releaseAll();
+        table_mod.test_sync_gate = null;
+    }
+
+    const values = [3]u64{ 11, 22, 33 };
+    var param_names: [3][24]u8 = undefined;
+    var ctxs: [3]GroupWriterCtx = undefined;
+    var threads: [3]std.Thread = undefined;
+    for (values, 0..) |value, i| {
+        const name = try std.fmt.bufPrint(&param_names[i], "gparams{d}.bin", .{i});
+        try groupTestWriteParams(tmp, name, value);
+        ctxs[i] = .{ .hash = fixture.setall_hash, .params = name, .expect = value };
+    }
+    for (&threads, &ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{ctx});
+    }
+    // The leader is inside walAppendSync with the batch framed
+    // but not written: no writer may have been acked yet.
+    try groupTestWaitFor(&gate.entered, "leader sync entry");
+    for (&ctxs) |*ctx| try std.testing.expect(!ctx.done.load(.acquire));
+    gate.releaseAll();
+    for (&threads) |*thread| thread.join();
+    for (&ctxs) |*ctx| {
+        try std.testing.expect(ctx.done.load(.acquire));
+        try std.testing.expect(ctx.ok);
+    }
+    // Serial order: the final state is exactly one writer's
+    // value in every row, and the chain advanced one epoch per
+    // writer (folded on this read).
+    const final_sum = try groupTestSum(std.testing.allocator, fixture.sum_hash);
+    try std.testing.expect(final_sum == 11 * rows or final_sum == 22 * rows or final_sum == 33 * rows);
+    try std.testing.expectEqual(base_epoch + 3, epoch_runtime.currentEpoch("conc").?);
+    try std.testing.expect(gate.hits.load(.acquire) >= 1);
+}
+
+test "qmod group commit keeps the unacked batch invisible to new readers" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    var gate = table_mod.TestSyncGate{};
+    table_mod.test_sync_gate = &gate;
+    defer {
+        gate.releaseAll();
+        table_mod.test_sync_gate = null;
+    }
+
+    try groupTestWriteParams(tmp, "gvis.bin", 77);
+    var ctx = GroupWriterCtx{ .hash = fixture.setall_hash, .params = "gvis.bin", .expect = 77 };
+    var thread = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{&ctx});
+    try groupTestWaitFor(&gate.entered, "leader sync entry");
+    // The batch is framed and syncing, but its sync has not
+    // completed: new readers keep resolving the old epoch, and
+    // the runtime's current epoch has not advanced.
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    try std.testing.expectEqual(base_epoch, epoch_runtime.currentEpoch("conc").?);
+    try std.testing.expect(!ctx.done.load(.acquire));
+    gate.releaseAll();
+    thread.join();
+    try std.testing.expect(ctx.ok);
+    try std.testing.expectEqual(@as(u64, 77 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    try std.testing.expectEqual(base_epoch + 1, epoch_runtime.currentEpoch("conc").?);
+}
+
+test "qmod group commit pipelines staging while a batch syncs" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    var gate = table_mod.TestSyncGate{};
+    table_mod.test_sync_gate = &gate;
+    defer {
+        gate.releaseAll();
+        table_mod.test_sync_gate = null;
+    }
+
+    try groupTestWriteParams(tmp, "gpipe_a.bin", 10);
+    try groupTestWriteParams(tmp, "gpipe_b.bin", 20);
+    var ctx_a = GroupWriterCtx{ .hash = fixture.setall_hash, .params = "gpipe_a.bin", .expect = 10 };
+    var thread_a = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{&ctx_a});
+    try groupTestWaitFor(&gate.entered, "leader sync entry");
+
+    // Writer B stages and queues behind the gated batch: the
+    // staging tip (which only advances at submit) must reach
+    // base+2 while A's sync is still in flight and A unacked.
+    var ctx_b = GroupWriterCtx{ .hash = fixture.setall_hash, .params = "gpipe_b.bin", .expect = 20 };
+    var thread_b = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{&ctx_b});
+    var waited_ms: u32 = 0;
+    while ((table_mod.epochTipEpoch(".", "conc") orelse 0) != base_epoch + 2) {
+        if (waited_ms > 10_000) return error.GroupTestTimeout;
+        sio.io().sleep(.fromNanoseconds(1_000_000), .awake) catch {};
+        waited_ms += 1;
+    }
+    try std.testing.expect(!ctx_a.done.load(.acquire));
+    try std.testing.expect(!ctx_b.done.load(.acquire));
+    gate.releaseAll();
+    thread_a.join();
+    thread_b.join();
+    try std.testing.expect(ctx_a.ok);
+    try std.testing.expect(ctx_b.ok);
+    // B staged on top of A, so B's value is the final state.
+    try std.testing.expectEqual(@as(u64, 20 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    try std.testing.expectEqual(base_epoch + 2, epoch_runtime.currentEpoch("conc").?);
+}
+
+test "qmod group commit readers are not starved by a syncing batch" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+
+    var gate = table_mod.TestSyncGate{};
+    table_mod.test_sync_gate = &gate;
+    defer {
+        gate.releaseAll();
+        table_mod.test_sync_gate = null;
+    }
+
+    try groupTestWriteParams(tmp, "gstarve.bin", 9);
+    var wctx = GroupWriterCtx{ .hash = fixture.setall_hash, .params = "gstarve.bin", .expect = 9 };
+    var wthread = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{&wctx});
+    try groupTestWaitFor(&gate.entered, "leader sync entry");
+
+    // While the batch's sync is held open, readers complete
+    // against the old epoch: they are neither blocked behind
+    // the sync nor exposed to the pending epoch.
+    var rctxs: [2]GroupReaderCtx = undefined;
+    var rthreads: [2]std.Thread = undefined;
+    for (&rctxs) |*rctx| rctx.* = .{ .hash = fixture.sum_hash, .expect_sum = 5 * rows, .execs = 10 };
+    for (&rthreads, &rctxs) |*thread, *rctx| {
+        thread.* = try std.Thread.spawn(.{}, GroupReaderCtx.work, .{rctx});
+    }
+    for (&rthreads) |*thread| thread.join();
+    for (&rctxs) |*rctx| {
+        try std.testing.expectEqual(@as(u64, 0), rctx.bad);
+        try std.testing.expectEqual(@as(u64, 10), rctx.completed);
+    }
+    try std.testing.expect(!wctx.done.load(.acquire));
+    gate.releaseAll();
+    wthread.join();
+    try std.testing.expect(wctx.ok);
+    try std.testing.expectEqual(@as(u64, 9 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+}
+
+test "qmod concurrent writers on one table all land through the commit queue" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    const values = [4]u64{ 101, 102, 103, 104 };
+    var param_names: [4][24]u8 = undefined;
+    var ctxs: [4]GroupWriterCtx = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (values, 0..) |value, i| {
+        const name = try std.fmt.bufPrint(&param_names[i], "gconc{d}.bin", .{i});
+        try groupTestWriteParams(tmp, name, value);
+        ctxs[i] = .{ .hash = fixture.setall_hash, .params = name, .expect = value };
+    }
+    for (&threads, &ctxs) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, GroupWriterCtx.work, .{ctx});
+    }
+    for (&threads) |*thread| thread.join();
+    for (&ctxs) |*ctx| try std.testing.expect(ctx.ok);
+    const final_sum = try groupTestSum(std.testing.allocator, fixture.sum_hash);
+    var matches = false;
+    for (values) |value| matches = matches or final_sum == value * rows;
+    try std.testing.expect(matches);
+    try std.testing.expectEqual(base_epoch + 4, epoch_runtime.currentEpoch("conc").?);
+}
+
+test "qmod group commits survive kill -9 and fold on reopen" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 600;
+    const fixture = try concSetup(std.testing.allocator, tmp, 600, 5);
+    defer concFreeFixture(std.testing.allocator, fixture);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    // Settle the ingest backlog (row WAL) into the manifest in
+    // the parent, so the child's writers meet a pure epoch
+    // stream and the manifest can only move by their commits.
+    table_mod.checkpointWalIfDirty(std.testing.allocator, ".", "conc") catch |err| return mapTableError(err);
+    try std.testing.expectEqual(@as(u64, 5 * rows), try groupTestSum(std.testing.allocator, fixture.sum_hash));
+    const base_epoch = epoch_runtime.currentEpoch("conc").?;
+
+    const values = [3]u64{ 201, 202, 203 };
+    var param_names: [3][24]u8 = undefined;
+    var param_slices: [3][]const u8 = undefined;
+    for (values, 0..) |value, i| {
+        const name = try std.fmt.bufPrint(&param_names[i], "gkill{d}.bin", .{i});
+        try groupTestWriteParams(tmp, name, value);
+        param_slices[i] = name;
+    }
+
+    const fork_rc = std.os.linux.fork();
+    if (fork_rc != 0 and fork_rc > @as(usize, @intCast(std.math.maxInt(i32)))) return error.ForkFailed;
+    const child_pid: std.os.linux.pid_t = @intCast(fork_rc);
+    if (child_pid == 0) {
+        // Child: three writer threads commit through the queue
+        // and are all acked; then SIGKILL with no cleanup.
+        // (Unlike the phase-1 solo test, the manifest is not
+        // asserted untouched: a group writer's fold-first
+        // staging may legitimately publish already-synced
+        // units mid-child — a fold is a durable publish. The
+        // invariant under test is that acked commits are not
+        // lost, asserted by the parent after reopen.)
+        var ctxs: [3]GroupWriterCtx = undefined;
+        var threads: [3]std.Thread = undefined;
+        for (values, 0..) |value, i| {
+            ctxs[i] = .{ .hash = fixture.setall_hash, .params = param_slices[i], .expect = value };
+        }
+        for (&threads, &ctxs) |*thread, *ctx| {
+            thread.* = std.Thread.spawn(.{}, GroupWriterCtx.work, .{ctx}) catch std.process.abort();
+        }
+        for (&threads) |*thread| thread.join();
+        for (&ctxs) |*ctx| if (!ctx.ok) {
+            if (sio.cwd().createFile("child_error.txt", .{ .truncate = true })) |f| {
+                var wf = f;
+                for (&ctxs) |*c| {
+                    var lbuf: [128]u8 = undefined;
+                    const ltxt = std.fmt.bufPrint(&lbuf, "expect={d} err={s} done={}\n", .{ c.expect, c.err_name orelse "-", c.done.load(.acquire) }) catch "";
+                    wf.writeAll(ltxt) catch {};
+                }
+                wf.close();
+            } else |_| {}
+            std.process.abort();
+        };
+        var marker = sio.cwd().createFile("group_child_marker", .{ .truncate = true }) catch std.process.abort();
+        marker.writeAll("committed") catch std.process.abort();
+        marker.close();
+        _ = std.os.linux.kill(std.os.linux.getpid(), std.os.linux.SIG.KILL);
+        unreachable;
+    }
+    var wait_status: i32 = 0;
+    _ = std.os.linux.waitpid(child_pid, &wait_status, 0);
+    if ((wait_status & 0x7f) != 9) {
+        if ((sio.Dir{ .inner = tmp.dir }).readFileAlloc(std.testing.allocator, "child_error.txt", 4096)) |contents| {
+            std.debug.print("child error report:\n{s}\n", .{contents});
+            std.testing.allocator.free(contents);
+        } else |_| {}
+    }
+    try std.testing.expectEqual(@as(i32, 9), wait_status & 0x7f);
+    try (sio.Dir{ .inner = tmp.dir }).access("group_child_marker", .{});
+    // Reopen in the parent: the fold discovers the acked units
+    // cross-process and publishes exactly one of the writer
+    // values, three epochs on.
+    const final_sum = try groupTestSum(std.testing.allocator, fixture.sum_hash);
+    var matches = false;
+    for (values) |value| matches = matches or final_sum == value * rows;
+    try std.testing.expect(matches);
+    try std.testing.expectEqual(base_epoch + 3, epoch_runtime.currentEpoch("conc").?);
 }
 
 test "qmod exec filters u64 DB column values" {
