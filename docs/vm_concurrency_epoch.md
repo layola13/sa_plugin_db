@@ -615,3 +615,214 @@ Remaining gaps, with profiling-grade attribution:
   change beyond this line's protocol-preserving scope; the
   table layer's existing WAL path for transactions is the
   natural base for a follow-up line.
+
+## 10. WAL-shaped epoch commit (follow-up line)
+
+Target: the write scenario at ≈99% of the same-machine
+SQLite/PG references, by collapsing the qmod epoch commit to a
+single synced WAL append — without weakening any durability,
+recovery, or safety guarantee of the epoch protocol.
+
+### 10.1 Investigation: what the four syncs protect, and why the table WAL never served this path
+
+The qmod commit (`commitWriteTable` in `src/db_stub.zig`, used
+by write procedures, the AOT tier, and the atomic-cursor
+evaluator) publishes a new epoch in four synced steps (durable
+mode, one dirty segment file, no user indexes — the bench
+shape; each additional dirty segment file adds one fdatasync,
+each rebuilt index file adds one more):
+
+1. **Segment fdatasync** — `rewriteColumnFileForEpoch` writes
+   each dirty segment's new versioned file (`.e<epoch+1>`) via
+   temp file + fdatasync + rename, no directory sync. Protects:
+   the segment *content* is on stable storage before anything
+   names it.
+2. **Meta fdatasync** — `writeVersionedMeta` writes the new
+   epoch's versioned meta JSON the same way. Protects: the
+   meta (file names + SHA-256 + block hashes for every segment)
+   is durable before the manifest points at it.
+3. **Manifest fdatasync** — `publishWrittenMeta` writes the
+   manifest the same way. Protects: the commit point itself —
+   the atomic epoch switch — is durable.
+4. **Directory fsync** — `publishWrittenMeta` ends with one
+   parent-directory fsync. Protects: all three renames'
+   directory entries become durable together; a crash before
+   it can lose the new entries as a set, in which case the old
+   manifest (hence the old epoch) survives intact (§9.2.3).
+
+CPU per commit is ~1.5–1.9 ms of the 12.1 ms p50 (§9.4); the
+rest is these four syncs at 2.4–6.3 ms each in-window.
+
+The table layer's WAL (`<table>.wal`, §"WAL — Phase 1" in
+`src/table.zig`) already commits row transactions with a
+single fdatasync, but it never served the qmod path, for a
+structural reason: its records are *row operations*
+(ROW/DICT_PUT/BLOB_PUT between TX_BEGIN/TX_COMMIT) replayed
+through a `WriteTransaction`, while the qmod layer never
+builds a `WriteTransaction`. It stages whole column-segment
+byte images in `db_stub.WriteTable` and commits them through
+`commitWriteTable` → `commitTableMetaWithRebuiltIndexesUnlocked`.
+The two staging models share the manifest epoch chain but not
+a commit vehicle; §3.5 recorded the split ("WAL interplay is
+unchanged … folding … remains the native layer's discipline").
+Small row transactions additionally keep the legacy path by
+policy (the 4096-byte rule in `commitWriteTransaction`), which
+this line mirrors for epoch commits.
+
+### 10.2 Design: epoch units in the same WAL
+
+The fix reuses the existing WAL file, framing
+(`u32 payload_len | payload | u64 crc64-xz(payload)`), append
+helper (`walAppendSync`: append + exactly one fdatasync;
+directory fsync only at file creation, tracked per process),
+checkpoint thresholds (100 txs / 4 MiB / 30 s), and the
+fold-before-read discipline of the native layer
+(`openReadSnapshot` / `verifyTable` / `recoverTable` /
+begin-overlay). It adds one record family — the *epoch unit*,
+a self-contained description of one qmod epoch commit:
+
+- `EPOCH_BEGIN` (tag 6): tag | txid u64 | base_epoch u64.
+- `EPOCH_FILE` (tag 7): tag | path_len u32 | path | bytes —
+  one per dirty segment file; `path` is the versioned relative
+  path the legacy commit would have written, `bytes` its full
+  staged content.
+- `EPOCH_META` (tag 8): tag | the new epoch's full meta JSON,
+  serialized exactly as `writeVersionedMeta` would serialize
+  it (segment file metas already point at the new paths and
+  hashes; index rebuild is deferred to the fold, where the
+  legacy publish performs it).
+- `EPOCH_COMMIT` (tag 9): tag | txid u64 | new_epoch u64.
+
+Commit (`commitWriteTable`, WAL branch — taken when durable
+mode is on, the table is not a memory root, every dirty
+segment fits the record cap, and the total staged dirty bytes
+are ≥ 4096, mirroring the row WAL's threshold policy; smaller
+commits keep the legacy publish bit-for-bit):
+
+1. Freshness check, unchanged.
+2. Per dirty segment, compute the versioned path and FileMeta
+   from the staged bytes in memory (`fileMetaForEpochBytes`,
+   the hash half of `rewriteColumnFileForEpoch`) — no writes.
+3. Frame BEGIN + FILE×n + META + COMMIT and append with one
+   `walAppendSync` — **one fdatasync is the whole commit**.
+4. `epoch_runtime.noteCommitted`, as the legacy tail does.
+
+Publication is deferred to a *fold*, performed by the unified
+checkpointer (`checkpointWalLocked`), which now collects an
+ordered unit stream (row transactions and epoch units share
+one epoch chain: each unit's base must equal the running
+epoch; stale units are skipped; a gap is `VerifyFailed` —
+loud, never silently dropped). Row units fold through the
+existing replay + legacy commit; an epoch unit folds by
+(a) verifying every FILE payload against the unit meta's
+FileMeta (length + SHA-256 + block hashes — the same checks
+as a segment load), (b) writing the files with the legacy
+write discipline (content fdatasync before publish, no
+per-file directory sync), and (c) publishing via
+`commitTableMetaWithRebuiltIndexesUnlocked`, which rebuilds
+indexes from the materialized segments and performs the
+legacy meta + manifest publish. The WAL is truncated (and the
+truncation fdatasync'd) only after every unit is published —
+the existing rule, unchanged.
+
+When folds happen (boundedness — the WAL never holds more
+than the thresholds allow, and the tip state below is bounded
+by the same thresholds):
+
+- **Readers** (`loadReadTable`): fold before resolving
+  whenever epoch units are pending — this process's own
+  (tip cache ahead of the manifest) or another's (a restarted
+  or read-only process has no tip entry, so pending epoch
+  units are detected from the WAL itself via
+  `walHasPendingEpochUnits`, cached per WAL length) —
+  read-after-commit visibility is the standing contract, so
+  the first reader after a WAL commit publishes it. A table
+  whose WAL was folded by another process is detected by
+  epoch equality and not re-folded. Row-only WALs are not
+  folded on this path; that remains the native layer's
+  discipline (§3.5), exactly as before.
+- **Writers** (`loadWriteTable`, under the table write lock):
+  below the checkpoint thresholds they stage from the *tip*
+  (below) instead of folding; at the thresholds, or when the
+  pending stream contains row units (which the columnar
+  staging model cannot overlay), they fold first, under the
+  lock, via the locked checkpoint variant.
+- **Native layer**: unchanged call sites fold the unified
+  stream — `beginWriteTransaction` checkpoints instead of
+  overlay-replaying when the valid prefix contains epoch
+  records (the row overlay cannot absorb a wholesale segment
+  replacement); `openReadSnapshot`, `verifyTable`,
+  `recoverTable`, and the direct dict/blob reads fold exactly
+  as before, now including epoch units.
+
+The writer's tip is a storage-layer cache (`EpochTip` in
+`src/table.zig`): the tip meta JSON plus the newest payload
+per carried file path, keyed by (root, table) and validated
+per staging against the manifest witness (epoch + meta
+SHA-256 of the chain base) and the WAL length — both cheap
+reads the write path already performs in spirit. Validation
+failure (another process appended, folded, or restored)
+drops the cache entry and rebuilds the tip by parsing the
+WAL (bounded by the thresholds), or folds if the stream is
+not epoch-only. Staging from the tip borrows payload bytes
+under the write column segments' existing copy-on-write
+discipline; the tip's epoch and meta hash are also the
+commit-time freshness witness while a tip is live
+(`tableMetaStillCurrent`), so load and commit always compare
+against the same "active meta" definition. Cross-process
+readers observe epoch units at `loadReadTable` (above);
+row-WAL commits keep the §3.5 discipline (snapshot / verify /
+recover folds), unchanged.
+
+### 10.3 Semantics and equivalence
+
+- **Committed = durable.** The commit is acked only after
+  the epoch unit's single fdatasync returns. Everything
+  needed to reconstruct the epoch (segment images + meta) is
+  inside the synced unit; a crash after the ack replays it at
+  the next fold. A crash *during* the append leaves a torn
+  tail: the unit is incomplete and is dropped whole — the
+  previous epoch remains the committed state, exactly as a
+  crash before the legacy manifest publish behaved.
+- **No half epochs.** Readers only ever resolve through the
+  manifest (published epochs) or a fully folded tip; a
+  partially applied fold is impossible because the fold
+  publishes with the legacy protocol (segment content synced
+  before the manifest names it) under the table write lock.
+  The concurrency oracle's invariant — every read sees one
+  whole committed epoch — is preserved by construction and
+  re-run (§10.4).
+- **Torn tail vs mid-file corruption.** A crash can only
+  tear the *tail* of the WAL: the framed prefix parser stops
+  at the first incomplete/CRC-invalid record and the fold
+  treats the remainder as a torn tail **only if no valid
+  frame exists after the stop point**. If a resync scan finds
+  a valid frame beyond it, the damage is mid-file corruption
+  and the fold fails loudly with `VerifyFailed`
+  (`SnapshotCorrupted` at the qmod layer) instead of silently
+  dropping committed units. This guard applies whenever the
+  stream involves epoch records; row-only streams keep the
+  Phase-1 parser behavior bit-for-bit.
+- **Freshness, grants, fuel, static checks.** Unchanged:
+  staging still validates the schema hash and segment hashes
+  (tip payloads are validated against the tip meta's hashes
+  at staging, exactly as file loads validate), the commit
+  still re-checks meta freshness (against the tip while one
+  is live, the manifest otherwise — byte-identity in both
+  cases), and no exec-semantics surface changes: no network,
+  listener, SQL, or wire surface is added (the §7 census
+  still holds).
+- **Restores and removal.** `removeTable` already deletes
+  the WAL with the table's artifacts; the tip cache entry is
+  dropped at the same point, and at every fold. A restore
+  that republishes an older epoch while units are pending
+  breaks the units' base chain, and the next fold fails
+  loudly — the same exposure the row WAL has today, not a
+  new silent path.
+
+### 10.4 Results
+
+(filled in after the same-window bench run — suite name-set
+comparison, crash-recovery tests, write/mixed ratios, and the
+read-path spot check.)
+
