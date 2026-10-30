@@ -1,0 +1,1184 @@
+// db_access.sla — goroutine access layer over the epoch engine
+// (stage-2 goroutine retrofit; engine Zig code is untouched).
+//
+// Shape (PLAN-GOROUTINE §3):
+//   - Queries run in short-lived goroutines. Each query pins ONE
+//     epoch snapshot (sa_db_open_read_table) and runs every engine
+//     op of that query through the handle face — a pin is paid
+//     once per query, never per op, so the pinned read path does
+//     not stack per-exec reload/validation costs (the G3 read
+//     regression response: root-face per-op calls are forbidden in
+//     the query path). The snapshot's epoch is reported in every
+//     result, so callers can see exactly which epoch they read.
+//   - Deduct-class writes are funneled through ONE writer
+//     goroutine (single-writer discipline at the language layer).
+//     The writer collects a batch (max size / window), applies it
+//     in ONE engine transaction, and commits once — group commit
+//     formed in SLA on top of the engine's single-writer commit.
+//   - The writer is monitored: its death is service-fatal. A
+//     monitor goroutine broadcasts on a Done channel and every
+//     waiter wakes with ACCESS_SERVICE_DEAD. The writer is never
+//     restarted (no sick restarts); query goroutines, by contrast,
+//     are supervised per query and a trapped query only fails its
+//     own receipt.
+//
+// Ownership rules:
+//   - Engine read/write handles exist only inside this layer's
+//     worker/writer goroutines. Callers hold AccessHandle (a ptr
+//     to the control block) and ticket values; result data travels
+//     in caller-owned blocks per the std block discipline (the
+//     channel carries a token, the block carries the payload —
+//     channel payloads are capped at 16 bytes, receipts are not).
+//   - A query's pin is released by the OUTER query goroutine,
+//     which never runs engine ops itself: it opens the pin, spawns
+//     the inner worker supervised, joins it, and closes the pin on
+//     every path — including inner trap paths. A trapped query
+//     therefore cannot leak a pin or stall the epoch frontier.
+//   - root/table are passed as explicit (ptr, len) pairs, NOT
+//     String: a String parameter only accepts owned strings in
+//     this ABI (literals are fat slices; passing one where a
+//     String struct is expected produces a malformed value —
+//     the DEF-2 dual-representation discipline). Callers pass
+//     string literals as STR_PTR("..") / STR_LEN("..") evaluated
+//     in their own frame, or any other (ptr, len) byte source;
+//     the bytes must outlive the AccessHandle.
+//
+// Concurrency notes (external-evaluation warnings, applied):
+//   - Fan-in is single-channel (the writer inbox; query replies
+//     are per-ticket), so select declaration-order bias cannot
+//     starve an arm. The only multi-arm selects are per-waiter
+//     (reply vs Done vs dead), where reply-first is the intended
+//     priority, not a fairness bug.
+//   - No compiler-inserted yields exist: the scan query chunks
+//     its row loop and calls sa_task_yield() every 256 rows; the
+//     writer yields after every batch. Handlers must do the same
+//     for any other CPU-dense section.
+//   - sa_std globals are used NOWHERE in this layer, hot or cold:
+//     all state lives in the control block behind the handle.
+//   - No recursion anywhere; traversal is loops with explicit
+//     bounds.
+
+@import "../db.sai"
+@import "sa_std/task.sai"
+@import "sa_std/time.sai"
+@import "sa_std/ctx.sla"
+@import "sa_std/core/box.sa"
+@import "sa_std/ptr.sa"
+
+// ---- access-layer status codes (receipts) ----
+// ACCESS_OK             request evaluated/committed as asked
+// ACCESS_INSUFFICIENT   deduct rejected: balance would go negative
+// ACCESS_NOT_FOUND      account row does not exist
+// ACCESS_CANCELLED      Done fired before the writer started the
+//                       batch holding the request (never faked for
+//                       requests already inside a committing batch)
+// ACCESS_ENGINE_ERROR   engine returned an error; the engine
+//                       status code rides in the receipt's value /
+//                       balance field for diagnosis
+// ACCESS_TRAPPED        query goroutine trapped; value carries
+//                       the trap code (queries only)
+// ACCESS_SERVICE_DEAD   the writer goroutine died; service fatal
+// ACCESS_CLOSED         submitted after access_close
+// ACCESS_BAD_KIND       unknown query kind
+fn access_ok() -> u64 { return 0; }
+fn access_insufficient() -> u64 { return 1; }
+fn access_not_found() -> u64 { return 2; }
+fn access_cancelled() -> u64 { return 3; }
+fn access_engine_error() -> u64 { return 4; }
+fn access_trapped() -> u64 { return 5; }
+fn access_service_dead() -> u64 { return 6; }
+fn access_closed() -> u64 { return 7; }
+fn access_bad_kind() -> u64 { return 8; }
+
+// ---- query kinds ----
+fn query_point() -> u64 { return 1; }
+fn query_sum() -> u64 { return 2; }
+fn query_count() -> u64 { return 3; }
+fn query_scan_sum_ge() -> u64 { return 4; }
+fn query_trap_probe() -> u64 { return 99; }
+
+struct AccessOpts {
+    batch_max: u64,
+    batch_window_ns: u64,
+    query_cap: u64,
+    inbox_cap: u32,
+}
+
+fn access_opts_default() -> AccessOpts {
+    return AccessOpts { batch_max: 32, batch_window_ns: 2000000, query_cap: 8, inbox_cap: 1024 };
+}
+
+fn access_opts(batch_max: u64, batch_window_ns: u64, query_cap: u64, inbox_cap: u32) -> AccessOpts {
+    let bm = batch_max;
+    if bm == 0 { bm = 1; };
+    if bm > 64 { bm = 64; };
+    let qc = query_cap;
+    if qc == 0 { qc = 1; };
+    return AccessOpts { batch_max: bm, batch_window_ns: batch_window_ns, query_cap: qc, inbox_cap: inbox_cap };
+}
+
+struct AccessHandle {
+    ctl: ptr,
+}
+
+struct DbQuery {
+    kind: u64,
+    key_col: u64,
+    key: u64,
+    val_col: u64,
+}
+
+fn db_query(kind: u64, key_col: u64, key: u64, val_col: u64) -> DbQuery {
+    return DbQuery { kind: kind, key_col: key_col, key: key, val_col: val_col };
+}
+
+fn db_query_point(key_col: u64, key: u64, val_col: u64) -> DbQuery {
+    return DbQuery { kind: 1, key_col: key_col, key: key, val_col: val_col };
+}
+
+struct DbResult {
+    status: u64,
+    found: u64,
+    value: i64,
+    epoch: u64,
+}
+
+struct DeductReq {
+    account: u64,
+    amount: i64,
+}
+
+fn deduct_req(account: u64, amount: i64) -> DeductReq {
+    return DeductReq { account: account, amount: amount };
+}
+
+
+struct DeductReceipt {
+    status: u64,
+    epoch: u64,
+    balance: i64,
+}
+
+struct AccessStats {
+    batches: u64,
+    commits: u64,
+    deducts_ok: u64,
+    deducts_rejected: u64,
+    live_queries: u64,
+    reap_overflow: u64,
+    closed: u64,
+}
+
+fn db_result_new() -> DbResult {
+    return DbResult { status: 0, found: 0, value: 0, epoch: 0 };
+}
+
+fn deduct_receipt_new() -> DeductReceipt {
+    return DeductReceipt { status: 0, epoch: 0, balance: 0 };
+}
+
+fn access_stats_new() -> AccessStats {
+    return AccessStats { batches: 0, commits: 0, deducts_ok: 0, deducts_rejected: 0, live_queries: 0, reap_overflow: 0, closed: 0 };
+}
+
+// ---- internal blocks ----
+
+struct AccessTableInfo {
+    row_count: u64,
+    segment_count: u64,
+    epoch: u64,
+    locked: u64,
+}
+
+struct AccessSnapInfo {
+    row_count: u64,
+    column_count: u64,
+    row_bytes: u64,
+    epoch: u64,
+}
+
+struct Row16 {
+    lo: u64,
+    hi: u64,
+}
+
+struct QueryBlk {
+    ctl: ptr,
+    kind: u64,
+    key_col: u64,
+    key: u64,
+    val_col: u64,
+    reply: Chan<u64>,
+    status: u64,
+    found: u64,
+    value: i64,
+    epoch: u64,
+}
+
+struct QueryJob {
+    ctl: ptr,
+    blk: ptr,
+}
+
+struct QueryWork {
+    handle: ptr,
+    blk: ptr,
+}
+
+struct DeductBlk {
+    tag: u64,
+    ctl: ptr,
+    account: u64,
+    amount: i64,
+    done: Chan<u64>,
+    reply: Chan<u64>,
+    status: u64,
+    epoch: u64,
+    balance: i64,
+}
+
+struct StopBlk {
+    tag: u64,
+    reply: Chan<u64>,
+}
+
+struct AccessCtl {
+    root_ptr: ptr,
+    root_len: u64,
+    table_ptr: ptr,
+    table_len: u64,
+    inbox: Chan<ptr>,
+    dead: Chan<u64>,
+    never_done: Chan<u64>,
+    sem: Chan<u64>,
+    query_cap: u64,
+    batch_max: u64,
+    batch_window_ns: u64,
+    mutex: u64,
+    wg: u64,
+    writer_task: u64,
+    watch_task: u64,
+    closed: u64,
+    batches: u64,
+    commits: u64,
+    deducts_ok: u64,
+    deducts_rejected: u64,
+    reap_store: ptr,
+}
+
+// Abandoned ticket blocks awaiting reaping at access_close. Kept
+// in its own Box: the big uniform arrays must not share a struct
+// literal with the control block's scalars (by-value construction
+// of large array fields is DEF-1 territory).
+struct ReapStore {
+    slots: [ptr; 128],
+    kinds: [u64; 128],
+    count: u64,
+    overflow: u64,
+}
+
+struct QueryTicket {
+    blk: ptr,
+    reply: Chan<u64>,
+    ctl: ptr,
+    dead: Chan<u64>,
+}
+
+struct DeductTicket {
+    blk: ptr,
+    reply: Chan<u64>,
+    ctl: ptr,
+    dead: Chan<u64>,
+}
+
+// Wait outcomes: results travel BY VALUE. (Writing through an
+// &Struct parameter from inside an SLA function is unreliable in
+// the current compiler — a one-function minimal repro segfaults
+// on `(*out).field = v` for a caller stack local, while extern
+// writes and heap-pointer writes through the same address work.
+// Minimal repro forwarded to the compiler line; until it is
+// fixed, this API returns small scalar structs by value.)
+struct QueryWaitOutcome {
+    filled: bool,
+    res: DbResult,
+}
+
+struct DeductWaitOutcome {
+    filled: bool,
+    res: DeductReceipt,
+}
+
+fn query_wait_outcome(filled: bool, res: DbResult) -> QueryWaitOutcome {
+    return QueryWaitOutcome { filled: filled, res: res };
+}
+
+fn deduct_wait_outcome(filled: bool, res: DeductReceipt) -> DeductWaitOutcome {
+    return DeductWaitOutcome { filled: filled, res: res };
+}
+
+// Mint another handle to the same service. Handles are how
+// callers multiply across goroutines: every handle reaches the
+// same control block, the same writer, the same query pool.
+// access_close through any one handle is terminal for all.
+fn access_share(h: &AccessHandle) -> AccessHandle {
+    return AccessHandle { ctl: h.ctl };
+}
+
+// ---- small helpers ----
+
+fn ctl_lock(ctl: *AccessCtl) {
+    let rc = sa_sync_mutex_lock((*ctl).mutex);
+    if rc != 0 { panic(9401); };
+}
+
+fn ctl_unlock(ctl: *AccessCtl) {
+    let rc = sa_sync_mutex_unlock((*ctl).mutex);
+    if rc != 0 { panic(9402); };
+}
+
+fn reap_register(ctl: *AccessCtl, blk: ptr, is_deduct: u64) {
+    let rs: *ReapStore = (*ctl).reap_store as *ReapStore;
+    ctl_lock(ctl);
+    if (*rs).count < 128 {
+        (*rs).slots[(*rs).count] = blk;
+        (*rs).kinds[(*rs).count] = is_deduct;
+        (*rs).count = (*rs).count + 1;
+    } else {
+        (*rs).overflow = (*rs).overflow + 1;
+    };
+    ctl_unlock(ctl);
+}
+
+// ---- query machinery ----
+
+fn query_inner(work: *QueryWork) {
+    let handle: ptr = (*work).handle;
+    let blk: *QueryBlk = (*work).blk as *QueryBlk;
+    let kind: u64 = (*blk).kind;
+    if kind == 1 {
+        let found: u64 = 0;
+        let ridx: u64 = 0;
+        let rc = sa_db_find_u64_handle(handle, (*blk).key_col, (*blk).key, &found, &ridx);
+        if rc != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc as i64;
+            return;
+        };
+        if found == 0 {
+            (*blk).status = 0;
+            (*blk).found = 0;
+            return;
+        };
+        let v: i64 = 0;
+        let rc2 = sa_db_get_i64_handle(handle, (*blk).val_col, ridx, &v);
+        if rc2 != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc2 as i64;
+            return;
+        };
+        (*blk).status = 0;
+        (*blk).found = 1;
+        (*blk).value = v;
+        return;
+    };
+    if kind == 2 {
+        let v: i64 = 0;
+        let rc = sa_db_sum_i64_handle(handle, (*blk).val_col, &v);
+        if rc != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc as i64;
+            return;
+        };
+        (*blk).status = 0;
+        (*blk).found = 1;
+        (*blk).value = v;
+        return;
+    };
+    if kind == 3 {
+        let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+        let rc = sa_db_snapshot_info_handle(handle, &sinfo);
+        if rc != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc as i64;
+            return;
+        };
+        (*blk).status = 0;
+        (*blk).found = 1;
+        (*blk).value = sinfo.row_count as i64;
+        return;
+    };
+    if kind == 4 {
+        let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+        let rc = sa_db_snapshot_info_handle(handle, &sinfo);
+        if rc != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc as i64;
+            return;
+        };
+        let acc: i64 = 0;
+        let i: u64 = 0;
+        let since_yield: u64 = 0;
+        while i < sinfo.row_count {
+            let k: u64 = 0;
+            let rc2 = sa_db_get_u64_handle(handle, (*blk).key_col, i, &k);
+            if rc2 != 0 {
+                (*blk).status = 4;
+                (*blk).value = rc2 as i64;
+                return;
+            };
+            if k >= (*blk).key {
+                let x: i64 = 0;
+                let rc3 = sa_db_get_i64_handle(handle, (*blk).val_col, i, &x);
+                if rc3 != 0 {
+                    (*blk).status = 4;
+                    (*blk).value = rc3 as i64;
+                    return;
+                };
+                acc = acc + x;
+            };
+            i = i + 1;
+            since_yield = since_yield + 1;
+            if since_yield >= 256 {
+                let yrc = sa_task_yield();
+                since_yield = 0;
+            };
+        }
+        (*blk).status = 0;
+        (*blk).found = 1;
+        (*blk).value = acc;
+        return;
+    };
+    if kind == 99 {
+        // Trap probe: a RUNTIME trap (double close, code 4) —
+        // the containable kind at the supervised boundary. A
+        // language panic() here is observed to propagate past
+        // the boundary and kill the process instead, so the
+        // probe deliberately does not use one.
+        let ch: Chan<u64> = Chan::new(0);
+        ch.close();
+        ch.close();
+        return;
+    };
+    (*blk).status = 8;
+}
+
+// Outer query goroutine: owns the pin across the inner worker's
+// whole lifetime and closes it on every path (normal, engine
+// error, inner trap). It runs no engine query ops itself.
+fn query_outer(blk: *QueryBlk) {
+    let ctl: *AccessCtl = (*blk).ctl as *AccessCtl;
+    let handle: ptr = PTR_NULL();
+    let rc = sa_db_open_read_table((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &handle);
+    if rc != 0 {
+        (*blk).status = 4;
+        (*blk).value = rc as i64;
+        (*blk).reply.send(1);
+        return;
+    };
+    let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+    let rc0 = sa_db_snapshot_info_handle(handle, &sinfo);
+    if rc0 == 0 {
+        (*blk).epoch = sinfo.epoch;
+    };
+    let work = Box::new(QueryWork { handle: handle, blk: blk as ptr });
+    let work_ptr = Box::into_raw(work);
+    let ih = go supervised query_inner(work_ptr);
+    let st = sa_task_join(ih);
+    if st == 100 {
+        let code: i32 = 0;
+        let mp: ptr = PTR_NULL();
+        let ml: u64 = 0;
+        let irc = sa_task_trap_info(ih, &code, &mp, &ml);
+        (*blk).status = 5;
+        (*blk).value = code as i64;
+    };
+    if st != 0 && st != 100 {
+        (*blk).status = 4;
+        (*blk).value = st as i64;
+    };
+    let crc = sa_db_close_read_table(handle);
+    if crc != 0 && (*blk).status == 0 {
+        (*blk).status = 4;
+        (*blk).value = crc as i64;
+    };
+    (*blk).reply.send(1);
+}
+
+// Runner: applies the query concurrency cap (semaphore tokens),
+// then hands the block to the outer goroutine and reaps the job.
+fn query_runner(job: *QueryJob) {
+    let ctl: *AccessCtl = (*job).ctl as *AccessCtl;
+    let blk: *QueryBlk = (*job).blk as *QueryBlk;
+    let (tok, sem_closed) = (*ctl).sem.recv();
+    let wh = go query_outer(blk);
+    let st = sa_task_join(wh);
+    (*ctl).sem.send(tok);
+    let drc = sa_sync_waitgroup_done((*ctl).wg);
+    let job_box = unsafe { Box::from_raw(job) };
+}
+
+fn access_query(h: &AccessHandle, q: DbQuery) -> QueryTicket {
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    ctl_lock(ctl);
+    if (*ctl).closed != 0 {
+        ctl_unlock(ctl);
+        let dummy: Chan<u64> = Chan::new(1);
+        return QueryTicket { blk: PTR_NULL(), reply: dummy, ctl: h.ctl, dead: (*ctl).dead };
+    };
+    let arc = sa_sync_waitgroup_add((*ctl).wg, 1);
+    ctl_unlock(ctl);
+    let reply: Chan<u64> = Chan::new(1);
+    let blk = Box::new(QueryBlk {
+        ctl: h.ctl, kind: q.kind, key_col: q.key_col, key: q.key, val_col: q.val_col,
+        reply: reply, status: 0, found: 0, value: 0, epoch: 0,
+    });
+    let blk_ptr = Box::into_raw(blk);
+    let job = Box::new(QueryJob { ctl: h.ctl, blk: blk_ptr as ptr });
+    let job_ptr = Box::into_raw(job);
+    let rh = go query_runner(job_ptr);
+    return QueryTicket { blk: blk_ptr as ptr, reply: reply, ctl: h.ctl, dead: (*ctl).dead };
+}
+
+fn query_ticket_fill(t: &QueryTicket) -> DbResult {
+    let blk: *QueryBlk = t.blk as *QueryBlk;
+    let res = db_result_new();
+    res.status = (*blk).status;
+    res.found = (*blk).found;
+    res.value = (*blk).value;
+    res.epoch = (*blk).epoch;
+    let blk_box = unsafe { Box::from_raw(blk) };
+    t.reply.destroy();
+    return res;
+}
+
+fn access_query_wait_ticket(t: &QueryTicket) -> DbResult {
+    if t.blk == PTR_NULL() {
+        let res = db_result_new();
+        res.status = 7;
+        t.reply.destroy();
+        return res;
+    };
+    let ctl: *AccessCtl = t.ctl as *AccessCtl;
+    // NOTE: helper calls live AFTER the select, never inside its
+    // arms — the compiler's import scan does not count references
+    // made only from select arms and prunes those callees
+    // (import-scan-prune family, also behind baseline idx54).
+    let outcome: u64 = 0;
+    select {
+        case let (tok, c1) = t.reply.recv() {
+            outcome = 0;
+        }
+        case let (dv, c2) = t.dead.recv() {
+            outcome = 2;
+        }
+    }
+    if outcome == 0 {
+        return query_ticket_fill(t);
+    };
+    let res = db_result_new();
+    res.status = 6;
+    reap_register(ctl, t.blk, 0);
+    return res;
+}
+
+// filled=true when the query completed (res read from the
+// block). On cancellation the ticket's block is registered for
+// reaping at access_close and res.status is ACCESS_CANCELLED.
+fn access_query_wait_cancellable(t: &QueryTicket, done: Chan<u64>) -> QueryWaitOutcome {
+    if t.blk == PTR_NULL() {
+        let res = db_result_new();
+        res.status = 7;
+        t.reply.destroy();
+        return query_wait_outcome(false, res);
+    };
+    let ctl: *AccessCtl = t.ctl as *AccessCtl;
+    let outcome: u64 = 0;
+    select {
+        case let (tok, c1) = t.reply.recv() {
+            outcome = 0;
+        }
+        case let (cv, c2) = done.recv() {
+            outcome = 1;
+        }
+        case let (dv, c3) = t.dead.recv() {
+            outcome = 2;
+        }
+    }
+    if outcome == 0 {
+        return query_wait_outcome(true, query_ticket_fill(t));
+    };
+    let res = db_result_new();
+    if outcome == 1 {
+        res.status = 3;
+    } else {
+        res.status = 6;
+    };
+    reap_register(ctl, t.blk, 0);
+    return query_wait_outcome(false, res);
+}
+
+fn access_query_wait(h: &AccessHandle, q: DbQuery) -> DbResult {
+    let t = access_query(h, q);
+    return access_query_wait_ticket(&t);
+}
+
+// ---- writer goroutine: single-writer group commit ----
+
+fn writer_process_batch(ctl: *AccessCtl, batch: &[ptr; 64], n: u64) {
+    // Classify cancellations first: a request whose Done fired
+    // before this batch started is answered CANCELLED and never
+    // enters the transaction.
+    let i: u64 = 0;
+    while i < n {
+        let blk: *DeductBlk = batch[i] as *DeductBlk;
+        if is_done((*blk).done) {
+            (*blk).status = 3;
+            (*ctl).deducts_rejected = (*ctl).deducts_rejected + 1;
+        } else {
+            (*blk).status = 0;
+        };
+        i = i + 1;
+    }
+    let handle: ptr = PTR_NULL();
+    let rc = sa_db_open_read_table((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &handle);
+    if rc != 0 {
+        let j: u64 = 0;
+        while j < n {
+            let blk: *DeductBlk = batch[j] as *DeductBlk;
+            if (*blk).status == 0 {
+                (*blk).status = 4;
+                (*blk).balance = rc as i64;
+            };
+            (*blk).reply.send(1);
+            j = j + 1;
+        }
+        return;
+    };
+    let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+    let rc0 = sa_db_snapshot_info_handle(handle, &sinfo);
+    let txh: ptr = PTR_NULL();
+    let brc = sa_db_tx_begin((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &txh);
+    if brc != 0 {
+        let crc = sa_db_close_read_table(handle);
+        let j: u64 = 0;
+        while j < n {
+            let blk: *DeductBlk = batch[j] as *DeductBlk;
+            if (*blk).status == 0 {
+                (*blk).status = 4;
+                (*blk).balance = brc as i64;
+            };
+            (*blk).reply.send(1);
+            j = j + 1;
+        }
+        return;
+    };
+    // Per-batch running balances: repeat deducts on one account
+    // inside a batch must see the staged value, not the snapshot.
+    let cacct: [u64; 64] = [0; 64];
+    let cbal: [i64; 64] = [0; 64];
+    let cn: u64 = 0;
+    let ops: u64 = 0;
+    let abort_rc: u32 = 0;
+    // Hoisted out of the k loop on purpose: struct locals
+    // declared inside a loop body ratchet the goroutine stack
+    // (loop-body stack_alloc does not rewind in this compiler
+    // phase — same family as the slanginx accept-loop finding).
+    let row = Row16 { lo: 0, hi: 0 };
+    let info = AccessTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let k: u64 = 0;
+    while k < n {
+        let blk: *DeductBlk = batch[k] as *DeductBlk;
+        if (*blk).status == 0 {
+            let acct: u64 = (*blk).account;
+            let bal: i64 = 0;
+            let have: bool = false;
+            let cidx: u64 = cn;
+            let ci: u64 = 0;
+            while ci < cn {
+                if cacct[ci] == acct {
+                    bal = cbal[ci];
+                    have = true;
+                    cidx = ci;
+                    ci = cn;
+                } else {
+                    ci = ci + 1;
+                };
+            }
+            if have == false {
+                let found: u64 = 0;
+                let ridx: u64 = 0;
+                let frc = sa_db_find_u64_handle(handle, 0, acct, &found, &ridx);
+                if frc != 0 {
+                    abort_rc = frc;
+                    k = n;
+                } else {
+                    if found == 0 {
+                        (*blk).status = 2;
+                        (*ctl).deducts_rejected = (*ctl).deducts_rejected + 1;
+                    } else {
+                        let grc = sa_db_get_i64_handle(handle, 1, ridx, &bal);
+                        if grc != 0 {
+                            abort_rc = grc;
+                            k = n;
+                        } else {
+                            have = true;
+                            cacct[cn] = acct;
+                            cbal[cn] = bal;
+                            cidx = cn;
+                            cn = cn + 1;
+                        };
+                    };
+                };
+            };
+            if have {
+                let new_bal: i64 = bal - (*blk).amount;
+                if new_bal < 0 {
+                    (*blk).status = 1;
+                    (*blk).balance = bal;
+                    (*blk).epoch = sinfo.epoch;
+                    (*ctl).deducts_rejected = (*ctl).deducts_rejected + 1;
+                } else {
+                    row.lo = acct;
+                    row.hi = new_bal as u64;
+                    let urc = sa_db_tx_update_row_u64_key(txh, 0, acct, &row, 16, &info);
+                    if urc != 0 {
+                        abort_rc = urc;
+                        k = n;
+                    } else {
+                        (*blk).status = 0;
+                        (*blk).balance = new_bal;
+                        cbal[cidx] = new_bal;
+                        ops = ops + 1;
+                    };
+                };
+            };
+        };
+        if abort_rc == 0 {
+            k = k + 1;
+        };
+    }
+    let commit_epoch: u64 = sinfo.epoch;
+    if abort_rc != 0 {
+        let rrc = sa_db_tx_rollback(txh);
+        let j: u64 = 0;
+        while j < n {
+            let blk: *DeductBlk = batch[j] as *DeductBlk;
+            if (*blk).status == 0 {
+                (*blk).status = 4;
+                (*blk).balance = abort_rc as i64;
+            };
+            j = j + 1;
+        }
+    } else {
+        if ops > 0 {
+            let info = AccessTableInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+            let crc2 = sa_db_tx_commit(txh, &info);
+            if crc2 != 0 {
+                let rrc = sa_db_tx_rollback(txh);
+                let j: u64 = 0;
+                while j < n {
+                    let blk: *DeductBlk = batch[j] as *DeductBlk;
+                    if (*blk).status == 0 {
+                        (*blk).status = 4;
+                        (*blk).balance = crc2 as i64;
+                    };
+                    j = j + 1;
+                }
+            } else {
+                commit_epoch = info.epoch;
+                (*ctl).commits = (*ctl).commits + 1;
+                let j: u64 = 0;
+                while j < n {
+                    let blk: *DeductBlk = batch[j] as *DeductBlk;
+                    if (*blk).status == 0 {
+                        (*blk).epoch = commit_epoch;
+                        (*ctl).deducts_ok = (*ctl).deducts_ok + 1;
+                    };
+                    j = j + 1;
+                }
+            };
+        } else {
+            let rrc = sa_db_tx_rollback(txh);
+            let j: u64 = 0;
+            while j < n {
+                let blk: *DeductBlk = batch[j] as *DeductBlk;
+                if (*blk).status == 0 {
+                    (*blk).epoch = commit_epoch;
+                };
+                j = j + 1;
+            }
+        };
+    };
+    let crc3 = sa_db_close_read_table(handle);
+    (*ctl).batches = (*ctl).batches + 1;
+    let j: u64 = 0;
+    while j < n {
+        let blk: *DeductBlk = batch[j] as *DeductBlk;
+        (*blk).reply.send(1);
+        j = j + 1;
+    }
+}
+
+// One writer cycle: block for the first request, collect a
+// batch inside the window, process it. Returns false when the
+// writer must exit (stop block or closed inbox). The cycle lives
+// in its own function on purpose: loop-body stack allocations do
+// not rewind in this compiler phase, so a while-true body that
+// carries the whole batch machinery ratchets the fixed
+// goroutine stack until it overflows; a per-batch call frame
+// unwinds instead. (Same family as the slanginx accept-loop
+// stack-ratchet finding, 2026-10-30.)
+fn writer_cycle(ctl: *AccessCtl) -> bool {
+    let batch: [ptr; 64] = [PTR_NULL(); 64];
+    let (msg, closed) = (*ctl).inbox.recv();
+    if closed {
+        return false;
+    };
+    let first_blk: *DeductBlk = msg as *DeductBlk;
+    let tag: u64 = (*first_blk).tag;
+    if tag == 2 {
+        let stop: *StopBlk = first_blk as *StopBlk;
+        (*stop).reply.send(1);
+        let stop_box = unsafe { Box::from_raw(stop) };
+        return false;
+    };
+    batch[0] = first_blk as ptr;
+    let n: u64 = 1;
+    let stop_after: bool = false;
+    let stop_blk: ptr = PTR_NULL();
+    if (*ctl).batch_window_ns > 0 {
+        let deadline: u64 = sa_time_instant_ns() + (*ctl).batch_window_ns;
+        let collecting: bool = true;
+        while collecting {
+            let now: u64 = sa_time_instant_ns();
+            if now >= deadline {
+                collecting = false;
+            } else {
+                if n >= (*ctl).batch_max {
+                    collecting = false;
+                } else {
+                    select {
+                        case let (m2, c2) = (*ctl).inbox.recv() {
+                            let m2_blk: *DeductBlk = m2 as *DeductBlk;
+                            let tag2: u64 = (*m2_blk).tag;
+                            if tag2 == 2 {
+                                stop_after = true;
+                                stop_blk = m2_blk as ptr;
+                                collecting = false;
+                            } else {
+                                batch[n] = m2_blk as ptr;
+                                n = n + 1;
+                            };
+                        }
+                        timeout(100000) {
+                        }
+                    }
+                };
+            };
+        }
+    } else {
+        let draining: bool = true;
+        while draining {
+            if n >= (*ctl).batch_max {
+                draining = false;
+            } else {
+                select {
+                    case let (m2, c2) = (*ctl).inbox.recv() {
+                        let m2_blk: *DeductBlk = m2 as *DeductBlk;
+                        let tag2: u64 = (*m2_blk).tag;
+                        if tag2 == 2 {
+                            stop_after = true;
+                            stop_blk = m2_blk as ptr;
+                            draining = false;
+                        } else {
+                            batch[n] = m2_blk as ptr;
+                            n = n + 1;
+                        };
+                    }
+                    default {
+                        draining = false;
+                    }
+                }
+            };
+        }
+    };
+    writer_process_batch(ctl, &batch, n);
+    if stop_after {
+        let stop: *StopBlk = stop_blk as *StopBlk;
+        (*stop).reply.send(1);
+        let stop_box = unsafe { Box::from_raw(stop) };
+        return false;
+    };
+    let yrc = sa_task_yield();
+    return true;
+}
+
+fn writer_main(ctl: *AccessCtl) {
+    let running: bool = true;
+    while running {
+        running = writer_cycle(ctl);
+    }
+}
+
+// Writer watchdog: a normal writer exit (code 0, via stop) is
+// fine; any other exit means the writer died — broadcast service
+// death on the Done channel. The writer is never restarted.
+fn writer_watch(ctl: *AccessCtl) {
+    let m = monitor((*ctl).writer_task);
+    let (msg, closed) = m.recv();
+    if closed == false {
+        if msg.1 != 0 {
+            done_signal((*ctl).dead);
+        };
+    };
+    m.destroy();
+}
+
+// ---- deduct submit / wait ----
+
+fn access_deduct_submit(h: &AccessHandle, req: DeductReq, done: Chan<u64>) -> DeductTicket {
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    let reply: Chan<u64> = Chan::new(1);
+    let blk = Box::new(DeductBlk {
+        tag: 1, ctl: h.ctl, account: req.account, amount: req.amount,
+        done: done, reply: reply, status: 0, epoch: 0, balance: 0,
+    });
+    let blk_ptr = Box::into_raw(blk);
+    // The closed check and the inbox send happen under the same
+    // lock access_close uses for its stop send, so a request can
+    // never land behind the stop block.
+    ctl_lock(ctl);
+    if (*ctl).closed != 0 {
+        ctl_unlock(ctl);
+        let blk_box = unsafe { Box::from_raw(blk_ptr) };
+        return DeductTicket { blk: PTR_NULL(), reply: reply, ctl: h.ctl, dead: (*ctl).dead };
+    };
+    (*ctl).inbox.send(blk_ptr as ptr);
+    ctl_unlock(ctl);
+    return DeductTicket { blk: blk_ptr as ptr, reply: reply, ctl: h.ctl, dead: (*ctl).dead };
+}
+
+fn access_deduct(h: &AccessHandle, req: DeductReq) -> DeductTicket {
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    return access_deduct_submit(h, req, (*ctl).never_done);
+}
+
+fn access_deduct_cancellable(h: &AccessHandle, req: DeductReq, done: Chan<u64>) -> DeductTicket {
+    return access_deduct_submit(h, req, done);
+}
+
+fn deduct_ticket_fill(t: &DeductTicket) -> DeductReceipt {
+    let blk: *DeductBlk = t.blk as *DeductBlk;
+    let res = deduct_receipt_new();
+    res.status = (*blk).status;
+    res.epoch = (*blk).epoch;
+    res.balance = (*blk).balance;
+    let blk_box = unsafe { Box::from_raw(blk) };
+    t.reply.destroy();
+    return res;
+}
+
+fn access_deduct_wait_ticket(t: &DeductTicket) -> DeductReceipt {
+    if t.blk == PTR_NULL() {
+        let res = deduct_receipt_new();
+        res.status = 7;
+        t.reply.destroy();
+        return res;
+    };
+    let ctl: *AccessCtl = t.ctl as *AccessCtl;
+    let outcome: u64 = 0;
+    select {
+        case let (tok, c1) = t.reply.recv() {
+            outcome = 0;
+        }
+        case let (dv, c2) = t.dead.recv() {
+            outcome = 2;
+        }
+    }
+    if outcome == 0 {
+        return deduct_ticket_fill(t);
+    };
+    let res = deduct_receipt_new();
+    res.status = 6;
+    reap_register(ctl, t.blk, 1);
+    return res;
+}
+
+// Cancellation caliber: the writer honors Done when it STARTS
+// the batch holding the request. A waiter whose Done fires first
+// returns false with ACCESS_CANCELLED — but if the writer already
+// started the batch, the request still commits and its receipt
+// (delivered to the buffered reply channel) honestly says so; the
+// block is reaped at access_close, never freed early.
+fn access_deduct_wait_cancellable(t: &DeductTicket) -> DeductWaitOutcome {
+    if t.blk == PTR_NULL() {
+        let res = deduct_receipt_new();
+        res.status = 7;
+        t.reply.destroy();
+        return deduct_wait_outcome(false, res);
+    };
+    let ctl: *AccessCtl = t.ctl as *AccessCtl;
+    let blk: *DeductBlk = t.blk as *DeductBlk;
+    let done: Chan<u64> = (*blk).done;
+    let outcome: u64 = 0;
+    select {
+        case let (tok, c1) = t.reply.recv() {
+            outcome = 0;
+        }
+        case let (cv, c2) = done.recv() {
+            outcome = 1;
+        }
+        case let (dv, c3) = t.dead.recv() {
+            outcome = 2;
+        }
+    }
+    if outcome == 0 {
+        return deduct_wait_outcome(true, deduct_ticket_fill(t));
+    };
+    let res = deduct_receipt_new();
+    if outcome == 1 {
+        res.status = 3;
+    } else {
+        res.status = 6;
+    };
+    reap_register(ctl, t.blk, 1);
+    return deduct_wait_outcome(false, res);
+}
+
+fn access_deduct_wait(h: &AccessHandle, req: DeductReq) -> DeductReceipt {
+    let t = access_deduct(h, req);
+    return access_deduct_wait_ticket(&t);
+}
+
+// ---- lifecycle ----
+
+fn access_start(root: ptr, root_len: u64, table: ptr, table_len: u64, opts: AccessOpts) -> AccessHandle {
+    let inbox: Chan<ptr> = Chan::new(opts.inbox_cap);
+    let sem: Chan<u64> = Chan::new(opts.query_cap as u32);
+    let i: u64 = 0;
+    while i < opts.query_cap {
+        sem.send(0);
+        i = i + 1;
+    }
+    let mutex: u64 = 0;
+    let mrc = sa_sync_mutex_new(&mutex);
+    if mrc != 0 { panic(9403); };
+    let wg: u64 = 0;
+    let wrc = sa_sync_waitgroup_new(&wg);
+    if wrc != 0 { panic(9404); };
+    let rs = Box::new(ReapStore { slots: [PTR_NULL(); 128], kinds: [0; 128], count: 0, overflow: 0 });
+    let rs_ptr = Box::into_raw(rs);
+    let rs_t: *ReapStore = rs_ptr;
+    (*rs_t).count = 0;
+    (*rs_t).overflow = 0;
+    let ctl = Box::new(AccessCtl {
+        root_ptr: root, root_len: root_len,
+        table_ptr: table, table_len: table_len,
+        inbox: inbox, dead: done_new(), never_done: done_new(),
+        sem: sem, query_cap: opts.query_cap,
+        batch_max: opts.batch_max, batch_window_ns: opts.batch_window_ns,
+        mutex: mutex, wg: wg, writer_task: 0, watch_task: 0, closed: 0,
+        batches: 0, commits: 0, deducts_ok: 0, deducts_rejected: 0,
+        reap_store: rs_t as ptr,
+    });
+    let ctl_ptr = Box::into_raw(ctl);
+    let ctl_t: *AccessCtl = ctl_ptr;
+    let wt = go writer_main(ctl_t);
+    (*ctl_t).writer_task = wt;
+    let vt = go writer_watch(ctl_t);
+    (*ctl_t).watch_task = vt;
+    return AccessHandle { ctl: ctl_t as ptr };
+}
+
+fn access_stats(h: &AccessHandle) -> AccessStats {
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    let st = access_stats_new();
+    st.batches = (*ctl).batches;
+    st.commits = (*ctl).commits;
+    st.deducts_ok = (*ctl).deducts_ok;
+    st.deducts_rejected = (*ctl).deducts_rejected;
+    st.live_queries = (*ctl).query_cap - ((*ctl).sem.len() as u64);
+    let rs: *ReapStore = (*ctl).reap_store as *ReapStore;
+    st.reap_overflow = (*rs).overflow;
+    st.closed = (*ctl).closed;
+    return st;
+}
+
+// Close protocol: stop intake under the lock, enqueue the stop
+// block behind everything already queued (the writer drains it
+// all, commits the final partial batch, then acks), join the
+// writer and the watchdog, wait out in-flight queries on the
+// waitgroup, then reap abandoned ticket blocks. Returns the
+// pending count: requests that never got a receipt. In a healthy
+// service this is 0; it is nonzero only when the writer died with
+// requests still queued (those blocks are reclaimed here by
+// draining the inbox; the batch in the dead writer's hands is
+// documented as leaked with the dead service).
+fn access_close(h: AccessHandle) -> u64 {
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    ctl_lock(ctl);
+    if (*ctl).closed != 0 {
+        ctl_unlock(ctl);
+        return 0;
+    };
+    (*ctl).closed = 1;
+    let dead_already: bool = is_done((*ctl).dead);
+    let stop_reply: Chan<u64> = Chan::new(1);
+    if dead_already == false {
+        let stop = Box::new(StopBlk { tag: 2, reply: stop_reply });
+        (*ctl).inbox.send(Box::into_raw(stop) as ptr);
+    };
+    ctl_unlock(ctl);
+    if dead_already == false {
+        let (ack, c) = stop_reply.recv();
+    };
+    stop_reply.destroy();
+    let wst = sa_task_join((*ctl).writer_task);
+    let vst = sa_task_join((*ctl).watch_task);
+    let wrc = sa_sync_waitgroup_wait((*ctl).wg);
+    let pending: u64 = 0;
+    if dead_already {
+        let left: u64 = (*ctl).inbox.len() as u64;
+        let i: u64 = 0;
+        while i < left {
+            let (m, c2) = (*ctl).inbox.recv();
+            let db: *DeductBlk = m as *DeductBlk;
+            if (*db).tag == 1 {
+                pending = pending + 1;
+                let db_box = unsafe { Box::from_raw(db) };
+            };
+            i = i + 1;
+        }
+    };
+    // Reap abandoned blocks. Query blocks are safe now (waitgroup
+    // drained). Deduct blocks are safe when the writer exited
+    // normally (it answered every queued request before the stop
+    // block); on the dead path their queued twins were drained
+    // above and the rest are left with the dead service rather
+    // than risk a double free.
+    let rs: *ReapStore = (*ctl).reap_store as *ReapStore;
+    let ri: u64 = 0;
+    while ri < (*rs).count {
+        let blk_ptr: ptr = (*rs).slots[ri];
+        if (*rs).kinds[ri] == 0 {
+            let qb: *QueryBlk = blk_ptr as *QueryBlk;
+            let qb_box = unsafe { Box::from_raw(qb) };
+        } else {
+            if dead_already == false {
+                let db: *DeductBlk = blk_ptr as *DeductBlk;
+                let db_box = unsafe { Box::from_raw(db) };
+            };
+        };
+        ri = ri + 1;
+    }
+    (*ctl).inbox.destroy();
+    (*ctl).sem.destroy();
+    let rs_box = unsafe { Box::from_raw(rs) };
+    let ctl_box = unsafe { Box::from_raw(ctl) };
+    return pending;
+}
+
+fn access_close_strict(h: AccessHandle) {
+    let pending = access_close(h);
+    if pending != 0 { panic(9405); };
+}

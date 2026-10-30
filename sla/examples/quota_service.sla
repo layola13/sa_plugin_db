@@ -1,0 +1,145 @@
+// quota_service.sla — the relay-station quota reference
+// scenario for the goroutine access layer (sala 15 named this
+// shape: many concurrent clients checking balances and deducting
+// quota against one account table).
+//
+//   - 4 client goroutines, one per account: each round does a
+//     balance check (pinned snapshot read) then a deduct of 3.
+//   - All deducts funnel into the single writer goroutine and
+//     commit in batches; balances stay exact throughout.
+//   - An overdraft is refused (INSUFFICIENT), a pre-cancelled
+//     deduct is never applied (CANCELLED), and a trapped probe
+//     query fails alone (TRAPPED) without touching the service.
+//   - Client summaries fan in over ONE shared channel — no
+//     multi-arm select, so declaration-order bias has nothing
+//     to starve.
+//
+// Run from a scratch directory (engine root is "."):
+//   SA_PLUGIN_DEV=1 sla build-exe sla/examples/quota_service.sla
+//   ./quota_service   (prints per-account results, exits 0)
+
+@import "../db_access.sla"
+@import "../../db.sai"
+@import "sa_std/string.sa"
+@import "sa_std/task.sai"
+@import "sa_std/ctx.sla"
+@import "sa_std/core/box.sa"
+@import "sa_std/ptr.sa"
+
+struct TestInfo {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+struct TRow {
+    lo: u64,
+    hi: u64,
+}
+
+fn setup_quota(table: ptr, table_len: u64, path: ptr, path_len: u64, schema: ptr, schema_len: u64, n: u64, balance: i64) {
+    let info = TestInfo { a: 0, b: 0, c: 0, d: 0 };
+    let rc0 = sa_db_remove_table(STR_PTR("."), 1, table, table_len, &info);
+    let rc1 = sa_db_init_schema(STR_PTR("."), 1, path, path_len, schema, schema_len, &info);
+    if rc1 != 0 { panic(9701); };
+    let rc2 = sa_db_create_u64_index(STR_PTR("."), 1, table, table_len, 0, 1, &info);
+    if rc2 != 0 { panic(9702); };
+    let txh: ptr = PTR_NULL();
+    let rc3 = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+    if rc3 != 0 { panic(9703); };
+    let i: u64 = 0;
+    while i < n {
+        let row = TRow { lo: i + 1, hi: balance as u64 };
+        let rc4 = sa_db_tx_insert_row(txh, &row, 16, &info);
+        if rc4 != 0 { panic(9704); };
+        i = i + 1;
+    }
+    let rc5 = sa_db_tx_commit(txh, &info);
+    if rc5 != 0 { panic(9705); };
+}
+
+struct ClientJob {
+    h: AccessHandle,
+    account: u64,
+    rounds: u64,
+    summary: Chan<(u64, i64)>,
+}
+
+fn quota_client(job: *ClientJob) {
+    let h = (*job).h;
+    let out = db_result_new();
+    let rc = deduct_receipt_new();
+    let i: u64 = 0;
+    while i < (*job).rounds {
+        out = access_query_wait(&h, db_query_point(0, (*job).account, 1));
+        if out.status != 0 { panic(9711); };
+        if out.found != 1 { panic(9712); };
+        rc = access_deduct_wait(&h, deduct_req((*job).account, 3));
+        if rc.status != 0 { panic(9713); };
+        i = i + 1;
+    }
+    out = access_query_wait(&h, db_query_point(0, (*job).account, 1));
+    if out.status != 0 { panic(9714); };
+    (*job).summary.send(((*job).account, out.value));
+}
+
+fn main() -> i32 {
+    setup_quota(STR_PTR("quota"), STR_LEN("quota") as u64, STR_PTR("quota.sadb-schema"), STR_LEN("quota.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 4, 1000);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("quota"), STR_LEN("quota") as u64, access_opts_default());
+    let summary: Chan<(u64, i64)> = Chan::new(8);
+    let j1 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 1, rounds: 10, summary: summary }));
+    let g1 = go quota_client(j1);
+    let j2 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 2, rounds: 10, summary: summary }));
+    let g2 = go quota_client(j2);
+    let j3 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 3, rounds: 10, summary: summary }));
+    let g3 = go quota_client(j3);
+    let j4 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 4, rounds: 10, summary: summary }));
+    let g4 = go quota_client(j4);
+    let s1 = sa_task_join(g1);
+    if s1 != 0 { panic(9721); };
+    let s2 = sa_task_join(g2);
+    if s2 != 0 { panic(9722); };
+    let s3 = sa_task_join(g3);
+    if s3 != 0 { panic(9723); };
+    let s4 = sa_task_join(g4);
+    if s4 != 0 { panic(9724); };
+    let total: i64 = 0;
+    let got: u64 = 0;
+    while got < 4 {
+        let (msg, closed) = summary.recv();
+        if closed { panic(9725); };
+        println("account {} final balance {}", msg.0, msg.1);
+        if msg.1 != 970 { panic(9726); };
+        total = total + msg.1;
+        got = got + 1;
+    }
+    if total != 3880 { panic(9727); };
+    // Overdraft is refused and changes nothing.
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait(&h, deduct_req(1, 2000));
+    if rc.status != 1 { panic(9731); };
+    println("overdraft refused: status {} balance still {}", rc.status, rc.balance);
+    // A deduct whose Done already fired is never applied.
+    let done: Chan<u64> = done_new();
+    done_signal(done);
+    let t = access_deduct_cancellable(&h, deduct_req(2, 500), done);
+    let w = access_deduct_wait_cancellable(&t);
+    let completed = w.filled;
+    rc = w.res;
+    if rc.status != 3 { panic(9732); };
+    println("pre-cancelled deduct: status {}", rc.status);
+    // A trapped probe query fails alone; the service lives.
+    let out = db_result_new();
+    out = access_query_wait(&h, db_query(99, 0, 0, 0));
+    if out.status != 5 { panic(9733); };
+    println("trap probe: status {} trap code {}", out.status, out.value);
+    out = access_query_wait(&h, db_query_point(0, 2, 1));
+    if out.value != 970 { panic(9734); };
+    let st = access_stats(&h);
+    println("writer: {} batches, {} commits, {} deducts ok, {} rejected", st.batches, st.commits, st.deducts_ok, st.deducts_rejected);
+    if st.deducts_ok != 40 { panic(9735); };
+    access_close_strict(h);
+    println("quota_service: OK");
+    return 0;
+}

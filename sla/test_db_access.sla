@@ -1,0 +1,286 @@
+// test_db_access.sla — acceptance tests for the goroutine
+// access layer (sla/db_access.sla). Run from a scratch directory:
+// the engine root is "." and each test uses its own table.
+//
+//   SA_PLUGIN_DEV=1 sla test sla/test_db_access.sla
+
+@import "db_access.sla"
+@import "../db.sai"
+@import "sa_std/string.sa"
+@import "sa_std/task.sai"
+@import "sa_std/ctx.sla"
+@import "sa_std/core/box.sa"
+@import "sa_std/ptr.sa"
+
+struct TestInfo {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+// Layout-identical to the engine's 16-byte row (id, balance).
+struct TRow {
+    lo: u64,
+    hi: u64,
+}
+
+// Creates a fresh two-column table (id u64 unique, balance i64)
+// with accounts 1..n at the given balance, via the engine's cold
+// path directly (setup is not part of the access layer).
+fn setup_table(table: ptr, table_len: u64, path: ptr, path_len: u64, schema: ptr, schema_len: u64, n: u64, balance: i64) {
+    let info = TestInfo { a: 0, b: 0, c: 0, d: 0 };
+    let rc0 = sa_db_remove_table(STR_PTR("."), 1, table, table_len, &info);
+    let rc1 = sa_db_init_schema(STR_PTR("."), 1, path, path_len, schema, schema_len, &info);
+    if rc1 != 0 { panic(9501); };
+    let rc2 = sa_db_create_u64_index(STR_PTR("."), 1, table, table_len, 0, 1, &info);
+    if rc2 != 0 { panic(9502); };
+    let txh: ptr = PTR_NULL();
+    let rc3 = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+    if rc3 != 0 { panic(9503); };
+    let i: u64 = 0;
+    while i < n {
+        let row = TRow { lo: i + 1, hi: balance as u64 };
+        let rc4 = sa_db_tx_insert_row(txh, &row, 16, &info);
+        if rc4 != 0 { panic(9504); };
+        i = i + 1;
+    }
+    let rc5 = sa_db_tx_commit(txh, &info);
+    if rc5 != 0 { panic(9505); };
+}
+
+fn point(h: &AccessHandle, acct: u64) -> DbResult {
+    return access_query_wait(h, db_query_point(0, acct, 1));
+}
+
+@test "access point count sum read one pinned snapshot"() {
+    setup_table(STR_PTR("tq1"), STR_LEN("tq1") as u64, STR_PTR("tq1.sadb-schema"), STR_LEN("tq1.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 4, 1000);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq1"), STR_LEN("tq1") as u64, access_opts_default());
+    let out = db_result_new();
+    out = point(&h, 2);
+    if out.status != 0 { panic(9511); };
+    if out.found != 1 { panic(9512); };
+    if out.value != 1000 { panic(9513); };
+    if out.epoch == 0 { panic(9514); };
+    out = access_query_wait(&h, db_query(3, 0, 0, 0));
+    if out.status != 0 { panic(9515); };
+    if out.value != 4 { panic(9516); };
+    out = access_query_wait(&h, db_query(2, 0, 0, 1));
+    if out.status != 0 { panic(9517); };
+    if out.value != 4000 { panic(9518); };
+    access_close_strict(h);
+}
+
+@test "access deduct commits and raises epoch"() {
+    setup_table(STR_PTR("tq2"), STR_LEN("tq2") as u64, STR_PTR("tq2.sadb-schema"), STR_LEN("tq2.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 500);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq2"), STR_LEN("tq2") as u64, access_opts_default());
+    let out = db_result_new();
+    out = point(&h, 1);
+    let epoch_before: u64 = out.epoch;
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait(&h, deduct_req(1, 200));
+    if rc.status != 0 { panic(9521); };
+    if rc.balance != 300 { panic(9522); };
+    if rc.epoch <= epoch_before { panic(9523); };
+    out = point(&h, 1);
+    if out.value != 300 { panic(9524); };
+    if out.epoch != rc.epoch { panic(9525); };
+    access_close_strict(h);
+}
+
+@test "access batch deducts share one commit"() {
+    setup_table(STR_PTR("tq3"), STR_LEN("tq3") as u64, STR_PTR("tq3.sadb-schema"), STR_LEN("tq3.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 3, 100);
+    let opts = access_opts(32, 300000000, 8, 1024);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq3"), STR_LEN("tq3") as u64, opts);
+    let t1 = access_deduct(&h, deduct_req(1, 10));
+    let t2 = access_deduct(&h, deduct_req(2, 20));
+    let t3 = access_deduct(&h, deduct_req(3, 30));
+    let r1 = deduct_receipt_new();
+    let r2 = deduct_receipt_new();
+    let r3 = deduct_receipt_new();
+    r1 = access_deduct_wait_ticket(&t1);
+    r2 = access_deduct_wait_ticket(&t2);
+    r3 = access_deduct_wait_ticket(&t3);
+    if r1.status != 0 { panic(9531); };
+    if r2.status != 0 { panic(9532); };
+    if r3.status != 0 { panic(9533); };
+    if r1.epoch != r2.epoch { panic(9534); };
+    if r2.epoch != r3.epoch { panic(9535); };
+    if r1.balance != 90 { panic(9536); };
+    if r2.balance != 80 { panic(9537); };
+    if r3.balance != 70 { panic(9538); };
+    let st = access_stats(&h);
+    if st.commits != 1 { panic(9539); };
+    if st.deducts_ok != 3 { panic(9540); };
+    access_close_strict(h);
+}
+
+@test "access insufficient and missing stay uncommitted"() {
+    setup_table(STR_PTR("tq4"), STR_LEN("tq4") as u64, STR_PTR("tq4.sadb-schema"), STR_LEN("tq4.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 50);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq4"), STR_LEN("tq4") as u64, access_opts_default());
+    let out = db_result_new();
+    out = point(&h, 1);
+    let epoch_before: u64 = out.epoch;
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait(&h, deduct_req(1, 51));
+    if rc.status != 1 { panic(9551); };
+    if rc.balance != 50 { panic(9552); };
+    rc = access_deduct_wait(&h, deduct_req(999, 1));
+    if rc.status != 2 { panic(9553); };
+    out = point(&h, 1);
+    if out.value != 50 { panic(9554); };
+    if out.epoch != epoch_before { panic(9555); };
+    access_close_strict(h);
+}
+
+@test "access cancelled deduct is never applied"() {
+    setup_table(STR_PTR("tq5"), STR_LEN("tq5") as u64, STR_PTR("tq5.sadb-schema"), STR_LEN("tq5.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 100);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq5"), STR_LEN("tq5") as u64, access_opts_default());
+    let done: Chan<u64> = done_new();
+    done_signal(done);
+    let t = access_deduct_cancellable(&h, deduct_req(1, 40), done);
+    let rc = deduct_receipt_new();
+    let w = access_deduct_wait_cancellable(&t);
+    let completed = w.filled;
+    rc = w.res;
+    if rc.status != 3 { panic(9561); };
+    let out = db_result_new();
+    out = point(&h, 1);
+    if out.value != 100 { panic(9562); };
+    access_close_strict(h);
+}
+
+@test "access trapped query fails alone and frontier advances"() {
+    setup_table(STR_PTR("tq6"), STR_LEN("tq6") as u64, STR_PTR("tq6.sadb-schema"), STR_LEN("tq6.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 100);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq6"), STR_LEN("tq6") as u64, access_opts_default());
+    let out = db_result_new();
+    out = access_query_wait(&h, db_query(99, 0, 0, 0));
+    if out.status != 5 { panic(9571); };
+    if out.value == 0 { panic(9572); };
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait(&h, deduct_req(1, 10));
+    if rc.status != 0 { panic(9573); };
+    out = point(&h, 1);
+    if out.value != 90 { panic(9574); };
+    if out.epoch != rc.epoch { panic(9575); };
+    access_close_strict(h);
+}
+
+@test "access close drains queued deducts"() {
+    setup_table(STR_PTR("tq7"), STR_LEN("tq7") as u64, STR_PTR("tq7.sadb-schema"), STR_LEN("tq7.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 2, 1000);
+    let opts = access_opts(32, 0, 8, 1024);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq7"), STR_LEN("tq7") as u64, opts);
+    let t1 = access_deduct(&h, deduct_req(1, 5));
+    let t2 = access_deduct(&h, deduct_req(2, 5));
+    let t3 = access_deduct(&h, deduct_req(1, 5));
+    let t4 = access_deduct(&h, deduct_req(2, 5));
+    let t5 = access_deduct(&h, deduct_req(1, 5));
+    let t6 = access_deduct(&h, deduct_req(2, 5));
+    let pending = access_close(h);
+    if pending != 0 { panic(9581); };
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait_ticket(&t1);
+    if rc.status != 0 { panic(9582); };
+    rc = access_deduct_wait_ticket(&t2);
+    if rc.status != 0 { panic(9583); };
+    rc = access_deduct_wait_ticket(&t3);
+    if rc.status != 0 { panic(9584); };
+    rc = access_deduct_wait_ticket(&t4);
+    if rc.status != 0 { panic(9585); };
+    rc = access_deduct_wait_ticket(&t5);
+    if rc.status != 0 { panic(9586); };
+    if rc.balance != 985 { panic(9587); };
+    rc = access_deduct_wait_ticket(&t6);
+    if rc.status != 0 { panic(9588); };
+    if rc.balance != 985 { panic(9589); };
+}
+
+@test "access query cap completes under backpressure"() {
+    setup_table(STR_PTR("tq8"), STR_LEN("tq8") as u64, STR_PTR("tq8.sadb-schema"), STR_LEN("tq8.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 200, 1);
+    let opts = access_opts(32, 0, 2, 1024);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq8"), STR_LEN("tq8") as u64, opts);
+    let q = db_query(4, 0, 101, 1);
+    let t1 = access_query(&h, q);
+    let t2 = access_query(&h, q);
+    let t3 = access_query(&h, q);
+    let t4 = access_query(&h, q);
+    let t5 = access_query(&h, q);
+    let t6 = access_query(&h, q);
+    let out = db_result_new();
+    out = access_query_wait_ticket(&t1);
+    if out.status != 0 { panic(9591); };
+    if out.value != 100 { panic(9592); };
+    out = access_query_wait_ticket(&t2);
+    if out.value != 100 { panic(9593); };
+    out = access_query_wait_ticket(&t3);
+    if out.value != 100 { panic(9594); };
+    out = access_query_wait_ticket(&t4);
+    if out.value != 100 { panic(9595); };
+    out = access_query_wait_ticket(&t5);
+    if out.value != 100 { panic(9596); };
+    out = access_query_wait_ticket(&t6);
+    if out.value != 100 { panic(9597); };
+    access_close_strict(h);
+}
+
+struct ClientJob {
+    h: AccessHandle,
+    account: u64,
+    rounds: u64,
+}
+
+fn client_worker(job: *ClientJob) {
+    let h = (*job).h;
+    let rc = deduct_receipt_new();
+    let i: u64 = 0;
+    while i < (*job).rounds {
+        rc = access_deduct_wait(&h, deduct_req((*job).account, 1));
+        if rc.status != 0 { panic(9601); };
+        i = i + 1;
+    }
+}
+
+@test "access fan-in from many clients stays exact"() {
+    setup_table(STR_PTR("tq9"), STR_LEN("tq9") as u64, STR_PTR("tq9.sadb-schema"), STR_LEN("tq9.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 8, 10000);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("tq9"), STR_LEN("tq9") as u64, access_opts_default());
+    let j1 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 1, rounds: 25 }));
+    let g1 = go client_worker(j1);
+    let j2 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 2, rounds: 25 }));
+    let g2 = go client_worker(j2);
+    let j3 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 3, rounds: 25 }));
+    let g3 = go client_worker(j3);
+    let j4 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 4, rounds: 25 }));
+    let g4 = go client_worker(j4);
+    let j5 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 5, rounds: 25 }));
+    let g5 = go client_worker(j5);
+    let j6 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 6, rounds: 25 }));
+    let g6 = go client_worker(j6);
+    let j7 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 7, rounds: 25 }));
+    let g7 = go client_worker(j7);
+    let j8 = Box::into_raw(Box::new(ClientJob { h: access_share(&h), account: 8, rounds: 25 }));
+    let g8 = go client_worker(j8);
+    let s1 = sa_task_join(g1);
+    if s1 != 0 { panic(9611); };
+    let s2 = sa_task_join(g2);
+    if s2 != 0 { panic(9612); };
+    let s3 = sa_task_join(g3);
+    if s3 != 0 { panic(9613); };
+    let s4 = sa_task_join(g4);
+    if s4 != 0 { panic(9614); };
+    let s5 = sa_task_join(g5);
+    if s5 != 0 { panic(9615); };
+    let s6 = sa_task_join(g6);
+    if s6 != 0 { panic(9616); };
+    let s7 = sa_task_join(g7);
+    if s7 != 0 { panic(9617); };
+    let s8 = sa_task_join(g8);
+    if s8 != 0 { panic(9618); };
+    let st = access_stats(&h);
+    if st.deducts_ok != 200 { panic(9619); };
+    let out = db_result_new();
+    out = point(&h, 5);
+    if out.value != 9975 { panic(9620); };
+    out = access_query_wait(&h, db_query(2, 0, 0, 1));
+    if out.value != 79800 { panic(9621); };
+    access_close_strict(h);
+}

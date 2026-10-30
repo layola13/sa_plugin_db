@@ -1,0 +1,146 @@
+// bench_access.sla — same-window bench for the access layer.
+// Prints one fact per line; compare against the engine bench
+// (scripts/bench/run_bench.sh) run in the same window.
+//
+//   point_direct_qps      engine handle face, one pin, in-process
+//   point_access_c{N}     access layer point queries, N clients
+//   deduct_c4             access layer deducts, 4 clients
+//   deduct_commits        writer commits for those deducts
+//
+// Run from a scratch directory (engine root is ".").
+
+@import "../db_access.sla"
+@import "../../db.sai"
+@import "sa_std/string.sa"
+@import "sa_std/task.sai"
+@import "sa_std/time.sai"
+@import "sa_std/core/box.sa"
+@import "sa_std/ptr.sa"
+
+struct TestInfo {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+struct TRow {
+    lo: u64,
+    hi: u64,
+}
+
+fn setup_bench(table: ptr, table_len: u64, path: ptr, path_len: u64, schema: ptr, schema_len: u64, n: u64, balance: i64) {
+    let info = TestInfo { a: 0, b: 0, c: 0, d: 0 };
+    let rc0 = sa_db_remove_table(STR_PTR("."), 1, table, table_len, &info);
+    let rc1 = sa_db_init_schema(STR_PTR("."), 1, path, path_len, schema, schema_len, &info);
+    if rc1 != 0 { panic(9801); };
+    let rc2 = sa_db_create_u64_index(STR_PTR("."), 1, table, table_len, 0, 1, &info);
+    if rc2 != 0 { panic(9802); };
+    let txh: ptr = PTR_NULL();
+    let rc3 = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+    if rc3 != 0 { panic(9803); };
+    let i: u64 = 0;
+    while i < n {
+        let row = TRow { lo: i + 1, hi: balance as u64 };
+        let rc4 = sa_db_tx_insert_row(txh, &row, 16, &info);
+        if rc4 != 0 { panic(9804); };
+        i = i + 1;
+    }
+    let rc5 = sa_db_tx_commit(txh, &info);
+    if rc5 != 0 { panic(9805); };
+}
+
+struct BenchJob {
+    h: AccessHandle,
+    base: u64,
+    rounds: u64,
+    mode: u64,
+    done: Chan<u64>,
+}
+
+fn bench_worker(job: *BenchJob) {
+    let h = (*job).h;
+    let out = db_result_new();
+    let rc = deduct_receipt_new();
+    let i: u64 = 0;
+    while i < (*job).rounds {
+        let acct: u64 = ((*job).base + i) % 2000 + 1;
+        if (*job).mode == 1 {
+            out = access_query_wait(&h, db_query_point(0, acct, 1));
+            if out.status != 0 { panic(9811); };
+        } else {
+            rc = access_deduct_wait(&h, deduct_req(acct, 1));
+            if rc.status != 0 { panic(9812); };
+        };
+        i = i + 1;
+    }
+    (*job).done.send(1);
+}
+
+fn run_clients(h: &AccessHandle, clients: u64, rounds: u64, mode: u64) {
+    let done: Chan<u64> = Chan::new(16);
+    let c: u64 = 0;
+    while c < clients {
+        let job = Box::into_raw(Box::new(BenchJob { h: access_share(h), base: c * 7919, rounds: rounds, mode: mode, done: done }));
+        let g = go bench_worker(job);
+        c = c + 1;
+    }
+    let got: u64 = 0;
+    while got < clients {
+        let (tok, closed) = done.recv();
+        if closed { panic(9813); };
+        got = got + 1;
+    }
+    done.destroy();
+}
+
+fn main() -> i32 {
+    setup_bench(STR_PTR("benchq"), STR_LEN("benchq") as u64, STR_PTR("benchq.sadb-schema"), STR_LEN("benchq.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 2000, 100000);
+    // Direct engine handle face: one pin, find+get per query.
+    let handle: ptr = PTR_NULL();
+    let orc = sa_db_open_read_table(STR_PTR("."), 1, STR_PTR("benchq"), 6, &handle);
+    if orc != 0 { panic(9821); };
+    let t0: u64 = sa_time_instant_ns();
+    let i: u64 = 0;
+    let sink: i64 = 0;
+    while i < 4000 {
+        let found: u64 = 0;
+        let ridx: u64 = 0;
+        let acct: u64 = (i * 31) % 2000 + 1;
+        let frc = sa_db_find_u64_handle(handle, 0, acct, &found, &ridx);
+        if frc != 0 { panic(9822); };
+        let v: i64 = 0;
+        let grc = sa_db_get_i64_handle(handle, 1, ridx, &v);
+        if grc != 0 { panic(9823); };
+        sink = sink + v;
+        i = i + 1;
+    }
+    let t1: u64 = sa_time_instant_ns();
+    let crc = sa_db_close_read_table(handle);
+    let direct_qps: u64 = 4000 * 1000000000 / (t1 - t0);
+    println("point_direct_qps {}", direct_qps);
+    if sink == 0 { panic(9824); };
+    // Access layer.
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("benchq"), STR_LEN("benchq") as u64, access_opts_default());
+    let a0: u64 = sa_time_instant_ns();
+    let _s1 = run_clients(&h, 1, 2000, 1);
+    let a1: u64 = sa_time_instant_ns();
+    println("point_access_c1_qps {}", 2000 * 1000000000 / (a1 - a0));
+    let b0: u64 = sa_time_instant_ns();
+    let _s2 = run_clients(&h, 4, 1000, 1);
+    let b1: u64 = sa_time_instant_ns();
+    println("point_access_c4_qps {}", 4000 * 1000000000 / (b1 - b0));
+    let c0: u64 = sa_time_instant_ns();
+    let _s3 = run_clients(&h, 8, 1000, 1);
+    let c1: u64 = sa_time_instant_ns();
+    println("point_access_c8_qps {}", 8000 * 1000000000 / (c1 - c0));
+    let d0: u64 = sa_time_instant_ns();
+    let _s4 = run_clients(&h, 4, 500, 2);
+    let d1: u64 = sa_time_instant_ns();
+    println("deduct_c4_rps {}", 2000 * 1000000000 / (d1 - d0));
+    let st = access_stats(&h);
+    println("deduct_batches {} deduct_commits {} deducts_ok {}", st.batches, st.commits, st.deducts_ok);
+    access_close_strict(h);
+    println("bench_access: OK");
+    return 0;
+}
