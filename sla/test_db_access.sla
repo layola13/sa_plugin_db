@@ -284,3 +284,146 @@ fn client_worker(job: *ClientJob) {
     if out.value != 79800 { panic(9621); };
     access_close_strict(h);
 }
+
+@test "access session point count sum on one snapshot"() {
+    setup_table(STR_PTR("ts1"), STR_LEN("ts1") as u64, STR_PTR("ts1.sadb-schema"), STR_LEN("ts1.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 4, 1000);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("ts1"), STR_LEN("ts1") as u64, access_opts_default());
+    let so = session_open(&h);
+    if so.status != 0 { panic(9631); };
+    if so.epoch == 0 { panic(9632); };
+    let s = so.session;
+    if session_epoch(&s) != so.epoch { panic(9633); };
+    let out = db_result_new();
+    out = session_query(&s, db_query_point(0, 2, 1));
+    if out.status != 0 { panic(9634); };
+    if out.found != 1 { panic(9635); };
+    if out.value != 1000 { panic(9636); };
+    if out.epoch != so.epoch { panic(9637); };
+    out = session_query(&s, db_query(3, 0, 0, 0));
+    if out.status != 0 { panic(9638); };
+    if out.value != 4 { panic(9639); };
+    out = session_query(&s, db_query(2, 0, 0, 1));
+    if out.status != 0 { panic(9640); };
+    if out.value != 4000 { panic(9641); };
+    out = session_query(&s, db_query(4, 0, 3, 1));
+    if out.status != 0 { panic(9642); };
+    if out.value != 2000 { panic(9643); };
+    if out.epoch != so.epoch { panic(9644); };
+    session_close(s);
+    access_close_strict(h);
+}
+
+@test "access session stays pinned across a commit until refresh"() {
+    setup_table(STR_PTR("ts2"), STR_LEN("ts2") as u64, STR_PTR("ts2.sadb-schema"), STR_LEN("ts2.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 100);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("ts2"), STR_LEN("ts2") as u64, access_opts_default());
+    let so = session_open(&h);
+    if so.status != 0 { panic(9645); };
+    let s = so.session;
+    let out = db_result_new();
+    out = session_query(&s, db_query_point(0, 1, 1));
+    if out.value != 100 { panic(9646); };
+    let e1: u64 = out.epoch;
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait(&h, deduct_req(1, 30));
+    if rc.status != 0 { panic(9647); };
+    if rc.balance != 70 { panic(9648); };
+    if rc.epoch <= e1 { panic(9649); };
+    out = session_query(&s, db_query_point(0, 1, 1));
+    if out.value != 100 { panic(9650); };
+    if out.epoch != e1 { panic(9651); };
+    out = point(&h, 1);
+    if out.value != 70 { panic(9652); };
+    if out.epoch != rc.epoch { panic(9653); };
+    out = session_refresh(&s);
+    if out.status != 0 { panic(9654); };
+    if out.epoch != rc.epoch { panic(9655); };
+    out = session_query(&s, db_query_point(0, 1, 1));
+    if out.value != 70 { panic(9656); };
+    if out.epoch != rc.epoch { panic(9657); };
+    session_close(s);
+    access_close_strict(h);
+}
+
+@test "access session open after close fails clean"() {
+    setup_table(STR_PTR("ts3"), STR_LEN("ts3") as u64, STR_PTR("ts3.sadb-schema"), STR_LEN("ts3.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 100);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("ts3"), STR_LEN("ts3") as u64, access_opts_default());
+    let h2 = access_share(&h);
+    access_close_strict(h);
+    let so = session_open(&h2);
+    if so.status != 7 { panic(9658); };
+    let out = db_result_new();
+    out = session_query(&so.session, db_query_point(0, 1, 1));
+    if out.status != 7 { panic(9659); };
+    if session_epoch(&so.session) != 0 { panic(9660); };
+    session_close(so.session);
+}
+
+struct SessionTrapJob {
+    h: AccessHandle,
+    session: DbSession,
+    ready: Chan<u64>,
+}
+
+fn session_trap_worker(job: *SessionTrapJob) {
+    let h = (*job).h;
+    let so = session_open(&h);
+    if so.status != 0 { panic(9661); };
+    (*job).session = so.session;
+    (*job).ready.send(1);
+    let out = session_query(&so.session, db_query(99, 0, 0, 0));
+}
+
+@test "access session trapped executor is abandoned and service survives"() {
+    setup_table(STR_PTR("ts4"), STR_LEN("ts4") as u64, STR_PTR("ts4.sadb-schema"), STR_LEN("ts4.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 1, 100);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("ts4"), STR_LEN("ts4") as u64, access_opts_default());
+    let ready_ch: Chan<u64> = Chan::new(1);
+    let job = Box::new(SessionTrapJob { h: access_share(&h), session: DbSession { state: PTR_NULL() }, ready: ready_ch });
+    let job_ptr = Box::into_raw(job);
+    let job_t: *SessionTrapJob = job_ptr;
+    let g = go supervised session_trap_worker(job_t);
+    let (tok, rclosed) = (*job_t).ready.recv();
+    let st = sa_task_join(g);
+    if st != 100 { panic(9662); };
+    session_abandon((*job_t).session);
+    let job_box = unsafe { Box::from_raw(job_t) };
+    let out = db_result_new();
+    out = point(&h, 1);
+    if out.status != 0 { panic(9663); };
+    if out.value != 100 { panic(9664); };
+    let rc = deduct_receipt_new();
+    rc = access_deduct_wait(&h, deduct_req(1, 10));
+    if rc.status != 0 { panic(9665); };
+    out = point(&h, 1);
+    if out.value != 90 { panic(9666); };
+    if out.epoch != rc.epoch { panic(9667); };
+    let so = session_open(&h);
+    if so.status != 0 { panic(9668); };
+    out = session_query(&so.session, db_query_point(0, 1, 1));
+    if out.value != 90 { panic(9669); };
+    session_close(so.session);
+    access_close_strict(h);
+}
+
+@test "access sessions are independent and survive bad kinds"() {
+    setup_table(STR_PTR("ts5"), STR_LEN("ts5") as u64, STR_PTR("ts5.sadb-schema"), STR_LEN("ts5.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 2, 500);
+    let h = access_start(STR_PTR("."), STR_LEN(".") as u64, STR_PTR("ts5"), STR_LEN("ts5") as u64, access_opts_default());
+    let so1 = session_open(&h);
+    if so1.status != 0 { panic(9670); };
+    let so2 = session_open(&h);
+    if so2.status != 0 { panic(9671); };
+    let out = db_result_new();
+    out = session_query(&so1.session, db_query_point(0, 1, 1));
+    if out.value != 500 { panic(9672); };
+    out = session_query(&so2.session, db_query_point(0, 2, 1));
+    if out.value != 500 { panic(9673); };
+    out = session_query(&so1.session, db_query(42, 0, 0, 0));
+    if out.status != 8 { panic(9674); };
+    out = session_query(&so1.session, db_query_point(0, 1, 1));
+    if out.status != 0 { panic(9675); };
+    if out.value != 500 { panic(9676); };
+    session_close(so1.session);
+    out = session_query(&so2.session, db_query_point(0, 2, 1));
+    if out.value != 500 { panic(9677); };
+    session_close(so2.session);
+    access_close_strict(h);
+}

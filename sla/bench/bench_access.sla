@@ -4,6 +4,8 @@
 //
 //   point_direct_qps      engine handle face, one pin, in-process
 //   point_access_c{N}     access layer point queries, N clients
+//   point_session_c{N}    pinned-session point queries, N clients
+//                         (one session per client goroutine)
 //   deduct_c4             access layer deducts, 4 clients
 //   deduct_commits        writer commits for those deducts
 //
@@ -77,12 +79,32 @@ fn bench_worker(job: *BenchJob) {
     (*job).done.send(1);
 }
 
+fn bench_session_worker(job: *BenchJob) {
+    let h = (*job).h;
+    let so = session_open(&h);
+    if so.status != 0 { panic(9814); };
+    let out = db_result_new();
+    let i: u64 = 0;
+    while i < (*job).rounds {
+        let acct: u64 = ((*job).base + i) % 2000 + 1;
+        out = session_query(&so.session, db_query_point(0, acct, 1));
+        if out.status != 0 { panic(9815); };
+        i = i + 1;
+    }
+    session_close(so.session);
+    (*job).done.send(1);
+}
+
 fn run_clients(h: &AccessHandle, clients: u64, rounds: u64, mode: u64) {
     let done: Chan<u64> = Chan::new(16);
     let c: u64 = 0;
     while c < clients {
         let job = Box::into_raw(Box::new(BenchJob { h: access_share(h), base: c * 7919, rounds: rounds, mode: mode, done: done }));
-        let g = go bench_worker(job);
+        if mode == 3 {
+            let g = go bench_session_worker(job);
+        } else {
+            let g = go bench_worker(job);
+        };
         c = c + 1;
     }
     let got: u64 = 0;
@@ -134,6 +156,20 @@ fn main() -> i32 {
     let _s3 = run_clients(&h, 8, 1000, 1);
     let c1: u64 = sa_time_instant_ns();
     println("point_access_c8_qps {}", 8000 * 1000000000 / (c1 - c0));
+    // Pinned sessions: one session per client goroutine, direct
+    // execution on the pinned snapshot.
+    let e0: u64 = sa_time_instant_ns();
+    let _t1 = run_clients(&h, 1, 2000, 3);
+    let e1: u64 = sa_time_instant_ns();
+    println("point_session_c1_qps {}", 2000 * 1000000000 / (e1 - e0));
+    let f0: u64 = sa_time_instant_ns();
+    let _t2 = run_clients(&h, 4, 1000, 3);
+    let f1: u64 = sa_time_instant_ns();
+    println("point_session_c4_qps {}", 4000 * 1000000000 / (f1 - f0));
+    let g0: u64 = sa_time_instant_ns();
+    let _t3 = run_clients(&h, 8, 1000, 3);
+    let g1: u64 = sa_time_instant_ns();
+    println("point_session_c8_qps {}", 8000 * 1000000000 / (g1 - g0));
     let d0: u64 = sa_time_instant_ns();
     let _s4 = run_clients(&h, 4, 500, 2);
     let d1: u64 = sa_time_instant_ns();

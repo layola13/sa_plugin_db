@@ -21,6 +21,15 @@
 //     restarted (no sick restarts); query goroutines, by contrast,
 //     are supervised per query and a trapped query only fails its
 //     own receipt.
+//   - Pinned sessions are the second read face: a caller checks
+//     one snapshot pin out of the layer (session_open) and runs
+//     query ops on it as direct function calls in its own
+//     goroutine (session_query) — the per-query spawn/channel
+//     cost of the ticket and fast-lane paths is the price of
+//     their containment, and sessions are for callers who would
+//     rather hold the pin and compose containment themselves
+//     (supervised goroutine + session_abandon). The session
+//     section below carries the full discipline.
 //
 // Ownership rules:
 //   - Engine read/write handles exist only inside this layer's
@@ -808,6 +817,280 @@ fn access_query_wait(h: &AccessHandle, q: DbQuery) -> DbResult {
     res.epoch = (*blk_t).epoch;
     let blk_box = unsafe { Box::from_raw(blk_t) };
     return res;
+}
+
+// ---- pinned sessions: the direct-execution read face ----
+//
+// A session checks ONE snapshot pin out of the layer for as
+// long as the caller keeps it open and runs query ops on that
+// pin as ordinary function calls in the caller's own goroutine:
+// no spawn, no reply channel, no cap token per query. It is the
+// closing path for point reads: the per-query cost left in the
+// fast lane is one supervised spawn+join plus block/channel
+// traffic (~115 us against 0.3 us of engine find+get); a session
+// removes the mechanism, not the semantics — the same DbQuery
+// kinds run through the same query_exec dispatch, the same
+// DbResult comes back, and the epoch it reports is the session's
+// pinned snapshot epoch.
+//
+// Discipline (caller contract):
+//   - One session is used by ONE goroutine at a time. Distinct
+//     sessions hold distinct pins and are independent. Mint one
+//     session per client goroutine (or serialise externally),
+//     exactly like a checked-out connection.
+//   - The snapshot is pinned: commits that land while a session
+//     is open do NOT move its reads (its results keep reporting
+//     the pinned epoch — that is what a pin means). Call
+//     session_refresh to drop the pin and take a fresh one.
+//   - A session whose op returns ACCESS_ENGINE_ERROR is marked
+//     dirty: session_close then closes its pin instead of
+//     returning it to the pool, mirroring the query paths (pins
+//     from errored queries never pool).
+//   - Trap containment composes at the caller: session ops run
+//     in the caller's goroutine, so a runtime trap there kills
+//     that goroutine — the per-op supervisor of the ticket/fast
+//     paths is precisely the cost this face removes. Callers
+//     that need containment run their session inside their own
+//     `go supervised` goroutine; on join status 100 the
+//     supervisor calls session_abandon, which closes the pin
+//     (never pools it) and advances the epoch frontier, exactly
+//     the containment the fast lane's waiter performs. The
+//     acceptance corpus demonstrates this composition.
+//   - DbSession is an owner token consumed by session_close /
+//     session_abandon (like AccessHandle at access_close). Do
+//     not copy it; there is deliberately no session_share.
+//   - Every session must be closed before access_close: close
+//     is terminal for the control block sessions borrow.
+
+struct DbSession {
+    state: ptr,
+}
+
+struct SessionState {
+    ctl: ptr,
+    pin: ptr,
+    epoch: u64,
+    dirty: u64,
+    closed: u64,
+    blk: ptr,
+}
+
+struct SessionOutcome {
+    status: u64,
+    value: i64,
+    epoch: u64,
+    session: DbSession,
+}
+
+struct PinTake {
+    handle: ptr,
+    epoch: u64,
+    rc: u32,
+}
+
+// Acquire a pin for a session: a fresh pooled pin when one is
+// available, else a newly opened snapshot. Unlike the query
+// workers (which tolerate a failed snapshot-info read and
+// report epoch 0), a session acquire is atomic: any failure
+// closes whatever was opened and reports the engine status, so
+// a live session always holds a pin with a known epoch.
+fn session_pin_acquire(ctl: *AccessCtl) -> PinTake {
+    let take = PinTake { handle: PTR_NULL(), epoch: 0, rc: 0 };
+    let hit = pool_take(ctl);
+    if hit.handle != PTR_NULL() {
+        take.handle = hit.handle;
+        take.epoch = hit.epoch;
+        return take;
+    };
+    let handle: ptr = PTR_NULL();
+    let rc = sa_db_open_read_table((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &handle);
+    if rc != 0 {
+        take.rc = rc;
+        return take;
+    };
+    let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+    let rc0 = sa_db_snapshot_info_handle(handle, &sinfo);
+    if rc0 != 0 {
+        let crc = sa_db_close_read_table(handle);
+        take.rc = rc0;
+        return take;
+    };
+    take.handle = handle;
+    take.epoch = sinfo.epoch;
+    return take;
+}
+
+// Dispose of a session's pin: a clean pin returns to the pool,
+// a dirty one is closed (the query paths' rule). The state
+// keeps the (now stale) pin value; callers either overwrite it
+// with a fresh pin (refresh) or free the state (close/abandon),
+// and session_query refuses to run on a closed session.
+fn session_dispose_pin(st: *SessionState) {
+    let p: ptr = (*st).pin;
+    if p == PTR_NULL() {
+        return;
+    };
+    if (*st).dirty == 0 {
+        let ctl: *AccessCtl = (*st).ctl as *AccessCtl;
+        pool_give(ctl, p, (*st).epoch);
+    } else {
+        let crc = sa_db_close_read_table(p);
+    };
+}
+
+// Open a pinned session on the service. Deterministic service
+// states are answered exactly as the fast lane answers them:
+// closed -> ACCESS_CLOSED (7), writer dead ->
+// ACCESS_SERVICE_DEAD (6); an engine failure opening the pin
+// reports ACCESS_ENGINE_ERROR (4) with the engine status in
+// value. On any failure the returned session is null and safe
+// to pass to session_close (a no-op).
+fn session_open(h: &AccessHandle) -> SessionOutcome {
+    let out = SessionOutcome { status: 0, value: 0, epoch: 0, session: DbSession { state: PTR_NULL() } };
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    ctl_lock(ctl);
+    if (*ctl).closed != 0 {
+        ctl_unlock(ctl);
+        out.status = 7;
+        return out;
+    };
+    if is_done((*ctl).dead) {
+        ctl_unlock(ctl);
+        out.status = 6;
+        return out;
+    };
+    ctl_unlock(ctl);
+    let take = session_pin_acquire(ctl);
+    if take.rc != 0 {
+        out.status = 4;
+        out.value = take.rc as i64;
+        return out;
+    };
+    let blk = Box::new(QueryBlk {
+        ctl: h.ctl, kind: 0, key_col: 0, key: 0, val_col: 0,
+        reply: (*ctl).never_done, status: 0, found: 0, value: 0, epoch: 0, pin_handle: PTR_NULL(),
+    });
+    let blk_ptr = Box::into_raw(blk);
+    let st = Box::new(SessionState {
+        ctl: h.ctl, pin: take.handle, epoch: take.epoch, dirty: 0, closed: 0, blk: blk_ptr as ptr,
+    });
+    let st_ptr = Box::into_raw(st);
+    out.epoch = take.epoch;
+    out.session = DbSession { state: st_ptr as ptr };
+    return out;
+}
+
+// Run one query on the session's pinned snapshot, in the
+// caller's goroutine, through the layer's one op dispatch
+// (query_exec — the same code the ticket and fast-lane paths
+// run, so kinds and status codes cannot drift). The result's
+// epoch is the session's pinned epoch. Querying a closed or
+// failed-open session reports ACCESS_CLOSED.
+fn session_query(s: &DbSession, q: DbQuery) -> DbResult {
+    let res = db_result_new();
+    if s.state == PTR_NULL() {
+        res.status = 7;
+        return res;
+    };
+    let st: *SessionState = s.state as *SessionState;
+    if (*st).closed != 0 {
+        res.status = 7;
+        return res;
+    };
+    let blk: *QueryBlk = (*st).blk as *QueryBlk;
+    (*blk).kind = q.kind;
+    (*blk).key_col = q.key_col;
+    (*blk).key = q.key;
+    (*blk).val_col = q.val_col;
+    (*blk).status = 0;
+    (*blk).found = 0;
+    (*blk).value = 0;
+    query_exec(blk, (*st).pin);
+    res.status = (*blk).status;
+    res.found = (*blk).found;
+    res.value = (*blk).value;
+    res.epoch = (*st).epoch;
+    if res.status == 4 {
+        (*st).dirty = 1;
+    };
+    return res;
+}
+
+// The pinned snapshot's epoch (0 for a null session).
+fn session_epoch(s: &DbSession) -> u64 {
+    if s.state == PTR_NULL() {
+        return 0;
+    };
+    let st: *SessionState = s.state as *SessionState;
+    return (*st).epoch;
+}
+
+// Drop the session's pin and take a fresh one at the current
+// snapshot. On success the result reports status 0 and the new
+// epoch in both value and epoch. If the fresh pin cannot be
+// acquired the session is left closed (its old pin already
+// disposed): the result reports ACCESS_ENGINE_ERROR with the
+// engine status, and the caller must session_close the token.
+fn session_refresh(s: &DbSession) -> DbResult {
+    let res = db_result_new();
+    if s.state == PTR_NULL() {
+        res.status = 7;
+        return res;
+    };
+    let st: *SessionState = s.state as *SessionState;
+    if (*st).closed != 0 {
+        res.status = 7;
+        return res;
+    };
+    let ctl: *AccessCtl = (*st).ctl as *AccessCtl;
+    session_dispose_pin(st);
+    let take = session_pin_acquire(ctl);
+    if take.rc != 0 {
+        (*st).closed = 1;
+        res.status = 4;
+        res.value = take.rc as i64;
+        return res;
+    };
+    (*st).pin = take.handle;
+    (*st).epoch = take.epoch;
+    (*st).dirty = 0;
+    res.status = 0;
+    res.found = 1;
+    res.value = take.epoch as i64;
+    res.epoch = take.epoch;
+    return res;
+}
+
+// Close a session: its pin returns to the pool when every op
+// on it was clean, and is closed when any op engine-errored.
+// Consumes the token; safe (a no-op) on a failed-open session.
+fn session_close(s: DbSession) {
+    if s.state == PTR_NULL() {
+        return;
+    };
+    let st: *SessionState = s.state as *SessionState;
+    session_dispose_pin(st);
+    let blk_ptr: ptr = (*st).blk;
+    let blk_box = unsafe { Box::from_raw(blk_ptr as *QueryBlk) };
+    let st_box = unsafe { Box::from_raw(st) };
+}
+
+// Abandon a session whose executing goroutine is gone (the
+// trap-cleanup verb for the supervised composition): the pin
+// is always closed, never pooled — its health is unknown.
+// Consumes the token; safe on a failed-open session.
+fn session_abandon(s: DbSession) {
+    if s.state == PTR_NULL() {
+        return;
+    };
+    let st: *SessionState = s.state as *SessionState;
+    let p: ptr = (*st).pin;
+    if p != PTR_NULL() {
+        let crc = sa_db_close_read_table(p);
+    };
+    let blk_ptr: ptr = (*st).blk;
+    let blk_box = unsafe { Box::from_raw(blk_ptr as *QueryBlk) };
+    let st_box = unsafe { Box::from_raw(st) };
 }
 
 // ---- writer goroutine: single-writer group commit ----

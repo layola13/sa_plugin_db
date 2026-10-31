@@ -8,7 +8,7 @@ untouched; everything here is SLA built on the goroutine runtime
 ## Files
 
 - `db_access.sla` — the access layer library.
-- `test_db_access.sla` — acceptance tests (9 tests).
+- `test_db_access.sla` — acceptance tests (14 tests).
 - `examples/quota_service.sla` — the relay-station quota
   reference scenario (sala 15): concurrent balance checks and
   deductions against one account table.
@@ -21,6 +21,8 @@ untouched; everything here is SLA built on the goroutine runtime
 clients ──tickets──> query goroutines (one pinned snapshot each)
 clients ──tickets──> inbox Chan ──> ONE writer goroutine
                                     (batch -> one tx -> one commit)
+clients ──sessions─> one checked-out pin, ops as direct calls
+                     in the caller's own goroutine (no tickets)
 writer ──monitor──> watchdog goroutine ──Done──> all waiters
 ```
 
@@ -58,6 +60,21 @@ writer ──monitor──> watchdog goroutine ──Done──> all waiters
   channel and every blocked waiter wakes with
   `ACCESS_SERVICE_DEAD`. The writer is never restarted. Query
   traps, by contrast, never take the service down.
+- **Pinned sessions** are the direct-execution read face:
+  `session_open` checks one snapshot pin out of the layer and
+  `session_query` runs the same query kinds through the same
+  op dispatch as ordinary function calls in the caller's own
+  goroutine — no spawn, no channel, no cap token per query.
+  The pin's epoch is fixed for the session's life (results
+  report it; commits landing meanwhile do not move the reads)
+  until `session_refresh` swaps in a fresh pin. One session is
+  used by one goroutine at a time; an engine-errored session's
+  pin is closed at `session_close` instead of pooled, like the
+  query paths. Trap containment composes at the caller: run
+  the session inside your own supervised goroutine and call
+  `session_abandon` from the supervisor on a trap join — the
+  pin is closed unpooled and the frontier advances, the same
+  containment the fast lane's waiter performs per query.
 - **Cancellation** (Done channels, per sa_std/ctx.sla): the
   writer honors Done when it *starts* the batch holding the
   request — answered `ACCESS_CANCELLED`, never applied. If the
@@ -74,6 +91,12 @@ access_query(&h, q) -> QueryTicket
 access_query_wait_ticket(&t) -> DbResult
 access_query_wait_cancellable(&t, done) -> QueryWaitOutcome { filled, res }
 access_query_wait(&h, q) -> DbResult        // submit + wait
+session_open(&h) -> SessionOutcome { status, value, epoch, session }
+session_query(&s, q) -> DbResult            // direct exec on the pin
+session_refresh(&s) -> DbResult             // drop pin, take a fresh one
+session_epoch(&s) -> u64                    // the pinned epoch
+session_close(s)                            // clean pins pool, dirty pins close
+session_abandon(s)                          // trap cleanup: pin always closes
 access_deduct(&h, req) -> DeductTicket
 access_deduct_cancellable(&h, req, done) -> DeductTicket
 access_deduct_wait_ticket(&t) -> DeductReceipt
