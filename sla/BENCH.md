@@ -105,3 +105,39 @@ G3 verdicts from the integration window (medians): write 1t
 0.77×/0.62×. The read regression is an engine-side per-exec
 cost; this layer's answer is structural (pin once per query,
 handle face per op), measured above.
+
+## Round 2 — pin pool + fast lane + pinned sessions (this tree)
+
+Window: 2026-10-31 ~16:54 (Asia/Shanghai), Colab box
+`666413dc6ee6`, toolchain built on the box from remote heads
+sci `63a74369` / sa_plugin_sla `ccbf41dc` (install.sh restore),
+db plugin built from this tree (round-2 commit `615b4f7` on top
+of the round-1 staging `82c5be5`) ReleaseFast. The box was
+shared with the other round-2 lines (load ~5–7), so treat
+these as same-session figures under contention. Acceptance in
+the same pipeline: 14/14 (the 9 above plus 5 session tests).
+
+| measurement | result |
+|---|---|
+| point direct (pinned handle, in-process) | 5,433,232 qps |
+| point via fast lane, 1 client | 11,233 qps |
+| point via fast lane, 4 clients | 4,847 qps |
+| point via fast lane, 8 clients | 4,413 qps |
+| point via pinned session, 1 client | 2,362,443 qps |
+| point via pinned session, 4 clients | 2,094,580 qps |
+| point via pinned session, 8 clients | 1,725,257 qps |
+| deduct via access layer, 4 clients × 500 | 89 rps |
+| deduct batches / commits / ok | 500 / 500 / 2,000 |
+
+Reading: the direct figure reproduces the 2026-10-30 box
+window (5,500,852) within noise, anchoring the two windows.
+A pinned session removes the per-query mechanism (supervised
+spawn + block/channel round trip) rather than tuning it:
+session c1 is ~210× the fast lane in the same window and
+lands at ~43% of the raw handle face — the remainder is the
+DbQuery/DbResult copies and the shared op dispatch, not
+orchestration. Aggregate throughput does not scale with
+session clients (c4/c8 at or below c1): the engine read path
+serialises, the same ceiling the engine bench shows for the
+handle face itself. The write path is unchanged (89 rps vs
+82 rps in the 2026-10-30 window; fsync-bound as before).
