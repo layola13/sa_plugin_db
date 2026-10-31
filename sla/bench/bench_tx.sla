@@ -1,0 +1,120 @@
+// bench_tx.sla — decompose the writer's per-batch cost on the
+// engine face: commit rate, pin-after-commits rate, full batch
+// shape rate. Same seed shape as bench_access (one tx, 2000 rows).
+
+@import "../../db.sai"
+@import "sa_std/string.sa"
+@import "sa_std/task.sai"
+@import "sa_std/time.sai"
+
+struct Row16 {
+    lo: u64,
+    hi: u64,
+}
+
+struct TInfo {
+    row_count: u64,
+    segment_count: u64,
+    epoch: u64,
+    locked: u64,
+}
+
+struct SInfo {
+    row_count: u64,
+    column_count: u64,
+    row_bytes: u64,
+    epoch: u64,
+}
+
+fn now_ns() -> i64 {
+    return sa_time_instant_ns() as i64;
+}
+
+fn seed() {
+    let table: ptr = STR_PTR("benchq");
+    let table_len: u64 = STR_LEN("benchq") as u64;
+    let info = TInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+    let rc0 = sa_db_remove_table(STR_PTR("."), 1, table, table_len, &info);
+    let schema: ptr = STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n");
+    let schema_len: u64 = STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64;
+    let rc1 = sa_db_init_schema(STR_PTR("."), 1, STR_PTR("benchq.sadb-schema"), STR_LEN("benchq.sadb-schema") as u64, schema, schema_len, &info);
+    if rc1 != 0 { panic(9801); };
+    let rc2 = sa_db_create_u64_index(STR_PTR("."), 1, table, table_len, 0, 1, &info);
+    if rc2 != 0 { panic(9802); };
+    let txh: ptr = PTR_NULL();
+    let rc3 = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+    if rc3 != 0 { panic(9803); };
+    let i: u64 = 0;
+    while i < 2000 {
+        let row = Row16 { lo: i + 1, hi: 1000000 };
+        let rc4 = sa_db_tx_insert_row(txh, &row, 16, &info);
+        if rc4 != 0 { panic(9804); };
+        i = i + 1;
+    }
+    let crc2 = sa_db_tx_commit(txh, &info);
+    if crc2 != 0 { panic(9805); };
+}
+
+fn main() -> i32 {
+    seed();
+    let table: ptr = STR_PTR("benchq");
+    let table_len: u64 = STR_LEN("benchq");
+
+    // 1) raw engine write: tx_begin + 1 update + commit per iter.
+    let t0 = now_ns();
+    let n1: u64 = 100;
+    let i: u64 = 0;
+    while i < n1 {
+        let txh: ptr = PTR_NULL();
+        let brc = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+        let info = TInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+        let row = Row16 { lo: (i % 2000) + 1, hi: 999999 };
+        let urc = sa_db_tx_update_row_u64_key(txh, 0, (i % 2000) + 1, &row, 16, &info);
+        let crc = sa_db_tx_commit(txh, &info);
+        i = i + 1;
+    }
+    let t1 = now_ns();
+    println("eng_write_qps {}", n1 * 1000000000 / (t1 - t0));
+
+    // 2) pin cycle right after those commits (writer conditions).
+    let t2 = now_ns();
+    let n2: u64 = 100;
+    let j: u64 = 0;
+    while j < n2 {
+        let h: ptr = PTR_NULL();
+        let rc = sa_db_open_read_table(STR_PTR("."), 1, table, table_len, &h);
+        let crc = sa_db_close_read_table(h);
+        j = j + 1;
+    }
+    let t3 = now_ns();
+    println("pin_after_commits_qps {}", n2 * 1000000000 / (t3 - t2));
+
+    // 3) full writer batch shape at n=1: pin + sinfo + tx + find +
+    // get + update + commit + pin close.
+    let t4 = now_ns();
+    let n3: u64 = 100;
+    let k: u64 = 0;
+    while k < n3 {
+        let h: ptr = PTR_NULL();
+        let orc = sa_db_open_read_table(STR_PTR("."), 1, table, table_len, &h);
+        let sinfo = SInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+        let src = sa_db_snapshot_info_handle(h, &sinfo);
+        let txh: ptr = PTR_NULL();
+        let brc = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+        let found: u64 = 0;
+        let ridx: u64 = 0;
+        let frc = sa_db_find_u64_handle(h, 0, (k % 2000) + 1, &found, &ridx);
+        let bal: i64 = 0;
+        let grc = sa_db_get_i64_handle(h, 1, ridx, &bal);
+        let info = TInfo { row_count: 0, segment_count: 0, epoch: 0, locked: 0 };
+        let row = Row16 { lo: (k % 2000) + 1, hi: (bal - 1) as u64 };
+        let urc = sa_db_tx_update_row_u64_key(txh, 0, (k % 2000) + 1, &row, 16, &info);
+        let crc = sa_db_tx_commit(txh, &info);
+        let crc3 = sa_db_close_read_table(h);
+        k = k + 1;
+    }
+    let t5 = now_ns();
+    println("batch_shape_qps {}", n3 * 1000000000 / (t5 - t4));
+    println("bench_tx: OK");
+    return 0;
+}

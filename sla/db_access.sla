@@ -213,6 +213,7 @@ struct QueryBlk {
     found: u64,
     value: i64,
     epoch: u64,
+    pin_handle: ptr,
 }
 
 struct QueryJob {
@@ -264,6 +265,10 @@ struct AccessCtl {
     deducts_ok: u64,
     deducts_rejected: u64,
     reap_store: ptr,
+    pool: Chan<ptr>,
+    pool_epochs: Chan<u64>,
+    pool_count: u64,
+    last_commit_epoch: u64,
 }
 
 // Abandoned ticket blocks awaiting reaping at access_close. Kept
@@ -275,6 +280,17 @@ struct ReapStore {
     kinds: [u64; 128],
     count: u64,
     overflow: u64,
+}
+
+// Idle read pins are held for reuse across queries in a pair of
+// channels on the control block (handle + epoch in lockstep). A
+// pin open is a full snapshot materialisation (meta parse +
+// per-file mmap + integrity validation), which dwarfs every
+// other per-query cost; pooling pins whose epoch is still
+// current removes it from the query path.
+struct PoolHit {
+    handle: ptr,
+    epoch: u64,
 }
 
 struct QueryTicket {
@@ -336,6 +352,67 @@ fn ctl_unlock(ctl: *AccessCtl) {
     if rc != 0 { panic(9402); };
 }
 
+// Take an idle pin whose snapshot epoch is still current (at or
+// past the writer's last published commit epoch). Stale pins met
+// on the way are closed rather than reused: their snapshot
+// predates a commit the layer has already acknowledged. Returns
+// handle NULL when no fresh pin is pooled. pool_count is kept
+// under the ctl mutex and exactly tracks the channel contents;
+// claims, recvs and sends all happen inside the same critical
+// section, so the handle/epoch pairing can never interleave and
+// the channel ops can never block (the count is the capacity
+// proof).
+fn pool_take(ctl: *AccessCtl) -> PoolHit {
+    let hit = PoolHit { handle: PTR_NULL(), epoch: 0 };
+    let searching: bool = true;
+    while searching {
+        let hd: ptr = PTR_NULL();
+        let ep: u64 = 0;
+        let claimed: bool = false;
+        ctl_lock(ctl);
+        if (*ctl).pool_count > 0 {
+            (*ctl).pool_count = (*ctl).pool_count - 1;
+            let (rh, c1) = (*ctl).pool.recv();
+            let (re, c2) = (*ctl).pool_epochs.recv();
+            hd = rh;
+            ep = re;
+            claimed = true;
+        };
+        ctl_unlock(ctl);
+        if claimed == false {
+            searching = false;
+        } else {
+            if ep >= (*ctl).last_commit_epoch {
+                hit.handle = hd;
+                hit.epoch = ep;
+                searching = false;
+            } else {
+                let crc = sa_db_close_read_table(hd);
+            };
+        };
+    }
+    return hit;
+}
+
+// Return a pin to the pool after a fully clean query. When the
+// pool is full the pin is closed instead. Pins from trapped or
+// errored queries never reach this function (the outer closes
+// them), so a pooled pin is always a healthy snapshot.
+fn pool_give(ctl: *AccessCtl, handle: ptr, epoch: u64) {
+    let stored: bool = false;
+    ctl_lock(ctl);
+    if (*ctl).pool_count < 8 {
+        (*ctl).pool_count = (*ctl).pool_count + 1;
+        (*ctl).pool.send(handle);
+        (*ctl).pool_epochs.send(epoch);
+        stored = true;
+    };
+    ctl_unlock(ctl);
+    if stored == false {
+        let crc = sa_db_close_read_table(handle);
+    };
+}
+
 fn reap_register(ctl: *AccessCtl, blk: ptr, is_deduct: u64) {
     let rs: *ReapStore = (*ctl).reap_store as *ReapStore;
     ctl_lock(ctl);
@@ -354,6 +431,10 @@ fn reap_register(ctl: *AccessCtl, blk: ptr, is_deduct: u64) {
 fn query_inner(work: *QueryWork) {
     let handle: ptr = (*work).handle;
     let blk: *QueryBlk = (*work).blk as *QueryBlk;
+    query_exec(blk, handle);
+}
+
+fn query_exec(blk: *QueryBlk, handle: ptr) {
     let kind: u64 = (*blk).kind;
     if kind == 1 {
         let found: u64 = 0;
@@ -463,22 +544,29 @@ fn query_inner(work: *QueryWork) {
 }
 
 // Outer query goroutine: owns the pin across the inner worker's
-// whole lifetime and closes it on every path (normal, engine
-// error, inner trap). It runs no engine query ops itself.
+// whole lifetime and disposes of it on every path (pool return on
+// a fully clean run, close on engine error or inner trap). It
+// runs no engine query ops itself.
 fn query_outer(blk: *QueryBlk) {
     let ctl: *AccessCtl = (*blk).ctl as *AccessCtl;
-    let handle: ptr = PTR_NULL();
-    let rc = sa_db_open_read_table((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &handle);
-    if rc != 0 {
-        (*blk).status = 4;
-        (*blk).value = rc as i64;
-        (*blk).reply.send(1);
-        return;
-    };
-    let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
-    let rc0 = sa_db_snapshot_info_handle(handle, &sinfo);
-    if rc0 == 0 {
-        (*blk).epoch = sinfo.epoch;
+    let hit = pool_take(ctl);
+    let handle: ptr = hit.handle;
+    let pooled: bool = handle != PTR_NULL();
+    if pooled {
+        (*blk).epoch = hit.epoch;
+    } else {
+        let rc = sa_db_open_read_table((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &handle);
+        if rc != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc as i64;
+            (*blk).reply.send(1);
+            return;
+        };
+        let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+        let rc0 = sa_db_snapshot_info_handle(handle, &sinfo);
+        if rc0 == 0 {
+            (*blk).epoch = sinfo.epoch;
+        };
     };
     let work = Box::new(QueryWork { handle: handle, blk: blk as ptr });
     let work_ptr = Box::into_raw(work);
@@ -496,12 +584,52 @@ fn query_outer(blk: *QueryBlk) {
         (*blk).status = 4;
         (*blk).value = st as i64;
     };
-    let crc = sa_db_close_read_table(handle);
-    if crc != 0 && (*blk).status == 0 {
-        (*blk).status = 4;
-        (*blk).value = crc as i64;
+    if st == 0 && (*blk).status == 0 {
+        pool_give(ctl, handle, (*blk).epoch);
+    } else {
+        let crc = sa_db_close_read_table(handle);
+        if crc != 0 && (*blk).status == 0 {
+            (*blk).status = 4;
+            (*blk).value = crc as i64;
+        };
     };
     (*blk).reply.send(1);
+}
+
+// Worker for the synchronous wait path: a single supervised
+// goroutine that takes the pin, runs the query ops itself and
+// disposes of the pin. It publishes the pin in the block before
+// running ops; if the worker traps, the waiter (its supervisor)
+// sees the pin still published and closes it, which is exactly
+// the containment the outer/inner split provided — with one
+// spawn instead of three and no reply channel.
+fn query_worker(blk: *QueryBlk) {
+    let ctl: *AccessCtl = (*blk).ctl as *AccessCtl;
+    let hit = pool_take(ctl);
+    let handle: ptr = hit.handle;
+    if handle != PTR_NULL() {
+        (*blk).epoch = hit.epoch;
+    } else {
+        let rc = sa_db_open_read_table((*ctl).root_ptr, (*ctl).root_len, (*ctl).table_ptr, (*ctl).table_len, &handle);
+        if rc != 0 {
+            (*blk).status = 4;
+            (*blk).value = rc as i64;
+            return;
+        };
+        let sinfo = AccessSnapInfo { row_count: 0, column_count: 0, row_bytes: 0, epoch: 0 };
+        let rc0 = sa_db_snapshot_info_handle(handle, &sinfo);
+        if rc0 == 0 {
+            (*blk).epoch = sinfo.epoch;
+        };
+    };
+    (*blk).pin_handle = handle;
+    query_exec(blk, handle);
+    (*blk).pin_handle = PTR_NULL();
+    if (*blk).status == 0 {
+        pool_give(ctl, handle, (*blk).epoch);
+    } else {
+        let crc = sa_db_close_read_table(handle);
+    };
 }
 
 // Runner: applies the query concurrency cap (semaphore tokens),
@@ -530,7 +658,7 @@ fn access_query(h: &AccessHandle, q: DbQuery) -> QueryTicket {
     let reply: Chan<u64> = Chan::new(1);
     let blk = Box::new(QueryBlk {
         ctl: h.ctl, kind: q.kind, key_col: q.key_col, key: q.key, val_col: q.val_col,
-        reply: reply, status: 0, found: 0, value: 0, epoch: 0,
+        reply: reply, status: 0, found: 0, value: 0, epoch: 0, pin_handle: PTR_NULL(),
     });
     let blk_ptr = Box::into_raw(blk);
     let job = Box::new(QueryJob { ctl: h.ctl, blk: blk_ptr as ptr });
@@ -617,9 +745,69 @@ fn access_query_wait_cancellable(t: &QueryTicket, done: Chan<u64>) -> QueryWaitO
     return query_wait_outcome(false, res);
 }
 
+// Synchronous query: the fast lane. One supervised worker
+// goroutine instead of the runner/outer/inner chain — the caller
+// takes the cap token itself, spawns the worker and joins it;
+// the join is the completion signal, so no reply channel is
+// allocated. Trap containment is unchanged: the worker publishes
+// its pin in the block before running ops, and a trap leaves it
+// published for the waiter to close (status 5, frontier advances
+// because the pin is closed). Deterministic service states are
+// answered exactly as the ticket path answers them: closed -> 7,
+// writer dead -> 6.
 fn access_query_wait(h: &AccessHandle, q: DbQuery) -> DbResult {
-    let t = access_query(h, q);
-    return access_query_wait_ticket(&t);
+    let ctl: *AccessCtl = h.ctl as *AccessCtl;
+    ctl_lock(ctl);
+    if (*ctl).closed != 0 {
+        ctl_unlock(ctl);
+        let res = db_result_new();
+        res.status = 7;
+        return res;
+    };
+    if is_done((*ctl).dead) {
+        ctl_unlock(ctl);
+        let res = db_result_new();
+        res.status = 6;
+        return res;
+    };
+    let arc = sa_sync_waitgroup_add((*ctl).wg, 1);
+    ctl_unlock(ctl);
+    let blk = Box::new(QueryBlk {
+        ctl: h.ctl, kind: q.kind, key_col: q.key_col, key: q.key, val_col: q.val_col,
+        reply: (*ctl).never_done, status: 0, found: 0, value: 0, epoch: 0, pin_handle: PTR_NULL(),
+    });
+    let blk_ptr = Box::into_raw(blk);
+    let blk_t: *QueryBlk = blk_ptr;
+    let (tok, sem_closed) = (*ctl).sem.recv();
+    let wh = go supervised query_worker(blk_t);
+    let st = sa_task_join(wh);
+    if st == 100 {
+        let code: i32 = 0;
+        let mp: ptr = PTR_NULL();
+        let ml: u64 = 0;
+        let irc = sa_task_trap_info(wh, &code, &mp, &ml);
+        (*blk_t).status = 5;
+        (*blk_t).value = code as i64;
+    };
+    if st != 0 {
+        if st != 100 {
+            (*blk_t).status = 4;
+            (*blk_t).value = st as i64;
+        };
+        let ph: ptr = (*blk_t).pin_handle;
+        if ph != PTR_NULL() {
+            let crc = sa_db_close_read_table(ph);
+        };
+    };
+    (*ctl).sem.send(tok);
+    let drc = sa_sync_waitgroup_done((*ctl).wg);
+    let res = db_result_new();
+    res.status = (*blk_t).status;
+    res.found = (*blk_t).found;
+    res.value = (*blk_t).value;
+    res.epoch = (*blk_t).epoch;
+    let blk_box = unsafe { Box::from_raw(blk_t) };
+    return res;
 }
 
 // ---- writer goroutine: single-writer group commit ----
@@ -787,6 +975,7 @@ fn writer_process_batch(ctl: *AccessCtl, batch: &[ptr; 64], n: u64) {
             } else {
                 commit_epoch = info.epoch;
                 (*ctl).commits = (*ctl).commits + 1;
+                (*ctl).last_commit_epoch = commit_epoch;
                 let j: u64 = 0;
                 while j < n {
                     let blk: *DeductBlk = batch[j] as *DeductBlk;
@@ -1071,6 +1260,8 @@ fn access_start(root: ptr, root_len: u64, table: ptr, table_len: u64, opts: Acce
     let rs_t: *ReapStore = rs_ptr;
     (*rs_t).count = 0;
     (*rs_t).overflow = 0;
+    let pool: Chan<ptr> = Chan::new(8);
+    let pool_epochs: Chan<u64> = Chan::new(8);
     let ctl = Box::new(AccessCtl {
         root_ptr: root, root_len: root_len,
         table_ptr: table, table_len: table_len,
@@ -1080,6 +1271,10 @@ fn access_start(root: ptr, root_len: u64, table: ptr, table_len: u64, opts: Acce
         mutex: mutex, wg: wg, writer_task: 0, watch_task: 0, closed: 0,
         batches: 0, commits: 0, deducts_ok: 0, deducts_rejected: 0,
         reap_store: rs_t as ptr,
+        pool: pool,
+        pool_epochs: pool_epochs,
+        pool_count: 0,
+        last_commit_epoch: 0,
     });
     let ctl_ptr = Box::into_raw(ctl);
     let ctl_t: *AccessCtl = ctl_ptr;
@@ -1171,6 +1366,16 @@ fn access_close(h: AccessHandle) -> u64 {
         };
         ri = ri + 1;
     }
+    // Drain the pin pool: no query goroutine is alive past the
+    // waitgroup wait, so the channel contents are stable here.
+    while (*ctl).pool_count > 0 {
+        (*ctl).pool_count = (*ctl).pool_count - 1;
+        let (hd, c1) = (*ctl).pool.recv();
+        let (ep, c2) = (*ctl).pool_epochs.recv();
+        let crc = sa_db_close_read_table(hd);
+    }
+    (*ctl).pool.destroy();
+    (*ctl).pool_epochs.destroy();
     (*ctl).inbox.destroy();
     (*ctl).sem.destroy();
     let rs_box = unsafe { Box::from_raw(rs) };

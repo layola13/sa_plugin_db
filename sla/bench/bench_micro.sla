@@ -1,0 +1,146 @@
+// bench_micro.sla — decomposition micro-bench for the access
+// layer's per-query fixed cost (db-opt line, 2026-10-31).
+// Each line isolates one component of access_query's ~0.9 ms:
+//   spawn_join_qps        plain go + join, empty body
+//   sup_spawn_join_qps    supervised go + join, empty body
+//   chan_cycle_qps        Chan::new(1) + send + recv + destroy
+//   pin_cycle_qps         sa_db_open_read_table + close (no ops)
+//   pin_ops_qps           one pin held; find+get per op (control)
+//   find_only_qps         one pin held; find per op
+// Run from a scratch directory (engine root is ".").
+
+@import "../../db.sai"
+@import "sa_std/string.sa"
+@import "sa_std/task.sai"
+@import "sa_std/time.sai"
+@import "sa_std/core/box.sa"
+@import "sa_std/ptr.sa"
+
+struct TestInfo {
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+struct TRow {
+    lo: u64,
+    hi: u64,
+}
+
+fn setup_bench(table: ptr, table_len: u64, path: ptr, path_len: u64, schema: ptr, schema_len: u64, n: u64, balance: i64) {
+    let info = TestInfo { a: 0, b: 0, c: 0, d: 0 };
+    let rc0 = sa_db_remove_table(STR_PTR("."), 1, table, table_len, &info);
+    let rc1 = sa_db_init_schema(STR_PTR("."), 1, path, path_len, schema, schema_len, &info);
+    if rc1 != 0 { panic(9801); };
+    let rc2 = sa_db_create_u64_index(STR_PTR("."), 1, table, table_len, 0, 1, &info);
+    if rc2 != 0 { panic(9802); };
+    let txh: ptr = PTR_NULL();
+    let rc3 = sa_db_tx_begin(STR_PTR("."), 1, table, table_len, &txh);
+    if rc3 != 0 { panic(9803); };
+    let i: u64 = 0;
+    while i < n {
+        let row = TRow { lo: i + 1, hi: balance as u64 };
+        let rc4 = sa_db_tx_insert_row(txh, &row, 16, &info);
+        if rc4 != 0 { panic(9804); };
+        i = i + 1;
+    }
+    let rc5 = sa_db_tx_commit(txh, &info);
+    if rc5 != 0 { panic(9805); };
+}
+
+struct NoopJob {
+    x: u64,
+}
+
+fn noop(job: *NoopJob) {
+    (*job).x = (*job).x + 1;
+}
+
+fn main() -> i32 {
+    setup_bench(STR_PTR("benchq"), STR_LEN("benchq") as u64, STR_PTR("benchq.sadb-schema"), STR_LEN("benchq.sadb-schema") as u64, STR_PTR("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n"), STR_LEN("#def MAX_ROWS = 4096\n#def COL_ID_STRIDE = 8 // u64\n#def COL_BALANCE_STRIDE = 8 // i64\n") as u64, 2000, 100000);
+
+    // plain spawn+join
+    let n1: u64 = 2000;
+    let job = Box::new(NoopJob { x: 0 });
+    let job_ptr = Box::into_raw(job);
+    let t0: u64 = sa_time_instant_ns();
+    let acc: u64 = 0;
+    let i: u64 = 0;
+    while i < n1 {
+        let h = go noop(job_ptr);
+        let st = sa_task_join(h);
+        acc = acc + st as u64;
+        i = i + 1;
+    }
+    let t1: u64 = sa_time_instant_ns();
+    println("spawn_join_qps {}", n1 * 1000000000 / (t1 - t0));
+
+    // supervised spawn+join
+    let t2: u64 = sa_time_instant_ns();
+    i = 0;
+    while i < n1 {
+        let h = go supervised noop(job_ptr);
+        let st = sa_task_join(h);
+        acc = acc + st as u64;
+        i = i + 1;
+    }
+    let t3: u64 = sa_time_instant_ns();
+    println("sup_spawn_join_qps {}", n1 * 1000000000 / (t3 - t2));
+    let job_back = unsafe { Box::from_raw(job_ptr) };
+
+    // chan cycle: new + send + recv + destroy
+    let t4: u64 = sa_time_instant_ns();
+    i = 0;
+    while i < n1 {
+        let ch: Chan<u64> = Chan::new(1);
+        ch.send(7);
+        let (v, closed) = ch.recv();
+        acc = acc + v;
+        ch.destroy();
+        i = i + 1;
+    }
+    let t5: u64 = sa_time_instant_ns();
+    println("chan_cycle_qps {}", n1 * 1000000000 / (t5 - t4));
+
+    // pin open/close only
+    let t6: u64 = sa_time_instant_ns();
+    i = 0;
+    while i < n1 {
+        let handle: ptr = PTR_NULL();
+        let orc = sa_db_open_read_table(STR_PTR("."), 1, STR_PTR("benchq"), 6, &handle);
+        if orc != 0 { panic(9831); };
+        let crc = sa_db_close_read_table(handle);
+        if crc != 0 { panic(9832); };
+        i = i + 1;
+    }
+    let t7: u64 = sa_time_instant_ns();
+    println("pin_cycle_qps {}", n1 * 1000000000 / (t7 - t6));
+
+    // control: one pin, find+get per op (same shape as bench_access direct)
+    let handle: ptr = PTR_NULL();
+    let orc = sa_db_open_read_table(STR_PTR("."), 1, STR_PTR("benchq"), 6, &handle);
+    if orc != 0 { panic(9833); };
+    let sink: i64 = 0;
+    let t8: u64 = sa_time_instant_ns();
+    i = 0;
+    while i < 4000 {
+        let found: u64 = 0;
+        let ridx: u64 = 0;
+        let acct: u64 = (i * 31) % 2000 + 1;
+        let frc = sa_db_find_u64_handle(handle, 0, acct, &found, &ridx);
+        if frc != 0 { panic(9834); };
+        let v: i64 = 0;
+        let grc = sa_db_get_i64_handle(handle, 1, ridx, &v);
+        if grc != 0 { panic(9835); };
+        sink = sink + v;
+        i = i + 1;
+    }
+    let t9: u64 = sa_time_instant_ns();
+    println("pin_ops_qps {}", 4000 * 1000000000 / (t9 - t8));
+    let crc2 = sa_db_close_read_table(handle);
+    if sink == 0 { panic(9836); };
+    if acc == 424242 { println("never"); };
+    println("bench_micro: OK");
+    return 0;
+}
