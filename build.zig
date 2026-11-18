@@ -229,6 +229,13 @@ pub fn build(b: *std.Build) void {
     hot_io_guards.addFileArg(b.path("src/table.zig"));
     hot_io_guards_step.dependOn(&hot_io_guards.step);
 
+    const hot_io_guards_scope_step = b.step("check-benchmark-hot-io-guards-scope", "Verify the hot I/O guard 1GiB forbid is production-scoped without losing production strength.");
+    const hot_io_guards_scope = b.addSystemCommand(&.{ "bash", "tests/check_hot_io_guards_scope_test.sh" });
+    hot_io_guards_scope.addFileInput(b.path("tests/check_hot_io_guards_scope_test.sh"));
+    hot_io_guards_scope.addFileInput(b.path("tests/check_hot_io_guards.sh"));
+    hot_io_guards_scope.addFileArg(b.path("src/table.zig"));
+    hot_io_guards_scope_step.dependOn(&hot_io_guards_scope.step);
+
     const abi_smoke_step = b.step("abi-smoke", "Build and run broad SA-facing db.sal ABI smokes.");
     abi_smoke_step.dependOn(abi_smoke_coverage_step);
     const abi_smoke_sources = [_][]const u8{
@@ -301,6 +308,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(bounded_locks_step);
     test_step.dependOn(benchmark_parser_guards_step);
     test_step.dependOn(hot_io_guards_step);
+    test_step.dependOn(hot_io_guards_scope_step);
 
     const bench_step = b.step("bench", "Build the main db and SQLite control benchmark executables.");
     const bench_compare_home_lock = pathFromRoot(b, ".zig-cache/db-bench-compare-home.lock");

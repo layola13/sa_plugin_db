@@ -33,7 +33,178 @@ def forbid(pattern: str, message: str, flags: int = 0) -> None:
         fail(f"{message} at {path}:{line}")
 
 
-forbid(r"readFileAlloc\([^\n;]*1\s*<<\s*30", "1GiB readFileAlloc hot-path read reintroduced")
+# --- Production scoping for the 1GiB readFileAlloc forbid (item 1 only) ---
+# DEF-DB-HOT-IO-GUARD-RED adjudication (2026-11-17): that forbid's only hit
+# in this tree is src/table.zig's walTestAppendEpochUnit, a test-only helper
+# (every call site inside a test block), so the guard red was a false
+# positive. Disposal form B (decision round R248; applied by default
+# 2026-11-18, user may overrule): scope ONLY this forbid to production
+# code. Test blocks and private functions referenced exclusively from test
+# regions are excluded from its scan; production code keeps full strength.
+# Every other rule below, including the epoch column-rewrite require,
+# still scans the whole file exactly as before: the epoch-sync item is a
+# separate item and is deliberately NOT adjusted in this batch.
+
+
+def _code_mask(text: str) -> str:
+    """Blank comments and string/char literal contents in place (length and
+    newlines preserved) so structural scans see only real punctuation."""
+    out = list(text)
+    i = 0
+    n = len(text)
+    line_start = True
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line_start = True
+            i += 1
+            continue
+        if line_start and c in " \t":
+            i += 1
+            continue
+        if line_start and text.startswith("\\\\", i):
+            # Zig multiline string literal: the rest of the line is literal.
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        line_start = False
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if c == '"' or c == "'":
+            quote = c
+            out[i] = " "
+            i += 1
+            while i < n and text[i] != quote and text[i] != "\n":
+                if text[i] == "\\" and i + 1 < n:
+                    out[i] = " "
+                    out[i + 1] = " "
+                    i += 2
+                    continue
+                out[i] = " "
+                i += 1
+            if i < n and text[i] == quote:
+                out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _top_level_spans(masked: str):
+    """Return (test_spans, fn_decls) for depth-0 declarations of the masked
+    source. fn_decls entries are (name, start, end, is_pub); a span covers
+    the whole declaration including its body (prototypes end at ';')."""
+    depth_at = [0] * (len(masked) + 1)
+    depth = 0
+    for i, ch in enumerate(masked):
+        depth_at[i] = depth
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    depth_at[len(masked)] = depth
+
+    def body_end(open_idx: int) -> int:
+        d = depth_at[open_idx]
+        j = open_idx + 1
+        while j < len(masked):
+            if masked[j] == "}" and depth_at[j] == d + 1:
+                return j + 1
+            j += 1
+        return len(masked)
+
+    test_spans = []
+    for m in re.finditer(r"(?<![\w.@])test\b", masked):
+        if depth_at[m.start()] != 0:
+            continue
+        brace = masked.find("{", m.end())
+        semi = masked.find(";", m.end())
+        if brace == -1 or (semi != -1 and semi < brace):
+            continue
+        test_spans.append((m.start(), body_end(brace)))
+
+    fn_decls = []
+    for m in re.finditer(r"(?<![\w.@])(pub\s+)?fn\s+(@?\"[^\"]+\"|[\w]+)\s*\(", masked):
+        if depth_at[m.start()] != 0:
+            continue
+        name = m.group(2).strip('@"')
+        j = m.end()
+        parens = 1
+        body_open = -1
+        while j < len(masked):
+            ch = masked[j]
+            if ch == "(":
+                parens += 1
+            elif ch == ")":
+                parens -= 1
+            elif parens == 0 and ch == "{":
+                body_open = j
+                break
+            elif parens == 0 and ch == ";":
+                break
+            j += 1
+        end = body_end(body_open) if body_open != -1 else min(j + 1, len(masked))
+        fn_decls.append((name, m.start(), end, m.group(1) is not None))
+    return test_spans, fn_decls
+
+
+def _production_source(text: str) -> str:
+    """The source with test regions blanked (newlines preserved, so line
+    numbers still match): test blocks plus private functions whose every
+    reference sits inside an already-excluded region (fixpoint). A private
+    function with no references, or any reference from production code,
+    stays in scope - the exclusion only ever fires on positive evidence
+    that a function is reachable exclusively from test code."""
+    masked = _code_mask(text)
+    test_spans, fn_decls = _top_level_spans(masked)
+    ident_positions = {}
+    for mm in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", masked):
+        ident_positions.setdefault(mm.group(0), []).append(mm.start())
+
+    def in_spans(pos: int, spans) -> bool:
+        return any(s <= pos < e for s, e in spans)
+
+    excluded = list(test_spans)
+    test_only = set()
+    changed = True
+    while changed:
+        changed = False
+        for idx, (name, start, end, is_pub) in enumerate(fn_decls):
+            if is_pub or idx in test_only:
+                continue
+            refs = [
+                p
+                for p in ident_positions.get(name, [])
+                if not (start <= p < end)
+            ]
+            if refs and all(in_spans(p, excluded) for p in refs):
+                test_only.add(idx)
+                excluded.append((start, end))
+                changed = True
+
+    chars = list(text)
+    for s, e in excluded:
+        for i in range(s, e):
+            if chars[i] != "\n":
+                chars[i] = " "
+    return "".join(chars)
+
+
+production_source = _production_source(source)
+
+
+def forbid_production(pattern: str, message: str, flags: int = 0) -> None:
+    match = re.search(pattern, production_source, flags)
+    if match:
+        line = production_source.count("\n", 0, match.start()) + 1
+        fail(f"{message} at {path}:{line}")
+
+
+forbid_production(r"readFileAlloc\([^\n;]*1\s*<<\s*30", "1GiB readFileAlloc hot-path read reintroduced")
 forbid(r"\breadDictBytes\s*\(", "owned dictionary read helper reintroduced")
 forbid(r"\breadBlobStoreBytes\s*\(", "owned blob-store read helper reintroduced")
 require(
