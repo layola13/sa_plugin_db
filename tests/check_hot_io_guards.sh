@@ -298,8 +298,19 @@ require(
     "compact merge output writes must build file metadata from write-time hashes",
     re.S,
 )
+# DEF-DB-HOT-IO-GUARD-EPOCH-SYNC (item 2), disposal form A: this require
+# originally expected `bytes, true` (parent-directory sync at the rewrite
+# site). f7051d4 (2026-10-28, "one dir fsync per commit") deliberately
+# changed the call to `bytes, false`, and the design contract documents
+# why: docs/vm_concurrency_epoch.md's four-step publication model has
+# step 1 (rewriteColumnFileForEpoch) do temp file + fdatasync + rename
+# with NO directory sync, because the versioned column file is only an
+# intermediate until publishWrittenMeta names it; the directory fsync
+# happens once, at the publish step (steps 3-4). The guard rule was
+# never updated to the documented model, so the expectation is synced
+# to `false` here. The code's durability semantics are unchanged.
 require(
-    r"fn\s+rewriteColumnFileForEpoch\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*active_next_path,\s*bytes,\s*true\)(?:(?!\nfn\s).)*makeFileMetaFromWrite\(allocator,\s*next_path,\s*written\)",
+    r"fn\s+rewriteColumnFileForEpoch\b(?:(?!\nfn\s).)*writeFileWithParentSyncAndHashes\(allocator,\s*active_next_path,\s*bytes,\s*false\)(?:(?!\nfn\s).)*makeFileMetaFromWrite\(allocator,\s*next_path,\s*written\)",
     "epoch column rewrite must build file metadata from write-time hashes",
     re.S,
 )
