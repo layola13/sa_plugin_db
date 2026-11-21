@@ -40,7 +40,11 @@
 @const SUM_TOTAL_LABEL = utf8:"sum_total="
 
 @extern pthread_spawn(*entry: ptr, *arg: ptr) -> i32
-@extern pthread_join(handle: i32, *out: ptr) -> i32
+// Join via sa_pthread_join, NOT pthread_join: the runtime join takes an
+// i32 slot handle (see sa_std/thread.sai); the bare libc pthread_join
+// dereferences the slot id as a pthread descriptor (SIGSEGV in
+// __pthread_clockjoin_ex). DEF-SCI-PTHREAD-SPAWN-SEGV.
+@extern sa_pthread_join(handle: i32, *out: ptr) -> i32
 @extern pthread_drop(handle: i32) -> void
 
 #def ROOT_LEN = 73
@@ -320,7 +324,8 @@ L_ENTRY:
 
 @ffi_wrapper join_worker(handle: i32, *slot: ptr) -> i32:
 L_ENTRY:
-    joined = call @pthread_join(handle, *slot)
+    joined = call @sa_pthread_join(handle, *slot)
+    call @pthread_drop(handle)
     !slot
     !handle
     return joined

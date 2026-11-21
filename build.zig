@@ -621,15 +621,28 @@ fn addSqliteStdArchiveStep(b: *std.Build, sa_std_lib: []const u8) std.Build.Lazy
         \\set -euo pipefail
         \\src="$1"
         \\out="$2"
+        \\# $out may be relative (zig passes the lazy output path); the final
+        \\# ar step runs after cd into $work, so absolutize it up front.
+        \\case "$out" in
+        \\  /*) ;;
+        \\  *) out="$PWD/$out" ;;
+        \\esac
         \\out_dir="$(dirname "$out")"
         \\mkdir -p "$out_dir"
         \\work="$(mktemp -d "$out_dir/sqlite_link_std_work.XXXXXX")"
         \\trap 'rm -rf "$work"' EXIT
+        \\# sci-built archives carry cache-path member names
+        \\# (.zig-cache/o/<hash>/*.o); GNU ar cannot extract a member
+        \\# whose parent directories do not exist. Pre-create them.
+        \\ar t "$src" | while IFS= read -r m; do mkdir -p "$work/$(dirname "$m")"; done
         \\if ! (cd "$work" && ar x "$src" 2> ar.stderr); then
         \\  cat "$work/ar.stderr" >&2
         \\  exit 1
         \\fi
         \\grep -v 'illegal output pathname for archive member' "$work/ar.stderr" >&2 || true
+        \\# Members land in subdirectories; flatten to $work (basenames are
+        \\# unique across the archive) so the glob below sees them all.
+        \\find "$work" -mindepth 2 -name '*.o' -exec mv -t "$work" {} +
         \\shopt -s nullglob
         \\objs=("$work"/*.o)
         \\if [ "${#objs[@]}" -eq 0 ]; then
