@@ -690,6 +690,13 @@ fn addSqliteBenchStep(
     if (std.fs.path.dirname(sqlite_lib)) |sqlite_dir| {
         link.addArg(b.fmt("-Wl,-rpath,{s}", .{sqlite_dir}));
     }
+    // sa_std unicode normalize (core_misc.zig) needs ICU 74 symbols
+    // (u_strFromUTF8_74, unorm2_normalize_74, ...); link ICU after the
+    // static std archive so they resolve. Order matches
+    // pkg-config --libs icu-uc icu-i18n gives -licui18n -licuuc -licudata.
+    link.addArg("-licui18n");
+    link.addArg("-licuuc");
+    link.addArg("-licudata");
     link.addArg("-o");
     const out = link.addOutputFileArg(out_name);
     link.step.dependOn(&build_obj.step);
@@ -719,6 +726,8 @@ fn addBenchCompareStep(
         \\import tempfile
         \\
         \\db_bench, sqlite_bench, runs_s, strict_chain_s, suite_label, db_prefix, sqlite_prefix = sys.argv[1:8]
+        \\db_bench = os.path.abspath(db_bench)
+        \\sqlite_bench = os.path.abspath(sqlite_bench)
         \\runs = int(runs_s)
         \\if runs <= 0 or runs % 2 == 0:
         \\    raise SystemExit("benchmark compare run count must be positive odd")
