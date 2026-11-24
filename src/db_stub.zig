@@ -454,11 +454,19 @@ const ReadTable = struct {
     name: []u8,
     row_count: u64,
     columns: []TableColumn,
-    /// Set when the columns borrow from a pinned snapshot: the pin
-    /// hold taken by loadReadTable is owned by this ReadTable and
-    /// released here, so the snapshot outlives every use of the
-    /// borrowed bytes. `pin_table_name` borrows the caller's table
-    /// name slice (grant storage outlives the exec).
+    /// Set when the columns borrow from a snapshot: this ReadTable
+    /// holds one snapshot ref (released here), so the snapshot
+    /// outlives every use of the borrowed bytes. The pin hold that
+    /// was used to obtain the snapshot is NOT owned here — the
+    /// per-thread cache holds only the snapshot ref (Stage 1 B),
+    /// and the pin is released by loadReadTable right after the
+    /// snapshot is obtained, so a cached read never stalls the
+    /// reaper floor and a thread that exits with a cache entry
+    /// leaks at most snapshot bytes, never a live pin.
+    snapshot: ?*Snapshot = null,
+    /// Legacy: retained for shape compatibility. loadReadTable no
+    /// longer transfers a pin hold to ReadTable (see `snapshot`
+    /// above); no constructor sets this anymore.
     pin: ?*epoch_runtime.EpochPin = null,
     pin_table_name: []const u8 = "",
 
@@ -466,6 +474,7 @@ const ReadTable = struct {
         allocator.free(self.name);
         for (self.columns) |*column| column.deinit(allocator);
         allocator.free(self.columns);
+        if (self.snapshot) |snap| snapshotRelease(snap);
         if (self.pin) |pin| epoch_runtime.release(self.pin_table_name, pin);
         self.* = undefined;
     }
@@ -983,6 +992,13 @@ const Snapshot = struct {
     columns: []TableColumn,
     row_count: u64,
     total_bytes: u64,
+    /// Independent atomic refcount (Stage 1 B). The pin-attachment
+    /// hold is 1; the per-thread cache and each borrowing ReadTable
+    /// hold one ref each. Deliberately separate from EpochPin.refs,
+    /// which stays guarded by the per-table registry mutex: a
+    /// snapshot is self-contained bytes, so its lifetime can be
+    /// refcounted without re-proving the pin retire/free race.
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 };
 
 const snapshot_allocator = std.heap.page_allocator;
@@ -995,10 +1011,26 @@ var snapshot_hook_installed: std.atomic.Value(bool) = std.atomic.Value(bool).ini
 
 fn freeSnapshotAttachment(pin: *epoch_runtime.EpochPin) void {
     const snapshot: *Snapshot = @ptrCast(@alignCast(pin.attachment.?));
-    for (snapshot.columns) |*column| column.deinit(snapshot_allocator);
-    snapshot_allocator.free(snapshot.columns);
-    snapshot_allocator.destroy(snapshot);
+    snapshotRelease(snapshot);
     pin.attachment = null;
+}
+
+/// Take one snapshot ref. The caller must observe a fully built
+/// snapshot: snapshotForPin publishes the pointer under the attach
+/// mutex, and a cache entry is installed by the same thread that
+/// obtained the pointer, so acquire ordering is belt-and-braces.
+fn snapshotAcquire(snap: *Snapshot) void {
+    _ = snap.refs.fetchAdd(1, .acquire);
+}
+
+/// Drop one snapshot ref; frees the snapshot when the last ref
+/// drains (the pin-attachment hold, cache holds, exec holds).
+fn snapshotRelease(snap: *Snapshot) void {
+    if (snap.refs.fetchSub(1, .acq_rel) == 1) {
+        for (snap.columns) |*column| column.deinit(snapshot_allocator);
+        snapshot_allocator.free(snap.columns);
+        snapshot_allocator.destroy(snap);
+    }
 }
 
 /// The segment reaper's floor source (docs §12.3): the
@@ -1014,26 +1046,42 @@ fn ensureSnapshotHook() void {
     }
 }
 
+/// Non-blocking snapshot lookup (design §4.2 no-block-on-build).
+/// `.busy` means another thread currently holds the attach mutex
+/// building this pin's snapshot; `.ready` carries the snapshot
+/// (null = over the cache cap, legacy load). The caller serves its
+/// old cached snapshot on `.busy` instead of spinning, and
+/// refreshes on its next read.
+const SnapshotLookup = union(enum) {
+    ready: ?*Snapshot,
+    busy: void,
+};
+
 /// Return the pin's materialized snapshot, building it on first
 /// use. Null means the snapshot exceeds the cache size cap and the
 /// caller should take the legacy load path. Build errors are the
 /// legacy load's errors, propagated unchanged; a failed build
 /// leaves nothing attached, so the next exec retries the load (and
 /// fails the same way) exactly as the uncached path would.
-fn snapshotForPin(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecError!?*Snapshot {
+/// Non-blocking variant: a single tryLock on the attach mutex.
+/// `.busy` when another thread is building; see
+/// snapshotForPinNoBlock for the read-path use and snapshotForPin
+/// for the blocking wrapper (write path, and read-path fallback
+/// when there is no old snapshot to serve).
+fn snapshotForPinTry(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecError!SnapshotLookup {
     ensureSnapshotHook();
-    while (!snapshot_attach_mutex.tryLock()) std.atomic.spinLoopHint();
+    if (!snapshot_attach_mutex.tryLock()) return .busy;
     defer snapshot_attach_mutex.unlock();
     if (pin.attachment) |attachment| {
         const snapshot: *Snapshot = @ptrCast(@alignCast(attachment));
-        return snapshot;
+        return .{ .ready = snapshot };
     }
     var built = try loadReadTableFromMeta(snapshot_allocator, table_name, pin.meta_source);
     var total: u64 = 0;
     for (built.columns) |column| total += @as(u64, column.bytes.len);
     if (total > snapshot_max_bytes) {
         built.deinit(snapshot_allocator);
-        return null;
+        return .{ .ready = null };
     }
     const snapshot = snapshot_allocator.create(Snapshot) catch {
         built.deinit(snapshot_allocator);
@@ -1042,20 +1090,35 @@ fn snapshotForPin(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecErro
     snapshot.* = .{ .columns = built.columns, .row_count = built.row_count, .total_bytes = total };
     snapshot_allocator.free(built.name);
     pin.attachment = snapshot;
-    return snapshot;
+    return .{ .ready = snapshot };
 }
 
-/// Build the borrowing ReadTable for a pinned snapshot. Takes
-/// ownership of the pin hold: released here on error, transferred
-/// to the ReadTable (released by its deinit) on success.
-fn readTableFromSnapshot(allocator: std.mem.Allocator, table_name: []const u8, pin: *epoch_runtime.EpochPin, snap: *Snapshot) ExecError!ReadTable {
-    errdefer epoch_runtime.release(table_name, pin);
+/// Blocking wrapper around snapshotForPinTry: spins until the
+/// snapshot is available. Used by the write path (which has no old
+/// cached snapshot to serve) and as the read-path fallback when
+/// there is no old snapshot to serve.
+fn snapshotForPin(table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecError!?*Snapshot {
+    while (true) {
+        switch (try snapshotForPinTry(table_name, pin)) {
+            .ready => |snap| return snap,
+            .busy => std.atomic.spinLoopHint(),
+        }
+    }
+}
+
+/// Build the borrowing ReadTable for a snapshot. Takes one
+/// snapshot ref (released by ReadTable.deinit); the caller keeps
+/// any pin hold it used to obtain the snapshot and releases it
+/// itself. The snapshot bytes are owned copies, so they stay valid
+/// after the pin is released.
+fn readTableFromSnapshot(allocator: std.mem.Allocator, table_name: []const u8, snap: *Snapshot) ExecError!ReadTable {
+    snapshotAcquire(snap);
+    errdefer snapshotRelease(snap);
     const out = ReadTable{
         .name = try allocator.dupe(u8, table_name),
         .row_count = snap.row_count,
         .columns = try allocator.alloc(TableColumn, snap.columns.len),
-        .pin = pin,
-        .pin_table_name = table_name,
+        .snapshot = snap,
     };
     for (snap.columns, out.columns) |*src_column, *dst_column| {
         dst_column.* = .{
@@ -1379,6 +1442,164 @@ fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []
 /// visibility work, and read-after-commit is already met.
 /// Every non-final slice publishes at least one unit, so the
 /// loop makes progress and terminates.
+/// Per-thread snapshot cache (Stage 1 B, design RESULT §4).
+/// Memoizes the pin+snapshot lookup: the common-path read is one
+/// atomic version load, one realpath (database identity), and a
+/// timestamp compare. The full path runs only when the version
+/// moved, the directory changed, or the TTL expired with a
+/// manifest/WAL stat change.
+/// Invalidation signals, cheapest first:
+///   1. commit_version (every read) — catches every in-process
+///      qmod commit (the three bumpCommitVersion sites);
+///   2. manifest + WAL stat (only at TTL expiry, 100 ms) —
+///      catches commits the counter misses (native row
+///      transactions, restores, foreign processes): every publish
+///      rewrites the manifest (temp+rename) and every WAL append
+///      changes the WAL, so mtime_ns+size detect them; the TTL
+///      backstop covers filesystem weirdness. The stat is TTL-
+///      gated (not per-read) deliberately: a fold rewrites the
+///      manifest and truncates the WAL without bumping the
+///      version, so a per-read stat would invalidate every
+///      reader after every fold.
+///   3. Working-directory identity (every read, one realpath):
+///      the cache is keyed by (table name, directory), because
+///      the process may chdir between databases — the unit tests
+///      do — and a table name alone does not identify a database.
+///      This is the one addition to the design RESULT section 4.1
+///      (which keys by table name alone): without it, a cached
+///      snapshot from one directory could be served in another.
+///   4. TTL backstop (100 ms): a full path at least every TTL even
+///      if the version and the stats both look unchanged.
+/// The cache holds a snapshot ref only, never a pin hold, so the
+/// reaper floor is untouched and a thread that exits with an entry
+/// installed leaks at most snapshot bytes. Total bytes held by all
+/// thread caches are capped (thread_cache_max_bytes); over the cap
+/// a fill simply does not install, which is correct but slower.
+const ThreadSnapCacheEntry = struct {
+    name: []u8 = &.{},
+    /// Working directory the snapshot was built in (owned). The
+    /// per-read identity check: a different directory is a
+    /// different database even when the table name matches.
+    cwd: []u8 = &.{},
+    snapshot: ?*Snapshot = null,
+    epoch: u64 = 0,
+    meta_hash: [32]u8 = std.mem.zeroes([32]u8),
+    last_version: u64 = 0,
+    last_full_check_ns: i128 = 0,
+    manifest: table_mod.TableFileStat = .{},
+    wal: table_mod.TableFileStat = .{},
+    occupied: bool = false,
+};
+threadlocal var thread_snap_cache: [8]ThreadSnapCacheEntry = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} };
+threadlocal var thread_snap_cache_next: usize = 0;
+/// Bytes of snapshot data held by all thread caches (each cache
+/// ref counts its snapshot's total_bytes, so a snapshot shared by
+/// N threads counts N times — conservative). Bounds the leak if
+/// a host runs each exec on a fresh thread that then exits with
+/// an entry installed.
+const thread_cache_max_bytes: u64 = 512 * 1024 * 1024;
+var thread_cache_snapshot_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn threadCacheFind(table_name: []const u8) ?*ThreadSnapCacheEntry {
+    for (&thread_snap_cache) |*entry| {
+        if (entry.occupied and std.mem.eql(u8, entry.name, table_name)) return entry;
+    }
+    return null;
+}
+
+fn threadCacheDropEntry(entry: *ThreadSnapCacheEntry) void {
+    if (!entry.occupied) return;
+    entry.occupied = false;
+    if (entry.snapshot) |snap| {
+        _ = thread_cache_snapshot_bytes.fetchSub(snap.total_bytes, .monotonic);
+        snapshotRelease(snap);
+    }
+    entry.snapshot = null;
+    std.heap.page_allocator.free(entry.name);
+    std.heap.page_allocator.free(entry.cwd);
+    entry.name = &.{};
+    entry.cwd = &.{};
+}
+
+fn threadCacheDrop(table_name: []const u8) void {
+    if (threadCacheFind(table_name)) |entry| threadCacheDropEntry(entry);
+}
+
+/// Install a cache entry for the snapshot just obtained on the
+/// full path. Takes one snapshot ref; the caller keeps (and
+/// releases) the pin hold. `version` is the commit version sampled
+/// BEFORE the full path ran: a commit landing during the fill
+/// forces re-validation on the next read instead of installing a
+/// stale snapshot under the new version. Installs nothing when
+/// the working directory cannot be read or the byte cap is hit.
+fn threadCacheInstall(table_name: []const u8, pin: *epoch_runtime.EpochPin, snap: *Snapshot, version: u64, allocator: std.mem.Allocator) void {
+    const owned_name = std.heap.page_allocator.dupe(u8, table_name) catch return;
+    const cwd = sio.cwd().realpathAlloc(allocator, ".") catch {
+        std.heap.page_allocator.free(owned_name);
+        return;
+    };
+    defer allocator.free(cwd);
+    const owned_cwd = std.heap.page_allocator.dupe(u8, cwd) catch {
+        std.heap.page_allocator.free(owned_name);
+        return;
+    };
+    if (thread_cache_snapshot_bytes.load(.monotonic) + snap.total_bytes > thread_cache_max_bytes) {
+        std.heap.page_allocator.free(owned_name);
+        std.heap.page_allocator.free(owned_cwd);
+        return;
+    }
+    const slot: *ThreadSnapCacheEntry = threadCacheFind(table_name) orelse blk: {
+        const idx = thread_snap_cache_next % thread_snap_cache.len;
+        thread_snap_cache_next += 1;
+        break :blk &thread_snap_cache[idx];
+    };
+    threadCacheDropEntry(slot);
+    const stats = table_mod.manifestWalStats(allocator, ".", table_name);
+    snapshotAcquire(snap);
+    _ = thread_cache_snapshot_bytes.fetchAdd(snap.total_bytes, .monotonic);
+    slot.* = .{
+        .name = owned_name,
+        .cwd = owned_cwd,
+        .snapshot = snap,
+        .epoch = pin.epoch,
+        .meta_hash = pin.meta_hash,
+        .last_version = version,
+        .last_full_check_ns = sio.nanoTimestamp(),
+        .manifest = stats.manifest,
+        .wal = stats.wal,
+        .occupied = true,
+    };
+}
+
+/// Serve from the thread cache when the invalidation signals say
+/// the cached snapshot is current. Returns null when the full path
+/// must run. The served ReadTable holds its own snapshot ref.
+fn threadCacheServe(allocator: std.mem.Allocator, table_name: []const u8, version: u64, now_ns: i128) ExecError!?ReadTable {
+    const entry = threadCacheFind(table_name) orelse return null;
+    if (version != entry.last_version) return null;
+    // Database identity (one realpath per read): a different
+    // working directory is a different database even when the
+    // table name matches, so a chdir between databases (the unit
+    // tests do this) can never serve another database's snapshot.
+    // A fold or publish never changes the working directory, so
+    // unlike a per-read stat this check is never tripped by folds.
+    const cwd = sio.cwd().realpathAlloc(allocator, ".") catch return null;
+    defer allocator.free(cwd);
+    if (!std.mem.eql(u8, cwd, entry.cwd)) return null;
+    if (now_ns - entry.last_full_check_ns < FOLD_CHECK_TTL_NS) {
+        return try readTableFromSnapshot(allocator, table_name, entry.snapshot.?);
+    }
+    // TTL expired: stat the manifest + WAL (design 4.1 signal 2).
+    // A fold changing the stats here only costs one full path per
+    // thread per TTL, not one per read.
+    const stats = table_mod.manifestWalStats(allocator, ".", table_name);
+    if (std.meta.eql(stats.manifest, entry.manifest) and std.meta.eql(stats.wal, entry.wal)) {
+        entry.last_full_check_ns = now_ns;
+        return try readTableFromSnapshot(allocator, table_name, entry.snapshot.?);
+    }
+    return null;
+}
+
 fn foldEpochWalInSlices(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
     // Pin yielding: if another thread is already folding this
     // table, serve the pinned manifest epoch instead of queueing
@@ -1452,7 +1673,58 @@ fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) 
     }
 }
 
+/// §4.2 no-block-on-build: serve this thread's old cached snapshot
+/// when another thread is building the new one. Returns null when
+/// there is no usable old entry (first read for this table, or the
+/// working directory changed — a different database), in which case
+/// the caller falls back to the blocking snapshotForPin. The entry
+/// is left installed with its old last_version, so the next read
+/// retries the full path and adopts the new snapshot once built.
+/// The served snapshot is a whole committed epoch, never a torn mix.
+fn threadCacheServeStaleOnBusy(allocator: std.mem.Allocator, table_name: []const u8) ExecError!?ReadTable {
+    const entry = threadCacheFind(table_name) orelse return null;
+    const snap = entry.snapshot orelse return null;
+    // Database identity: never serve another directory's snapshot.
+    const cwd = sio.cwd().realpathAlloc(allocator, ".") catch return null;
+    defer allocator.free(cwd);
+    if (!std.mem.eql(u8, cwd, entry.cwd)) return null;
+    return try readTableFromSnapshot(allocator, table_name, snap);
+}
+
+/// What snapshotForPinNoBlock returns: either the pin's snapshot
+/// (`.fresh`, null = over the cache cap) or a stale ReadTable served
+/// from this thread's cache while another thread builds (`.stale`).
+const SnapshotResolve = union(enum) {
+    fresh: ?*Snapshot,
+    stale: ReadTable,
+};
+
+/// Resolve the pin's snapshot for the read path (design §4.2
+/// no-block-on-build). On attach-mutex contention, serves this
+/// thread's old cached snapshot instead of spinning, and refreshes
+/// on the next read. Falls back to the blocking snapshotForPin when
+/// there is no old snapshot to serve. The caller keeps and releases
+/// the pin hold on every path.
+fn snapshotForPinNoBlock(allocator: std.mem.Allocator, table_name: []const u8, pin: *epoch_runtime.EpochPin) ExecError!SnapshotResolve {
+    switch (try snapshotForPinTry(table_name, pin)) {
+        .ready => |snap| return .{ .fresh = snap },
+        .busy => {
+            if (try threadCacheServeStaleOnBusy(allocator, table_name)) |stale| {
+                return .{ .stale = stale };
+            }
+            return .{ .fresh = try snapshotForPin(table_name, pin) };
+        },
+    }
+}
+
 fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError!ReadTable {
+    // Stage 1 B fast path: version + cwd + TTL/stat only. The
+    // version is sampled before the full path so a commit landing
+    // during the fill cannot install a stale snapshot under the
+    // new version (see threadCacheInstall).
+    const read_version = commit_version.load(.acquire);
+    const read_now = sio.nanoTimestamp();
+    if (try threadCacheServe(allocator, table_name, read_version, read_now)) |cached| return cached;
     try foldEpochWalTipForRead(allocator, table_name);
     {
         const t_witness = ScopedTimer.begin(.table_meta_source);
@@ -1460,13 +1732,25 @@ fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError
         t_witness.end();
         if (witness) |w| {
             if (epoch_runtime.pinCurrentIf(table_name, w.epoch, w.meta_hash)) |pin| {
-                const snapshot = snapshotForPin(table_name, pin) catch |err| {
+                const resolved = snapshotForPinNoBlock(allocator, table_name, pin) catch |err| {
                     epoch_runtime.release(table_name, pin);
                     return err;
                 };
-                if (snapshot) |snap| return readTableFromSnapshot(allocator, table_name, pin, snap);
-                epoch_runtime.release(table_name, pin);
-                // Over the cache cap: fall through to the legacy load.
+                switch (resolved) {
+                    .stale => |stale| {
+                        epoch_runtime.release(table_name, pin);
+                        return stale;
+                    },
+                    .fresh => |snapshot| {
+                        if (snapshot) |snap| {
+                            threadCacheInstall(table_name, pin, snap, read_version, allocator);
+                            epoch_runtime.release(table_name, pin);
+                            return readTableFromSnapshot(allocator, table_name, snap);
+                        }
+                        epoch_runtime.release(table_name, pin);
+                        // Over the cache cap: fall through to the legacy load.
+                    },
+                }
             }
         }
     }
@@ -1478,13 +1762,28 @@ fn loadReadTable(allocator: std.mem.Allocator, table_name: []const u8) ExecError
     const epoch = try activeMetaEpoch(allocator, meta_bytes);
     const pin = epoch_runtime.pinLatest(table_name, meta_bytes, epoch, hashBytes(meta_bytes)) catch return ExecError.OutOfMemory;
     t_parse.end();
-    const snapshot = snapshotForPin(table_name, pin) catch |err| {
+    const resolved = snapshotForPinNoBlock(allocator, table_name, pin) catch |err| {
         epoch_runtime.release(table_name, pin);
         return err;
     };
-    if (snapshot) |snap| return readTableFromSnapshot(allocator, table_name, pin, snap);
-    defer epoch_runtime.release(table_name, pin);
-    return loadReadTableFromMeta(allocator, table_name, pin.meta_source);
+    switch (resolved) {
+        .stale => |stale| {
+            epoch_runtime.release(table_name, pin);
+            return stale;
+        },
+        .fresh => |snapshot| {
+            if (snapshot) |snap| {
+                threadCacheInstall(table_name, pin, snap, read_version, allocator);
+                epoch_runtime.release(table_name, pin);
+                return readTableFromSnapshot(allocator, table_name, snap);
+            }
+            // Over the cache cap: no snapshot to cache; drop any stale
+            // entry so later reads do not serve it.
+            threadCacheDrop(table_name);
+            defer epoch_runtime.release(table_name, pin);
+            return loadReadTableFromMeta(allocator, table_name, pin.meta_source);
+        },
+    }
 }
 
 fn loadReadTableFromMeta(allocator: std.mem.Allocator, table_name: []const u8, meta_bytes: []const u8) ExecError!ReadTable {
@@ -8839,6 +9138,171 @@ test "qmod concurrent readers and single writer keep the epoch oracle" {
     try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
     try std.testing.expectEqual(@as(?u64, null), epoch_runtime.oldestLiveEpoch("conc"));
     try std.testing.expectEqual(@as(?u64, base_epoch + commits), epoch_runtime.currentEpoch("conc"));
+}
+
+
+test "qmod per-thread snapshot cache serves repeats and adopts commits" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 200;
+    const fixture = try concSetup(std.testing.allocator, tmp, @intCast(rows), 0);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    // Warm read installs the cache (sum 0).
+    {
+        var warm = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer warm.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), warm.ok.result_u64.?);
+    }
+    // The cache serves without a pin hold (pin-less design: the
+    // snapshot ref, not a pin, is what the cache retains).
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
+    try std.testing.expectEqual(@as(?u64, null), epoch_runtime.oldestLiveEpoch("conc"));
+
+    // One set-all commit (val = 3): the version moves, so the next
+    // serve must miss, and the following exec must see the new sum.
+    var v3: [8]u8 = undefined;
+    std.mem.writeInt(u64, &v3, 3, .little);
+    try concWriteFile(tmp, "v3.bin", &v3);
+    {
+        var w = try execQuery(std.testing.allocator, fixture.setall_hash, "v3.bin");
+        defer w.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), w.ok.code);
+        try std.testing.expectEqual(@as(u64, 3), w.ok.result_u64.?);
+    }
+    {
+        const missed = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(missed == null);
+    }
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 3 * rows), run.ok.result_u64.?);
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
+    _ = try table_mod.verifyTable(std.testing.allocator, ".", "conc");
+}
+
+test "qmod per-thread snapshot cache invalidates on manifest stat change after TTL" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 200;
+    const fixture = try concSetup(std.testing.allocator, tmp, @intCast(rows), 0);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    {
+        var warm = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer warm.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), warm.ok.result_u64.?);
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+
+    // Rewrite the manifest with byte-identical content: no commit
+    // version bump, but the mtime moves. Within the TTL the cache
+    // still serves; after the TTL the stat check must miss.
+    var manifest_file = try (sio.Dir{ .inner = tmp.dir }).openFile("conc.manifest", .{});
+    const manifest_bytes = try manifest_file.readToEndAlloc(std.testing.allocator, 1 << 20);
+    manifest_file.close();
+    defer std.testing.allocator.free(manifest_bytes);
+    var manifest_out = try (sio.Dir{ .inner = tmp.dir }).createFile("conc.manifest", .{ .truncate = true });
+    defer manifest_out.close();
+    try manifest_out.writeAll(manifest_bytes);
+
+    sio.io().sleep(.fromNanoseconds(150 * std.time.ns_per_ms), .awake) catch {};
+    {
+        const missed = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(missed == null);
+    }
+    // The full path re-reads the identical manifest and reinstalls.
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), run.ok.result_u64.?);
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
+}
+
+
+test "qmod per-thread snapshot cache never serves another directory" {
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+
+    // Database A (val 0) and database B (val 9), same table name.
+    var tmp_a = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_a.cleanup();
+    try (sio.Dir{ .inner = tmp_a.dir }).setAsCwd();
+    const fixture_a = try concSetup(std.testing.allocator, tmp_a, 200, 0);
+    defer concFreeFixture(std.testing.allocator, fixture_a);
+
+    var tmp_b = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_b.cleanup();
+    try (sio.Dir{ .inner = tmp_b.dir }).setAsCwd();
+    const fixture_b = try concSetup(std.testing.allocator, tmp_b, 200, 9);
+    defer concFreeFixture(std.testing.allocator, fixture_b);
+
+    // Warm read in A installs A's snapshot (sum 0).
+    try (sio.Dir{ .inner = tmp_a.dir }).setAsCwd();
+    {
+        var run = try execQuery(std.testing.allocator, fixture_a.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), run.ok.result_u64.?);
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+
+    // Same thread, same table name, different directory: the serve
+    // must miss and the exec must see B's data (1800), never A's 0.
+    try (sio.Dir{ .inner = tmp_b.dir }).setAsCwd();
+    {
+        const missed = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(missed == null);
+    }
+    {
+        var run = try execQuery(std.testing.allocator, fixture_b.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 9 * 200), run.ok.result_u64.?);
+    }
+
+    // Back in A: B's entry must not serve either.
+    try (sio.Dir{ .inner = tmp_a.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+    {
+        var run = try execQuery(std.testing.allocator, fixture_a.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 0), run.ok.result_u64.?);
+    }
 }
 
 fn churnIsSegmentFileName(table_name: []const u8, name: []const u8) bool {

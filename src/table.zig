@@ -8257,6 +8257,40 @@ fn walFilePath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: [
     return activePath(allocator, root_dir, basename);
 }
 
+/// One file's change-detector stat (Stage 1 B): existence plus
+/// mtime (ns) and size. A publish rewrites the manifest by
+/// temp+rename and a WAL append changes the WAL, so a change in
+/// either field proves a mutation the commit-version counter may
+/// have missed (native row transactions, restores, foreign
+/// processes). Missing files stat as not-exists (memory roots).
+pub const TableFileStat = struct {
+    exists: bool = false,
+    mtime_ns: i96 = 0,
+    size: u64 = 0,
+};
+
+pub const ManifestWalStats = struct {
+    manifest: TableFileStat = .{},
+    wal: TableFileStat = .{},
+};
+
+fn statTableFile(path: []const u8) TableFileStat {
+    const st = sio.cwd().statFile(path) catch return .{};
+    return .{ .exists = true, .mtime_ns = st.mtime.nanoseconds, .size = st.size };
+}
+
+/// Stat the table's manifest and WAL (two syscalls, no reads).
+/// Never fails: any path or stat error degrades to not-exists,
+/// which only makes the caller's TTL backstop do the full path.
+pub fn manifestWalStats(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) ManifestWalStats {
+    const manifest_path = tableManifestPath(allocator, root_dir, table_name) catch return .{};
+    defer allocator.free(manifest_path);
+    const manifest_stat = statTableFile(manifest_path);
+    const wal_path = walFilePath(allocator, root_dir, table_name) catch return .{ .manifest = manifest_stat };
+    defer allocator.free(wal_path);
+    return .{ .manifest = manifest_stat, .wal = statTableFile(wal_path) };
+}
+
 fn walDeleteIfExists(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
     const path = walFilePath(allocator, root_dir, table_name) catch return;
     defer allocator.free(path);
