@@ -1380,6 +1380,12 @@ fn cachedProgram(allocator: std.mem.Allocator, source: []const u8, main_name: []
 /// Every non-final slice publishes at least one unit, so the
 /// loop makes progress and terminates.
 fn foldEpochWalInSlices(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
+    // Pin yielding: if another thread is already folding this
+    // table, serve the pinned manifest epoch instead of queueing
+    // behind the fold's write lock. The claiming thread still
+    // advances the manifest, so later reads see the new epoch.
+    if (!foldGuardClaim(table_name)) return;
+    defer foldGuardRelease(table_name);
     var slices: u32 = 0;
     while (true) {
         const step = table_mod.checkpointWalSlice(allocator, ".", table_name, table_mod.FOLD_SLICE_MAX_UNITS) catch |err| return mapTableError(err);
@@ -1404,6 +1410,17 @@ fn foldEpochWalInSlices(allocator: std.mem.Allocator, table_name: []const u8) Ex
 }
 
 fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) ExecError!void {
+    // Cheap change detector: nothing committed since this
+    // thread's last full reconciliation (and that check was
+    // recent) means the pinned manifest view is still current --
+    // skip the group/tip/witness checks entirely. The TTL keeps
+    // a reader that never sees a local commit (another process
+    // committed) from going stale indefinitely.
+    const ver = commit_version.load(.acquire);
+    const now_ns = sio.nanoTimestamp();
+    if (ver == fold_last_version and now_ns - fold_last_check_ns < FOLD_CHECK_TTL_NS) return;
+    fold_last_version = ver;
+    fold_last_check_ns = now_ns;
     // Group queue active (docs §11.4): the staging tip runs
     // ahead of the durable frontier by the queued units. If the
     // manifest already sits at the frontier, a fold cannot
@@ -1422,6 +1439,10 @@ fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) 
         const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
         if (witness) |w| {
             if (w.epoch == tip_epoch) return;
+            // Batched ack window: below the threshold, serve the
+            // pinned manifest epoch; the fold runs once the lag
+            // reaches the threshold and publishes the whole run.
+            if (tip_epoch > w.epoch and tip_epoch - w.epoch < FOLD_LAG_THRESHOLD) return;
         }
         try foldEpochWalInSlices(allocator, table_name);
         return;
@@ -2709,6 +2730,7 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     // same as the legacy path's.
     if (try commitWriteTableWal(allocator, write_table, next_epoch, &owned_paths, &owned_hashes, &owned_block_hashes)) {
         epoch_runtime.noteCommitted(write_table.parsed.value.table_name, next_epoch);
+        bumpCommitVersion();
         return;
     }
 
@@ -2745,6 +2767,7 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     // retires the previous epoch pin so in-process readers that pin
     // from now on adopt the new epoch and the old pin drains.
     epoch_runtime.noteCommitted(write_table.parsed.value.table_name, next_epoch);
+    bumpCommitVersion();
     // Segment reclamation (docs §12.3): a legacy publish is a
     // quiescent point for this table — the write lock is held
     // and the new epoch's files are all named by the active
@@ -2832,6 +2855,91 @@ const GroupTableState = struct {
 var group_mutex: std.atomic.Mutex = .unlocked;
 var group_states: std.StringHashMap(*GroupTableState) = undefined;
 var group_states_init: bool = false;
+
+/// Per-table fold-in-progress guard (pin yielding, docs §10/§11
+/// mixed-readers fix): at most one thread folds a given table at
+/// a time. A reader that finds a fold already running returns
+/// immediately and serves the pinned manifest epoch instead of
+/// queueing behind the fold's exclusive write lock. The fold is a
+/// full legacy commit (~28ms: segment + meta + manifest + WAL
+/// truncate fdatasyncs plus a reaper pass), and every commit used
+/// to trigger one fold per reader -- a thundering herd (100 folds
+/// for 25 commits with 4 readers) that collapsed mixed readers
+/// from ~13.8k/s to ~500/s. The guard coalesces that to one fold
+/// per commit window; the manifest still advances via the claiming
+/// thread, so later reads see the new epoch. Readers pin the
+/// manifest epoch they serve, and the reaper's floor is the oldest
+/// live pin, so a yielded (stale-but-pinned) read stays valid.
+var fold_guard_mutex: std.atomic.Mutex = .unlocked;
+var fold_guards: std.StringHashMap(*std.atomic.Value(bool)) = undefined;
+var fold_guards_init: bool = false;
+
+fn foldGuardFor(table_name: []const u8) *std.atomic.Value(bool) {
+    while (!fold_guard_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer fold_guard_mutex.unlock();
+    if (!fold_guards_init) {
+        fold_guards = std.StringHashMap(*std.atomic.Value(bool)).init(std.heap.page_allocator);
+        fold_guards_init = true;
+    }
+    if (fold_guards.get(table_name)) |g| return g;
+    const g = std.heap.page_allocator.create(std.atomic.Value(bool)) catch @panic("fold guard OOM");
+    g.* = std.atomic.Value(bool).init(false);
+    const key = std.heap.page_allocator.dupe(u8, table_name) catch @panic("fold guard OOM");
+    fold_guards.put(key, g) catch @panic("fold guard OOM");
+    return g;
+}
+
+/// Try to claim the fold for this table. True when this thread
+/// owns the fold and must release it; false when another thread
+/// is already folding (caller yields and serves the pinned
+/// manifest epoch).
+fn foldGuardClaim(table_name: []const u8) bool {
+    const g = foldGuardFor(table_name);
+    return g.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+}
+
+fn foldGuardRelease(table_name: []const u8) void {
+    const g = foldGuardFor(table_name);
+    g.store(false, .release);
+}
+
+/// Commit version (mixed-readers fix, attempt 3): a process-wide
+/// monotonic counter bumped on every successful commit
+/// (noteCommitted sites in commitWriteTable / the group batch).
+/// Readers use it as a cheap change detector: when the version a
+/// thread last saw is unchanged AND the thread's last full
+/// reconciliation was recent, the group/tip/witness checks (mutex
+/// + manifest disk read on every read, ~130us under a live
+/// writer) are skipped -- nothing committed since the last check,
+/// so the pinned manifest view is still current. The TTL bounds
+/// staleness for commits this process did not make (another
+/// process, or a path that bypasses noteCommitted): a reader does
+/// a full check at least every TTL even when the version is
+/// unchanged. Bump uses release semantics so a reader that
+/// observes the new version (acquire) also observes the tip-cache
+/// update the commit made before it; the WAL fallback in the full
+/// check covers a tip cache that still lags.
+var commit_version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn bumpCommitVersion() void {
+    _ = commit_version.fetchAdd(1, .release);
+}
+
+threadlocal var fold_last_version: u64 = 0;
+threadlocal var fold_last_check_ns: i128 = 0;
+const FOLD_CHECK_TTL_NS: i128 = 100 * std.time.ns_per_ms;
+
+/// Batched ack window: the read path only folds once the WAL tip
+/// is at least this many epochs ahead of the published manifest.
+/// A smaller lag is served from the pinned manifest epoch (a
+/// valid snapshot -- the read linearizes before those commits),
+/// and the fold then publishes several units in one batch
+/// (single meta commit, only final segments), amortizing the
+/// fold's fdatasyncs over the run instead of paying a full legacy
+/// commit per commit per reader. Bounds manifest staleness to
+/// (threshold - 1) commits and WAL growth to ~threshold units.
+const FOLD_LAG_THRESHOLD: u64 = 4;
+
 
 fn groupLock() void {
     while (!group_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -3072,6 +3180,7 @@ fn groupLead(allocator: std.mem.Allocator, table_name: []const u8, state: *Group
         group_mutex.unlock();
         for (batch.items) |_| table_mod.noteWalUnitCommitted(allocator, ".", table_name);
         epoch_runtime.noteCommitted(table_name, batch.items[batch.items.len - 1].new_epoch);
+        bumpCommitVersion();
         for (batch.items) |req| req.cell.complete(null);
     }
 }

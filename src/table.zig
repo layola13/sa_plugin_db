@@ -9837,6 +9837,82 @@ fn applyEpochUnitLocked(
     try commitTableMetaWithRebuiltIndexesUnlocked(allocator, root_dir, table_name, meta);
 }
 
+/// Fold a run of consecutive epoch units with a SINGLE meta
+/// publish (batched ack window): validate every unit's meta and
+/// the chain, then materialize ONLY the segment files the FINAL
+/// unit's meta names and publish the final meta once. Earlier
+/// units' versions of a column are superseded before any publish
+/// names them, so they never need to exist on disk; intermediate
+/// epochs are never published as separate manifest states. No
+/// reader can pin an intermediate epoch (pins name a published
+/// manifest epoch or the WAL tip), and the reaper tolerates
+/// missing intermediate versioned metas (FileNotFound -> skip).
+/// A file path the final meta names but no unit in the run
+/// carries already exists on disk from an earlier publish and is
+/// left alone. File payloads are validated only for the files the
+/// final meta names -- bytes no publish will ever reference need
+/// no second check beyond the WAL frame SHA the parser already
+/// verified. The batch is all-or-nothing: any validation failure
+/// aborts before any file is written. Caller holds the table
+/// write lock. The units must form a consecutive chain
+/// (walCollectUnits guarantees this).
+fn applyEpochUnitBatchLocked(
+    allocator: std.mem.Allocator,
+    root_dir: []const u8,
+    table_name: []const u8,
+    units: []const *const WalEpochUnit,
+) TableError!void {
+    if (units.len == 0) return;
+    if (units.len == 1) return applyEpochUnitLocked(allocator, root_dir, table_name, units[0]);
+    // Validate every unit's meta and the chain (cheap: JSON parse
+    // + epoch checks).
+    var expected_base = units[0].base_epoch;
+    for (units) |unit| {
+        if (unit.base_epoch != expected_base) return TableError.VerifyFailed;
+        const meta_json = unit.meta_json orelse return TableError.VerifyFailed;
+        var parsed_meta = try parseTableMeta(allocator, meta_json);
+        defer parsed_meta.deinit();
+        const meta = parsed_meta.value;
+        if (!std.mem.eql(u8, meta.table_name, table_name)) return TableError.VerifyFailed;
+        if (meta.epoch != unit.base_epoch + 1) return TableError.VerifyFailed;
+        expected_base = meta.epoch;
+    }
+    // Final meta = the last unit's meta; it names the segment
+    // files the published state needs.
+    const final_json = units[units.len - 1].meta_json orelse return TableError.VerifyFailed;
+    var final_parsed = try parseTableMeta(allocator, final_json);
+    defer final_parsed.deinit();
+    const final_meta = final_parsed.value;
+    // Materialize only the files the final meta names. A path is
+    // found in the run by searching the units newest-first (each
+    // versioned path is carried by exactly one unit); a path no
+    // unit carries already exists on disk from an earlier publish.
+    for (final_meta.segments) |segment| {
+        for (segment.files) |file_meta| {
+            var found: ?[]const u8 = null;
+            var ui = units.len;
+            while (ui > 0) {
+                ui -= 1;
+                for (units[ui].files.items) |file| {
+                    if (std.mem.eql(u8, file.path, file_meta.path)) {
+                        found = file.bytes;
+                        break;
+                    }
+                }
+                if (found != null) break;
+            }
+            if (found) |bytes| {
+                try validateFileMetaBytes(file_meta, bytes);
+                const active_path = try activePath(allocator, root_dir, file_meta.path);
+                defer allocator.free(active_path);
+                try writeArtifactFile(allocator, active_path, bytes);
+            }
+            // else: already on disk from an earlier publish; leave it.
+        }
+    }
+    try commitTableMetaWithRebuiltIndexesUnlocked(allocator, root_dir, table_name, final_meta);
+}
+
 /// The outcome of one fold pass (docs §12.2): how many
 /// committed units were published, and whether the whole
 /// currently-foldable prefix was consumed. `complete == false`
@@ -9926,6 +10002,12 @@ fn checkpointWalLockedBudget(allocator: std.mem.Allocator, root_dir: []const u8,
     }
     var consumed: u64 = 0;
     var stopped = false;
+    // Pending run of consecutive epoch units, published as one
+    // batch (single meta commit, only the final segments
+    // materialized) when the run ends -- at a row transaction, at
+    // the budget, or at the end of the stream.
+    var epoch_batch = std.array_list.Managed(*const WalEpochUnit).init(allocator);
+    defer epoch_batch.deinit();
     for (units.items) |*unit| {
         if (max_units) |budget| {
             if (consumed >= budget) {
@@ -9935,6 +10017,10 @@ fn checkpointWalLockedBudget(allocator: std.mem.Allocator, root_dir: []const u8,
         }
         switch (unit.*) {
             .row_tx => |*tx| {
+                if (epoch_batch.items.len != 0) {
+                    try applyEpochUnitBatchLocked(allocator, root_dir, table_name, epoch_batch.items);
+                    epoch_batch.clearRetainingCapacity();
+                }
                 try row_group.append(tx.*);
                 tx.ops = std.array_list.Managed(WalParsedRecord).init(allocator);
             },
@@ -9944,10 +10030,14 @@ fn checkpointWalLockedBudget(allocator: std.mem.Allocator, root_dir: []const u8,
                     for (row_group.items) |*t| t.ops.deinit();
                     row_group.clearRetainingCapacity();
                 }
-                try applyEpochUnitLocked(allocator, root_dir, table_name, eu);
+                try epoch_batch.append(eu);
             },
         }
         consumed += 1;
+    }
+    if (epoch_batch.items.len != 0) {
+        try applyEpochUnitBatchLocked(allocator, root_dir, table_name, epoch_batch.items);
+        epoch_batch.clearRetainingCapacity();
     }
     if (row_group.items.len != 0) {
         try checkpointFlushRowGroup(allocator, root_dir, table_name, row_group.items);
