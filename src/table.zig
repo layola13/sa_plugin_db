@@ -9051,7 +9051,7 @@ pub const GroupWalState = struct {
 
 var group_wal_mutex: std.atomic.Mutex = .unlocked;
 var group_wal_states: std.StringHashMap(GroupWalState) = undefined;
-var group_wal_states_init: bool = false;
+var group_wal_states_init: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn groupWalLock() void {
     while (!group_wal_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -9171,21 +9171,29 @@ fn groupFrontierRead(key: []const u8) ?GroupWalState {
 }
 
 pub fn groupWalState(root_dir: []const u8, table_name: []const u8) GroupWalState {
+    // [f778415-fix160] Nothing has ever been published: the map is
+    // uninitialized and the frontier slots are empty, so the answer is
+    // the default state. Skip the key build (a page-allocator alloc/free
+    // per call) — pure waste here. Publish order (init is set before any
+    // state is stored) makes a stale-false read exactly the
+    // pre-publication state the mutex design exposed at that
+    // interleaving (§12.1 freshness argument).
+    if (!group_wal_states_init.load(.acquire)) return .{};
     const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return .{};
     defer unsafe_init_cache_allocator.free(key);
     if (groupFrontierRead(key)) |state| return state;
     groupWalLock();
     defer group_wal_mutex.unlock();
-    if (!group_wal_states_init) return .{};
+    if (!group_wal_states_init.load(.acquire)) return .{};
     return group_wal_states.get(key) orelse .{};
 }
 
 pub fn groupWalPublishState(root_dir: []const u8, table_name: []const u8, state: GroupWalState) void {
     groupWalLock();
     defer group_wal_mutex.unlock();
-    if (!group_wal_states_init) {
+    if (!group_wal_states_init.load(.acquire)) {
         group_wal_states = std.StringHashMap(GroupWalState).init(unsafe_init_cache_allocator);
-        group_wal_states_init = true;
+        group_wal_states_init.store(true, .release);
     }
     const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return;
     const gop = group_wal_states.getOrPut(key) catch {
@@ -9200,7 +9208,7 @@ pub fn groupWalPublishState(root_dir: []const u8, table_name: []const u8, state:
 pub fn groupWalClear(root_dir: []const u8, table_name: []const u8) void {
     groupWalLock();
     defer group_wal_mutex.unlock();
-    if (!group_wal_states_init) return;
+    if (!group_wal_states_init.load(.acquire)) return;
     const key = walCheckpointStateKey(unsafe_init_cache_allocator, root_dir, table_name) catch return;
     defer unsafe_init_cache_allocator.free(key);
     if (group_wal_states.fetchRemove(key)) |kv| unsafe_init_cache_allocator.free(kv.key);
