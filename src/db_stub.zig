@@ -1639,7 +1639,16 @@ fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) 
     // committed) from going stale indefinitely.
     const ver = commit_version.load(.acquire);
     const now_ns = sio.nanoTimestamp();
-    if (ver == fold_last_version and now_ns - fold_last_check_ns < FOLD_CHECK_TTL_NS) return;
+    if (ver == fold_last_version and now_ns - fold_last_check_ns < FOLD_CHECK_TTL_NS) {
+        // A commit from another process never bumps this
+        // process's commit_version, so the version check alone
+        // cannot prove there is nothing to fold: only skip when
+        // the WAL holds no pending epoch units (task 178: the
+        // kill -9 reopen tests fork the commit into a child,
+        // and the parent's read must discover it immediately,
+        // not after the TTL).
+        if (!table_mod.walHasPendingEpochUnits(allocator, ".", table_name)) return;
+    }
     fold_last_version = ver;
     fold_last_check_ns = now_ns;
     // Group queue active (docs §11.4): the staging tip runs
