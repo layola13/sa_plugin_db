@@ -1587,6 +1587,14 @@ fn threadCacheServe(allocator: std.mem.Allocator, table_name: []const u8, versio
     defer allocator.free(cwd);
     if (!std.mem.eql(u8, cwd, entry.cwd)) return null;
     if (now_ns - entry.last_full_check_ns < FOLD_CHECK_TTL_NS) {
+        // A commit from another process leaves WAL bytes until a
+        // fold publishes them, and this process's version counter
+        // never sees it: never serve a cached snapshot while the
+        // WAL is non-empty (task 178: the group kill -9 test
+        // forks its commits into a child). An empty WAL means no
+        // pending units; staleness from a foreign fold is still
+        // bounded by the TTL, as the design already accepts.
+        if (table_mod.walIsDirty(allocator, ".", table_name)) return null;
         return try readTableFromSnapshot(allocator, table_name, entry.snapshot.?);
     }
     // TTL expired: stat the manifest + WAL (design 4.1 signal 2).

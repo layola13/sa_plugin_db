@@ -8563,7 +8563,7 @@ fn walFileSize(allocator: std.mem.Allocator, root_dir: []const u8, table_name: [
     return stat.size;
 }
 
-fn walIsDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
+pub fn walIsDirty(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) bool {
     return walFileSize(allocator, root_dir, table_name) > 0;
 }
 
