@@ -1660,10 +1660,6 @@ fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) 
         const witness = table_mod.readActiveManifestWitness(allocator, ".", table_name) catch null;
         if (witness) |w| {
             if (w.epoch == tip_epoch) return;
-            // Batched ack window: below the threshold, serve the
-            // pinned manifest epoch; the fold runs once the lag
-            // reaches the threshold and publishes the whole run.
-            if (tip_epoch > w.epoch and tip_epoch - w.epoch < FOLD_LAG_THRESHOLD) return;
         }
         try foldEpochWalInSlices(allocator, table_name);
         return;
@@ -3227,18 +3223,6 @@ fn bumpCommitVersion() void {
 threadlocal var fold_last_version: u64 = 0;
 threadlocal var fold_last_check_ns: i128 = 0;
 const FOLD_CHECK_TTL_NS: i128 = 100 * std.time.ns_per_ms;
-
-/// Batched ack window: the read path only folds once the WAL tip
-/// is at least this many epochs ahead of the published manifest.
-/// A smaller lag is served from the pinned manifest epoch (a
-/// valid snapshot -- the read linearizes before those commits),
-/// and the fold then publishes several units in one batch
-/// (single meta commit, only final segments), amortizing the
-/// fold's fdatasyncs over the run instead of paying a full legacy
-/// commit per commit per reader. Bounds manifest staleness to
-/// (threshold - 1) commits and WAL growth to ~threshold units.
-const FOLD_LAG_THRESHOLD: u64 = 4;
-
 
 fn groupLock() void {
     while (!group_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -7313,6 +7297,16 @@ test "qmod pin completes while a checkpoint fold is parked between slices" {
     // still in progress.
     var folder = SliceFolderCtx{ .table_name = table_name };
     var folder_thread = try std.Thread.spawn(.{}, SliceFolderCtx.work, .{&folder});
+    // The folder thread holds a pointer to this stack frame: it
+    // must be released and joined on every exit path, including
+    // an early `try` return, or it keeps running on dead stack
+    // memory after the test returns (task 178: it used to abort
+    // a later test with a memcpy from address 0x0).
+    var folder_joined = false;
+    defer if (!folder_joined) {
+        folder.release_flag.store(true, .release);
+        folder_thread.join();
+    };
     try groupTestWaitFor(&folder.parked, "folder parked between slices");
     try std.testing.expectEqual(@as(u64, 1), folder.first_published);
     try std.testing.expect(!folder.first_complete);
@@ -7331,6 +7325,7 @@ test "qmod pin completes while a checkpoint fold is parked between slices" {
 
     folder.release_flag.store(true, .release);
     folder_thread.join();
+    folder_joined = true;
     try std.testing.expect(folder.err_name == null);
     // The completing slice truncated the WAL; the table
     // verifies end to end.
