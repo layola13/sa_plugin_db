@@ -957,6 +957,57 @@ pub fn acquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8,
     return .{ .file = file };
 }
 
+/// Non-blocking variant of acquireTableWriteLock (task 180):
+/// returns null when the lock is held by another thread/process
+/// (or on any error), never waits. The read-side cache install
+/// uses it so a reader never blocks behind a writer that holds
+/// the lock: the group-commit gate tests park a leader inside
+/// the sync holding the lock while readers must complete, so a
+/// blocking acquire there deadlocks (the leader waits for the
+/// gate, the gate waits for the readers to join, the readers
+/// wait for the lock). A failed try only skips the epoch stamp;
+/// the snapshot itself is still installed, governed by the
+/// pre-epoch gates.
+pub fn tryAcquireTableWriteLock(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) ?TableWriteLock {
+    if (isMemoryRoot(root_dir) or skipDurabilitySync()) {
+        const path = tableWriteLockPath(allocator, root_dir, table_name) catch return null;
+        defer allocator.free(path);
+        while (!process_write_locks_mutex.tryLock()) std.atomic.spinLoopHint();
+        const entry = process_write_locks.getOrPut(unsafe_init_cache_allocator, path) catch {
+            process_write_locks_mutex.unlock();
+            return null;
+        };
+        if (!entry.found_existing) {
+            entry.key_ptr.* = unsafe_init_cache_allocator.dupe(u8, path) catch {
+                _ = process_write_locks.remove(path);
+                process_write_locks_mutex.unlock();
+                return null;
+            };
+            process_write_locks_mutex.unlock();
+            return .{ .memory_path = @constCast(entry.key_ptr.*) };
+        }
+        process_write_locks_mutex.unlock();
+        return null;
+    }
+
+    const path = tableWriteLockPath(allocator, root_dir, table_name) catch return null;
+    defer allocator.free(path);
+    ensureParentDir(path) catch return null;
+    var file = sio.cwd().createFile(path, .{
+        .read = true,
+        .truncate = false,
+    }) catch return null;
+    const locked = file.inner.tryLock(sio.io(), .exclusive) catch {
+        file.close();
+        return null;
+    };
+    if (!locked) {
+        file.close();
+        return null;
+    }
+    return .{ .file = file };
+}
+
 fn schemaMetaPath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
     const basename = try allocPrintPath(allocator, "{s}.sadb-schema", .{table_name});
     errdefer allocator.free(basename);
@@ -8257,6 +8308,102 @@ fn walFilePath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: [
     return activePath(allocator, root_dir, basename);
 }
 
+// --- cross-process commit epoch signal (task 180) --------------------------
+// One small empty file per table, `<table>.epoch`, whose ONLY content is
+// its modification time. Every publish of newly committed state bumps
+// it BEFORE the publish lands (see noteCommitEpochBeforePublish), so a
+// reader that stats an unchanged mtime knows no commit became visible
+// anywhere since the mtime was sampled — without opening or parsing
+// the WAL. A missing/unreadable file means "signal unavailable": the
+// caller falls back to the pre-epoch checks, never to a wrong serve.
+// The file is deleted with the table's other artifacts: it shares the
+// `<table>.` prefix deleteRootTableArtifacts enumerates.
+const epoch_file_suffix = ".epoch";
+
+fn epochFilePath(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) TableError![]u8 {
+    const basename = try allocPrintPath(allocator, "{s}" ++ epoch_file_suffix, .{table_name});
+    defer allocator.free(basename);
+    return activePath(allocator, root_dir, basename);
+}
+
+/// The cross-process commit epoch signal's current value: the
+/// `<table>.epoch` file's mtime in nanoseconds, or null when the
+/// file is missing/unreadable or the table lives on a memory root
+/// (no files at all).
+pub fn commitEpochMtime(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) ?i96 {
+    if (isMemoryRoot(root_dir)) return null;
+    const path = epochFilePath(allocator, root_dir, table_name) catch return null;
+    defer allocator.free(path);
+    const st = sio.cwd().statFile(path) catch return null;
+    return st.mtime.nanoseconds;
+}
+
+/// Poison (delete) the epoch signal file. Best-effort: a missing
+/// file simply means "signal unavailable" to readers.
+fn commitEpochPoison(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    const path = epochFilePath(allocator, root_dir, table_name) catch return;
+    defer allocator.free(path);
+    sio.cwd().deleteFile(path) catch {};
+}
+
+/// Bump the cross-process commit epoch signal BEFORE a commit
+/// publishes (task 180, conditions 1-2): set the `<table>.epoch`
+/// file's mtime to max(current mtime + 1ns, wall-clock now), so
+/// the signal is strictly increasing even when two commits land
+/// in the same nanosecond. The bump is fdatasync'd (unless
+/// durability syncs are skipped) BEFORE the caller publishes, so
+/// a crash can never leave a durable commit behind an unbumped
+/// signal: the failure direction is always "readers take the
+/// full path", never a stale serve. On ANY bump failure the file
+/// is deleted (poisoned) and the commit proceeds: readers then
+/// see "signal unavailable" and take the full path until the
+/// next successful bump recreates it. A crash between the bump
+/// and the publish leaves the signal ahead, which is equally
+/// safe (readers only do extra full paths).
+/// Caller must hold the table write lock across the bump AND the
+/// publish: the lock is what makes a reader's snapshot stamp
+/// (sampled under the same lock, see db_stub threadCacheInstall)
+/// correspond to the state the fold observed — a stamp sampled
+/// after the fold but outside the lock could be stamped with a
+/// bump whose commit had not appended yet.
+pub fn noteCommitEpochBeforePublish(allocator: std.mem.Allocator, root_dir: []const u8, table_name: []const u8) void {
+    if (isMemoryRoot(root_dir)) return;
+    const path = epochFilePath(allocator, root_dir, table_name) catch return;
+    defer allocator.free(path);
+    const now_ns = std.Io.Clock.real.now(sio.io()).nanoseconds;
+    const cur_ns: i96 = blk: {
+        const st = sio.cwd().statFile(path) catch break :blk 0;
+        break :blk st.mtime.nanoseconds;
+    };
+    var target: i96 = cur_ns + 1;
+    if (now_ns > target) target = now_ns;
+    if (target < 0) target = 0;
+    var file = sio.cwd().createFile(path, .{ .truncate = false }) catch {
+        commitEpochPoison(allocator, root_dir, table_name);
+        return;
+    };
+    defer file.close();
+    // std.Io's setTimestamps (futimens underneath, no libc link
+    // needed): set only mtime, leave atime unchanged.
+    file.inner.setTimestamps(sio.io(), .{ .modify_timestamp = .{ .new = .{ .nanoseconds = target } } }) catch {
+        commitEpochPoison(allocator, root_dir, table_name);
+        return;
+    };
+    if (!skipDurabilitySync()) {
+        if (builtin.os.tag == .linux) {
+            std.posix.fdatasync(file.inner.handle) catch {
+                commitEpochPoison(allocator, root_dir, table_name);
+                return;
+            };
+        } else {
+            file.sync() catch {
+                commitEpochPoison(allocator, root_dir, table_name);
+                return;
+            };
+        }
+    }
+}
+
 /// One file's change-detector stat (Stage 1 B): existence plus
 /// mtime (ns) and size. A publish rewrites the manifest by
 /// temp+rename and a WAL append changes the WAL, so a change in
@@ -9376,6 +9523,9 @@ pub fn appendWalBytesSynced(
     table_name: []const u8,
     bytes: []const u8,
 ) TableError!void {
+    // One bump per batch, before the append, under the leader's
+    // write lock (task 180).
+    noteCommitEpochBeforePublish(allocator, root_dir, table_name);
     try walAppendSync(allocator, root_dir, table_name, bytes);
 }
 
@@ -9404,6 +9554,7 @@ pub fn appendEpochCommitWal(
     defer allocator.free(frame);
 
     const pre_len = walFileSize(allocator, root_dir, table_name);
+    noteCommitEpochBeforePublish(allocator, root_dir, table_name);
     try walAppendSync(allocator, root_dir, table_name, frame);
     walCheckpointStateOnCommit(allocator, root_dir, table_name);
     epochTipCacheNoteAppend(root_dir, table_name, base_epoch, base_meta_hash, pre_len, pre_len + frame.len, files, meta_json);
@@ -10402,6 +10553,7 @@ fn commitWriteTransactionWal(allocator: std.mem.Allocator, tx: *WriteTransaction
 
     // The single durability barrier for this commit: everything needed to
     // replay the transaction is on stable storage before we ack.
+    noteCommitEpochBeforePublish(allocator, tx.root_dir, tx.table_name);
     try walAppendSync(allocator, tx.root_dir, tx.table_name, frame.items);
     walCheckpointStateOnCommit(allocator, tx.root_dir, tx.table_name);
 
@@ -10468,6 +10620,9 @@ fn commitWriteTransactionLegacy(allocator: std.mem.Allocator, tx: *WriteTransact
         // Append-only incremental paths refresh indexes themselves; unchanged-index rewrites can keep prior artifacts.
     }
     try flushPendingDictWrites(allocator, tx);
+    // Cross-process epoch signal (task 180): bump before the
+    // manifest publish below, under the tx's write lock.
+    noteCommitEpochBeforePublish(allocator, tx.root_dir, tx.table_name);
     if (unsafe_no_sync) {
         try writeCompatMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
         unsafeInitCacheRefreshFromMeta(allocator, tx.root_dir, tx.table_name, tx.meta);
@@ -30019,6 +30174,54 @@ test "wal epoch unit folds on checkpoint and publishes its meta" {
     // The fold rebuilt the index over the materialized segment.
     const found = try snapshotFindU64(snapshot, 0, 2);
     try std.testing.expect(found.found);
+}
+
+test "wal commit epoch signal bumps strictly and reports its mtime" {
+    // task 180: every publish bumps `<table>.epoch` before it
+    // lands, with a strictly increasing mtime; a deleted signal
+    // reads as unavailable, never stale.
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+    try (sio.Dir{ .inner = tmp_dir.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const table_name = "wal_epoch_signal";
+    try walTestInitTable(std.testing.allocator, table_name);
+    // No commit yet: no signal file.
+    try std.testing.expectEqual(@as(?i96, null), commitEpochMtime(std.testing.allocator, ".", table_name));
+
+    // Legacy row commits bump too (manifest publish path).
+    try walTestInsertLegacy(std.testing.allocator, table_name, 1, 100);
+    const m0 = commitEpochMtime(std.testing.allocator, ".", table_name) orelse return error.TestExpectedEqual;
+    try walTestInsertLegacy(std.testing.allocator, table_name, 2, 200);
+    const m1 = commitEpochMtime(std.testing.allocator, ".", table_name) orelse return error.TestExpectedEqual;
+    try std.testing.expect(m1 > m0);
+
+    var base_meta = try loadActiveMeta(std.testing.allocator, ".", table_name);
+    defer base_meta.deinit(std.testing.allocator);
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_meta.epoch, 777);
+    const m2 = commitEpochMtime(std.testing.allocator, ".", table_name) orelse return error.TestExpectedEqual;
+    try std.testing.expect(m2 > m1);
+    // A second commit bumps strictly, even back-to-back.
+    try walTestAppendEpochUnit(std.testing.allocator, table_name, base_meta.epoch + 1, 778);
+    const m3 = commitEpochMtime(std.testing.allocator, ".", table_name) orelse return error.TestExpectedEqual;
+    try std.testing.expect(m3 > m2);
+
+    // A row-transaction WAL commit bumps too.
+    {
+        const tx = try beginWriteTransaction(std.testing.allocator, ".", table_name);
+        _ = try writeTransactionInsertRawRow(tx, &walTestRow(3, 300));
+        _ = try commitWriteTransactionWal(std.testing.allocator, tx);
+        destroyWriteTransaction(std.testing.allocator, tx);
+    }
+    const m4 = commitEpochMtime(std.testing.allocator, ".", table_name) orelse return error.TestExpectedEqual;
+    try std.testing.expect(m4 > m3);
+
+    // Poison: a deleted signal reads as unavailable, never stale.
+    try sio.cwd().deleteFile("wal_epoch_signal.epoch");
+    try std.testing.expectEqual(@as(?i96, null), commitEpochMtime(std.testing.allocator, ".", table_name));
 }
 
 test "wal checkpoint fold honors a unit budget and resumes to completion" {

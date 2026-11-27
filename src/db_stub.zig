@@ -1488,6 +1488,13 @@ const ThreadSnapCacheEntry = struct {
     last_full_check_ns: i128 = 0,
     manifest: table_mod.TableFileStat = .{},
     wal: table_mod.TableFileStat = .{},
+    /// Cross-process epoch signal (task 180): the `<table>.epoch`
+    /// mtime sampled under the table write lock when this entry
+    /// was installed, with the WAL verified clean. When
+    /// `epoch_available` is false (memory root, or no signal file
+    /// at install) the entry falls back to the pre-epoch WAL gate.
+    epoch_mtime: i96 = 0,
+    epoch_available: bool = false,
     occupied: bool = false,
 };
 threadlocal var thread_snap_cache: [8]ThreadSnapCacheEntry = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} };
@@ -1548,6 +1555,35 @@ fn threadCacheInstall(table_name: []const u8, pin: *epoch_runtime.EpochPin, snap
         std.heap.page_allocator.free(owned_cwd);
         return;
     }
+    // Cross-process epoch signal (task 180): the stamp is only
+    // sound if it is sampled while holding the table write lock
+    // with the WAL verified clean. A writer bumps the signal and
+    // appends its commit under the same lock, so under the lock
+    // either the commit already landed (its units are in the WAL
+    // -> no stamp) or it has not bumped yet (the sampled mtime
+    // is current and the writer's later bump invalidates this
+    // entry). Sampling after the fold but outside the lock would
+    // admit a snapshot stamped with a bump whose commit had not
+    // appended yet. The acquire is a non-blocking try: a reader
+    // must never block behind a writer holding the lock (the
+    // group-commit gate tests park a leader inside the sync
+    // holding the lock while readers must complete — a blocking
+    // acquire there deadlocks). When the try fails, or the WAL
+    // is dirty under the lock, the entry is still installed but
+    // WITHOUT a stamp, i.e. the pre-epoch behavior governed by
+    // the WAL gate and the TTL stats; the next full path retries
+    // the stamp. The snapshot itself is a valid committed epoch
+    // either way; only the stamp is conditional.
+    var epoch_mtime: ?i96 = null;
+    {
+        var write_lock = table_mod.tryAcquireTableWriteLock(allocator, ".", table_name);
+        if (write_lock) |*lock| {
+            defer lock.release();
+            if (!table_mod.walIsDirty(allocator, ".", table_name)) {
+                epoch_mtime = table_mod.commitEpochMtime(allocator, ".", table_name);
+            }
+        }
+    }
     const slot: *ThreadSnapCacheEntry = threadCacheFind(table_name) orelse blk: {
         const idx = thread_snap_cache_next % thread_snap_cache.len;
         thread_snap_cache_next += 1;
@@ -1567,6 +1603,8 @@ fn threadCacheInstall(table_name: []const u8, pin: *epoch_runtime.EpochPin, snap
         .last_full_check_ns = sio.nanoTimestamp(),
         .manifest = stats.manifest,
         .wal = stats.wal,
+        .epoch_mtime = epoch_mtime orelse 0,
+        .epoch_available = epoch_mtime != null,
         .occupied = true,
     };
 }
@@ -1587,13 +1625,28 @@ fn threadCacheServe(allocator: std.mem.Allocator, table_name: []const u8, versio
     defer allocator.free(cwd);
     if (!std.mem.eql(u8, cwd, entry.cwd)) return null;
     if (now_ns - entry.last_full_check_ns < FOLD_CHECK_TTL_NS) {
-        // A commit from another process leaves WAL bytes until a
-        // fold publishes them, and this process's version counter
-        // never sees it: never serve a cached snapshot while the
-        // WAL is non-empty (task 178: the group kill -9 test
-        // forks its commits into a child). An empty WAL means no
-        // pending units; staleness from a foreign fold is still
-        // bounded by the TTL, as the design already accepts.
+        // Cross-process epoch signal (task 180): when this entry
+        // carries an epoch stamp, the signal alone decides — an
+        // unchanged mtime means no commit became visible anywhere
+        // since install, so the snapshot is served even while the
+        // WAL still holds un-folded units (a fold that stopped at
+        // the durable frontier leaves them behind). Any commit
+        // bumps the signal before publishing, so a changed (or
+        // unreadable) signal takes the full path. Without a stamp
+        // (memory root, or no signal file at install) keep the
+        // task 178 WAL gate: a commit from another process leaves
+        // WAL bytes until a fold publishes them, and this
+        // process's version counter never sees it, so never serve
+        // a cached snapshot while the WAL is non-empty (the group
+        // kill -9 test forks its commits into a child). An empty
+        // WAL means no pending units; staleness from a foreign
+        // fold is still bounded by the TTL, as the design already
+        // accepts.
+        if (entry.epoch_available) {
+            const mtime = table_mod.commitEpochMtime(allocator, ".", table_name) orelse return null;
+            if (mtime != entry.epoch_mtime) return null;
+            return try readTableFromSnapshot(allocator, table_name, entry.snapshot.?);
+        }
         if (table_mod.walIsDirty(allocator, ".", table_name)) return null;
         return try readTableFromSnapshot(allocator, table_name, entry.snapshot.?);
     }
@@ -1648,14 +1701,26 @@ fn foldEpochWalTipForRead(allocator: std.mem.Allocator, table_name: []const u8) 
     const ver = commit_version.load(.acquire);
     const now_ns = sio.nanoTimestamp();
     if (ver == fold_last_version and now_ns - fold_last_check_ns < FOLD_CHECK_TTL_NS) {
-        // A commit from another process never bumps this
-        // process's commit_version, so the version check alone
-        // cannot prove there is nothing to fold: only skip when
-        // the WAL holds no pending epoch units (task 178: the
-        // kill -9 reopen tests fork the commit into a child,
-        // and the parent's read must discover it immediately,
-        // not after the TTL).
-        if (!table_mod.walHasPendingEpochUnits(allocator, ".", table_name)) return;
+        // Cross-process epoch signal (task 180): when the signal
+        // file exists, one stat decides — an unchanged mtime
+        // means no commit became visible anywhere since this
+        // thread's last check, so the fold is skipped without
+        // opening or parsing the WAL. A changed mtime proceeds
+        // to the full checks below. When the signal is
+        // unavailable (memory root, or no signal file yet) keep
+        // the task 178 WAL gate: a commit from another process
+        // never bumps this process's commit_version, so the
+        // version check alone cannot prove there is nothing to
+        // fold — only skip when the WAL holds no pending epoch
+        // units (the kill -9 reopen tests fork the commit into
+        // a child, and the parent's read must discover it
+        // immediately, not after the TTL).
+        if (table_mod.commitEpochMtime(allocator, ".", table_name)) |mtime| {
+            const table_key = std.hash.Wyhash.hash(0, table_name);
+            if (mtime == fold_last_epoch_mtime and table_key == fold_last_epoch_table) return;
+            fold_last_epoch_mtime = mtime;
+            fold_last_epoch_table = table_key;
+        } else if (!table_mod.walHasPendingEpochUnits(allocator, ".", table_name)) return;
     }
     fold_last_version = ver;
     fold_last_check_ns = now_ns;
@@ -3072,6 +3137,9 @@ fn commitWriteTable(allocator: std.mem.Allocator, write_table: *WriteTable) Exec
     t_rewrite.end();
     write_table.parsed.value.epoch = next_epoch;
     const t_meta = ScopedTimer.begin(.commit_meta);
+    // Cross-process epoch signal (task 180): bump before the
+    // manifest publish, under the write lock held by the caller.
+    table_mod.noteCommitEpochBeforePublish(allocator, ".", write_table.parsed.value.table_name);
     table_mod.commitTableMetaWithRebuiltIndexesUnlocked(allocator, ".", write_table.parsed.value.table_name, write_table.parsed.value) catch |err| return mapTableError(err);
     t_meta.end();
     // In-process publication (docs/vm_concurrency_epoch.md §3.2): the
@@ -3239,6 +3307,13 @@ fn bumpCommitVersion() void {
 
 threadlocal var fold_last_version: u64 = 0;
 threadlocal var fold_last_check_ns: i128 = 0;
+/// Cross-process epoch signal (task 180): the `<table>.epoch`
+/// mtime this thread last observed in the change detector, plus
+/// the table it belonged to — the detector threadlocals are
+/// shared across tables, so the table key is part of the
+/// comparison (two tables' signals must never be confused).
+threadlocal var fold_last_epoch_mtime: i96 = 0;
+threadlocal var fold_last_epoch_table: u64 = 0;
 const FOLD_CHECK_TTL_NS: i128 = 100 * std.time.ns_per_ms;
 
 fn groupLock() void {
@@ -9263,6 +9338,104 @@ test "qmod per-thread snapshot cache invalidates on manifest stat change after T
     try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
 }
 
+
+test "qmod epoch signal gates the per-thread snapshot cache" {
+    // task 180: the cache entry's epoch stamp decides serves. A
+    // changed signal forces a miss; an unchanged signal serves
+    // even while the WAL holds bytes (the task 178 WAL gate would
+    // have blocked that serve); a deleted signal falls back to
+    // the full path and the WAL gate again.
+    var original_cwd = try sio.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try (sio.Dir{ .inner = tmp.dir }).setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    const rows: u64 = 200;
+    const fixture = try concSetup(std.testing.allocator, tmp, @intCast(rows), 0);
+    defer concFreeFixture(std.testing.allocator, fixture);
+
+    // One set-all commit (val = 3) so the epoch signal file exists.
+    var v3: [8]u8 = undefined;
+    std.mem.writeInt(u64, &v3, 3, .little);
+    try concWriteFile(tmp, "v3.bin", &v3);
+    {
+        var w = try execQuery(std.testing.allocator, fixture.setall_hash, "v3.bin");
+        defer w.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), w.ok.code);
+    }
+    // Full path installs the cache, stamped with the signal.
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 3 * rows), run.ok.result_u64.?);
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+
+    // A foreign bump (signal moved, no version move) must miss.
+    {
+        var epoch_file = try (sio.Dir{ .inner = tmp.dir }).openFile("conc.epoch", .{});
+        defer epoch_file.close();
+        const now = std.Io.Clock.real.now(sio.io());
+        try epoch_file.inner.setTimestamps(sio.io(), .{ .modify_timestamp = .{ .new = .{ .nanoseconds = now.nanoseconds + std.time.ns_per_s } } });
+    }
+    {
+        const missed = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(missed == null);
+    }
+    // The full path reinstalls under the new signal.
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 3 * rows), run.ok.result_u64.?);
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+
+    // WAL bytes with an UNCHANGED signal must still serve: the
+    // bytes below are a torn tail (no valid record), so no commit
+    // is hiding in them — the signal is the authority.
+    {
+        var wal = try sio.cwd().createFile("conc.wal", .{ .truncate = false });
+        defer wal.close();
+        const st = try wal.stat();
+        try wal.seekTo(st.size);
+        try wal.writeAll(&[_]u8{ 0, 0, 0, 0 });
+        try std.testing.expect(table_mod.walIsDirty(std.testing.allocator, ".", "conc"));
+    }
+    {
+        var served = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(served != null);
+        served.?.deinit(std.testing.allocator);
+    }
+
+    // Poison: with the signal file deleted the serve must miss
+    // (full path), and the reinstall without a stamp falls back
+    // to the WAL gate — the dirty WAL blocks serves again.
+    try (sio.Dir{ .inner = tmp.dir }).deleteFile("conc.epoch");
+    {
+        const missed = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(missed == null);
+    }
+    {
+        var run = try execQuery(std.testing.allocator, fixture.sum_hash, null);
+        defer run.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u64, 3 * rows), run.ok.result_u64.?);
+    }
+    {
+        const missed = try threadCacheServe(std.testing.allocator, "conc", commit_version.load(.acquire), sio.nanoTimestamp());
+        try std.testing.expect(missed == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), epoch_runtime.livePinCount("conc"));
+}
 
 test "qmod per-thread snapshot cache never serves another directory" {
     var original_cwd = try sio.cwd().openDir(".", .{});
