@@ -38,15 +38,17 @@ pub const Profile = struct {
         write_load,
         write_eval_rest,
         commit_publish,
+        serve_cache,
+        install_cache,
     };
-    pub const phase_count = 21;
+    pub const phase_count = 23;
     pub const phase_names: [phase_count][]const u8 = .{
         "registry_meta",      "params_read",   "qmod_load",       "scalar_eval",
         "table_meta_source",  "table_meta_parse_pin", "table_schema", "segment_read",
         "segment_validate",   "segment_copy",  "read_eval_rest",  "prog_params",
         "prog_lines",         "stmt_loop",     "scan_fold",      "commit_check",
         "commit_rewrite",     "commit_meta",   "write_load",     "write_eval_rest",
-        "commit_publish",
+        "commit_publish",     "serve_cache",   "install_cache",
     };
 
     var enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -1158,6 +1160,11 @@ const MetaCacheEntry = struct {
     parsed: std.json.Parsed(QueryMeta),
     refs: u32 = 1, // guarded by exec_cache_mutex; includes the map's own hold while installed
     retired: bool = false,
+    // task 180 round 3 (A): the file state the cached parse was
+    // verified against. A matching (mtime, size) serves the cached
+    // parse without re-reading or re-hashing the meta file.
+    mtime_ns: i96 = 0,
+    size: u64 = 0,
 
     fn value(self: *MetaCacheEntry) *const QueryMeta {
         return &self.parsed.value;
@@ -1172,15 +1179,36 @@ fn destroyMetaEntry(entry: *MetaCacheEntry) void {
 }
 
 /// Acquire the registry meta for `hash_text`, parsing only when
-/// the on-disk bytes changed since the cached parse. The meta file
-/// is read and hashed on every call (freshness); a byte-identical
-/// file serves the cached parse. Release with releaseMeta.
+/// the on-disk bytes changed since the cached parse. Freshness is
+/// gated on the file's (mtime, size): a matching stat serves the
+/// cached parse without re-reading or re-hashing; a changed file
+/// is re-read, re-hashed, and re-parsed, and the content hash
+/// still decides identity. Release with releaseMeta.
 fn acquireMeta(allocator: std.mem.Allocator, hash_text: []const u8) ExecError!*MetaCacheEntry {
     const hash = try parseHashHex(hash_text);
     const hash_hex = try hashHexAlloc(allocator, hash);
     defer allocator.free(hash_hex);
     const path = try metaPath(allocator, hash_hex);
     defer allocator.free(path);
+    // task 180 round 3 (A): mtime/size gate. A stat matching the
+    // cached entry serves the parse without re-reading or
+    // re-hashing the meta file; only a changed file pays the
+    // re-read. A failed stat falls through to the re-read path.
+    const file_stat = sio.cwd().statFile(path) catch |err| switch (err) {
+        error.FileNotFound => return ExecError.QueryHashUnknown,
+        else => null,
+    };
+    if (file_stat) |st| {
+        lockExecCache();
+        if (meta_cache.get(hash_hex)) |entry| {
+            if (entry.mtime_ns == st.mtime.nanoseconds and entry.size == st.size) {
+                entry.refs += 1;
+                exec_cache_mutex.unlock();
+                return entry;
+            }
+        }
+        exec_cache_mutex.unlock();
+    }
     const bytes = readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
         ExecError.FileNotFound => return ExecError.QueryHashUnknown,
         else => return err,
@@ -1203,7 +1231,12 @@ fn acquireMeta(allocator: std.mem.Allocator, hash_text: []const u8) ExecError!*M
         parsed.deinit();
         return ExecError.OutOfMemory;
     };
-    entry.* = .{ .content_hash = content_hash, .parsed = parsed };
+    entry.* = .{
+        .content_hash = content_hash,
+        .parsed = parsed,
+        .mtime_ns = if (file_stat) |st| st.mtime.nanoseconds else 0,
+        .size = if (file_stat) |st| st.size else 0,
+    };
     parsed = undefined;
 
     lockExecCache();
@@ -1540,6 +1573,9 @@ fn threadCacheDrop(table_name: []const u8) void {
 /// stale snapshot under the new version. Installs nothing when
 /// the working directory cannot be read or the byte cap is hit.
 fn threadCacheInstall(table_name: []const u8, pin: *epoch_runtime.EpochPin, snap: *Snapshot, version: u64, allocator: std.mem.Allocator) void {
+    // task 180 round 3: time the install path (next-wall decomposition).
+    const install_timer = ScopedTimer.begin(.install_cache);
+    defer install_timer.end();
     const owned_name = std.heap.page_allocator.dupe(u8, table_name) catch return;
     const cwd = sio.cwd().realpathAlloc(allocator, ".") catch {
         std.heap.page_allocator.free(owned_name);
@@ -1613,6 +1649,9 @@ fn threadCacheInstall(table_name: []const u8, pin: *epoch_runtime.EpochPin, snap
 /// the cached snapshot is current. Returns null when the full path
 /// must run. The served ReadTable holds its own snapshot ref.
 fn threadCacheServe(allocator: std.mem.Allocator, table_name: []const u8, version: u64, now_ns: i128) ExecError!?ReadTable {
+    // task 180 round 3: time the serve path (next-wall decomposition).
+    const serve_timer = ScopedTimer.begin(.serve_cache);
+    defer serve_timer.end();
     const entry = threadCacheFind(table_name) orelse return null;
     if (version != entry.last_version) {
         // push_cache_replumb (task 180 round 2): while a snapshot
