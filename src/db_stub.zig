@@ -1614,7 +1614,33 @@ fn threadCacheInstall(table_name: []const u8, pin: *epoch_runtime.EpochPin, snap
 /// must run. The served ReadTable holds its own snapshot ref.
 fn threadCacheServe(allocator: std.mem.Allocator, table_name: []const u8, version: u64, now_ns: i128) ExecError!?ReadTable {
     const entry = threadCacheFind(table_name) orelse return null;
-    if (version != entry.last_version) return null;
+    if (version != entry.last_version) {
+        // push_cache_replumb (task 180 round 2): while a snapshot
+        // build is in flight, the full path would return this
+        // thread's old snapshot via .stale without installing —
+        // the same outcome, at full-path cost (fold detector +
+        // witness + pin + busy-check) on every read. Serve it
+        // here directly instead: the snapshot is a whole committed
+        // epoch (the .stale justification), the staleness window
+        // is the same build duration, and the next read re-probes
+        // once the build lands. When no build is in flight, take
+        // the full path so the fresh snapshot installs promptly.
+        // The attach mutex is held only for the duration of a
+        // snapshot build (snapshotForPinTry), so tryLock failing
+        // is exactly the .busy signal. Database identity still
+        // applies: a chdir must never serve another database's
+        // snapshot.
+        if (entry.snapshot) |snap| {
+            if (!snapshot_attach_mutex.tryLock()) {
+                const cwd = sio.cwd().realpathAlloc(allocator, ".") catch return null;
+                defer allocator.free(cwd);
+                if (!std.mem.eql(u8, cwd, entry.cwd)) return null;
+                return try readTableFromSnapshot(allocator, table_name, snap);
+            }
+            snapshot_attach_mutex.unlock();
+        }
+        return null;
+    }
     // Database identity (one realpath per read): a different
     // working directory is a different database even when the
     // table name matches, so a chdir between databases (the unit
